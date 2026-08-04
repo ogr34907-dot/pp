@@ -22,6 +22,9 @@ from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_chapter_repository import (
     SqliteChapterRepository,
 )
+from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+    SqliteChapterNarrativeCommitRepository,
+)
 from infrastructure.persistence.database.sqlite_knowledge_repository import (
     SqliteKnowledgeRepository,
 )
@@ -579,3 +582,203 @@ async def test_later_chapter_commit_preserves_prior_summary_provenance(
             "sync_attempts": 1,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_commit_rejects_content_changed_during_extraction(
+    tmp_path, monkeypatch
+):
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+
+    async def extract_after_out_of_band_content_change(*args, **kwargs):
+        db.execute(
+            "UPDATE chapters SET content = ? WHERE novel_id = ? AND number = ?",
+            ("并发覆盖后的正文", "novel-1", 1),
+        )
+        db.commit()
+        return _canonical_bundle()
+
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(side_effect=extract_after_out_of_band_content_change),
+    )
+
+    result = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+
+    assert result.get("commit_status") == "failed"
+    assert result.get("failure_reason") == "source_hash_mismatch"
+    assert db.fetch_one("SELECT status FROM chapter_narrative_commits")["status"] == "failed"
+
+
+def test_canonical_commit_rejects_replaced_or_invalid_summary_row(tmp_path):
+    db, _chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    content_sha256 = hashlib.sha256(chapter.content.encode("utf-8")).hexdigest()
+    claim = repository.claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync/v1",
+    )
+    knowledge.upsert_chapter_summary(
+        novel_id="novel-1",
+        chapter_id=1,
+        summary="准备提交的规范摘要",
+        key_events="事件",
+        open_threads="线索",
+        sync_status="in_progress",
+    )
+    repository.prepare_summary(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync/v1",
+        attempt_count=claim.attempt_count,
+    )
+    db.execute(
+        "UPDATE chapter_summaries SET summary = '', source_content_sha256 = '', "
+        "pipeline_version = 'replaced', sync_status = 'draft' WHERE chapter_number = 1"
+    )
+    db.commit()
+
+    with pytest.raises(RuntimeError, match="canonical_summary_write_missing"):
+        repository.commit(
+            novel_id="novel-1",
+            chapter_number=1,
+            content_sha256=content_sha256,
+            pipeline_version="chapter-narrative-sync/v1",
+            attempt_count=claim.attempt_count,
+            content_revision=claim.content_revision,
+        )
+
+
+@pytest.mark.asyncio
+async def test_vector_status_write_failure_does_not_downgrade_canonical_commit(
+    tmp_path, monkeypatch
+):
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=_canonical_bundle()),
+    )
+
+    class FailingIndexer:
+        async def ensure_collection(self, novel_id):
+            return None
+
+        async def index_chapter_summary(self, *args, **kwargs):
+            raise RuntimeError("vector offline")
+
+    def fail_vector_status_write(self, **kwargs):
+        raise RuntimeError("vector status unavailable")
+
+    monkeypatch.setattr(
+        SqliteChapterNarrativeCommitRepository,
+        "set_vector_status",
+        fail_vector_status_write,
+    )
+
+    result = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, FailingIndexer(), SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+
+    assert result.get("commit_status") == "committed"
+    assert result.get("narrative_sync_ok") is True
+    assert result.get("vector_status") == "failed"
+    assert db.fetch_one("SELECT status FROM chapter_narrative_commits")["status"] == "committed"
+
+
+@pytest.mark.asyncio
+async def test_critical_tension_write_failure_prevents_canonical_commit(
+    tmp_path, monkeypatch
+):
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    bundle = _canonical_bundle()
+    bundle["tension_score"] = 72.0
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=bundle),
+    )
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync._write_tension_ephemeral",
+        lambda *args, **kwargs: False,
+    )
+
+    result = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+
+    assert result.get("commit_status") == "failed"
+    assert result.get("failure_reason") == "critical_bundle_write_failed"
+    assert db.fetch_one("SELECT status FROM chapter_narrative_commits")["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_canonical_summary_is_durable_when_dispatch_only_accepts_the_batch(
+    tmp_path, monkeypatch
+):
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=_canonical_bundle()),
+    )
+    monkeypatch.delenv("PLOTPILOT_ALLOW_DIRECT_SQLITE_WRITES", raising=False)
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.write_dispatch.enqueue_txn_batch",
+        lambda operations: True,
+    )
+
+    result = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+
+    assert result.get("commit_status") == "committed"
+    summary = db.fetch_one(
+        "SELECT sync_status, source_content_sha256 FROM chapter_summaries WHERE chapter_number = 1"
+    )
+    assert dict(summary) == {
+        "sync_status": "committed",
+        "source_content_sha256": result.get("content_sha256"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_canonical_dialogue_event_is_durable_when_dispatch_only_accepts_batch(
+    tmp_path, monkeypatch
+):
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    bundle = _canonical_bundle()
+    bundle["dialogues"] = [
+        {"speaker": "林澈", "content": "城门会在子时关闭。", "context": "城门"}
+    ]
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=bundle),
+    )
+    monkeypatch.delenv("PLOTPILOT_ALLOW_DIRECT_SQLITE_WRITES", raising=False)
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.write_dispatch.enqueue_execute_sql",
+        lambda sql, params: True,
+    )
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.write_dispatch.enqueue_txn_batch",
+        lambda operations: True,
+    )
+
+    result = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+        narrative_event_repository=SqliteNarrativeEventRepository(db),
+    )
+
+    assert result.get("commit_status") == "committed"
+    assert db.fetch_one(
+        "SELECT event_summary FROM narrative_events WHERE novel_id = ? AND chapter_number = ?",
+        ("novel-1", 1),
+    )["event_summary"] == "林澈: 城门会在子时关闭。"

@@ -4,7 +4,10 @@ from pathlib import Path
 
 from domain.novel.entities.chapter import Chapter
 from domain.novel.value_objects.novel_id import NovelId
-from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.connection import (
+    DatabaseConnection,
+    _apply_migration_files,
+)
 from infrastructure.persistence.database.sqlite_chapter_repository import (
     SqliteChapterRepository,
 )
@@ -116,3 +119,75 @@ def test_chapter_repository_versions_only_changed_content(tmp_path):
     }
     assert loaded.content_sha256 == second["content_sha256"]
     assert loaded.content_revision == 2
+
+
+def test_migration_runner_upgrades_existing_database_with_canonical_provenance(
+    tmp_path,
+):
+    db_path = tmp_path / "runner-legacy.db"
+    migrations_dir = Path("infrastructure/persistence/database/migrations")
+    content = "迁移脚本下的旧正文"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE chapters (
+                id TEXT PRIMARY KEY,
+                novel_id TEXT NOT NULL,
+                number INTEGER NOT NULL,
+                content TEXT DEFAULT ''
+            );
+            CREATE TABLE knowledge (
+                id TEXT PRIMARY KEY,
+                novel_id TEXT NOT NULL
+            );
+            CREATE TABLE chapter_summaries (
+                id TEXT PRIMARY KEY,
+                knowledge_id TEXT NOT NULL,
+                chapter_number INTEGER NOT NULL,
+                summary TEXT DEFAULT '',
+                sync_status TEXT DEFAULT 'draft'
+            );
+            CREATE TABLE migrations_applied (
+                migration_file TEXT PRIMARY KEY,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO chapters (id, novel_id, number, content) VALUES (?, ?, ?, ?)",
+            ("chapter-1", "novel-1", 1, content),
+        )
+        conn.execute("INSERT INTO knowledge (id, novel_id) VALUES ('knowledge-1', 'novel-1')")
+        conn.execute(
+            "INSERT INTO chapter_summaries (id, knowledge_id, chapter_number, summary) "
+            "VALUES ('summary-1', 'knowledge-1', 1, '旧摘要')"
+        )
+        for migration in migrations_dir.glob("*.sql"):
+            if migration.name != "014_chapter_narrative_commits.sql":
+                conn.execute(
+                    "INSERT INTO migrations_applied (migration_file) VALUES (?)",
+                    (migration.name,),
+                )
+        _apply_migration_files(conn)
+
+        chapter_columns = {row[1] for row in conn.execute("PRAGMA table_info(chapters)")}
+        summary_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(chapter_summaries)")
+        }
+        chapter = conn.execute(
+            "SELECT content_sha256, content_revision FROM chapters WHERE id = 'chapter-1'"
+        ).fetchone()
+        summary = conn.execute(
+            "SELECT source_content_sha256, pipeline_version, sync_status, sync_attempts "
+            "FROM chapter_summaries WHERE id = 'summary-1'"
+        ).fetchone()
+
+    assert {"content_sha256", "content_revision"} <= chapter_columns
+    assert {
+        "source_content_sha256",
+        "pipeline_version",
+        "sync_error",
+        "sync_attempts",
+    } <= summary_columns
+    assert chapter == (hashlib.sha256(content.encode("utf-8")).hexdigest(), 1)
+    assert summary == (chapter[0], "legacy", "legacy", 0)

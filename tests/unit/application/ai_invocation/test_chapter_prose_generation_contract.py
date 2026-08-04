@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 
@@ -50,6 +51,8 @@ class _Db:
                 outline TEXT,
                 status TEXT DEFAULT 'draft',
                 word_count INTEGER DEFAULT 0,
+                content_sha256 TEXT NOT NULL DEFAULT '',
+                content_revision INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(novel_id, number)
@@ -94,6 +97,46 @@ def test_project_chapter_prose_updates_existing_chapter():
     row = db.fetch_one("SELECT content, status, word_count FROM chapters WHERE id = ?", ("chapter-1",))
     assert result["action"] == "updated"
     assert row == {"content": "新的正文", "status": "draft", "word_count": 4}
+
+
+def test_project_chapter_prose_updates_content_version_for_existing_chapter():
+    db = _Db()
+    with db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO chapters (id, novel_id, number, title, content, status, word_count, content_sha256, content_revision) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "chapter-1",
+                "novel-1",
+                2,
+                "旧章",
+                "旧正文",
+                "draft",
+                3,
+                hashlib.sha256("旧正文".encode("utf-8")).hexdigest(),
+                1,
+            ),
+        )
+
+    project_chapter_prose_to_chapters(
+        db,
+        {
+            "adapter": "chapters_table",
+            "novel_id": "novel-1",
+            "chapter_number": 2,
+            "content": "新的正文",
+            "word_count": 4,
+        },
+    )
+
+    row = db.fetch_one(
+        "SELECT content_sha256, content_revision FROM chapters WHERE id = ?",
+        ("chapter-1",),
+    )
+    assert row == {
+        "content_sha256": hashlib.sha256("新的正文".encode("utf-8")).hexdigest(),
+        "content_revision": 2,
+    }
 
 
 def test_project_chapter_prose_refuses_empty_overwrite():

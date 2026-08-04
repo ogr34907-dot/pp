@@ -107,15 +107,25 @@ class SqliteChapterNarrativeCommitRepository:
         content_sha256: str,
         pipeline_version: str,
         attempt_count: int,
+        content_revision: int,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with sqlite_writes_bypass_queue():
             with self._db.transaction() as conn:
                 source = conn.execute(
-                    "SELECT content_sha256 FROM chapters WHERE novel_id = ? AND number = ?",
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
                     (novel_id, chapter_number),
                 ).fetchone()
-                if source is None or (source[0] or "") != content_sha256:
+                actual_hash = hashlib.sha256(
+                    (source[0] or "").encode("utf-8")
+                ).hexdigest() if source is not None else ""
+                if (
+                    source is None
+                    or actual_hash != content_sha256
+                    or (source[1] or "") != content_sha256
+                    or int(source[2] or 0) != content_revision
+                ):
                     raise RuntimeError("source_hash_mismatch")
 
                 summary_cursor = conn.execute(
@@ -126,6 +136,11 @@ class SqliteChapterNarrativeCommitRepository:
                         updated_at = ?
                     WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?)
                       AND chapter_number = ?
+                      AND summary IS NOT NULL AND TRIM(summary) != ''
+                      AND source_content_sha256 = ?
+                      AND pipeline_version = ?
+                      AND sync_status = 'in_progress'
+                      AND sync_attempts = ?
                     """,
                     (
                         content_sha256,
@@ -134,6 +149,9 @@ class SqliteChapterNarrativeCommitRepository:
                         now,
                         novel_id,
                         chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        attempt_count,
                     ),
                 )
                 if summary_cursor.rowcount != 1:
@@ -146,6 +164,7 @@ class SqliteChapterNarrativeCommitRepository:
                         committed_at = ?
                     WHERE novel_id = ? AND chapter_number = ?
                       AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ?
                       AND status = 'in_progress'
                     """,
                     (
@@ -155,6 +174,7 @@ class SqliteChapterNarrativeCommitRepository:
                         chapter_number,
                         content_sha256,
                         pipeline_version,
+                        content_revision,
                     ),
                 )
                 if claim_cursor.rowcount != 1:

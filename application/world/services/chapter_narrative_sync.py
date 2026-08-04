@@ -1987,7 +1987,9 @@ def persist_bundle_extras(
     chapter_repository: Any = None,
     plot_arc_repository: Any = None,
     narrative_event_repository: Any = None,
-) -> None:
+    *,
+    require_durable: bool = False,
+) -> bool:
     """将 bundle 中的故事线进展、张力值、对话写入表，并自动生成剧情点、推进里程碑、调整故事线范围。
 
     🔥 核心修复：张力值写入改用独立短连接（_write_tension_ephemeral），
@@ -1998,7 +2000,11 @@ def persist_bundle_extras(
     tension_score = bundle.get("tension_score")
     tension_dims = bundle.get("tension_dimensions")
     if tension_score is not None or tension_dims:
-        _write_tension_ephemeral(novel_id, chapter_number, tension_score, tension_dims)
+        if not _write_tension_ephemeral(
+            novel_id, chapter_number, tension_score, tension_dims
+        ):
+            logger.warning("关键张力写入未确认 novel=%s ch=%s", novel_id, chapter_number)
+            return False
 
     # 2. 自动生成剧情点（基于张力变化）
     if chapter_repository and plot_arc_repository and tension_score is not None:
@@ -2034,7 +2040,14 @@ def persist_bundle_extras(
                     matched = _make_storyline_from_progress_item(
                         novel_id, chapter_number, line_type, arc_label, description
                     )
-                    storyline_repository.save(matched)
+                    if require_durable:
+                        from infrastructure.persistence.database.write_dispatch import (
+                            sqlite_writes_bypass_queue,
+                        )
+                        with sqlite_writes_bypass_queue():
+                            storyline_repository.save(matched)
+                    else:
+                        storyline_repository.save(matched)
                     storylines.append(matched)
                     logger.info(
                         "故事线自动建档 novel=%s ch=%s name=%s type=%s",
@@ -2069,22 +2082,32 @@ def persist_bundle_extras(
 
             # 🔥 通过持久化队列写入（主进程执行，无锁竞争）
             if updated_storylines:
-                try:
-                    from application.engine.services.persistence_queue import get_persistence_queue, PersistenceCommandType
-                    get_persistence_queue().push(
-                        PersistenceCommandType.UPDATE_STORYLINES.value,
-                        {"novel_id": novel_id, "storylines": updated_storylines},
+                row_ids = {row["id"] for row in updated_storylines if row.get("id")}
+                if require_durable:
+                    from infrastructure.persistence.database.write_dispatch import (
+                        sqlite_writes_bypass_queue,
                     )
-                    logger.debug("故事线已推送持久化队列 novel=%s count=%d", novel_id, len(updated_storylines))
-                except Exception as pq_err:
-                    # 持久化队列不可用，降级到直接写入（可能持锁）
-                    logger.warning("持久化队列不可用，降级直接写入故事线: %s", pq_err)
-                    row_ids = {row["id"] for row in updated_storylines if row.get("id")}
-                    for sl in storylines:
-                        if getattr(sl, "id", None) in row_ids:
-                            storyline_repository.save(sl)
+                    with sqlite_writes_bypass_queue():
+                        for sl in storylines:
+                            if getattr(sl, "id", None) in row_ids:
+                                storyline_repository.save(sl)
+                else:
+                    try:
+                        from application.engine.services.persistence_queue import get_persistence_queue, PersistenceCommandType
+                        get_persistence_queue().push(
+                            PersistenceCommandType.UPDATE_STORYLINES.value,
+                            {"novel_id": novel_id, "storylines": updated_storylines},
+                        )
+                        logger.debug("故事线已推送持久化队列 novel=%s count=%d", novel_id, len(updated_storylines))
+                    except Exception as pq_err:
+                        # 持久化队列不可用，降级到直接写入（可能持锁）
+                        logger.warning("故事线持久化队列不可用: %s", pq_err)
+                        for sl in storylines:
+                            if getattr(sl, "id", None) in row_ids:
+                                storyline_repository.save(sl)
         except Exception as e:
             logger.warning("故事线进展落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
+            return False
 
     # 4. 自动推进里程碑
     if storyline_repository and storyline_progress:
@@ -2139,26 +2162,54 @@ def persist_bundle_extras(
                     context,
                 )
                 if hasattr(narrative_event_repository, "upsert_event"):
-                    narrative_event_repository.upsert_event(
-                        event_id=event_id,
-                        novel_id=novel_id,
-                        chapter_number=chapter_number,
-                        event_summary=event_summary,
-                        mutations=mutations,
-                        tags=tags,
-                    )
+                    if require_durable:
+                        from infrastructure.persistence.database.write_dispatch import (
+                            sqlite_writes_bypass_queue,
+                        )
+                        with sqlite_writes_bypass_queue():
+                            narrative_event_repository.upsert_event(
+                                event_id=event_id,
+                                novel_id=novel_id,
+                                chapter_number=chapter_number,
+                                event_summary=event_summary,
+                                mutations=mutations,
+                                tags=tags,
+                            )
+                    else:
+                        narrative_event_repository.upsert_event(
+                            event_id=event_id,
+                            novel_id=novel_id,
+                            chapter_number=chapter_number,
+                            event_summary=event_summary,
+                            mutations=mutations,
+                            tags=tags,
+                        )
                 else:
-                    narrative_event_repository.append_event(
-                        novel_id=novel_id,
-                        chapter_number=chapter_number,
-                        event_summary=event_summary,
-                        mutations=mutations,
-                        tags=tags,
-                    )
+                    if require_durable:
+                        from infrastructure.persistence.database.write_dispatch import (
+                            sqlite_writes_bypass_queue,
+                        )
+                        with sqlite_writes_bypass_queue():
+                            narrative_event_repository.append_event(
+                                novel_id=novel_id,
+                                chapter_number=chapter_number,
+                                event_summary=event_summary,
+                                mutations=mutations,
+                                tags=tags,
+                            )
+                    else:
+                        narrative_event_repository.append_event(
+                            novel_id=novel_id,
+                            chapter_number=chapter_number,
+                            event_summary=event_summary,
+                            mutations=mutations,
+                            tags=tags,
+                        )
 
             logger.info("对话提取完成 novel=%s ch=%s count=%d", novel_id, chapter_number, len(dialogues))
         except Exception as e:
             logger.warning("对话落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
+            return False
 
     # 8. 时间轴事件提取（写入 timeline_notes）
     timeline_events = bundle.get("timeline_events") or []
@@ -2190,6 +2241,9 @@ def persist_bundle_extras(
             logger.info("时间轴事件提取完成 novel=%s ch=%s count=%d", novel_id, chapter_number, len(timeline_events))
         except Exception as e:
             logger.warning("时间轴落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
+            return False
+
+    return True
 
 
 async def sync_chapter_narrative_after_save(
@@ -2425,17 +2479,22 @@ async def sync_chapter_narrative_after_save(
         logger.debug("微观节拍赋值失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
     
     try:
-        knowledge_service.upsert_chapter_summary(
-            novel_id=novel_id,
-            chapter_id=chapter_number,
-            summary=summary,
-            key_events=key_events or "（未提取）",
-            open_threads=open_threads or "无",
-            consistency_note=consistency_note,
-            beat_sections=beat_sections,
-            micro_beats=mb_out if mb_out else None,
-            sync_status="in_progress",
+        from infrastructure.persistence.database.write_dispatch import (
+            sqlite_writes_bypass_queue,
         )
+
+        with sqlite_writes_bypass_queue():
+            knowledge_service.upsert_chapter_summary(
+                novel_id=novel_id,
+                chapter_id=chapter_number,
+                summary=summary,
+                key_events=key_events or "（未提取）",
+                open_threads=open_threads or "无",
+                consistency_note=consistency_note,
+                beat_sections=beat_sections,
+                micro_beats=mb_out if mb_out else None,
+                sync_status="in_progress",
+            )
     except Exception as e:
         return failed_result(str(e) or type(e).__name__)
     try:
@@ -2471,7 +2530,7 @@ async def sync_chapter_narrative_after_save(
 
     if storyline_repository is not None or chapter_repository is not None or narrative_event_repository is not None:
         try:
-            persist_bundle_extras(
+            extras_persisted = persist_bundle_extras(
                 novel_id,
                 chapter_number,
                 bundle,
@@ -2479,7 +2538,10 @@ async def sync_chapter_narrative_after_save(
                 chapter_repository,
                 plot_arc_repository,
                 narrative_event_repository,
+                require_durable=True,
             )
+            if not extras_persisted:
+                return failed_result("critical_bundle_write_failed")
         except Exception as e:
             logger.warning(
                 "bundle 故事线/张力/对话落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
@@ -2562,6 +2624,7 @@ async def sync_chapter_narrative_after_save(
             content_sha256=content_sha256,
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
             attempt_count=claim.attempt_count,
+            content_revision=claim.content_revision,
         )
     except Exception as e:
         failure_reason = str(e) or type(e).__name__
@@ -2601,13 +2664,22 @@ async def sync_chapter_narrative_after_save(
         except Exception as e:
             vector_status = "failed"
             logger.warning("章节向量索引失败 novel=%s ch=%s: [%s] %s", novel_id, chapter_number, type(e).__name__, e, exc_info=True)
-        commit_repository.set_vector_status(
-            novel_id=novel_id,
-            chapter_number=chapter_number,
-            content_sha256=content_sha256,
-            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-            vector_status=vector_status,
-        )
+        try:
+            commit_repository.set_vector_status(
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                content_sha256=content_sha256,
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                vector_status=vector_status,
+            )
+        except Exception as e:
+            vector_status = "failed"
+            logger.warning(
+                "章节向量状态写入失败，保留已提交规范状态 novel=%s ch=%s: %s",
+                novel_id,
+                chapter_number,
+                e,
+            )
 
     # 🔥 将多维张力评分（0-100）传递给调用方，供审计流程替代旧式 _score_tension
     tension_composite = bundle.get("tension_score")

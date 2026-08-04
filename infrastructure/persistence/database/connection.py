@@ -448,6 +448,9 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
 def _apply_migration_files(conn: sqlite3.Connection) -> None:
     """兼容入口：SQL migration 执行已迁到 migration_runner。"""
     run_migration_files(conn, _database_asset_dir() / "migrations")
+    # The standalone migration script reaches this wrapper without DatabaseConnection
+    # initialization. Keep the canonical provenance data migration in that path too.
+    _apply_chapter_narrative_commit_migration(conn)
 
 
 def _apply_migration_files_legacy(conn: sqlite3.Connection) -> None:

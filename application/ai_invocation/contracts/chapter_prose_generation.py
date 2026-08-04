@@ -1,6 +1,7 @@
 """Contracts and continuations for interactive chapter prose generation."""
 from __future__ import annotations
 
+import hashlib
 import uuid
 from typing import Any
 
@@ -130,6 +131,7 @@ def project_chapter_prose_to_chapters(db, projection: dict[str, Any]) -> dict[st
         return {"blocked": True, "reason": "missing_projection_context"}
     if not content.strip():
         return {"blocked": True, "reason": "empty_content_refuses_overwrite"}
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     existing = db.fetch_one(
         "SELECT id, content FROM chapters WHERE novel_id = ? AND number = ?",
@@ -141,10 +143,22 @@ def project_chapter_prose_to_chapters(db, projection: dict[str, Any]) -> dict[st
             chapter_id = f"chapter_{uuid.uuid4().hex}"
             conn.execute(
                 """
-                INSERT INTO chapters (id, novel_id, number, title, content, status, word_count, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                INSERT INTO chapters (
+                    id, novel_id, number, title, content, status, word_count,
+                    content_sha256, content_revision, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """,
-                (chapter_id, novel_id, chapter_number, f"第{chapter_number}章", content, "draft", word_count),
+                (
+                    chapter_id,
+                    novel_id,
+                    chapter_number,
+                    f"第{chapter_number}章",
+                    content,
+                    "draft",
+                    word_count,
+                    content_sha256,
+                ),
             )
             action = "inserted"
         else:
@@ -152,10 +166,23 @@ def project_chapter_prose_to_chapters(db, projection: dict[str, Any]) -> dict[st
             conn.execute(
                 """
                 UPDATE chapters
-                SET content = ?, status = 'draft', word_count = ?, updated_at = CURRENT_TIMESTAMP
+                SET content = ?, status = 'draft', word_count = ?,
+                    content_sha256 = ?,
+                    content_revision = CASE
+                        WHEN content = ? THEN MAX(1, content_revision)
+                        ELSE MAX(1, content_revision + 1)
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE novel_id = ? AND number = ?
                 """,
-                (content, word_count, novel_id, chapter_number),
+                (
+                    content,
+                    word_count,
+                    content_sha256,
+                    content,
+                    novel_id,
+                    chapter_number,
+                ),
             )
             action = "updated"
     return {
