@@ -8,6 +8,7 @@ import pytest
 from engine.pipeline.base import BaseStoryPipeline
 from engine.pipeline.context import PipelineContext
 from engine.pipeline.prose_composer import ChapterProseInvocationComposer, ProseCompositionRequest, ProseCompositionResult
+from application.engine.services.context_budget_allocator import ContextBudgetAllocator
 
 
 class _Pipeline(BaseStoryPipeline):
@@ -24,6 +25,30 @@ class _Composer:
         if request.stream_sink:
             request.stream_sink(self.result.content)
         return self.result
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_carries_workflow_context_budget_to_prose_metadata():
+    chapter_workflow = SimpleNamespace(
+        prepare_chapter_generation=lambda *args, **kwargs: {
+            "context": "已预算主上下文",
+            "context_tokens": 80,
+            "context_budget_tokens": 123,
+            "voice_anchors": "",
+        }
+    )
+    ctx = PipelineContext(
+        novel_id="novel-1",
+        chapter_number=2,
+        outline="本章大纲",
+    )
+    ctx.chapter_workflow = chapter_workflow
+
+    result = await _Pipeline()._step_build_context(ctx)
+
+    assert result.passed
+    assert ctx.context_text == "已预算主上下文"
+    assert ctx.metadata["context_budget_tokens"] == 123
 
 
 def test_story_pipeline_prose_fallback_uses_full_continuity_ledger():
@@ -109,6 +134,51 @@ def test_chapter_prose_composer_does_not_duplicate_continuity_already_in_full_co
     )
 
     assert variables["continuity_context"] == "事实锁\n章前规划补充\n检索证据"
+
+
+def test_chapter_prose_composer_compresses_additional_continuity_inside_context_budget():
+    allocator = ContextBudgetAllocator()
+    base_context = "b" * 320  # 80 tokens
+    additional = "c" * 400  # 100 tokens before its header
+
+    variables = ChapterProseInvocationComposer()._build_variables(
+        ProseCompositionRequest(
+            novel_id="novel-1",
+            chapter_number=4,
+            outline="七段细纲",
+            context_text=base_context,
+            metadata={
+                "continuity_context": additional,
+                "context_budget_tokens": 100,
+            },
+        )
+    )
+
+    emitted = variables["continuity_context"]
+    assert emitted.startswith(base_context + "\n\n=== ADDITIONAL CONTINUITY ===\n")
+    assert additional not in emitted
+    assert allocator.estimate_tokens(emitted) <= 100
+
+
+def test_chapter_prose_composer_drops_additional_continuity_when_main_context_fills_budget():
+    allocator = ContextBudgetAllocator()
+    base_context = "b" * 400  # 100 tokens
+
+    variables = ChapterProseInvocationComposer()._build_variables(
+        ProseCompositionRequest(
+            novel_id="novel-1",
+            chapter_number=4,
+            outline="七段细纲",
+            context_text=base_context,
+            metadata={
+                "continuity_context": "章前规划补充",
+                "context_budget_tokens": 100,
+            },
+        )
+    )
+
+    assert variables["continuity_context"] == base_context
+    assert allocator.estimate_tokens(variables["continuity_context"]) == 100
 
 
 @pytest.mark.asyncio

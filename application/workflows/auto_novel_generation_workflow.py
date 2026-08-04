@@ -406,6 +406,7 @@ class AutoNovelGenerationWorkflow:
             "plot_tension": plot_tension,
             "context": context,
             "context_tokens": context_tokens,
+            "context_budget_tokens": max_tokens,
             "style_summary": style_summary,
             "voice_anchors": voice_anchors,
             "evolution_gate": evolution_gate_report,
@@ -496,6 +497,7 @@ class AutoNovelGenerationWorkflow:
             "plot_tension": plot_tension,
             "context": context,
             "context_tokens": context_tokens,
+            "context_budget_tokens": max_tokens,
             "style_summary": style_summary,
             "voice_anchors": voice_anchors,
         }
@@ -1158,7 +1160,9 @@ class AutoNovelGenerationWorkflow:
                 parts = [p for p in [fl, beats, clues] if p.strip()]
                 fact_lock = "\n\n".join(parts) if parts else ""
             except Exception as e:
-                logger.warning(f"MemoryEngine fact_lock 构建失败: {e}")
+                raise RuntimeError(
+                    f"configured MemoryEngine fact_lock 构建失败: {e}"
+                ) from e
 
         # ★ Theme 集成：获取系统人设和写作规则
         theme_persona = ""

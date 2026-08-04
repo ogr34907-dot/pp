@@ -141,6 +141,17 @@ def test_assemble_chapter_bundle_context_text_uses_t2_t3_headers():
     assert "L1" in s and "L2" in s and "L3" in s
 
 
+def test_prepare_chapter_generation_reports_originating_context_budget(workflow):
+    bundle = workflow.prepare_chapter_generation(
+        "novel-1",
+        4,
+        "本章大纲",
+        max_tokens=12345,
+    )
+
+    assert bundle["context_budget_tokens"] == 12345
+
+
 class TestGenerateChapter:
     """测试 generate_chapter 方法"""
 
@@ -318,6 +329,24 @@ class TestBuildPrompt:
         assert "主线" in prompt.system
         assert "HIGH" in prompt.system
         assert "CTX" in prompt.system
+
+    def test_build_prompt_propagates_configured_memory_engine_fact_lock_failure(self, workflow):
+        class BrokenMemoryEngine:
+            def build_fact_lock_section(self, novel_id, chapter_number):
+                raise RuntimeError("configured fact lock unavailable")
+
+            def get_completed_beats_section(self, novel_id):
+                return ""
+
+            def get_revealed_clues_section(self, novel_id):
+                return ""
+
+        workflow.memory_engine = BrokenMemoryEngine()
+        workflow._current_novel_id = "novel-1"
+        workflow._current_chapter_number = 4
+
+        with pytest.raises(RuntimeError, match="configured fact lock unavailable"):
+            workflow._build_prompt(context="CTX", outline="OL")
 
     def test_build_prompt_includes_genre_profile_contract(self, workflow):
         """类型画像应进入正文生成 system，避免分类只停留在前置向导。"""

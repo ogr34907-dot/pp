@@ -352,6 +352,9 @@ class BaseStoryPipeline(ABC):
                 )
                 ctx.context_text = bundle.get("context", "")
                 ctx.context_tokens = bundle.get("context_tokens", 0)
+                ctx.metadata["context_budget_tokens"] = int(
+                    bundle.get("context_budget_tokens") or 35000
+                )
                 ctx.voice_anchors = bundle.get("voice_anchors", "")
                 ctx.bundle = bundle
                 logger.info(
@@ -371,6 +374,7 @@ class BaseStoryPipeline(ABC):
                     outline=ctx.outline,
                     max_tokens=20000,
                 )
+                ctx.metadata["context_budget_tokens"] = 20000
                 logger.info(f"[{ctx.novel_id}] 上下文（builder）: {len(ctx.context_text)} 字符")
             except Exception as e:
                 logger.warning(f"context_builder 构建失败: {e}")

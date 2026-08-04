@@ -59,18 +59,18 @@ class ChapterProseInvocationComposer:
     """
 
     def _build_variables(self, request: ProseCompositionRequest) -> dict[str, Any]:
+        from application.engine.services.context_budget_allocator import ContextBudgetAllocator
+
         metadata = request.metadata or {}
         continuity_context = str(request.context_text or "").strip()
         additional_continuity = str(metadata.get("continuity_context") or "").strip()
-        if additional_continuity and additional_continuity not in continuity_context:
-            continuity_context = "\n\n".join(
-                part
-                for part in (
-                    continuity_context,
-                    f"=== ADDITIONAL CONTINUITY ===\n{additional_continuity}",
-                )
-                if part
-            )
+        context_budget = int(metadata.get("context_budget_tokens") or 35000)
+        continuity_context = ContextBudgetAllocator().append_budgeted_additional_context(
+            continuity_context,
+            additional_continuity,
+            header="ADDITIONAL CONTINUITY",
+            total_budget=context_budget,
+        )
         return {
             "target_words": int(request.target_words or 2500),
             "chapter_outline": request.outline,

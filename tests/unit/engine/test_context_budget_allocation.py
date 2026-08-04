@@ -101,3 +101,15 @@ def test_allocator_raises_clear_error_when_critical_header_cannot_fit(monkeypatc
 
     with pytest.raises(ContextBudgetExceededError, match="context budget"):
         allocator.allocate("novel-1", 2, "outline", total_budget=1)
+
+
+def test_allocator_propagates_configured_memory_engine_fact_lock_failure(monkeypatch):
+    class BrokenMemoryEngine:
+        def build_fact_lock_section(self, novel_id, chapter_number):
+            raise RuntimeError("configured fact lock unavailable")
+
+    allocator = ContextBudgetAllocator(memory_engine=BrokenMemoryEngine())
+    monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 100)
+
+    with pytest.raises(RuntimeError, match="configured fact lock unavailable"):
+        allocator.allocate("novel-1", 2, "outline", total_budget=1000)

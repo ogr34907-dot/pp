@@ -264,6 +264,50 @@ class ContextBudgetAllocator:
                 high = middle - 1
         return best
 
+    def append_budgeted_additional_context(
+        self,
+        base_context: str,
+        additional_context: str,
+        *,
+        header: str,
+        total_budget: int,
+    ) -> str:
+        """Append a low-priority block without exceeding the emitted-context budget."""
+        base = str(base_context or "").strip()
+        additional = str(additional_context or "").strip()
+        if total_budget <= 0:
+            raise ContextBudgetExceededError(
+                f"context budget must be positive, got {total_budget}"
+            )
+        base_tokens = self.estimate_tokens(base)
+        if base_tokens > total_budget:
+            raise ContextBudgetExceededError(
+                f"context budget {total_budget} cannot fit required main context "
+                f"({base_tokens} tokens)"
+            )
+        if not additional or additional in base:
+            return base
+
+        prefix = "\n\n".join(part for part in (base, f"=== {header} ===") if part)
+        full = prefix + "\n" + additional
+        if self.estimate_tokens(full) <= total_budget:
+            return full
+
+        low, high = 1, len(additional)
+        best = base
+        while low <= high:
+            middle = (low + high) // 2
+            candidate_additional = additional[:middle]
+            if middle < len(additional):
+                candidate_additional += "..."
+            candidate = prefix + "\n" + candidate_additional
+            if self.estimate_tokens(candidate) <= total_budget:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
     def _apply_slot_maximums(
         self,
         slots: Dict[str, ContextSlot],
@@ -662,7 +706,9 @@ class ContextBudgetAllocator:
                     novel_id, chapter_number
                 )
             except Exception as e:
-                logger.warning(f"FACT_LOCK 构建失败: {e}")
+                raise RuntimeError(
+                    f"configured MemoryEngine FACT_LOCK 构建失败: {e}"
+                ) from e
         slots["fact_lock"] = ContextSlot(
             name="绝对事实边界(FACT_LOCK)",
             tier=PriorityTier.T0_CRITICAL,
