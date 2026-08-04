@@ -17,6 +17,11 @@ class ChapterDTO:
     word_count: int
     status: str
     generation_hint: str = ""
+    content_sha256: str = ""
+    content_revision: int = 0
+    rewrite_mode: str = ""
+    requires_rebuild: bool = False
+    replay_completed: bool = False
 
     @classmethod
     def from_domain(cls, chapter: 'Chapter') -> 'ChapterDTO':
@@ -41,4 +46,9 @@ class ChapterDTO:
             word_count=chapter.word_count.value,
             status=status,
             generation_hint=getattr(chapter, 'generation_hint', '') or '',
+            content_sha256=getattr(chapter, 'content_sha256', '') or '',
+            content_revision=int(getattr(chapter, 'content_revision', 0) or 0),
+            rewrite_mode=getattr(chapter, 'rewrite_mode', '') or '',
+            requires_rebuild=bool(getattr(chapter, 'requires_rebuild', False)),
+            replay_completed=bool(getattr(chapter, 'replay_completed', False)),
         )

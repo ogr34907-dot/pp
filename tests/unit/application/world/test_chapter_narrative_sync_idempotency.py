@@ -256,6 +256,43 @@ async def test_canonical_sync_reuses_same_version_and_claims_changed_content(
 
 
 @pytest.mark.asyncio
+async def test_canonical_sync_fails_when_required_character_state_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    _db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    bundle = _canonical_bundle()
+    bundle["character_states"] = [
+        {"character_name": "林澈", "mental_state": "警觉"}
+    ]
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=bundle),
+    )
+
+    class _FailingCharacterStateRepository:
+        def get(self, *_args):
+            return None
+
+        def save(self, _state):
+            raise RuntimeError("character state unavailable")
+
+    result = await sync_chapter_narrative_after_save(
+        "novel-1",
+        1,
+        chapter.content,
+        knowledge,
+        None,
+        SimpleNamespace(),
+        chapter_repository=chapter_repo,
+        character_state_repository=_FailingCharacterStateRepository(),
+    )
+
+    assert result.commit_status == "failed"
+    assert "character state unavailable" in result.failure_reason
+
+
+@pytest.mark.asyncio
 async def test_returning_to_prior_hash_reclaims_claim_for_current_revision(
     tmp_path, monkeypatch
 ):
@@ -307,6 +344,26 @@ async def test_returning_to_prior_hash_reclaims_claim_for_current_revision(
         "status": "committed",
         "attempt_count": 1,
     }
+
+
+def test_claim_rejects_stale_expected_content_revision(tmp_path):
+    db, chapter_repo, chapter, _knowledge = _canonical_services(tmp_path)
+    repository = SqliteChapterNarrativeCommitRepository(db)
+
+    chapter.update_content("第二版正文")
+    chapter_repo.save(chapter)
+    result = repository.claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=hashlib.sha256("第二版正文".encode("utf-8")).hexdigest(),
+        pipeline_version="chapter-narrative-sync:v1",
+        expected_content_revision=1,
+    )
+
+    assert result.disposition == "failed"
+    assert result.content_revision == 2
+    assert result.failure_reason == "source_revision_mismatch"
+    assert db.fetch_all("SELECT * FROM chapter_narrative_commits") == []
 
 
 def test_stale_failure_cannot_poison_reclaimed_hash_revision(tmp_path):

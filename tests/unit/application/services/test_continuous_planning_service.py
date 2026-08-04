@@ -11,6 +11,9 @@ from application.blueprint.services.continuous_planning_service import (
     _try_parse_parts_from_llm_buffer,
     get_macro_plan_progress,
 )
+from application.blueprint.services.chapter_planning_policy import (
+    validate_lightweight_act_plan,
+)
 from domain.ai.value_objects.prompt import Prompt
 from domain.novel.value_objects.generation_preferences import GenerationPreferences
 from domain.structure.story_node import NodeType, StoryNode
@@ -565,3 +568,70 @@ async def test_generate_macro_plan_precise_mode_repairs_missing_act_fields_and_r
     assert progress["status"] == "completed"
     assert progress["current"] == 5
     assert progress["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_confirm_act_planning_rejects_chapters_beyond_novel_target_before_mutation():
+    act = _story_node("act-1", NodeType.ACT, 1, parent_id="volume-1")
+    existing = _story_node("chapter-3", NodeType.CHAPTER, 3, parent_id="act-other")
+    story_repo = SimpleNamespace(
+        get_by_id=AsyncMock(return_value=act),
+        get_children_sync=Mock(return_value=[]),
+        get_by_novel_sync=Mock(return_value=[act, existing]),
+        delete=AsyncMock(),
+        save_batch=AsyncMock(),
+        update=AsyncMock(),
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=SimpleNamespace(
+            delete_by_chapter=AsyncMock(),
+            save_batch=AsyncMock(),
+        ),
+        chapter_repository=None,
+        novel_repository=SimpleNamespace(
+            get_by_id=Mock(return_value=SimpleNamespace(target_chapters=3))
+        ),
+        llm_service=Mock(),
+    )
+    service._write_chapter_plan_variables = Mock()
+    chapters = [
+        {
+            "number": 1,
+            "title": "越界一",
+            "main_event": "推进冲突",
+            "handoff_from_previous": "承接前章",
+            "handoff_to_next": "留下悬念",
+        },
+        {
+            "number": 2,
+            "title": "越界二",
+            "main_event": "推进冲突",
+            "handoff_from_previous": "承接前章",
+            "handoff_to_next": "留下悬念",
+        },
+    ]
+
+    with pytest.raises(ValueError, match="目标章节数"):
+        await service.confirm_act_planning("act-1", chapters)
+
+    story_repo.delete.assert_not_awaited()
+    story_repo.save_batch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("title", ["description", "描述"])
+def test_act_plan_validation_rejects_description_placeholder_titles(title):
+    errors = validate_lightweight_act_plan(
+        [
+            {
+                "number": 1,
+                "title": title,
+                "main_event": "推进冲突",
+                "handoff_from_previous": "承接前章",
+                "handoff_to_next": "留下悬念",
+            }
+        ],
+        expected_count=1,
+    )
+
+    assert "placeholder" in " ".join(errors)

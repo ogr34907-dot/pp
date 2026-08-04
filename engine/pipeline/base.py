@@ -742,6 +742,19 @@ class BaseStoryPipeline(ABC):
         )
 
         try:
+            from domain.novel.value_objects.novel_id import NovelId
+
+            existing = ctx.chapter_repository.get_by_novel_and_number(
+                NovelId(ctx.novel_id), int(ctx.chapter_number)
+            )
+            if (
+                existing is not None
+                and str(getattr(existing, "content", "") or "").strip()
+                and str(getattr(existing, "content", "") or "") != ctx.chapter_content
+            ):
+                await self._save_chapter_via_repository(ctx)
+                if ctx.metadata.get("rewrite_requires_rebuild"):
+                    return StepResult.fail("chapter_rewrite_requires_rebuild")
             self._prepare_chapter_persistence_receipt(ctx)
             # 尝试推持久化队列
             pushed = self._push_persistence_command(ctx)
@@ -924,11 +937,22 @@ class BaseStoryPipeline(ABC):
                         "drift_alert": ctx.drift_alert,
                         "mode": ctx.voice_mode,
                     }
+                receipt = dict(
+                    ctx.metadata.get("chapter_persistence_receipt") or {}
+                )
+                expected_content_sha256 = str(
+                    receipt.get("content_sha256") or ""
+                )
+                expected_content_revision = int(
+                    receipt.get("content_revision") or 0
+                )
                 result = await ctx.aftermath_pipeline.run_after_chapter_saved(
                     ctx.novel_id,
                     ctx.chapter_number,
                     ctx.chapter_content,
                     voice_result=voice_result,
+                    expected_content_sha256=expected_content_sha256 or None,
+                    expected_content_revision=expected_content_revision or None,
                 )
                 ctx.narrative_sync_ok = self._is_chapter_narrative_ready(ctx)
                 ctx.vector_stored = bool(result.get("vector_stored", False))
@@ -1250,6 +1274,36 @@ class BaseStoryPipeline(ABC):
         novel_id = NovelId(ctx.novel_id)
         existing = ctx.chapter_repository.get_by_novel_and_number(novel_id, int(ctx.chapter_number))
         if existing is not None:
+            if (
+                str(getattr(existing, "content", "") or "").strip()
+                and str(getattr(existing, "content", "") or "") != ctx.chapter_content
+            ):
+                from application.core.services.chapter_rewrite_coordinator import (
+                    ChapterRewriteCoordinator,
+                )
+
+                coordinator = ctx.get_dep("chapter_rewrite_coordinator")
+                if coordinator is None:
+                    coordinator = ChapterRewriteCoordinator.for_chapter_repository(
+                        ctx.chapter_repository,
+                        vector_store=getattr(ctx.context_builder, "vector_store", None),
+                        aftermath_pipeline=ctx.aftermath_pipeline,
+                    )
+                if coordinator is None:
+                    raise RuntimeError("chapter_rewrite_coordinator_unavailable")
+                outcome = coordinator.rewrite(
+                    existing,
+                    ctx.chapter_content,
+                    rewrite_mode="safe_snapshot",
+                )
+                ctx.metadata["rewrite_requires_rebuild"] = bool(
+                    outcome.requires_rebuild
+                )
+                ctx.metadata["rewrite_replay_completed"] = bool(
+                    outcome.replay_completed
+                )
+                ctx.metadata["rewrite_checkpoint_id"] = outcome.checkpoint_id
+                return
             existing.update_content(ctx.chapter_content)
             existing.status = ChapterStatus.COMPLETED
             if ctx.outline:

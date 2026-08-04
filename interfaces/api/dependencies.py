@@ -349,6 +349,27 @@ def get_chapter_service() -> ChapterService:
         get_novel_repository(),
         review_repo,
         chapter_renumber_coordinator=get_chapter_renumber_coordinator(),
+        chapter_rewrite_coordinator=get_chapter_rewrite_coordinator(),
+    )
+
+
+def get_chapter_rewrite_coordinator():
+    """已完成章节覆写统一走快照、失效和暂停协调器。"""
+    from application.core.services.chapter_rewrite_coordinator import (
+        ChapterRewriteCoordinator,
+    )
+    from infrastructure.persistence.database.chapter_draft_repository import (
+        ChapterDraftRepository,
+    )
+
+    db = get_database()
+    return ChapterRewriteCoordinator(
+        db=db,
+        chapter_repository=get_chapter_repository(),
+        chapter_draft_repository=ChapterDraftRepository(db),
+        checkpoint_service=get_unified_checkpoint_service(),
+        vector_store=get_vector_store(),
+        aftermath_pipeline=get_chapter_aftermath_pipeline(),
     )
 
 

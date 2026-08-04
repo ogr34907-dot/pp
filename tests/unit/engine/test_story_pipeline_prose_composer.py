@@ -457,7 +457,9 @@ async def test_story_pipeline_save_falls_back_when_queue_write_not_visible(monke
         chapter_content="正文",
         word_count=2,
     )
-    ctx.chapter_repository = object()
+    ctx.chapter_repository = SimpleNamespace(
+        get_by_novel_and_number=lambda *_args: None,
+    )
     saved = []
 
     async def _save_via_repo(_ctx):
@@ -495,7 +497,9 @@ async def test_story_pipeline_queue_idle_without_durable_receipt_is_not_saved(mo
         chapter_content="正文",
         word_count=2,
     )
-    ctx.chapter_repository = object()
+    ctx.chapter_repository = SimpleNamespace(
+        get_by_novel_and_number=lambda *_args: None,
+    )
 
     monkeypatch.setattr(
         pipeline,
@@ -576,6 +580,41 @@ async def test_story_pipeline_post_commit_fails_closed_without_canonical_readine
     assert not result.passed
     assert result.message == "canonical_aftermath_not_ready"
     assert ctx.narrative_sync_ok is False
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_post_commit_passes_persisted_content_version():
+    class _Aftermath:
+        def __init__(self):
+            self.kwargs = None
+
+        async def run_after_chapter_saved(self, *args, **kwargs):
+            self.kwargs = kwargs
+            return {"narrative_sync_ok": True}
+
+    content = "正文"
+    aftermath = _Aftermath()
+    pipeline = _Pipeline()
+    pipeline._is_chapter_narrative_ready = lambda _ctx: True
+    ctx = PipelineContext(
+        novel_id="novel-versioned-aftermath",
+        chapter_number=1,
+        chapter_content=content,
+        word_count=2,
+    )
+    ctx.aftermath_pipeline = aftermath
+    ctx.metadata["chapter_persistence_receipt"] = {
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "content_revision": 4,
+    }
+
+    result = await pipeline._step_run_post_commit(ctx)
+
+    assert result.passed
+    assert aftermath.kwargs["expected_content_sha256"] == hashlib.sha256(
+        content.encode("utf-8")
+    ).hexdigest()
+    assert aftermath.kwargs["expected_content_revision"] == 4
 
 
 @pytest.mark.asyncio

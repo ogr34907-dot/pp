@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 import logging
 import asyncio
+import hashlib
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -274,8 +275,19 @@ class DaemonHostMixin:
         params = []
 
         if content is not None:
+            content_sha256 = hashlib.sha256(
+                str(content).encode("utf-8")
+            ).hexdigest()
             set_parts.append("content = ?")
             params.append(content)
+            set_parts.append("content_sha256 = ?")
+            params.append(content_sha256)
+            set_parts.append(
+                "content_revision = CASE "
+                "WHEN content_sha256 = ? THEN MAX(content_revision, 1) "
+                "ELSE MAX(content_revision + 1, 1) END"
+            )
+            params.append(content_sha256)
         if status is not None:
             set_parts.append("status = ?")
             params.append(status)
@@ -1424,12 +1436,28 @@ class DaemonHostMixin:
                 break
 
             current_content = rewritten
-            # 🔥 核心修复：使用独立短连接写入，避免持有长连接写锁阻塞 API 进程
-            self._save_chapter_ephemeral(
-                novel.novel_id.value, chapter.number,
-                content=current_content,
-                word_count=len(current_content.strip()),
+            from application.core.services.chapter_rewrite_coordinator import (
+                ChapterRewriteCoordinator,
             )
+
+            coordinator = ChapterRewriteCoordinator.for_chapter_repository(
+                self.chapter_repository
+            )
+            if coordinator is None:
+                raise RuntimeError("chapter_rewrite_coordinator_unavailable")
+            rewrite = coordinator.rewrite(
+                chapter,
+                current_content,
+                rewrite_mode="safe_snapshot",
+            )
+            if rewrite.requires_rebuild:
+                return current_content, {
+                    **current_result,
+                    "rewrite_requires_rebuild": True,
+                    "rewrite_replay_completed": rewrite.replay_completed,
+                    "rewrite_checkpoint_id": rewrite.checkpoint_id,
+                }
+
             current_result = await self._score_voice_only(
                 novel.novel_id.value,
                 chapter.number,
@@ -1454,12 +1482,40 @@ class DaemonHostMixin:
         chapter_id: ChapterId,
     ) -> Dict[str, Any]:
         """无统一管线时：VOICE + extract_bundle（单次 LLM 叙事/三元组/伏笔）入队 + 同步文风（可能与队列内 VOICE 重复）。"""
+        payload = {"content": content, "chapter_number": chapter_num}
+        current = self.chapter_repository.get_by_novel_and_number(
+            novel.novel_id,
+            chapter_num,
+        )
+        content_sha256 = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+        current_hash = hashlib.sha256(
+            str(getattr(current, "content", "") or "").encode("utf-8")
+        ).hexdigest()
+        content_revision = int(getattr(current, "content_revision", 0) or 0)
+        bundle_payload = None
+        if current is not None and current_hash == content_sha256 and content_revision >= 1:
+            bundle_payload = {
+                **payload,
+                "content_sha256": str(
+                    getattr(current, "content_sha256", "") or content_sha256
+                ),
+                "content_revision": content_revision,
+            }
+        else:
+            logger.warning(
+                "[%s] 跳过无当前正文版本的 legacy extract_bundle：ch=%s",
+                novel.novel_id.value,
+                chapter_num,
+            )
+
         for task_type in [TaskType.VOICE_ANALYSIS, TaskType.EXTRACT_BUNDLE]:
+            if task_type == TaskType.EXTRACT_BUNDLE and bundle_payload is None:
+                continue
             self.background_task_service.submit_task(
                 task_type=task_type,
                 novel_id=novel.novel_id,
                 chapter_id=chapter_id,
-                payload={"content": content, "chapter_number": chapter_num},
+                payload=bundle_payload if task_type == TaskType.EXTRACT_BUNDLE else payload,
             )
         if self.voice_drift_service and content:
             try:
@@ -2134,6 +2190,27 @@ class DaemonHostMixin:
                     self._save_chapter_ephemeral(novel_id, chapter_number, status="draft")
                 return
 
+            if (
+                status == ChapterStatus.COMPLETED.value
+                and getattr(existing, "status", None) == ChapterStatus.COMPLETED
+                and existing_content != content_str
+            ):
+                from application.core.services.chapter_rewrite_coordinator import (
+                    ChapterRewriteCoordinator,
+                )
+
+                coordinator = ChapterRewriteCoordinator.for_chapter_repository(
+                    self.chapter_repository
+                )
+                if coordinator is None:
+                    raise RuntimeError("chapter_rewrite_coordinator_unavailable")
+                coordinator.rewrite(
+                    existing,
+                    content_str,
+                    rewrite_mode="safe_snapshot",
+                )
+                return
+
             # 正常更新：使用独立短连接
             import uuid
             wc = len(content_str)
@@ -2192,6 +2269,13 @@ class DaemonHostMixin:
         if not volume_nodes:
             logger.warning(f"[{novel_id}] 无可用卷节点，无法确定父卷")
             return None
+        if target_chapters > 0 and current_auto_chapters >= target_chapters:
+            logger.info(
+                "[%s] 已达到目标章节数 %s，不再创建新幕",
+                novel_id,
+                target_chapters,
+            )
+            return None
 
         # 统计每个卷下的幕数量
         volume_act_counts: Dict[int, int] = {}
@@ -2211,13 +2295,12 @@ class DaemonHostMixin:
                 )
                 return v
 
-        # 所有卷都已达到建议幕数，挂在最后一个卷上（允许超发）
-        last_volume = volume_nodes[-1]
         logger.info(
-            f"[{novel_id}] 父卷选择：所有卷已达{rec_acts_per_volume}幕上限"
-            f"，新幕挂到最后一个卷（第{last_volume.number}卷）"
+            "[%s] 所有现有卷均已达到 %s 幕上限，需要显式创建下一卷",
+            novel_id,
+            rec_acts_per_volume,
         )
-        return last_volume
+        return None
 
     async def _find_next_unwritten_chapter_async(self, novel):
         """找到下一个未写的章节节点

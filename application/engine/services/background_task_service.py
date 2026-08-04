@@ -194,6 +194,15 @@ class BackgroundTaskService:
         chapter_number = int(task.payload.get("chapter_number") or 0)
         if not content:
             return
+        content_sha256 = str(task.payload.get("content_sha256") or "")
+        content_revision = int(task.payload.get("content_revision") or 0)
+        if not content_sha256 or content_revision < 1:
+            logger.warning(
+                "[BG] 丢弃缺少正文版本的 extract_bundle 任务：novel=%s ch=%s",
+                task.novel_id.value,
+                chapter_number,
+            )
+            return
 
         from application.world.services.chapter_narrative_sync import sync_chapter_narrative_after_save
 
@@ -214,5 +223,7 @@ class BackgroundTaskService:
             character_state_repository=getattr(self, 'character_state_repository', None),
             debt_repository=getattr(self, 'debt_repository', None),
             bible_repository=getattr(self, 'bible_repository', None),
+            expected_content_sha256=content_sha256,
+            expected_content_revision=content_revision,
         )
         logger.info(f"[BG] extract_bundle 完成：第 {chapter_number} 章")

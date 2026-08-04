@@ -30,7 +30,15 @@ class HostedWriteService:
         self._novel = novel_service
         self._aftermath = chapter_aftermath_pipeline
 
-    def _schedule_chapter_aftermath(self, novel_id: str, chapter_number: int, content: str) -> None:
+    def _schedule_chapter_aftermath(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        content: str,
+        *,
+        expected_content_sha256: str = "",
+        expected_content_revision: int = 0,
+    ) -> None:
         """与 HTTP 保存同源：叙事/向量、文风、KG（不阻塞 SSE）；三元组与伏笔在叙事同步单次 LLM 中落库。"""
         if not self._aftermath or not content.strip():
             return
@@ -40,7 +48,13 @@ class HostedWriteService:
                 dto = self._chapter.get_chapter_by_novel_and_number(novel_id, chapter_number)
                 if not dto:
                     return
-                await self._aftermath.run_after_chapter_saved(novel_id, chapter_number, content)
+                await self._aftermath.run_after_chapter_saved(
+                    novel_id,
+                    chapter_number,
+                    content,
+                    expected_content_sha256=expected_content_sha256 or None,
+                    expected_content_revision=expected_content_revision or None,
+                )
             except Exception as e:
                 logger.warning(
                     "托管章后管线失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
@@ -124,11 +138,26 @@ class HostedWriteService:
                     logger.info(f"  → 尝试保存章节 {n} ({len(content)} 字符)")
                     try:
                         # 先尝试更新已存在的章节
-                        self._chapter.update_chapter_by_novel_and_number(
+                        chapter = self._chapter.update_chapter_by_novel_and_number(
                             novel_id, n, content
                         )
                         logger.info(f"  章节 {n} 更新成功")
-                        self._schedule_chapter_aftermath(novel_id, n, content)
+                        if chapter.requires_rebuild:
+                            yield {
+                                "type": "saved",
+                                "chapter": n,
+                                "ok": True,
+                                "requires_rebuild": True,
+                            }
+                            return
+                        if not chapter.replay_completed:
+                            self._schedule_chapter_aftermath(
+                                novel_id,
+                                n,
+                                content,
+                                expected_content_sha256=chapter.content_sha256,
+                                expected_content_revision=chapter.content_revision,
+                            )
                         yield {"type": "saved", "chapter": n, "ok": True}
                     except EntityNotFoundError as e:
                         # 章节不存在，创建新章节
@@ -146,7 +175,27 @@ class HostedWriteService:
                                 content=content
                             )
                             logger.info(f"  章节 {n} 创建成功")
-                            self._schedule_chapter_aftermath(novel_id, n, content)
+                            persisted = self._chapter.get_chapter_by_novel_and_number(
+                                novel_id, n
+                            )
+                            if persisted is None:
+                                logger.warning(
+                                    "托管章节已创建但无法读取正文版本，跳过章后管线 novel=%s ch=%s",
+                                    novel_id,
+                                    n,
+                                )
+                            else:
+                                self._schedule_chapter_aftermath(
+                                    novel_id,
+                                    n,
+                                    content,
+                                    expected_content_sha256=(
+                                        persisted.content_sha256 or ""
+                                    ),
+                                    expected_content_revision=int(
+                                        persisted.content_revision or 0
+                                    ),
+                                )
                             yield {"type": "saved", "chapter": n, "ok": True, "created": True}
                         except (ValueError, Exception) as create_ex:
                             logger.error(f"  × 创建章节 {n} 失败: {type(create_ex).__name__}: {create_ex}")

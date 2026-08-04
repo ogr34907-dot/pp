@@ -191,6 +191,8 @@ class ChapterAftermathPipeline:
         content: str,
         chapter_micro_beats: Optional[List[Dict[str, Any]]] = None,
         voice_result: Optional[Dict[str, Any]] = None,
+        expected_content_sha256: Optional[str] = None,
+        expected_content_revision: Optional[int] = None,
     ) -> Dict[str, Any]:
         """保存正文后执行完整管线。返回文风结果供托管/审计门控使用。
 
@@ -216,6 +218,28 @@ class ChapterAftermathPipeline:
             "character_reconcile": None,
         }
 
+        if not self._is_current_content_version(
+            novel_id,
+            chapter_number,
+            content,
+            expected_content_sha256=expected_content_sha256,
+            expected_content_revision=expected_content_revision,
+        ):
+            out.update(
+                {
+                    "discarded_stale": True,
+                    "failure_reason": "source_version_mismatch",
+                    "content_sha256": expected_content_sha256 or "",
+                    "content_revision": expected_content_revision or 0,
+                }
+            )
+            logger.info(
+                "discard stale aftermath job novel=%s ch=%s",
+                novel_id,
+                chapter_number,
+            )
+            return out
+
         if not content or not str(content).strip():
             logger.debug("aftermath 跳过：正文为空 novel=%s ch=%s", novel_id, chapter_number)
             return out
@@ -240,6 +264,11 @@ class ChapterAftermathPipeline:
             )
 
             async def _sync_narrative() -> Dict[str, Any]:
+                sync_kwargs: Dict[str, Any] = {}
+                if expected_content_sha256 is not None:
+                    sync_kwargs["expected_content_sha256"] = expected_content_sha256
+                if expected_content_revision is not None:
+                    sync_kwargs["expected_content_revision"] = expected_content_revision
                 return await sync_chapter_narrative_after_save(
                     novel_id,
                     chapter_number,
@@ -258,6 +287,7 @@ class ChapterAftermathPipeline:
                     debt_repository=self._debt_repository,
                     bible_repository=self._bible_repository,
                     chapter_micro_beats=chapter_micro_beats,
+                    **sync_kwargs,
                 )
 
             sync_flags = await _timed_aftermath_stage(
@@ -354,9 +384,61 @@ class ChapterAftermathPipeline:
                 logger.warning("文风评分失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
 
         out["auxiliary_deferred"] = True
-        self._schedule_auxiliary_stages(novel_id, chapter_number, content, dict(out))
+        self._schedule_auxiliary_stages(
+            novel_id,
+            chapter_number,
+            content,
+            dict(out),
+            expected_content_sha256=expected_content_sha256,
+            expected_content_revision=expected_content_revision,
+        )
 
         return out
+
+    def _is_current_content_version(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        content: str,
+        *,
+        expected_content_sha256: Optional[str],
+        expected_content_revision: Optional[int],
+    ) -> bool:
+        repository = self._chapter_repository
+        if repository is None:
+            return True
+        try:
+            import hashlib
+
+            from domain.novel.value_objects.novel_id import NovelId
+
+            current = repository.get_by_novel_and_number(
+                NovelId(novel_id), int(chapter_number)
+            )
+            if current is None:
+                return False
+            current_hash = hashlib.sha256(
+                str(getattr(current, "content", "") or "").encode("utf-8")
+            ).hexdigest()
+            job_hash = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+            if current_hash != job_hash:
+                return False
+            if expected_content_sha256 and current_hash != expected_content_sha256:
+                return False
+            if (
+                expected_content_revision is not None
+                and int(getattr(current, "content_revision", 0) or 0)
+                != int(expected_content_revision)
+            ):
+                return False
+            return True
+        except Exception:
+            logger.exception(
+                "chapter version check failed; discard aftermath novel=%s ch=%s",
+                novel_id,
+                chapter_number,
+            )
+            return False
 
     @staticmethod
     def _apply_voice_result(out: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -378,8 +460,24 @@ class ChapterAftermathPipeline:
         chapter_number: int,
         content: str,
         evidence: Dict[str, Any],
+        *,
+        expected_content_sha256: Optional[str] = None,
+        expected_content_revision: Optional[int] = None,
     ) -> None:
         async def _job() -> None:
+            if not self._is_current_content_version(
+                novel_id,
+                chapter_number,
+                content,
+                expected_content_sha256=expected_content_sha256,
+                expected_content_revision=expected_content_revision,
+            ):
+                logger.info(
+                    "discard stale auxiliary aftermath novel=%s ch=%s",
+                    novel_id,
+                    chapter_number,
+                )
+                return
             await self._run_auxiliary_stages(novel_id, chapter_number, content, evidence)
 
         _AUXILIARY_QUEUE.enqueue(

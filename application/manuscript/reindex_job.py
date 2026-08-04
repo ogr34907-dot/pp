@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from typing import List, Tuple
 
 from domain.novel.value_objects.novel_id import NovelId
@@ -16,9 +17,38 @@ from infrastructure.persistence.database.unified_prop_repository import SqliteUn
 logger = logging.getLogger(__name__)
 
 
-def reindex_chapter_entity_mentions(novel_id: str, chapter_number: int, content: str) -> None:
+def reindex_chapter_entity_mentions(
+    novel_id: str,
+    chapter_number: int,
+    content: str,
+    expected_content_sha256: str | None = None,
+    expected_content_revision: int | None = None,
+) -> None:
     try:
         db = get_database()
+        if expected_content_sha256 or expected_content_revision:
+            source = db.fetch_one(
+                "SELECT content, content_sha256, content_revision FROM chapters "
+                "WHERE novel_id = ? AND number = ?",
+                (novel_id, chapter_number),
+            )
+            actual_hash = hashlib.sha256(
+                str(source["content"] if source else "").encode("utf-8")
+            ).hexdigest()
+            if (
+                source is None
+                or (expected_content_sha256 and actual_hash != expected_content_sha256)
+                or (
+                    expected_content_revision is not None
+                    and int(source["content_revision"] or 0) != int(expected_content_revision)
+                )
+            ):
+                logger.info(
+                    "discard stale chapter entity reindex novel=%s ch=%s",
+                    novel_id,
+                    chapter_number,
+                )
+                return
         bible = SqliteBibleRepository(db).get_by_novel_id(NovelId(novel_id))
 
         chars: List[Tuple[str, str, List[str]]] = [

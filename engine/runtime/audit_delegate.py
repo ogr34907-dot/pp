@@ -257,6 +257,24 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
             "drift_alert": drift_result.get("drift_alert"),
         }
     )
+    if drift_result.get("rewrite_requires_rebuild"):
+        novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+        novel.autopilot_status = AutopilotStatus.STOPPED
+        novel.audit_progress = "rewrite_paused"
+        host._update_shared_state(
+            novel.novel_id.value,
+            current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+            autopilot_status=AutopilotStatus.STOPPED.value,
+            audit_progress="rewrite_paused",
+            writing_substep="audit_rewrite_paused",
+            writing_substep_label="正文重写后暂停",
+        )
+        host._flush_novel(novel)
+        logger.info(
+            "[%s] 文风重写已创建安全快照，暂停后续审计与章后管线",
+            novel.novel_id.value,
+        )
+        return
 
     _write_autopilot_invocation_input(
         novel_id=novel.novel_id.value,
@@ -418,6 +436,21 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
                 (novel.novel_id.value, chapter_num), None
             )
             voice_result = drift_result if drift_result.get("similarity_score") is not None else None
+            persisted_chapter = host.chapter_repository.get_by_novel_and_number(
+                NovelId(novel.novel_id.value), chapter_num
+            )
+            expected_content_sha256 = str(
+                getattr(persisted_chapter, "content_sha256", "") or ""
+            )
+            if not expected_content_sha256 and persisted_chapter is not None:
+                expected_content_sha256 = hashlib.sha256(
+                    str(getattr(persisted_chapter, "content", "") or "").encode("utf-8")
+                ).hexdigest()
+            expected_content_revision = (
+                int(getattr(persisted_chapter, "content_revision", 0) or 0)
+                if persisted_chapter is not None
+                else None
+            )
             drift_result = await host._call_with_timeout(
                 host.aftermath_pipeline.run_after_chapter_saved(
                     novel.novel_id.value,
@@ -425,6 +458,8 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
                     content,
                     chapter_micro_beats=_mb,
                     voice_result=voice_result,
+                    expected_content_sha256=expected_content_sha256 or None,
+                    expected_content_revision=expected_content_revision,
                 ),
                 timeout=300.0,  # 章后管线最多 5 分钟（含多次 LLM）
                 novel_id=novel.novel_id.value,

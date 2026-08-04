@@ -22,6 +22,7 @@ class ChapterService:
         novel_repository: NovelRepository,
         chapter_review_repository=None,
         chapter_renumber_coordinator: Any = None,
+        chapter_rewrite_coordinator: Any = None,
     ):
         """初始化服务
 
@@ -30,16 +31,19 @@ class ChapterService:
             novel_repository: Novel 仓储
             chapter_review_repository: Chapter Review 仓储（可选）
             chapter_renumber_coordinator: 删章后伏笔/快照/向量等侧车数据章号重排（可选）
+            chapter_rewrite_coordinator: 已完成正文覆写的快照/失效协调器（可选）
         """
         self.chapter_repository = chapter_repository
         self.novel_repository = novel_repository
         self.chapter_review_repository = chapter_review_repository
         self._chapter_renumber_coordinator = chapter_renumber_coordinator
+        self._chapter_rewrite_coordinator = chapter_rewrite_coordinator
 
     def update_chapter_content(
         self,
         chapter_id: str,
-        content: str
+        content: str,
+        rewrite_mode: str = "safe_snapshot",
     ) -> ChapterDTO:
         """更新章节内容
 
@@ -57,10 +61,7 @@ class ChapterService:
         if chapter is None:
             raise EntityNotFoundError("Chapter", chapter_id)
 
-        chapter.update_content(content)
-        self.chapter_repository.save(chapter)
-
-        return ChapterDTO.from_domain(chapter)
+        return self._update_existing_chapter(chapter, content, rewrite_mode)
 
     def list_chapters_by_novel(self, novel_id: str) -> List[ChapterDTO]:
         """列出小说的所有章节
@@ -132,7 +133,8 @@ class ChapterService:
         self,
         novel_id: str,
         chapter_number: int,
-        content: str
+        content: str,
+        rewrite_mode: str = "safe_snapshot",
     ) -> Optional[ChapterDTO]:
         """根据小说 ID 和章节号更新章节内容
 
@@ -150,10 +152,45 @@ class ChapterService:
         chapters = self.chapter_repository.list_by_novel(NovelId(novel_id))
         for chapter in chapters:
             if chapter.number == chapter_number:
-                chapter.update_content(content)
-                self.chapter_repository.save(chapter)
-                return ChapterDTO.from_domain(chapter)
+                return self._update_existing_chapter(chapter, content, rewrite_mode)
         raise EntityNotFoundError("Chapter", f"{novel_id}/chapter-{chapter_number}")
+
+    def _update_existing_chapter(
+        self,
+        chapter: Chapter,
+        content: str,
+        rewrite_mode: str,
+    ) -> ChapterDTO:
+        coordinator = self._chapter_rewrite_coordinator
+        if (
+            coordinator is None
+            and getattr(chapter, "status", None) == ChapterStatus.COMPLETED
+            and str(getattr(chapter, "content", "") or "") != str(content)
+        ):
+            from application.core.services.chapter_rewrite_coordinator import (
+                ChapterRewriteCoordinator,
+            )
+
+            coordinator = ChapterRewriteCoordinator.for_chapter_repository(
+                self.chapter_repository
+            )
+            if coordinator is None:
+                raise RuntimeError("chapter_rewrite_coordinator_unavailable")
+        if coordinator is None:
+            chapter.update_content(content)
+            self.chapter_repository.save(chapter)
+            return ChapterDTO.from_domain(chapter)
+
+        outcome = coordinator.rewrite(
+            chapter,
+            content,
+            rewrite_mode=rewrite_mode,
+        )
+        dto = ChapterDTO.from_domain(outcome.chapter)
+        dto.rewrite_mode = outcome.rewrite_mode
+        dto.requires_rebuild = outcome.requires_rebuild
+        dto.replay_completed = outcome.replay_completed
+        return dto
 
     def update_chapter_generation_hint(
         self,

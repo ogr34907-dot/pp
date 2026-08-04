@@ -1,10 +1,15 @@
+from types import SimpleNamespace
+
+import pytest
+
 from application.core.services.chapter_rewrite_coordinator import ChapterRewriteResult
-from application.engine.services.chapter_generation_workspace import ChapterGenerationWorkspace
 from domain.novel.entities.chapter import Chapter, ChapterStatus
 from domain.novel.value_objects.novel_id import NovelId
+from engine.pipeline.base import BaseStoryPipeline
+from engine.pipeline.context import PipelineContext
 
 
-class _ExistingChapterRepository:
+class _ChapterRepository:
     def __init__(self, chapter):
         self.chapter = chapter
         self.saved = []
@@ -27,46 +32,35 @@ class _RewriteCoordinator:
             rewrite_mode=rewrite_mode,
             requires_rebuild=True,
             replay_completed=False,
+            checkpoint_id="checkpoint-1",
         )
 
 
-def test_chapter_generation_workspace_preview_is_transient(monkeypatch, tmp_path):
-    import application.paths
-
-    monkeypatch.setattr(application.paths, "DATA_DIR", tmp_path)
-    workspace = ChapterGenerationWorkspace()
-
-    ref = workspace.begin("novel/1", 3, "run-1")
-    workspace.append_preview(ref.novel_id, ref.chapter_number, ref.run_id, "半章正文")
-
-    assert workspace.read_latest_preview("novel/1", 3, "run-1") == "半章正文"
-
-    removed = workspace.discard("novel/1", 3)
-
-    assert removed == 2
-    assert workspace.read_latest_preview("novel/1", 3, "run-1") is None
-
-
-def test_workspace_commit_routes_existing_prose_through_rewrite_coordinator():
-    chapter = Chapter(
+@pytest.mark.asyncio
+async def test_story_pipeline_uses_shared_rewrite_coordinator_for_existing_prose():
+    existing = Chapter(
         id="chapter-1",
         novel_id=NovelId("novel-1"),
         number=1,
-        title="第1章",
+        title="第一章",
         content="旧正文",
         status=ChapterStatus.COMPLETED,
     )
-    repository = _ExistingChapterRepository(chapter)
+    repository = _ChapterRepository(existing)
     coordinator = _RewriteCoordinator()
-
-    ChapterGenerationWorkspace().commit_to_chapter(
+    context = PipelineContext(
         novel_id="novel-1",
         chapter_number=1,
-        content="新正文",
+        chapter_content="新正文",
+        chapter_node=SimpleNamespace(title="第一章"),
+    )
+    context.inject(
         chapter_repository=repository,
         chapter_rewrite_coordinator=coordinator,
     )
 
-    assert coordinator.calls == [(chapter, "新正文", "safe_snapshot")]
-    assert repository.saved == []
+    await BaseStoryPipeline()._save_chapter_via_repository(context)
 
+    assert coordinator.calls == [(existing, "新正文", "safe_snapshot")]
+    assert context.metadata["rewrite_requires_rebuild"] is True
+    assert repository.saved == []

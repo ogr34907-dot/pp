@@ -45,6 +45,8 @@ async def _run_chapter_aftermath(
     content: str,
     pipeline: ChapterAftermathPipeline,
     chapter_micro_beats: Optional[List[Dict[str, Any]]] = None,
+    expected_content_sha256: str = "",
+    expected_content_revision: int = 0,
 ) -> None:
     """与托管/守护进程同源的章后管线（叙事/向量、文风、KG；三元组与伏笔单次 LLM）。"""
     await pipeline.run_after_chapter_saved(
@@ -52,6 +54,8 @@ async def _run_chapter_aftermath(
         chapter_number,
         content,
         chapter_micro_beats=chapter_micro_beats,
+        expected_content_sha256=expected_content_sha256 or None,
+        expected_content_revision=expected_content_revision or None,
     )
 
 
@@ -80,6 +84,10 @@ class UpdateChapterContentRequest(BaseModel):
     micro_beats: Optional[List[ChapterMicroBeatPayload]] = Field(
         None,
         description="可选：本章指挥器节拍快照；落库后侧栏「微观」以知识库为准",
+    )
+    rewrite_mode: Literal["safe_snapshot", "retain_prose"] = Field(
+        default="safe_snapshot",
+        description="已完成章节覆写策略；默认保存可恢复快照并暂停主线",
     )
 
 
@@ -280,33 +288,39 @@ async def update_chapter(
         chapter = service.update_chapter_by_novel_and_number(
             novel_id,
             chapter_number,
-            request.content
+            request.content,
+            rewrite_mode=request.rewrite_mode,
         )
     except EntityNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     content = request.content
     micro_beats_dicts: Optional[List[Dict[str, Any]]] = None
-    if request.micro_beats:
+    if request.micro_beats and not chapter.requires_rebuild and not chapter.replay_completed:
         micro_beats_dicts = [b.model_dump() for b in request.micro_beats]
         knowledge_service.patch_chapter_micro_beats(
             novel_id, chapter_number, micro_beats_dicts
         )
 
-    background_tasks.add_task(
-        _run_chapter_aftermath,
-        novel_id,
-        chapter_number,
-        content,
-        pipeline,
-        micro_beats_dicts,
-    )
-    background_tasks.add_task(
-        reindex_chapter_entity_mentions,
-        novel_id,
-        chapter_number,
-        content,
-    )
+    if not chapter.requires_rebuild and not chapter.replay_completed:
+        background_tasks.add_task(
+            _run_chapter_aftermath,
+            novel_id,
+            chapter_number,
+            content,
+            pipeline,
+            micro_beats_dicts,
+            chapter.content_sha256,
+            chapter.content_revision,
+        )
+        background_tasks.add_task(
+            reindex_chapter_entity_mentions,
+            novel_id,
+            chapter_number,
+            content,
+            chapter.content_sha256,
+            chapter.content_revision,
+        )
     return chapter
 
 

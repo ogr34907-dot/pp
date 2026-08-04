@@ -6,6 +6,7 @@ from domain.novel.value_objects.chapter_id import ChapterId
 from domain.novel.value_objects.novel_id import NovelId
 from domain.shared.exceptions import EntityNotFoundError
 from application.core.services.chapter_service import ChapterService
+from application.core.services.chapter_rewrite_coordinator import ChapterRewriteResult
 
 
 class TestChapterService:
@@ -58,6 +59,46 @@ class TestChapterService:
                 chapter_id="nonexistent",
                 content="新内容"
             )
+
+    def test_completed_rewrite_builds_shared_coordinator_when_not_injected(
+        self,
+        service,
+        mock_chapter_repository,
+        monkeypatch,
+    ):
+        chapter = Chapter(
+            id="chapter-1",
+            novel_id=NovelId("novel-1"),
+            number=1,
+            title="第一章",
+            content="原始内容",
+            status=ChapterStatus.COMPLETED,
+        )
+        calls = []
+
+        class _Coordinator:
+            def rewrite(self, existing, content, *, rewrite_mode):
+                calls.append((existing, content, rewrite_mode))
+                existing.update_content(content)
+                return ChapterRewriteResult(
+                    chapter=existing,
+                    rewrite_mode=rewrite_mode,
+                    requires_rebuild=True,
+                    replay_completed=False,
+                )
+
+        mock_chapter_repository.get_by_id.return_value = chapter
+        monkeypatch.setattr(
+            "application.core.services.chapter_rewrite_coordinator.ChapterRewriteCoordinator.for_chapter_repository",
+            lambda *_args, **_kwargs: _Coordinator(),
+        )
+
+        result = service.update_chapter_content("chapter-1", "重写后的内容")
+
+        assert result.content == "重写后的内容"
+        assert result.requires_rebuild is True
+        assert calls == [(chapter, "重写后的内容", "safe_snapshot")]
+        mock_chapter_repository.save.assert_not_called()
 
     def test_list_chapters_by_novel(self, service, mock_chapter_repository):
         """测试列出小说的所有章节"""

@@ -1587,6 +1587,22 @@ class ContinuousPlanningService:
                 f"请重试载入结构树以对齐。"
             )
 
+    def _target_chapter_limit(self, novel_id: str) -> Optional[int]:
+        """Return the persisted novel capacity, when this service has that dependency."""
+        if self.novel_repository is None:
+            return None
+        try:
+            novel = self.novel_repository.get_by_id(NovelId(novel_id))
+            limit = int(getattr(novel, "target_chapters", 0) or 0)
+        except (TypeError, ValueError, AttributeError) as exc:
+            logger.warning(
+                "[ActPlanning] 无法读取小说目标章节数 novel=%s: %s",
+                novel_id,
+                exc,
+            )
+            return None
+        return limit if limit > 0 else None
+
     async def confirm_act_planning(self, act_id: str, chapters: List[Dict]) -> Dict:
         """确认幕级规划：写入 story_nodes + chapters 表（供工作台侧栏列表），并关联 Bible 元素。"""
         logger.info(f"Confirming act planning for act {act_id}")
@@ -1599,9 +1615,29 @@ class ContinuousPlanningService:
         if validation_errors:
             raise ValueError("章节规划不完整/被截断：" + "；".join(validation_errors))
 
+        novel_id_str = act_node.novel_id
+        target_limit = self._target_chapter_limit(novel_id_str)
+        if target_limit is not None:
+            current_children = self.story_node_repo.get_children_sync(act_id)
+            current_numbers = {
+                int(node.number)
+                for node in current_children
+                if node.node_type == NodeType.CHAPTER
+            }
+            other_chapter_numbers = (
+                collect_structure_chapter_numbers(self.story_node_repo, novel_id_str)
+                - current_numbers
+            )
+            projected_start = max(other_chapter_numbers, default=0) + 1
+            projected_end = projected_start + len(chapters) - 1
+            if projected_end > target_limit:
+                raise ValueError(
+                    f"幕级规划将写入第 {projected_start}—{projected_end} 章，"
+                    f"超过目标章节数 {target_limit}"
+                )
+
         await self._remove_chapter_children_of_act(act_id)
 
-        novel_id_str = act_node.novel_id
         novel_id_vo = NovelId(novel_id_str)
         # ★ 树为真源：正文表多出或无对应树上章节的行一律清掉后再顺延编号
         pruned = purge_chapter_book_rows_not_matching_structure(
@@ -1614,6 +1650,15 @@ class ContinuousPlanningService:
 
         chapter_nums_on_tree = collect_structure_chapter_numbers(self.story_node_repo, novel_id_str)
         next_global_number = (max(chapter_nums_on_tree) + 1) if chapter_nums_on_tree else 1
+        if (
+            target_limit is not None
+            and next_global_number + len(chapters) - 1 > target_limit
+        ):
+            raise ValueError(
+                f"幕级规划将写入第 {next_global_number}—"
+                f"{next_global_number + len(chapters) - 1} 章，"
+                f"超过目标章节数 {target_limit}"
+            )
 
         # 兜底清理：直接按章号范围删除残留正文行（list_by_novel 可能因缓存/事务隔离漏删）
         if self.chapter_repository:
@@ -1751,7 +1796,12 @@ class ContinuousPlanningService:
                 "message": f"继续第 {current_act.number} 幕"
             }
 
-    async def create_next_act_auto(self, novel_id: str, current_act_id: str) -> Dict:
+    async def create_next_act_auto(
+        self,
+        novel_id: str,
+        current_act_id: str,
+        parent_volume_id: Optional[str] = None,
+    ) -> Dict:
         """自动创建下一幕"""
         logger.info(f"Creating next act after {current_act_id}")
 
@@ -1759,12 +1809,19 @@ class ContinuousPlanningService:
         if not current_act:
             raise ValueError(f"当前幕不存在: {current_act_id}")
 
+        parent_id = current_act.parent_id
+        if parent_volume_id is not None:
+            parent_volume = await self.story_node_repo.get_by_id(parent_volume_id)
+            if not parent_volume or parent_volume.node_type != NodeType.VOLUME:
+                raise ValueError(f"下一幕父卷不存在或类型错误: {parent_volume_id}")
+            parent_id = parent_volume.id
+
         bible_context = self._get_bible_context(novel_id)
         next_act_info = await self._generate_next_act_info(novel_id, current_act, bible_context)
 
         next_act = self._create_node_from_data(
             novel_id,
-            current_act.parent_id,
+            parent_id,
             NodeType.ACT,
             {
                 "number": current_act.number + 1,

@@ -177,11 +177,34 @@ def _recover_draft_to_db(novel_id: str, chapter_number: int, content: str) -> No
         # 已有记录：仅当现有内容比 .draft 短时才更新（避免覆盖更完整的数据）
         existing_content = (existing.content or "").strip()
         if len(content) > len(existing_content):
-            existing.update_content(content)
+            coordinated_rewrite = False
+            if existing_content and existing.content != content:
+                from application.core.services.chapter_rewrite_coordinator import (
+                    ChapterRewriteCoordinator,
+                )
+
+                coordinator = ChapterRewriteCoordinator.for_chapter_repository(
+                    chapter_repo
+                )
+                if coordinator is None:
+                    raise RuntimeError("chapter_rewrite_coordinator_unavailable")
+                existing = coordinator.rewrite(
+                    existing,
+                    content,
+                    rewrite_mode="safe_snapshot",
+                ).chapter
+                coordinated_rewrite = True
+            else:
+                existing.update_content(content)
+
             # 保留 draft 状态（不标记为 completed，让守护进程继续处理）
+            status_changed = False
             if existing.status != ChapterStatus.COMPLETED:
-                existing.status = ChapterStatus.DRAFT
-            chapter_repo.save(existing)
+                if existing.status != ChapterStatus.DRAFT:
+                    existing.status = ChapterStatus.DRAFT
+                    status_changed = True
+            if not coordinated_rewrite or status_changed:
+                chapter_repo.save(existing)
         # else: DB 中的数据更完整，不覆盖
     else:
         # 无记录：创建新章节（draft 状态）

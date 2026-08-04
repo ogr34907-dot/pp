@@ -167,6 +167,24 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
     rec_acts_per_volume = struct_params["acts_per_volume"]
 
     all_nodes = await host.story_node_repo.get_by_novel(novel_id)
+    chapter_nodes = [
+        node for node in all_nodes if node.node_type.value == "chapter"
+    ]
+    highest_planned_chapter = max(
+        (int(node.number) for node in chapter_nodes), default=0
+    )
+    remaining_chapter_capacity = target_chapters - highest_planned_chapter
+    if remaining_chapter_capacity <= 0:
+        logger.info(
+            "[%s] 已无剩余章节容量（target=%s planned=%s），暂停幕级规划",
+            novel.novel_id,
+            target_chapters,
+            highest_planned_chapter,
+        )
+        novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+        novel.autopilot_status = AutopilotStatus.STOPPED
+        host._flush_novel(novel)
+        return
     act_nodes = sorted(
         [n for n in all_nodes if n.node_type.value == "act"],
         key=lambda n: n.number,
@@ -179,7 +197,6 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
             [n for n in all_nodes if n.node_type.value == "volume"],
             key=lambda n: n.number,
         )
-
         if not volume_nodes:
             logger.error(
                 "[%s] 宏观规划缺少卷节点！无法进行幕级规划。"
@@ -202,6 +219,55 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
             novel_id=novel.novel_id,
         )
 
+        if parent_volume is None:
+            next_chapter_number = (
+                max((int(n.number) for n in chapter_nodes), default=0) + 1
+            )
+            if target_chapters > 0 and next_chapter_number > target_chapters:
+                logger.info(
+                    "[%s] 结构已规划至目标章节 %s，暂停新增幕",
+                    novel.novel_id,
+                    target_chapters,
+                )
+                novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+                novel.autopilot_status = AutopilotStatus.STOPPED
+                host._flush_novel(novel)
+                return
+
+            last_volume = volume_nodes[-1]
+            if not last_volume.parent_id:
+                logger.error(
+                    "[%s] 最后一个卷缺少父部，无法安全创建下一卷",
+                    novel.novel_id,
+                )
+                novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+                novel.autopilot_status = AutopilotStatus.ERROR
+                host._flush_novel(novel)
+                return
+
+            next_volume_number = max(int(node.number) for node in volume_nodes) + 1
+            parent_volume = StoryNode(
+                id=f"volume-{novel_id}-{next_volume_number}",
+                novel_id=novel_id,
+                parent_id=last_volume.parent_id,
+                node_type=NodeType.VOLUME,
+                number=next_volume_number,
+                title=f"第{next_volume_number}卷",
+                description="动态续规划卷",
+                order_index=max(
+                    (int(getattr(node, "order_index", 0) or 0) for node in all_nodes),
+                    default=0,
+                ) + 1,
+                planning_status=PlanningStatus.CONFIRMED,
+                planning_source=PlanningSource.AI_MACRO,
+            )
+            await host.story_node_repo.save(parent_volume)
+            logger.info(
+                "[%s] 所有现有卷已满，已创建第 %s 卷承接后续幕",
+                novel.novel_id,
+                next_volume_number,
+            )
+
         if parent_volume:
             logger.info(
                 "[%s] 动态生成第 %s 幕（父卷：第 %s 卷，每幕建议 %s 章）",
@@ -216,6 +282,7 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
                     await host.planning_service.create_next_act_auto(
                         novel_id=novel_id,
                         current_act_id=last_act.id,
+                        parent_volume_id=parent_volume.id,
                     )
                 else:
                     logger.info("[%s] 创建首幕", novel.novel_id)
@@ -259,7 +326,10 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
 
     just_created_chapter_plan = False
     if not confirmed_chapters:
-        chapter_budget = target_act.suggested_chapter_count or rec_chapters_per_act
+        chapter_budget = min(
+            target_act.suggested_chapter_count or rec_chapters_per_act,
+            remaining_chapter_capacity,
+        )
         if not target_act.suggested_chapter_count:
             logger.info(
                 "[%s] 幕 %s 无 suggested_chapter_count，使用引擎推荐值 %s",
@@ -324,10 +394,25 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
             host._flush_novel(novel)
             return
 
-        await host.planning_service.confirm_act_planning(
-            act_id=target_act.id,
-            chapters=chapters_data,
-        )
+        try:
+            await host.planning_service.confirm_act_planning(
+                act_id=target_act.id,
+                chapters=chapters_data,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] 幕 %s 结构化规划落库失败: %s",
+                novel.novel_id,
+                target_act_number,
+                exc,
+            )
+            novel.consecutive_error_count = (novel.consecutive_error_count or 0) + 1
+            if novel.consecutive_error_count >= 3:
+                novel.autopilot_status = AutopilotStatus.ERROR
+                novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+                logger.error("[%s] 幕级规划连续失败达3次，已挂起", novel.novel_id)
+            host._flush_novel(novel)
+            return
         just_created_chapter_plan = True
 
     act_children = host.story_node_repo.get_children_sync(target_act.id)

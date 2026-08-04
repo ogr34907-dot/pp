@@ -60,6 +60,31 @@ def test_story_pipeline_runner_is_self_hosted():
     assert runner.use_story_pipeline_for_writing is True
 
 
+def test_parent_volume_selection_does_not_overflow_last_full_volume():
+    volumes = [
+        SimpleNamespace(id="volume-1", number=1),
+        SimpleNamespace(id="volume-2", number=2),
+    ]
+    acts = [
+        SimpleNamespace(parent_id="volume-1"),
+        SimpleNamespace(parent_id="volume-1"),
+        SimpleNamespace(parent_id="volume-2"),
+        SimpleNamespace(parent_id="volume-2"),
+    ]
+
+    parent = DaemonHostMixin._find_parent_volume_for_new_act(
+        SimpleNamespace(),
+        volume_nodes=volumes,
+        act_nodes=acts,
+        current_auto_chapters=4,
+        target_chapters=20,
+        rec_acts_per_volume=2,
+        novel_id="novel-1",
+    )
+
+    assert parent is None
+
+
 @pytest.mark.asyncio
 async def test_audit_number_cannot_force_draft_chapter_completed_without_canonical_claim():
     host = DaemonHostMixin.__new__(DaemonHostMixin)

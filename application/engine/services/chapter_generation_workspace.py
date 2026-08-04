@@ -173,6 +173,7 @@ class ChapterGenerationWorkspace:
         content: str,
         status: str = "completed",
         chapter_repository: Any = None,
+        chapter_rewrite_coordinator: Any = None,
     ) -> None:
         """Commit complete content to the formal chapter store.
 
@@ -191,12 +192,42 @@ class ChapterGenerationWorkspace:
         novel_id_obj = NovelId(str(novel_id))
         existing = chapter_repository.get_by_novel_and_number(novel_id_obj, int(chapter_number))
         if existing is not None:
-            existing.update_content(str(content))
+            coordinated_rewrite = False
+            if (
+                str(getattr(existing, "content", "") or "").strip()
+                and str(getattr(existing, "content", "") or "") != str(content)
+            ):
+                if chapter_rewrite_coordinator is None:
+                    from application.core.services.chapter_rewrite_coordinator import (
+                        ChapterRewriteCoordinator,
+                    )
+
+                    chapter_rewrite_coordinator = (
+                        ChapterRewriteCoordinator.for_chapter_repository(
+                            chapter_repository
+                        )
+                    )
+                if chapter_rewrite_coordinator is None:
+                    raise RuntimeError("chapter_rewrite_coordinator_unavailable")
+                existing = chapter_rewrite_coordinator.rewrite(
+                    existing,
+                    str(content),
+                    rewrite_mode="safe_snapshot",
+                ).chapter
+                coordinated_rewrite = True
+            else:
+                existing.update_content(str(content))
+
+            status_changed = False
             try:
-                existing.status = ChapterStatus(status)
+                requested_status = ChapterStatus(status)
             except ValueError:
-                existing.status = status
-            chapter_repository.save(existing)
+                requested_status = status
+            if existing.status != requested_status:
+                existing.status = requested_status
+                status_changed = True
+            if not coordinated_rewrite or status_changed:
+                chapter_repository.save(existing)
             return
 
         chapter = Chapter(

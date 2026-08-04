@@ -740,6 +740,8 @@ def persist_causal_edges(
     chapter_number: int,
     bundle: dict,
     causal_edge_repository: Any,
+    *,
+    strict: bool = False,
 ) -> int:
     """将 bundle 中的因果边写入 causal_edges 表，并检测已有因果边的闭环。
 
@@ -823,6 +825,8 @@ def persist_causal_edges(
                 causal_type.value, strength,
             )
         except Exception as e:
+            if strict:
+                raise
             logger.debug("因果边入库跳过: %s", e)
 
     # ★ 检测因果边闭环：如果本章的事件匹配了某个未闭环因果边的 target_event
@@ -891,6 +895,8 @@ def persist_character_mutations(
     bundle: dict,
     character_state_repository: Any,
     bible_repository: Any = None,
+    *,
+    strict: bool = False,
 ) -> int:
     """将 bundle 中的 character_mutations 写入 character_states 表。
 
@@ -1084,6 +1090,8 @@ def persist_character_mutations(
                 novel_id, chapter_number, character_name, mutation_type,
             )
         except Exception as e:
+            if strict:
+                raise
             logger.debug("人物状态突变入库跳过: %s", e)
 
     if processed > 0:
@@ -1098,6 +1106,8 @@ def persist_character_end_states(
     bundle: dict,
     character_state_repository: Any,
     bible_repository: Any = None,
+    *,
+    strict: bool = False,
 ) -> int:
     """将 bundle 中的 character_states（章末心理状态快照）写入 character_states 表。
 
@@ -1171,6 +1181,8 @@ def persist_character_end_states(
                 novel_id, chapter_number, character_name, mental_state[:30],
             )
         except Exception as e:
+            if strict:
+                raise
             logger.debug("章末人物状态落库跳过: %s", e)
 
     if saved > 0:
@@ -1184,6 +1196,8 @@ def persist_bundle_memory_atoms(
     bundle: dict,
     bible_repository: Any = None,
     memory_service: Any = None,
+    *,
+    strict: bool = False,
 ) -> int:
     """Mirror chapter extraction output into the unified MemoryAtom ledger.
 
@@ -1193,6 +1207,8 @@ def persist_bundle_memory_atoms(
     try:
         from application.memory.services.legacy_memory_importer import LegacyMemoryImporter
     except Exception as e:
+        if strict:
+            raise RuntimeError("memory substrate imports unavailable") from e
         logger.debug("memory substrate imports unavailable: %s", e)
         return 0
 
@@ -1220,6 +1236,8 @@ def persist_bundle_memory_atoms(
                 SqliteNarrativeMemoryRepository(get_database())
             )
         except Exception as e:
+            if strict:
+                raise RuntimeError("memory substrate unavailable") from e
             logger.debug("memory substrate unavailable: %s", e)
             return 0
 
@@ -2267,6 +2285,8 @@ async def _sync_chapter_narrative_after_save_once(
     debt_repository: Any = None,
     bible_repository: Any = None,
     chapter_micro_beats: Optional[List[Dict[str, Any]]] = None,
+    expected_content_sha256: Optional[str] = None,
+    expected_content_revision: Optional[int] = None,
 ) -> AftermathCommitResult:
     """异步：LLM bundle + 向量等落库。
 
@@ -2277,6 +2297,15 @@ async def _sync_chapter_narrative_after_save_once(
     """
     content_sha256 = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
     empty_flags = _aftermath_flags()
+    if expected_content_sha256 and expected_content_sha256 != content_sha256:
+        return AftermathCommitResult(
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            commit_status="failed",
+            failure_reason="task_content_hash_mismatch",
+            content_revision=int(expected_content_revision or 0),
+            flags=empty_flags,
+        )
     if not content or not str(content).strip():
         logger.debug("跳过叙事同步：正文为空 novel=%s ch=%s", novel_id, chapter_number)
         return AftermathCommitResult(
@@ -2303,6 +2332,7 @@ async def _sync_chapter_narrative_after_save_once(
         chapter_number=chapter_number,
         content_sha256=content_sha256,
         pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        expected_content_revision=expected_content_revision,
     )
     if claim.disposition != "claimed":
         vector_status = claim.vector_status
@@ -2573,14 +2603,19 @@ async def _sync_chapter_narrative_after_save_once(
 
     if triple_repository is not None or foreshadowing_repo is not None:
         try:
-            persist_bundle_triples_and_foreshadows(
-                novel_id,
-                chapter_number,
-                bundle,
-                triple_repository,
-                foreshadowing_repo,
-                strict=True,
+            from infrastructure.persistence.database.write_dispatch import (
+                sqlite_writes_bypass_queue,
             )
+
+            with sqlite_writes_bypass_queue():
+                persist_bundle_triples_and_foreshadows(
+                    novel_id,
+                    chapter_number,
+                    bundle,
+                    triple_repository,
+                    foreshadowing_repo,
+                    strict=True,
+                )
             if triple_repository is not None:
                 flags["triples_extracted"] = True
             if foreshadowing_repo is not None:
@@ -2614,9 +2649,18 @@ async def _sync_chapter_narrative_after_save_once(
     # ★ V8 Feed-forward: 因果边提取 + 人物状态突变 + 叙事债务更新
     if causal_edge_repository is not None:
         try:
-            saved_edges = persist_causal_edges(
-                novel_id, chapter_number, bundle, causal_edge_repository
+            from infrastructure.persistence.database.write_dispatch import (
+                sqlite_writes_bypass_queue,
             )
+
+            with sqlite_writes_bypass_queue():
+                saved_edges = persist_causal_edges(
+                    novel_id,
+                    chapter_number,
+                    bundle,
+                    causal_edge_repository,
+                    strict=True,
+                )
             if saved_edges > 0:
                 flags["causal_edges_stored"] = True
         except Exception as e:
@@ -2627,9 +2671,19 @@ async def _sync_chapter_narrative_after_save_once(
 
     if character_state_repository is not None:
         try:
-            saved_mutations = persist_character_mutations(
-                novel_id, chapter_number, bundle, character_state_repository, bible_repository
+            from infrastructure.persistence.database.write_dispatch import (
+                sqlite_writes_bypass_queue,
             )
+
+            with sqlite_writes_bypass_queue():
+                saved_mutations = persist_character_mutations(
+                    novel_id,
+                    chapter_number,
+                    bundle,
+                    character_state_repository,
+                    bible_repository,
+                    strict=True,
+                )
             if saved_mutations > 0:
                 flags["character_mutations_stored"] = True
         except Exception as e:
@@ -2638,9 +2692,19 @@ async def _sync_chapter_narrative_after_save_once(
             )
             return failed_result(str(e) or type(e).__name__)
         try:
-            persist_character_end_states(
-                novel_id, chapter_number, bundle, character_state_repository, bible_repository
+            from infrastructure.persistence.database.write_dispatch import (
+                sqlite_writes_bypass_queue,
             )
+
+            with sqlite_writes_bypass_queue():
+                persist_character_end_states(
+                    novel_id,
+                    chapter_number,
+                    bundle,
+                    character_state_repository,
+                    bible_repository,
+                    strict=True,
+                )
         except Exception as e:
             logger.warning(
                 "章末人物状态落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
@@ -2648,9 +2712,18 @@ async def _sync_chapter_narrative_after_save_once(
             return failed_result(str(e) or type(e).__name__)
 
     try:
-        memory_saved = persist_bundle_memory_atoms(
-            novel_id, chapter_number, bundle, bible_repository
+        from infrastructure.persistence.database.write_dispatch import (
+            sqlite_writes_bypass_queue,
         )
+
+        with sqlite_writes_bypass_queue():
+            memory_saved = persist_bundle_memory_atoms(
+                novel_id,
+                chapter_number,
+                bundle,
+                bible_repository,
+                strict=True,
+            )
         if memory_saved > 0:
             flags["memory_atoms_stored"] = True
     except Exception as e:
@@ -2781,6 +2854,8 @@ async def sync_chapter_narrative_after_save(
     debt_repository: Any = None,
     bible_repository: Any = None,
     chapter_micro_beats: Optional[List[Dict[str, Any]]] = None,
+    expected_content_sha256: Optional[str] = None,
+    expected_content_revision: Optional[int] = None,
 ) -> AftermathCommitResult:
     """Run at most three durable canonical attempts with exponential backoff."""
     kwargs = dict(
@@ -2795,6 +2870,8 @@ async def sync_chapter_narrative_after_save(
         debt_repository=debt_repository,
         bible_repository=bible_repository,
         chapter_micro_beats=chapter_micro_beats,
+        expected_content_sha256=expected_content_sha256,
+        expected_content_revision=expected_content_revision,
     )
     while True:
         result = await _sync_chapter_narrative_after_save_once(

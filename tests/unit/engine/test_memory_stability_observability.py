@@ -1,6 +1,7 @@
 """Observability baselines for the memory-stability rollout."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -365,8 +366,12 @@ def _execution_plan(chapter_number: int) -> str:
     )
 
 
-@pytest.mark.asyncio
-async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_path: Path, monkeypatch):
+async def _run_memory_stability_regression(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    chapter_count: int,
+) -> None:
     """Exercise persisted extraction evidence across restart, failure, and rewrite boundaries."""
     database_path = tmp_path / "memory-stability-regression.sqlite"
     database = DatabaseConnection(str(database_path))
@@ -427,7 +432,7 @@ async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_pa
     story_node_repository = _CurrentStoryNodeRepository()
     novel_repository = _NovelRepository()
     pipeline = BaseStoryPipeline()
-    for chapter_number in range(1, 31):
+    for chapter_number in range(1, chapter_count + 1):
         if chapter_number == 10:
             database.close()
             database = DatabaseConnection(str(database_path))
@@ -466,22 +471,22 @@ async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_pa
             chapter = chapter_repository.chapters[chapter_number]
             chapter.update_content(recovered_content)
             chapter_repository.save(chapter)
-            recovered = await sync_chapter_narrative_after_save(
+            persisted_recovery_chapter = chapter_repository.chapters[chapter_number]
+            assert persisted_recovery_chapter.content_sha256 == hashlib.sha256(
+                recovered_content.encode("utf-8")
+            ).hexdigest()
+            assert persisted_recovery_chapter.content_revision == 2
+            recovered = await aftermath.run_after_chapter_saved(
                 "memory-stability",
                 chapter_number,
                 recovered_content,
-                knowledge,
-                aftermath._indexing,
-                llm,
-                triple_repository=aftermath._triple_repository,
-                foreshadowing_repo=aftermath._foreshadowing_repository,
-                chapter_repository=chapter_repository,
-                causal_edge_repository=aftermath._causal_edge_repository,
-                character_state_repository=aftermath._character_state_repository,
+                expected_content_sha256=persisted_recovery_chapter.content_sha256,
+                expected_content_revision=persisted_recovery_chapter.content_revision,
             )
             assert recovered["narrative_sync_ok"] is True
             assert recovered["content_revision"] == 2
             assert recovered["attempt_count"] == 1
+            assert recovered["auxiliary_deferred"] is True
         else:
             assert result.success
         assert chapter_repository.chapters[chapter_number].status == ChapterStatus.COMPLETED
@@ -516,14 +521,40 @@ async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_pa
     database.close()
 
     assert database_path.exists()
-    assert len(persisted_chapters) == 30
+    assert len(persisted_chapters) == chapter_count
+    assert {row[0] for row in persisted_chapters} == set(range(1, chapter_count + 1))
     assert dict(persisted_chapters)[10] == "第10章重写后的正文"
     assert not any('"chapter_number": 17' in payload for payload in triple_payloads)
     persisted_text = "\n".join(triple_payloads)
     for marker in ("林澈死亡", "赤铜钥匙", "钟楼", "内鬼秘密", "卷一结束", "卷二开始", "幕二转场"):
         assert marker in persisted_text
     assert "钟楼暗门伏笔" in foreshadows
-    assert len([item for item in aftermath_calls if item[0] == "bridge"]) == 31
-    assert len([item for item in aftermath_calls if item[0] == "auxiliary"]) == 31
+    bridge_calls = [item for item in aftermath_calls if item[0] == "bridge"]
+    auxiliary_calls = [item for item in aftermath_calls if item[0] == "auxiliary"]
+    assert len(bridge_calls) == chapter_count + 2
+    assert len(auxiliary_calls) == chapter_count + 1
+    assert len([item for item in bridge_calls if item[1] == 17]) == 2
+    assert len([item for item in auxiliary_calls if item[1] == 17]) == 1
     assert vector_store.records["memory-stability_ch10_summary"]["text"] == "第10章重写后的正文已被重新抽取"
     assert "memory-stability_ch12_summary" in vector_store.records
+
+
+@pytest.mark.asyncio
+async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_path: Path, monkeypatch):
+    """Exercise persisted extraction evidence across restart, failure, and rewrite boundaries."""
+    await _run_memory_stability_regression(
+        tmp_path,
+        monkeypatch,
+        chapter_count=30,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.slow
+async def test_hundred_chapter_memory_stability_regression(tmp_path: Path, monkeypatch):
+    """Run the real StoryPipeline and aftermath fixture across 100 persisted chapters."""
+    await _run_memory_stability_regression(
+        tmp_path,
+        monkeypatch,
+        chapter_count=100,
+    )

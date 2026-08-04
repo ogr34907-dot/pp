@@ -165,6 +165,7 @@ class UnifiedCheckpointService:
         active_foreshadows: Optional[List[str]] = None,
         outline: Optional[str] = None,
         recent_summary: Optional[str] = None,
+        anchor_chapter: Optional[int] = None,
     ) -> str:
         """创建统一 checkpoint，写入 novel_checkpoints 表。
 
@@ -181,6 +182,7 @@ class UnifiedCheckpointService:
             active_foreshadows: 活跃伏笔列表
             outline: 当前大纲
             recent_summary: 近期摘要
+            anchor_chapter: 可恢复的章节锚点；未传时从 story_state 推断
 
         Returns:
             checkpoint ID（str）
@@ -194,11 +196,29 @@ class UnifiedCheckpointService:
 
         # 1. 采集章节指针（已完成章节）
         chapter_pointers: List[str] = []
+        completed_chapter_numbers: List[int] = []
         try:
             chapters = self.chapter_repository.list_by_novel(NovelId(novel_id))
             chapter_pointers = [str(c.id) for c in chapters if c.status.value == "completed"]
+            completed_chapter_numbers = [
+                int(c.number)
+                for c in chapters
+                if c.status.value == "completed" and int(getattr(c, "number", 0) or 0) > 0
+            ]
         except Exception as e:
             logger.warning("[UnifiedCheckpoint] 章节指针采集失败: %s", e)
+
+        if anchor_chapter is None and isinstance(story_state, dict):
+            for key in ("anchor_chapter", "chapter", "chapter_number"):
+                raw_anchor = story_state.get(key)
+                try:
+                    if raw_anchor is not None:
+                        anchor_chapter = max(0, int(raw_anchor))
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if anchor_chapter is None and completed_chapter_numbers:
+            anchor_chapter = max(completed_chapter_numbers)
 
         # 2. Bible 结构化状态；只采集 Bible 元数据和结构化条目，不深拷贝章节正文。
         bible_state: Dict[str, Any] = collect_bible_snapshot_state(self.db, novel_id)
@@ -224,11 +244,11 @@ class UnifiedCheckpointService:
             INSERT INTO novel_checkpoints (
                 id, novel_id, parent_id, branch_name,
                 trigger_type, name, description,
-                chapter_pointers, bible_state, foreshadow_state,
+                chapter_pointers, anchor_chapter, bible_state, foreshadow_state,
                 story_state, character_masks, emotion_ledger,
                 active_foreshadows, outline, recent_summary,
                 is_active, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """
         try:
             self.db.execute(sql, (
@@ -240,6 +260,7 @@ class UnifiedCheckpointService:
                 name,
                 description,
                 json.dumps(chapter_pointers, ensure_ascii=False),
+                anchor_chapter,
                 json.dumps(bible_state, ensure_ascii=False),
                 json.dumps(foreshadow_state, ensure_ascii=False),
                 json.dumps(story_state, ensure_ascii=False) if story_state is not None else "{}",

@@ -37,6 +37,8 @@ CHAPTER_EXECUTION_PLAN_FORBIDDEN_MARKERS = (
     "情绪变化节点",
 )
 
+CHAPTER_TITLE_PLACEHOLDERS = frozenset({"description", "描述"})
+
 
 def _is_blank(value: Any) -> bool:
     if value is None:
@@ -76,6 +78,9 @@ def validate_lightweight_act_plan(
         for field in policy.required_act_plan_fields:
             if _is_blank(raw.get(field)):
                 errors.append(f"chapter {index} missing required field: {field}")
+        title = str(raw.get("title") or "").strip().casefold()
+        if title in CHAPTER_TITLE_PLACEHOLDERS:
+            errors.append(f"chapter {index} title is a placeholder")
 
     return errors
 

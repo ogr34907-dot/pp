@@ -51,6 +51,7 @@ class SqliteChapterNarrativeCommitRepository:
         chapter_number: int,
         content_sha256: str,
         pipeline_version: str,
+        expected_content_revision: int | None = None,
     ) -> NarrativeClaim:
         now = datetime.now(timezone.utc).isoformat()
         with sqlite_writes_bypass_queue():
@@ -79,6 +80,15 @@ class SqliteChapterNarrativeCommitRepository:
                         "failed",
                         revision,
                         failure_reason="source_hash_mismatch",
+                    )
+                if (
+                    expected_content_revision is not None
+                    and revision != int(expected_content_revision)
+                ):
+                    return NarrativeClaim(
+                        "failed",
+                        revision,
+                        failure_reason="source_revision_mismatch",
                     )
 
                 cursor = conn.execute(
@@ -136,6 +146,36 @@ class SqliteChapterNarrativeCommitRepository:
                     )
                     if reclaim_cursor.rowcount == 1:
                         return NarrativeClaim("claimed", revision)
+                    row = conn.execute(
+                        """
+                        SELECT status, content_revision, attempt_count, vector_status,
+                               failure_reason
+                        FROM chapter_narrative_commits
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND pipeline_version = ?
+                        """,
+                        (novel_id, chapter_number, content_sha256, pipeline_version),
+                    ).fetchone()
+                if row[0] == "stale":
+                    reclaim_cursor = conn.execute(
+                        """
+                        UPDATE chapter_narrative_commits
+                        SET status = 'in_progress', failure_reason = '', attempt_count = 1,
+                            vector_status = 'not_started', committed_at = NULL, updated_at = ?
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND pipeline_version = ?
+                          AND status = 'stale'
+                        """,
+                        (
+                            now,
+                            novel_id,
+                            chapter_number,
+                            content_sha256,
+                            pipeline_version,
+                        ),
+                    )
+                    if reclaim_cursor.rowcount == 1:
+                        return NarrativeClaim("claimed", int(row[1]))
                     row = conn.execute(
                         """
                         SELECT status, content_revision, attempt_count, vector_status,
@@ -380,6 +420,7 @@ class SqliteChapterNarrativeCommitRepository:
         chapter_number: int,
         content_sha256: str,
         pipeline_version: str,
+        expected_content_revision: int | None = None,
         content_revision: int,
         failure_reason: str,
     ) -> None:
