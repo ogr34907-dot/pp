@@ -1,6 +1,37 @@
 """Chapter Summary entity"""
-from typing import List, Dict, Any
+import hashlib
+import json
+from typing import Any, Dict, List
+
 from domain.shared.base_entity import BaseEntity
+
+
+def canonical_summary_payload_sha256(
+    *,
+    summary: str,
+    key_events: str = "",
+    open_threads: str = "",
+    consistency_note: str = "",
+    beat_sections: List[str] = None,
+    micro_beats: List[Dict[str, Any]] = None,
+) -> str:
+    """Return a stable digest for the canonical narrative payload."""
+    payload = {
+        "summary": summary or "",
+        "key_events": key_events or "",
+        "open_threads": open_threads or "",
+        "consistency_note": consistency_note or "",
+        "beat_sections": list(beat_sections or []),
+        "micro_beats": list(micro_beats or []),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class ChapterSummary(BaseEntity):
@@ -20,6 +51,7 @@ class ChapterSummary(BaseEntity):
         pipeline_version: str = "",
         sync_error: str = "",
         sync_attempts: int = 0,
+        canonical_payload_sha256: str = "",
     ):
         """初始化章节摘要
 
@@ -46,6 +78,7 @@ class ChapterSummary(BaseEntity):
         self.pipeline_version = pipeline_version
         self.sync_error = sync_error
         self.sync_attempts = sync_attempts
+        self.canonical_payload_sha256 = canonical_payload_sha256
 
     def __repr__(self) -> str:
         return f"<ChapterSummary chapter_id={self.chapter_id} status={self.sync_status}>"

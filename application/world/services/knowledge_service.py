@@ -68,6 +68,7 @@ class KnowledgeService:
                 pipeline_version=ch.get("pipeline_version", ""),
                 sync_error=ch.get("sync_error", ""),
                 sync_attempts=int(ch.get("sync_attempts", 0) or 0),
+                canonical_payload_sha256=ch.get("canonical_payload_sha256", ""),
             )
             for ch in data.get("chapters", [])
         ]
@@ -405,6 +406,9 @@ class KnowledgeService:
                 pipeline_version=getattr(existing, "pipeline_version", "") or "",
                 sync_error=getattr(existing, "sync_error", "") or "",
                 sync_attempts=int(getattr(existing, "sync_attempts", 0) or 0),
+                canonical_payload_sha256=(
+                    getattr(existing, "canonical_payload_sha256", "") or ""
+                ),
             )
         else:
             chapter = ChapterSummary(

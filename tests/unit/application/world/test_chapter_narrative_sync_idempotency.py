@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from domain.knowledge.chapter_summary import canonical_summary_payload_sha256
 from domain.novel.entities.foreshadowing_registry import ForeshadowingRegistry
 from domain.novel.entities.chapter import Chapter
 from domain.novel.value_objects.novel_id import NovelId
@@ -652,6 +653,126 @@ def test_canonical_commit_rejects_replaced_or_invalid_summary_row(tmp_path):
             pipeline_version="chapter-narrative-sync/v1",
             attempt_count=claim.attempt_count,
             content_revision=claim.content_revision,
+        )
+
+
+def test_canonical_commit_rejects_nonempty_replaced_summary_payload(tmp_path):
+    db, _chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    content_sha256 = hashlib.sha256(chapter.content.encode("utf-8")).hexdigest()
+    claim = repository.claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync/v1",
+    )
+    payload_sha256 = canonical_summary_payload_sha256(
+        summary="准备提交的规范摘要",
+        key_events="准备提交的事件",
+        open_threads="准备提交的线索",
+    )
+    knowledge.upsert_chapter_summary(
+        novel_id="novel-1",
+        chapter_id=1,
+        summary="准备提交的规范摘要",
+        key_events="准备提交的事件",
+        open_threads="准备提交的线索",
+        sync_status="in_progress",
+    )
+    repository.prepare_summary(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync/v1",
+        attempt_count=claim.attempt_count,
+        canonical_payload_sha256=payload_sha256,
+    )
+
+    # A whole-knowledge save can retain the provenance/status fields while
+    # replacing the nonempty canonical narrative payload.
+    db.execute(
+        "UPDATE chapter_summaries SET summary = ?, key_events = ?, open_threads = ? "
+        "WHERE chapter_number = 1",
+        ("并发替换后的摘要", "并发替换后的事件", "并发替换后的线索"),
+    )
+    db.commit()
+
+    with pytest.raises(RuntimeError, match="canonical_summary_write_missing"):
+        repository.commit(
+            novel_id="novel-1",
+            chapter_number=1,
+            content_sha256=content_sha256,
+            pipeline_version="chapter-narrative-sync/v1",
+            attempt_count=claim.attempt_count,
+            content_revision=claim.content_revision,
+            canonical_payload_sha256=payload_sha256,
+        )
+
+
+def test_canonical_commit_rejects_whole_knowledge_save_replacement(tmp_path):
+    db, _chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    content_sha256 = hashlib.sha256(chapter.content.encode("utf-8")).hexdigest()
+    claim = repository.claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync/v1",
+    )
+    payload_sha256 = canonical_summary_payload_sha256(
+        summary="准备提交的规范摘要",
+        key_events="准备提交的事件",
+        open_threads="准备提交的线索",
+    )
+    knowledge.upsert_chapter_summary(
+        novel_id="novel-1",
+        chapter_id=1,
+        summary="准备提交的规范摘要",
+        key_events="准备提交的事件",
+        open_threads="准备提交的线索",
+        sync_status="in_progress",
+    )
+    repository.prepare_summary(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync/v1",
+        attempt_count=claim.attempt_count,
+        canonical_payload_sha256=payload_sha256,
+    )
+
+    replacement = knowledge.get_knowledge("novel-1")
+    replacement_summary = replacement.get_chapter(1)
+    replacement_summary.summary = "全量保存替换后的摘要"
+    replacement_summary.key_events = "全量保存替换后的事件"
+    replacement_summary.open_threads = "全量保存替换后的线索"
+    knowledge.knowledge_repository.save(replacement)
+
+    replaced_row = db.fetch_one(
+        "SELECT source_content_sha256, pipeline_version, sync_status, sync_attempts, "
+        "canonical_payload_sha256 FROM chapter_summaries WHERE chapter_number = 1"
+    )
+    assert dict(replaced_row) == {
+        "source_content_sha256": content_sha256,
+        "pipeline_version": "chapter-narrative-sync/v1",
+        "sync_status": "in_progress",
+        "sync_attempts": claim.attempt_count,
+        "canonical_payload_sha256": canonical_summary_payload_sha256(
+            summary="全量保存替换后的摘要",
+            key_events="全量保存替换后的事件",
+            open_threads="全量保存替换后的线索",
+        ),
+    }
+
+    with pytest.raises(RuntimeError, match="canonical_summary_write_missing"):
+        repository.commit(
+            novel_id="novel-1",
+            chapter_number=1,
+            content_sha256=content_sha256,
+            pipeline_version="chapter-narrative-sync/v1",
+            attempt_count=claim.attempt_count,
+            content_revision=claim.content_revision,
+            canonical_payload_sha256=payload_sha256,
         )
 
 

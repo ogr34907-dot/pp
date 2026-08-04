@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS chapter_summaries (
     sync_status TEXT NOT NULL DEFAULT 'draft',
     sync_error TEXT NOT NULL DEFAULT '',
     sync_attempts INTEGER NOT NULL DEFAULT 0,
+    canonical_payload_sha256 TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (knowledge_id) REFERENCES knowledge(id) ON DELETE CASCADE,

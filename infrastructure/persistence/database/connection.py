@@ -379,6 +379,10 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
             "ALTER TABLE chapter_summaries ADD COLUMN "
             "sync_attempts INTEGER NOT NULL DEFAULT 0"
         ),
+        "canonical_payload_sha256": (
+            "ALTER TABLE chapter_summaries ADD COLUMN "
+            "canonical_payload_sha256 TEXT NOT NULL DEFAULT ''"
+        ),
     }
     for column, sql in summary_migrations.items():
         if column not in summary_cols:

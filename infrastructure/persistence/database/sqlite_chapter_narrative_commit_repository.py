@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from domain.knowledge.chapter_summary import canonical_summary_payload_sha256
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
 
@@ -16,6 +18,26 @@ class NarrativeClaim:
     attempt_count: int = 1
     vector_status: str = "not_started"
     failure_reason: str = ""
+
+
+def _payload_sha256_from_summary_row(row) -> str:
+    try:
+        beat_sections = json.loads(row["beat_sections"]) if row["beat_sections"] else []
+        micro_beats = json.loads(row["micro_beats"]) if row["micro_beats"] else []
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("canonical_summary_write_missing") from exc
+
+    if not isinstance(beat_sections, list) or not isinstance(micro_beats, list):
+        raise RuntimeError("canonical_summary_write_missing")
+
+    return canonical_summary_payload_sha256(
+        summary=row["summary"] or "",
+        key_events=row["key_events"] or "",
+        open_threads=row["open_threads"] or "",
+        consistency_note=row["consistency_note"] or "",
+        beat_sections=beat_sections,
+        micro_beats=micro_beats,
+    )
 
 
 class SqliteChapterNarrativeCommitRepository:
@@ -108,6 +130,7 @@ class SqliteChapterNarrativeCommitRepository:
         pipeline_version: str,
         attempt_count: int,
         content_revision: int,
+        canonical_payload_sha256: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with sqlite_writes_bypass_queue():
@@ -128,15 +151,57 @@ class SqliteChapterNarrativeCommitRepository:
                 ):
                     raise RuntimeError("source_hash_mismatch")
 
+                summary_row = conn.execute(
+                    """
+                    SELECT id, summary, key_events, open_threads, consistency_note,
+                           beat_sections, micro_beats, canonical_payload_sha256
+                    FROM chapter_summaries
+                    WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?)
+                      AND chapter_number = ?
+                      AND summary IS NOT NULL AND TRIM(summary) != ''
+                      AND source_content_sha256 = ?
+                      AND pipeline_version = ?
+                      AND sync_status = 'in_progress'
+                      AND sync_attempts = ?
+                    """,
+                    (
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        attempt_count,
+                    ),
+                ).fetchone()
+                if summary_row is None:
+                    raise RuntimeError("canonical_summary_write_missing")
+
+                actual_payload_sha256 = _payload_sha256_from_summary_row(summary_row)
+                expected_payload_sha256 = (
+                    canonical_payload_sha256
+                    or summary_row["canonical_payload_sha256"]
+                    or ""
+                )
+                if (
+                    not expected_payload_sha256
+                    or actual_payload_sha256 != expected_payload_sha256
+                    or summary_row["canonical_payload_sha256"] != expected_payload_sha256
+                ):
+                    raise RuntimeError("canonical_summary_write_missing")
+
                 summary_cursor = conn.execute(
                     """
                     UPDATE chapter_summaries
                     SET source_content_sha256 = ?, pipeline_version = ?,
                         sync_status = 'committed', sync_error = '', sync_attempts = ?,
                         updated_at = ?
-                    WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?)
-                      AND chapter_number = ?
-                      AND summary IS NOT NULL AND TRIM(summary) != ''
+                    WHERE id = ?
+                      AND summary IS ?
+                      AND key_events IS ?
+                      AND open_threads IS ?
+                      AND consistency_note IS ?
+                      AND beat_sections IS ?
+                      AND micro_beats IS ?
+                      AND canonical_payload_sha256 = ?
                       AND source_content_sha256 = ?
                       AND pipeline_version = ?
                       AND sync_status = 'in_progress'
@@ -147,8 +212,14 @@ class SqliteChapterNarrativeCommitRepository:
                         pipeline_version,
                         attempt_count,
                         now,
-                        novel_id,
-                        chapter_number,
+                        summary_row["id"],
+                        summary_row["summary"],
+                        summary_row["key_events"],
+                        summary_row["open_threads"],
+                        summary_row["consistency_note"],
+                        summary_row["beat_sections"],
+                        summary_row["micro_beats"],
+                        expected_payload_sha256,
                         content_sha256,
                         pipeline_version,
                         attempt_count,
@@ -188,26 +259,44 @@ class SqliteChapterNarrativeCommitRepository:
         content_sha256: str,
         pipeline_version: str,
         attempt_count: int,
+        canonical_payload_sha256: str | None = None,
     ) -> None:
         with sqlite_writes_bypass_queue():
-            cursor = self._db.execute(
-                """
-                UPDATE chapter_summaries
-                SET source_content_sha256 = ?, pipeline_version = ?,
-                    sync_status = 'in_progress', sync_error = '', sync_attempts = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?)
-                  AND chapter_number = ?
-                """,
-                (
-                    content_sha256,
-                    pipeline_version,
-                    attempt_count,
-                    novel_id,
-                    chapter_number,
-                ),
-            )
-            self._db.commit()
+            with self._db.transaction() as conn:
+                summary_row = conn.execute(
+                    """
+                    SELECT id, summary, key_events, open_threads, consistency_note,
+                           beat_sections, micro_beats
+                    FROM chapter_summaries
+                    WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?)
+                      AND chapter_number = ?
+                    """,
+                    (novel_id, chapter_number),
+                ).fetchone()
+                if summary_row is None:
+                    raise RuntimeError("canonical_summary_write_missing")
+
+                actual_payload_sha256 = _payload_sha256_from_summary_row(summary_row)
+                expected_payload_sha256 = canonical_payload_sha256 or actual_payload_sha256
+                if actual_payload_sha256 != expected_payload_sha256:
+                    raise RuntimeError("canonical_summary_write_missing")
+
+                cursor = conn.execute(
+                    """
+                    UPDATE chapter_summaries
+                    SET source_content_sha256 = ?, pipeline_version = ?,
+                        sync_status = 'in_progress', sync_error = '', sync_attempts = ?,
+                        canonical_payload_sha256 = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        content_sha256,
+                        pipeline_version,
+                        attempt_count,
+                        expected_payload_sha256,
+                        summary_row["id"],
+                    ),
+                )
         if cursor.rowcount != 1:
             raise RuntimeError("canonical_summary_write_missing")
 

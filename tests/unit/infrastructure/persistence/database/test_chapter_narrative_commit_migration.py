@@ -27,6 +27,7 @@ def test_clean_install_has_content_versions_summary_provenance_and_claim_table(t
         "sync_status",
         "sync_error",
         "sync_attempts",
+        "canonical_payload_sha256",
     } <= _columns(db, "chapter_summaries")
     assert {
         "novel_id",
@@ -67,7 +68,8 @@ def test_existing_chapter_and_summary_receive_mechanical_legacy_backfill(tmp_pat
         "SELECT content_sha256, content_revision FROM chapters WHERE id = 'chapter-1'"
     )
     summary = db.fetch_one(
-        "SELECT source_content_sha256, pipeline_version, sync_status, sync_attempts "
+        "SELECT source_content_sha256, pipeline_version, sync_status, sync_attempts, "
+        "canonical_payload_sha256 "
         "FROM chapter_summaries WHERE id = 'summary-1'"
     )
 
@@ -80,6 +82,7 @@ def test_existing_chapter_and_summary_receive_mechanical_legacy_backfill(tmp_pat
         "pipeline_version": "legacy",
         "sync_status": "legacy",
         "sync_attempts": 0,
+        "canonical_payload_sha256": "",
     }
     assert db.fetch_all("SELECT * FROM chapter_narrative_commits") == []
 
@@ -163,7 +166,10 @@ def test_migration_runner_upgrades_existing_database_with_canonical_provenance(
             "VALUES ('summary-1', 'knowledge-1', 1, '旧摘要')"
         )
         for migration in migrations_dir.glob("*.sql"):
-            if migration.name != "014_chapter_narrative_commits.sql":
+            if migration.name not in {
+                "014_chapter_narrative_commits.sql",
+                "015_chapter_summary_payload_digest.sql",
+            }:
                 conn.execute(
                     "INSERT INTO migrations_applied (migration_file) VALUES (?)",
                     (migration.name,),
@@ -178,7 +184,8 @@ def test_migration_runner_upgrades_existing_database_with_canonical_provenance(
             "SELECT content_sha256, content_revision FROM chapters WHERE id = 'chapter-1'"
         ).fetchone()
         summary = conn.execute(
-            "SELECT source_content_sha256, pipeline_version, sync_status, sync_attempts "
+            "SELECT source_content_sha256, pipeline_version, sync_status, sync_attempts, "
+            "canonical_payload_sha256 "
             "FROM chapter_summaries WHERE id = 'summary-1'"
         ).fetchone()
 
@@ -188,6 +195,7 @@ def test_migration_runner_upgrades_existing_database_with_canonical_provenance(
         "pipeline_version",
         "sync_error",
         "sync_attempts",
+        "canonical_payload_sha256",
     } <= summary_columns
     assert chapter == (hashlib.sha256(content.encode("utf-8")).hexdigest(), 1)
-    assert summary == (chapter[0], "legacy", "legacy", 0)
+    assert summary == (chapter[0], "legacy", "legacy", 0, "")

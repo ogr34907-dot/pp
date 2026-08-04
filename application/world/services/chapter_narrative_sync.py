@@ -18,6 +18,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
 from domain.ai.services.llm_service import LLMService, GenerationConfig
+from domain.knowledge.chapter_summary import canonical_summary_payload_sha256
 from domain.novel.value_objects.foreshadowing import (
     Foreshadowing,
     ForeshadowingStatus,
@@ -2483,6 +2484,14 @@ async def sync_chapter_narrative_after_save(
             sqlite_writes_bypass_queue,
         )
 
+        canonical_payload_sha256 = canonical_summary_payload_sha256(
+            summary=summary,
+            key_events=key_events or "（未提取）",
+            open_threads=open_threads or "无",
+            consistency_note=consistency_note,
+            beat_sections=beat_sections,
+            micro_beats=mb_out if mb_out else None,
+        )
         with sqlite_writes_bypass_queue():
             knowledge_service.upsert_chapter_summary(
                 novel_id=novel_id,
@@ -2504,6 +2513,7 @@ async def sync_chapter_narrative_after_save(
             content_sha256=content_sha256,
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
             attempt_count=claim.attempt_count,
+            canonical_payload_sha256=canonical_payload_sha256,
         )
     except Exception as e:
         return failed_result(str(e) or type(e).__name__)
@@ -2625,6 +2635,7 @@ async def sync_chapter_narrative_after_save(
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
             attempt_count=claim.attempt_count,
             content_revision=claim.content_revision,
+            canonical_payload_sha256=canonical_payload_sha256,
         )
     except Exception as e:
         failure_reason = str(e) or type(e).__name__
