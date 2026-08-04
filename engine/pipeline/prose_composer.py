@@ -60,10 +60,17 @@ class ChapterProseInvocationComposer:
 
     def _build_variables(self, request: ProseCompositionRequest) -> dict[str, Any]:
         metadata = request.metadata or {}
-        continuity_context = (
-            str(metadata.get("continuity_context") or "").strip()
-            or str(request.context_text or "").strip()
-        )
+        continuity_context = str(request.context_text or "").strip()
+        additional_continuity = str(metadata.get("continuity_context") or "").strip()
+        if additional_continuity and additional_continuity not in continuity_context:
+            continuity_context = "\n\n".join(
+                part
+                for part in (
+                    continuity_context,
+                    f"=== ADDITIONAL CONTINUITY ===\n{additional_continuity}",
+                )
+                if part
+            )
         return {
             "target_words": int(request.target_words or 2500),
             "chapter_outline": request.outline,

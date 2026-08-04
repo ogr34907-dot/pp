@@ -282,30 +282,42 @@ class MemoryNode(BaseNode):
         import time
         start = time.time()
         novel_id = inputs.get("novel_id") or context.get("novel_id", "")
+        chapter_number = int(
+            inputs.get("chapter_number") or context.get("chapter_number", 0) or 0
+        )
 
         try:
-            fact_lock = ""
-            entity_memory = ""
+            shared_state = context.get("shared_state") or {}
+            memory_engine = context.get("memory_engine") or shared_state.get("memory_engine")
+            if memory_engine is None:
+                from application.engine.services.memory_engine import MemoryEngine
+                from infrastructure.persistence.database.connection import get_database
+                from infrastructure.persistence.database.sqlite_bible_repository import (
+                    SqliteBibleRepository,
+                )
 
-            try:
-                from application.engine.services.context_assembler import ContextAssembler
-                assembler = ContextAssembler()
-                fact_lock = getattr(assembler, "build_fact_lock", lambda x: "")(novel_id)
-            except Exception as e:
-                logger.warning(f"ContextAssembler 调用失败: {e}")
+                db = get_database()
+                memory_engine = MemoryEngine(
+                    llm_service=None,
+                    bible_repository=SqliteBibleRepository(db),
+                    db_connection=db,
+                )
+
+            fact_lock = str(
+                memory_engine.build_fact_lock_section(novel_id, chapter_number) or ""
+            ).strip()
+            if not fact_lock:
+                raise RuntimeError(
+                    f"MemoryEngine returned an empty fact lock for {novel_id} chapter {chapter_number}"
+                )
 
             return NodeResult(
-                outputs={"fact_lock": fact_lock, "entity_memory": entity_memory},
+                outputs={"fact_lock": fact_lock, "entity_memory": ""},
                 status=NodeStatus.SUCCESS,
                 duration_ms=int((time.time() - start) * 1000),
             )
         except Exception as e:
-            return NodeResult(
-                outputs={"fact_lock": "", "entity_memory": ""},
-                status=NodeStatus.ERROR,
-                duration_ms=int((time.time() - start) * 1000),
-                error=str(e),
-            )
+            raise RuntimeError(f"ctx_memory fact lock failed: {e}") from e
 
     def validate_inputs(self, inputs: Dict[str, Any]) -> bool:
         return True

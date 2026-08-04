@@ -8,6 +8,10 @@ from typing import Dict, List, Optional
 from engine.core.entities.story import StoryPhase
 
 
+class ContextBudgetExceededError(ValueError):
+    """Raised when required emitted context cannot fit the configured budget."""
+
+
 class PriorityTier(str, Enum):
     """优先级层级（洋葱模型）"""
 
@@ -57,6 +61,17 @@ class BudgetAllocation:
     phase: StoryPhase = StoryPhase.OPENING
     total_chapters: int = 0
 
+    def get_governance_context(self) -> str:
+        """Render budgeted cross-slot governance that is emitted with context."""
+        if not self.expired_foreshadows:
+            return ""
+        return (
+            "=== 强制剧情收束令 ===\n"
+            "以下伏笔已超出预期揭晓章节，必须在本章或本节拍的行文中，通过回忆、对话、意外发展或直接揭露等方式去解答或明显推进悬念：\n"
+            + "\n".join(f"- {item}" for item in self.expired_foreshadows)
+            + "\n【如果你无视此指令，长篇小说的情节网将陷入崩溃】"
+        )
+
     def get_final_context(self) -> str:
         """组装最终上下文"""
         parts = []
@@ -76,12 +91,8 @@ class BudgetAllocation:
                 if slot.content.strip():
                     parts.append(f"\n=== {slot.name.upper()} ===\n{slot.content}")
 
-        if self.expired_foreshadows:
-            parts.append(
-                "\n=== 强制剧情收束令 ===\n"
-                "以下伏笔已超出预期揭晓章节，必须在本章或本节拍的行文中，通过回忆、对话、意外发展或直接揭露等方式去解答或明显推进悬念：\n"
-                + "\n".join(f"- {f}" for f in self.expired_foreshadows)
-                + "\n【如果你无视此指令，长篇小说的情节网将陷入崩溃】"
-            )
+        governance_context = self.get_governance_context()
+        if governance_context:
+            parts.append("\n" + governance_context)
 
         return "\n".join(parts)

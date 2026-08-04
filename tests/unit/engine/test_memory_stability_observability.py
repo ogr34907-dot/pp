@@ -56,10 +56,6 @@ class _NoCommittedContentDatabase:
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason="Task 2 must preserve the full T0-T3 context when the StoryPipeline creates its real prose invocation intent",
-)
 async def test_story_pipeline_final_intent_contains_all_memory_tiers(monkeypatch):
     """The real ChapterProseInvocationComposer must carry all tiers to its final intent."""
     t0 = "[T0] BIBLE_LOCK: 林澈已经死亡，赤铜钥匙归沈青。"

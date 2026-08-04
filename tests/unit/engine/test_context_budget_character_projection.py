@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
+from application.memory.services.character_projection_service import CharacterProjectionService
+from infrastructure.persistence.database.unified_character_repository import (
+    SqliteUnifiedCharacterRepository,
+)
 
 
 class FakeProjectionService:
@@ -51,3 +55,17 @@ def test_projection_locks_for_plan_maps_support_tiers():
     locks = allocator._projection_locks_for_plan("novel-1", plan, tier="support")
 
     assert locks.splitlines() == ["常规角色锁", "过场角色锁"]
+
+
+def test_projection_service_fallback_constructs_with_unified_character_repository(monkeypatch):
+    database = SimpleNamespace(db_path="memory")
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_database",
+        lambda: database,
+    )
+    allocator = ContextBudgetAllocator()
+
+    service = allocator._get_character_projection_service()
+
+    assert isinstance(service, CharacterProjectionService)
+    assert isinstance(service.character_repo, SqliteUnifiedCharacterRepository)

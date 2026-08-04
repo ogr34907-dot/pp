@@ -71,3 +71,26 @@ def test_planning_context_prefers_lightweight_act_plan_over_tail_of_full_preplan
     assert "交给下一章：明确交给下一章的钩子" in text
     assert "爽点/反转设计" not in text
     assert "主角状态变化" not in text
+
+
+def test_prose_ledger_keeps_facts_that_compact_planning_context_omits():
+    service = ChapterContinuityLedgerService(
+        chapter_repository=_ChapterRepo(
+            [
+                SimpleNamespace(
+                    number=1,
+                    title="第1章",
+                    outline="章前只规划潜入钟楼",
+                    content="沈青亲眼看见林澈死亡，并拿走赤铜钥匙。",
+                )
+            ]
+        ),
+        story_node_repo=_StoryNodeRepo([_node(1, {})]),
+    )
+
+    ledger = service.build_for_chapter("novel-1", 2)
+
+    assert "林澈死亡" in ledger.to_prompt_text()
+    assert "赤铜钥匙" in ledger.to_prompt_text()
+    assert "林澈死亡" not in ledger.to_planning_context_text()
+    assert "赤铜钥匙" not in ledger.to_planning_context_text()

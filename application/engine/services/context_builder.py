@@ -35,6 +35,7 @@ from domain.novel.repositories.foreshadowing_repository import ForeshadowingRepo
 from domain.ai.services.vector_store import VectorStore
 from domain.ai.services.embedding_service import EmbeddingService
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
+from application.engine.services.context_budget_models import ContextSlot, PriorityTier
 from application.engine.dag.plan.schema import ChapterExecutionPlan
 
 logger = logging.getLogger(__name__)
@@ -186,12 +187,31 @@ class ContextBuilder:
         Returns:
             组装好的上下文字符串
         """
+        bible_layer2 = self._build_layer2_smart_retrieval(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            outline=outline,
+            budget=max_tokens,
+            scene_director=scene_director,
+        )
+        additional_slots = {}
+        if bible_layer2:
+            additional_slots["bible_layer2"] = ContextSlot(
+                name="Bible Layer2",
+                tier=PriorityTier.T2_DYNAMIC,
+                content=bible_layer2,
+                tokens=self.estimate_tokens(bible_layer2),
+                max_tokens=max_tokens,
+                priority=45,
+            )
+
         allocation = self.budget_allocator.allocate(
             novel_id=novel_id,
             chapter_number=chapter_number,
             outline=outline,
             total_budget=max_tokens,
             scene_director=scene_director,
+            additional_slots=additional_slots,
         )
         
         return allocation.get_final_context()
@@ -219,12 +239,30 @@ class ContextBuilder:
                 },
             }
         """
+        bible_layer2 = self._build_layer2_smart_retrieval(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            outline=outline,
+            budget=max_tokens,
+            scene_director=scene_director,
+        )
+        additional_slots = {}
+        if bible_layer2:
+            additional_slots["bible_layer2"] = ContextSlot(
+                name="Bible Layer2",
+                tier=PriorityTier.T2_DYNAMIC,
+                content=bible_layer2,
+                tokens=self.estimate_tokens(bible_layer2),
+                max_tokens=max_tokens,
+                priority=45,
+            )
         allocation = self.budget_allocator.allocate(
             novel_id=novel_id,
             chapter_number=chapter_number,
             outline=outline,
             total_budget=max_tokens,
             scene_director=scene_director,
+            additional_slots=additional_slots,
         )
         
         # 从 BudgetAllocation 中提取三层内容
@@ -242,34 +280,34 @@ class ContextBuilder:
             
             if slot.tier.value in ["t0_critical", "t1_compressible"]:
                 layer1_parts.append(f"=== {slot.name.upper()} ===\n{slot.content}")
-                layer1_tokens += slot.tokens
             elif slot.tier.value == "t2_dynamic":
                 layer2_parts.append(f"=== {slot.name.upper()} ===\n{slot.content}")
-                layer2_tokens += slot.tokens
             elif slot.tier.value == "t3_sacrificial":
                 layer3_parts.append(f"=== {slot.name.upper()} ===\n{slot.content}")
-                layer3_tokens += slot.tokens
 
-        bible_layer2 = self._build_layer2_smart_retrieval(
-            novel_id=novel_id,
-            chapter_number=chapter_number,
-            outline=outline,
-            budget=max_tokens,
-            scene_director=scene_director,
+        governance_context = allocation.get_governance_context()
+        if governance_context:
+            layer1_parts.append(governance_context)
+
+        layer1_text = "\n\n".join(layer1_parts)
+        layer2_text = "\n\n".join(layer2_parts)
+        layer3_text = "\n\n".join(layer3_parts)
+        layer1_tokens = self.estimate_tokens(layer1_text)
+        layer2_tokens = self.estimate_tokens(layer2_text)
+        layer3_tokens = self.estimate_tokens(layer3_text)
+        emitted_context = "\n\n".join(
+            text for text in (layer1_text, layer2_text, layer3_text) if text
         )
-        if bible_layer2:
-            layer2_parts.append(bible_layer2)
-            layer2_tokens += self.estimate_tokens(bible_layer2)
         
         return {
-            "layer1_text": "\n\n".join(layer1_parts),
-            "layer2_text": "\n\n".join(layer2_parts),
-            "layer3_text": "\n\n".join(layer3_parts),
+            "layer1_text": layer1_text,
+            "layer2_text": layer2_text,
+            "layer3_text": layer3_text,
             "token_usage": {
                 "layer1": layer1_tokens,
                 "layer2": layer2_tokens,
                 "layer3": layer3_tokens,
-                "total": allocation.used_tokens,
+                "total": self.estimate_tokens(emitted_context),
             },
         }
 

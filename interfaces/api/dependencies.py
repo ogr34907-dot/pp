@@ -763,8 +763,15 @@ def build_auto_workflow(llm_service: LLMService) -> AutoNovelGenerationWorkflow:
     from application.audit.services.conflict_detection_service import ConflictDetectionService
     from application.audit.services.cliche_scanner import ClicheScanner
 
+    context_builder = get_context_builder()
+    memory_engine = getattr(
+        getattr(context_builder, "budget_allocator", None),
+        "memory_engine",
+        None,
+    )
+
     return AutoNovelGenerationWorkflow(
-        context_builder=get_context_builder(),
+        context_builder=context_builder,
         consistency_checker=get_consistency_checker(),
         storyline_manager=get_storyline_manager(),
         plot_arc_repository=get_plot_arc_repository(),
@@ -776,6 +783,7 @@ def build_auto_workflow(llm_service: LLMService) -> AutoNovelGenerationWorkflow:
         voice_fingerprint_service=get_voice_fingerprint_service(),
         conflict_detection_service=ConflictDetectionService(),
         cliche_scanner=ClicheScanner(),
+        memory_engine=memory_engine,
         evolution_gate_service=get_evolution_gate_service(),
     )
 

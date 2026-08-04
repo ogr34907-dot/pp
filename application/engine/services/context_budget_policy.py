@@ -6,6 +6,20 @@ from typing import Dict, List
 from application.engine.services.context_budget_models import ContextSlot
 
 
+def _clear_slot(slot: ContextSlot) -> None:
+    slot.content = ""
+    slot.tokens = 0
+
+
+def _cap_slot(slot: ContextSlot, limit: int, *, chars_per_token_zh: float) -> None:
+    if limit <= 0:
+        _clear_slot(slot)
+        return
+    target_chars = int(limit * chars_per_token_zh)
+    slot.content = slot.content[:target_chars]
+    slot.tokens = limit
+
+
 def truncate_t0_slots(
     t0_slots: Dict[str, ContextSlot],
     budget: int,
@@ -14,7 +28,11 @@ def truncate_t0_slots(
 ) -> int:
     """Keep T0 slots in insertion order and truncate the first overflowing slot."""
     total = 0
+    exhausted = False
     for slot in t0_slots.values():
+        if exhausted:
+            _clear_slot(slot)
+            continue
         if total + slot.tokens <= budget:
             total += slot.tokens
             continue
@@ -25,7 +43,9 @@ def truncate_t0_slots(
             slot.content = slot.content[:target_chars] + "..."
             slot.tokens = remaining
             total += remaining
-        break
+        else:
+            _clear_slot(slot)
+        exhausted = True
     return total
 
 
@@ -45,6 +65,13 @@ def allocate_tier(
 
     total_used = 0
     for name, slot in sorted_slots:
+        if slot.max_tokens is not None and slot.max_tokens >= 0 and slot.tokens > slot.max_tokens:
+            original_tokens = slot.tokens
+            _cap_slot(slot, slot.max_tokens, chars_per_token_zh=chars_per_token_zh)
+            compression_log.append(
+                f"槽位上限 {name}: {original_tokens} → {slot.tokens} tokens"
+            )
+
         if total_used + slot.tokens <= budget:
             total_used += slot.tokens
             continue
@@ -59,8 +86,7 @@ def allocate_tier(
                 total_used += remaining
                 compression_log.append(f"压缩 {name}: {original_tokens} → {remaining} tokens")
             else:
-                slot.content = ""
-                slot.tokens = 0
+                _clear_slot(slot)
                 compression_log.append(f"舍弃 {name}（预算不足）")
             continue
 
@@ -71,7 +97,6 @@ def allocate_tier(
             total_used += remaining
             compression_log.append(f"截断 {name}: {original_tokens} → {remaining} tokens")
         else:
-            slot.content = ""
-            slot.tokens = 0
+            _clear_slot(slot)
 
     return total_used

@@ -44,6 +44,19 @@ def test_allocate_tier_discards_when_remaining_below_minimum():
     assert log == ["舍弃 low（预算不足）"]
 
 
+def test_allocate_tier_applies_slot_maximum_before_tier_budget():
+    slots = {
+        "capped": _slot("限" * 30, tokens=30, priority=100, max_tokens=10),
+    }
+    log = []
+
+    used = allocate_tier(slots, 100, log, chars_per_token_zh=1.0)
+
+    assert used == 10
+    assert slots["capped"].tokens == 10
+    assert slots["capped"].content == "限" * 10
+
+
 def test_truncate_t0_slots_stops_at_first_overflowing_slot():
     slots = {
         "first": ContextSlot(
@@ -58,6 +71,12 @@ def test_truncate_t0_slots_stops_at_first_overflowing_slot():
             content="二" * 20,
             tokens=10,
         ),
+        "third": ContextSlot(
+            name="third",
+            tier=PriorityTier.T0_CRITICAL,
+            content="三" * 20,
+            tokens=10,
+        ),
     }
 
     used = truncate_t0_slots(slots, 15, chars_per_token_zh=1.0)
@@ -66,3 +85,5 @@ def test_truncate_t0_slots_stops_at_first_overflowing_slot():
     assert slots["first"].tokens == 10
     assert slots["second"].tokens == 5
     assert slots["second"].content.endswith("...")
+    assert slots["third"].tokens == 0
+    assert slots["third"].content == ""

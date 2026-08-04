@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,13 +26,54 @@ class _Composer:
         return self.result
 
 
-def test_chapter_prose_composer_builds_only_core_prompt_variables():
+def test_story_pipeline_prose_fallback_uses_full_continuity_ledger():
+    previous_chapter = SimpleNamespace(
+        number=1,
+        title="第1章",
+        outline="沈青准备潜入钟楼。",
+        content="沈青目睹林澈死亡，并确认赤铜钥匙归自己保管。",
+    )
+    current_node = SimpleNamespace(
+        number=2,
+        title="第2章",
+        node_type=SimpleNamespace(value="chapter"),
+        metadata={},
+    )
+    previous_node = SimpleNamespace(
+        number=1,
+        title="第1章",
+        node_type=SimpleNamespace(value="chapter"),
+        metadata={},
+        outline=previous_chapter.outline,
+        content=previous_chapter.content,
+    )
+    chapter_repository = SimpleNamespace(
+        list_by_novel=lambda _novel_id: [previous_chapter]
+    )
+    story_node_repo = SimpleNamespace(
+        get_tree_sync=lambda _novel_id: SimpleNamespace(nodes=[previous_node, current_node])
+    )
+    ctx = PipelineContext(
+        novel_id="novel-1",
+        chapter_number=2,
+        chapter_node=current_node,
+    )
+    ctx.chapter_repository = chapter_repository
+    ctx.story_node_repo = story_node_repo
+
+    _Pipeline()._attach_chapter_preplan_metadata(ctx)
+
+    assert "林澈死亡" in ctx.metadata["continuity_context"]
+    assert "赤铜钥匙" in ctx.metadata["continuity_context"]
+
+
+def test_chapter_prose_composer_keeps_full_context_before_additional_continuity():
     composer = ChapterProseInvocationComposer()
     request = ProseCompositionRequest(
         novel_id="novel-1",
         chapter_number=4,
         outline="七段细纲",
-        context_text="前3章规划",
+        context_text="T0 世界观事实\nT1 有效摘要\nT2 最近承接\nT3 检索证据",
         target_words=2000,
         metadata={
             "key_plot_points": ["情节点1", "情节点2"],
@@ -39,6 +81,7 @@ def test_chapter_prose_composer_builds_only_core_prompt_variables():
             "chapter_plan_json": {"unused": True},
             "previous_summary": "不应进入 prompt",
             "previous_ending": "不应进入 prompt",
+            "continuity_context": "章前规划补充",
         },
     )
 
@@ -47,8 +90,25 @@ def test_chapter_prose_composer_builds_only_core_prompt_variables():
     assert variables == {
         "target_words": 2000,
         "chapter_outline": "七段细纲",
-        "continuity_context": "前3章规划",
+        "continuity_context": (
+            "T0 世界观事实\nT1 有效摘要\nT2 最近承接\nT3 检索证据"
+            "\n\n=== ADDITIONAL CONTINUITY ===\n章前规划补充"
+        ),
     }
+
+
+def test_chapter_prose_composer_does_not_duplicate_continuity_already_in_full_context():
+    variables = ChapterProseInvocationComposer()._build_variables(
+        ProseCompositionRequest(
+            novel_id="novel-1",
+            chapter_number=4,
+            outline="七段细纲",
+            context_text="事实锁\n章前规划补充\n检索证据",
+            metadata={"continuity_context": "章前规划补充"},
+        )
+    )
+
+    assert variables["continuity_context"] == "事实锁\n章前规划补充\n检索证据"
 
 
 @pytest.mark.asyncio

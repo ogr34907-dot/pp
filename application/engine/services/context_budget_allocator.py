@@ -32,6 +32,7 @@ from domain.ai.services.embedding_service import EmbeddingService
 from application.ai.vector_retrieval_facade import VectorRetrievalFacade
 from application.engine.services.context_budget_models import (
     BudgetAllocation,
+    ContextBudgetExceededError,
     ContextSlot,
     PriorityTier,
 )
@@ -235,13 +236,77 @@ class ContextBudgetAllocator:
         if total_chars == 0:
             return 0
         
-        chinese_ratio = chinese_chars / total_chars
-        
-        # 加权估算
+        # 中英文成本已经按各自字符数拆分；直接相加，不能再按语言比例缩小。
         zh_tokens = chinese_chars / self.CHARS_PER_TOKEN_ZH
         en_tokens = (total_chars - chinese_chars) / self.CHARS_PER_TOKEN_EN
         
-        return int(zh_tokens * chinese_ratio + en_tokens * (1 - chinese_ratio) + 0.5)
+        return int(zh_tokens + en_tokens + 0.5)
+
+    def _truncate_text_to_tokens(self, text: str, budget: int) -> str:
+        """Return the longest deterministic prefix whose actual estimate fits."""
+        value = str(text or "")
+        if not value or budget <= 0:
+            return ""
+        if self.estimate_tokens(value) <= budget:
+            return value
+
+        low, high = 0, len(value)
+        best = ""
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = value[:middle]
+            if middle < len(value) and middle > 0:
+                candidate += "..."
+            if self.estimate_tokens(candidate) <= budget:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
+    def _apply_slot_maximums(
+        self,
+        slots: Dict[str, ContextSlot],
+        compression_log: List[str],
+    ) -> None:
+        for name, slot in slots.items():
+            if slot.max_tokens is None or slot.max_tokens < 0 or slot.tokens <= slot.max_tokens:
+                continue
+            original_tokens = slot.tokens
+            slot.content = self._truncate_text_to_tokens(slot.content, slot.max_tokens)
+            slot.tokens = self.estimate_tokens(slot.content)
+            compression_log.append(
+                f"槽位上限 {name}: {original_tokens} → {slot.tokens} tokens"
+            )
+
+    def _ensure_critical_header_can_fit(
+        self,
+        slots: Dict[str, ContextSlot],
+        total_budget: int,
+    ) -> None:
+        critical = [
+            slot
+            for slot in slots.values()
+            if slot.tier == PriorityTier.T0_CRITICAL and slot.content.strip()
+        ]
+        if not critical:
+            return
+        highest = max(critical, key=lambda slot: slot.priority)
+        minimal = BudgetAllocation(
+            slots={
+                "critical": ContextSlot(
+                    name=highest.name,
+                    tier=highest.tier,
+                    content=highest.content[:1],
+                    priority=highest.priority,
+                )
+            },
+            total_budget=total_budget,
+        ).get_final_context()
+        if self.estimate_tokens(minimal) > total_budget:
+            raise ContextBudgetExceededError(
+                f"context budget {total_budget} cannot fit required critical header {highest.name!r}"
+            )
     
     def allocate(
         self,
@@ -251,6 +316,7 @@ class ContextBudgetAllocator:
         total_budget: int = 35000,
         scene_director: SceneDirectorInput = None,
         current_beat_index: int = 0,
+        additional_slots: Optional[Dict[str, ContextSlot]] = None,
     ) -> BudgetAllocation:
         """执行预算分配
 
@@ -265,6 +331,10 @@ class ContextBudgetAllocator:
         Returns:
             BudgetAllocation: 分配结果
         """
+        if total_budget <= 0:
+            raise ContextBudgetExceededError(
+                f"context budget must be positive, got {total_budget}"
+            )
         allocation = BudgetAllocation(total_budget=total_budget)
 
         scene_director_dict = coerce_scene_director(scene_director)
@@ -284,6 +354,10 @@ class ContextBudgetAllocator:
 
         # ========== 第一步：收集所有内容 ==========
         slots = self._collect_all_slots(novel_id, chapter_number, outline, scene_director_dict, current_beat_index)
+        if additional_slots:
+            slots.update(additional_slots)
+        self._apply_slot_maximums(slots, allocation.compression_log)
+        self._ensure_critical_header_can_fit(slots, total_budget)
         
         # 提取过期伏笔用于终端强制约束
         pending_fs_slot = slots.get("pending_foreshadowings")
@@ -343,12 +417,16 @@ class ContextBudgetAllocator:
         if remaining_after_t2 < t3_min_tokens and t3_slots:
             # 从 T2 中回收部分配额给 T3
             shortfall = t3_min_tokens - remaining_after_t2
-            if t2_actual > shortfall:
+            if t2_actual >= shortfall:
                 logger.info(
                     f"T3 最低保障：从 T2 回收 {shortfall} tokens 给 T3 "
                     f"(确保跨幕记忆不断裂)"
                 )
-                t2_actual -= shortfall
+                t2_actual = self._allocate_tier(
+                    t2_slots,
+                    t2_actual - shortfall,
+                    allocation.compression_log,
+                )
                 allocation.t2_allocated = t2_actual
                 remaining_after_t2 = t3_min_tokens
                 allocation.compression_log.append(
@@ -359,8 +437,7 @@ class ContextBudgetAllocator:
         
         # ========== 第四步：组装最终结果 ==========
         allocation.slots = slots
-        allocation.used_tokens = t0_total + t1_actual + t2_actual + t3_actual
-        allocation.remaining_tokens = total_budget - allocation.used_tokens
+        self._fit_emitted_context(allocation)
         
         if allocation.compression_log:
             allocation.compression_applied = True
@@ -374,6 +451,141 @@ class ContextBudgetAllocator:
         )
         
         return allocation
+
+    def _recount_allocation(self, allocation: BudgetAllocation) -> None:
+        for slot in allocation.slots.values():
+            slot.tokens = self.estimate_tokens(slot.content)
+        allocation.t0_reserved = sum(
+            slot.tokens
+            for slot in allocation.slots.values()
+            if slot.tier == PriorityTier.T0_CRITICAL
+        )
+        allocation.t1_allocated = sum(
+            slot.tokens
+            for slot in allocation.slots.values()
+            if slot.tier == PriorityTier.T1_COMPRESSIBLE
+        )
+        allocation.t2_allocated = sum(
+            slot.tokens
+            for slot in allocation.slots.values()
+            if slot.tier == PriorityTier.T2_DYNAMIC
+        )
+        allocation.t3_allocated = sum(
+            slot.tokens
+            for slot in allocation.slots.values()
+            if slot.tier == PriorityTier.T3_SACRIFICIAL
+        )
+        allocation.used_tokens = self.estimate_tokens(allocation.get_final_context())
+        allocation.remaining_tokens = allocation.total_budget - allocation.used_tokens
+
+    def _fit_emitted_context(self, allocation: BudgetAllocation) -> None:
+        """Compress real rendered output, including headers and governance blocks."""
+        self._recount_allocation(allocation)
+        if allocation.used_tokens <= allocation.total_budget:
+            return
+
+        t3_slots = sorted(
+            (
+                slot
+                for slot in allocation.slots.values()
+                if slot.tier == PriorityTier.T3_SACRIFICIAL and slot.content.strip()
+            ),
+            key=lambda slot: slot.priority,
+            reverse=True,
+        )
+        t3_reserve = min(
+            int(allocation.total_budget * 0.05),
+            sum(slot.tokens for slot in t3_slots),
+        )
+        protected_t3: Dict[int, int] = {}
+        reserve_left = t3_reserve
+        for slot in t3_slots:
+            protected = min(slot.tokens, reserve_left)
+            protected_t3[id(slot)] = protected
+            reserve_left -= protected
+
+        candidates = sorted(
+            allocation.slots.values(),
+            key=lambda slot: (
+                {
+                    PriorityTier.T3_SACRIFICIAL: 0,
+                    PriorityTier.T2_DYNAMIC: 1,
+                    PriorityTier.T1_COMPRESSIBLE: 2,
+                    PriorityTier.T0_CRITICAL: 3,
+                }[slot.tier],
+                slot.priority,
+            ),
+        )
+        highest_t0 = max(
+            (
+                slot
+                for slot in allocation.slots.values()
+                if slot.tier == PriorityTier.T0_CRITICAL and slot.content.strip()
+            ),
+            key=lambda slot: slot.priority,
+            default=None,
+        )
+
+        deferred_protected_t3: List[ContextSlot] = []
+        for slot in candidates:
+            if allocation.used_tokens <= allocation.total_budget or not slot.content.strip():
+                continue
+            floor = protected_t3.get(id(slot), 0)
+            if floor and slot.tokens <= floor:
+                deferred_protected_t3.append(slot)
+                continue
+            if slot is highest_t0:
+                floor = max(floor, self.estimate_tokens(slot.content[:1]))
+
+            original = slot.content
+            floor_content = self._truncate_text_to_tokens(original, floor)
+            slot.content = floor_content
+            self._recount_allocation(allocation)
+            if allocation.used_tokens > allocation.total_budget:
+                allocation.compression_log.append(
+                    f"最终文本压缩 {slot.name}: {self.estimate_tokens(original)} → {slot.tokens} tokens"
+                )
+                continue
+
+            low, high = len(floor_content), len(original)
+            best = floor_content
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = original[:middle]
+                if middle < len(original) and middle > 0:
+                    candidate += "..."
+                slot.content = candidate
+                if self.estimate_tokens(allocation.get_final_context()) <= allocation.total_budget:
+                    best = candidate
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            slot.content = best
+            allocation.compression_log.append(
+                f"最终文本压缩 {slot.name}: {self.estimate_tokens(original)} → {self.estimate_tokens(best)} tokens"
+            )
+            self._recount_allocation(allocation)
+
+        while allocation.used_tokens > allocation.total_budget and allocation.expired_foreshadows:
+            allocation.expired_foreshadows.pop()
+            allocation.compression_log.append("最终文本压缩：移除超预算伏笔治理条目")
+            self._recount_allocation(allocation)
+
+        for slot in deferred_protected_t3:
+            if allocation.used_tokens <= allocation.total_budget:
+                break
+            original_tokens = slot.tokens
+            slot.content = ""
+            allocation.compression_log.append(
+                f"最终文本压缩 {slot.name}: {original_tokens} → 0 tokens"
+            )
+            self._recount_allocation(allocation)
+
+        if allocation.used_tokens > allocation.total_budget:
+            raise ContextBudgetExceededError(
+                f"context budget {allocation.total_budget} cannot fit required emitted context "
+                f"({allocation.used_tokens} tokens)"
+            )
     
     def _collect_all_slots(
         self,
@@ -2083,15 +2295,20 @@ class ContextBudgetAllocator:
             from infrastructure.persistence.database.sqlite_narrative_debt_repository import (
                 SqliteNarrativeDebtRepository,
             )
+            from infrastructure.persistence.database.triple_repository import TripleRepository
+            from infrastructure.persistence.database.unified_character_repository import (
+                SqliteUnifiedCharacterRepository,
+            )
 
             db = get_database()
-            return CharacterProjectionService(
+            self.character_projection_service = CharacterProjectionService(
                 memory_service=NarrativeMemoryService(SqliteNarrativeMemoryRepository(db)),
-                bible_repository=self.bible_repo,
+                unified_character_repository=SqliteUnifiedCharacterRepository(db),
                 character_state_repository=SqliteCharacterStateRepository(db),
-                triple_repository=self.triple_repo,
+                triple_repository=self.triple_repo or TripleRepository(db),
                 debt_repository=SqliteNarrativeDebtRepository(db),
             )
+            return self.character_projection_service
         except Exception as e:
             logger.debug("角色 Projection 服务不可用: %s", e)
             return None

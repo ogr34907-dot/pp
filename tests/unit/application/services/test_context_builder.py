@@ -410,3 +410,58 @@ class TestContextBuilder:
 
         total_tokens = structured["token_usage"]["total"]
         assert total_tokens <= 5500
+
+    def test_structured_context_budgets_bible_layer2_and_headers(self):
+        dto = _empty_bible_dto(
+            characters=[
+                CharacterDTO("c1", "Alice", "世界秘密" * 3000, []),
+            ]
+        )
+        builder = _make_builder(bible_dto=dto)
+
+        structured = builder.build_structured_context(
+            novel_id="novel-1",
+            chapter_number=2,
+            outline="Alice investigates the secret",
+            max_tokens=1000,
+        )
+
+        emitted = "\n\n".join(
+            text
+            for text in (
+                structured["layer1_text"],
+                structured["layer2_text"],
+                structured["layer3_text"],
+            )
+            if text
+        )
+        assert builder.estimate_tokens(emitted) <= 1000
+        assert structured["token_usage"]["total"] == builder.estimate_tokens(emitted)
+
+    def test_structured_context_emits_budgeted_foreshadow_governance(self, monkeypatch):
+        monkeypatch.setattr(
+            ContextBudgetAllocator,
+            "_get_pending_foreshadowings",
+            lambda self, novel_id, chapter_number: "已过期: 钟楼暗门必须推进",
+        )
+        builder = _make_builder()
+
+        structured = builder.build_structured_context(
+            novel_id="novel-1",
+            chapter_number=20,
+            outline="进入钟楼",
+            max_tokens=1000,
+        )
+
+        emitted = "\n\n".join(
+            text
+            for text in (
+                structured["layer1_text"],
+                structured["layer2_text"],
+                structured["layer3_text"],
+            )
+            if text
+        )
+        assert "强制剧情收束令" in emitted
+        assert "钟楼暗门必须推进" in emitted
+        assert builder.estimate_tokens(emitted) <= 1000

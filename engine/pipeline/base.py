@@ -504,7 +504,7 @@ class BaseStoryPipeline(ABC):
                 continuity_context = ChapterContinuityLedgerService(
                     chapter_repository=ctx.chapter_repository,
                     story_node_repo=ctx.story_node_repo,
-                ).build_for_chapter(ctx.novel_id, ctx.chapter_number).to_planning_context_text()
+                ).build_for_chapter(ctx.novel_id, ctx.chapter_number).to_prompt_text()
             except Exception:
                 continuity_context = ""
 
