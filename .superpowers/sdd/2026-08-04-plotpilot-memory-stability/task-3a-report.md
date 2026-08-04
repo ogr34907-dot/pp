@@ -122,3 +122,47 @@ Warnings are existing `datetime.utcnow()` deprecations. Changed Python modules a
 - Vector retry policy remains undefined; only provenance and independent status are persisted here.
 - No old-chapter replay or summary/vector recall strategy was introduced.
 - Verification was the requested targeted plus adjacent suite, not the entire repository test suite.
+
+## Review Fix Round 1
+
+Independent review found five Important issues in the original implementation: stale source content
+could commit, a replaced summary could commit, critical writes treated enqueue/`False` as success,
+the standalone migration wrapper skipped the provenance upgrade, and vector-status persistence errors
+escaped after canonical commit. Commit `e8879eff` addresses those findings.
+
+New tests were observed red before each implementation change:
+
+- an out-of-band `chapters.content` update during the LLM await was incorrectly committed;
+- a prepared summary replaced with an empty/different-provenance row was incorrectly committed;
+- vector-status persistence failure escaped after an otherwise committed canonical result;
+- a failed tension write still committed;
+- a queue that merely accepted a summary/event batch was treated as enough even when no row was visible;
+- the actual `_apply_migration_files()` wrapper left a legacy database without provenance columns;
+- the AI prose projection changed content but left its source hash/revision untouched.
+
+The fix recomputes and validates source content hash plus revision in the final SQLite transaction,
+requires the exact non-empty prepared summary row to remain in-progress, performs canonical summary and
+dialogue writes through the existing direct SQLite bypass before committing, propagates critical extras
+failure, applies canonical provenance backfill from the standalone migration wrapper, isolates vector
+status write failure, and versions the AI prose projection update.
+
+Verification after the fix:
+
+```text
+python -m pytest -q \
+  tests/unit/application/world/test_chapter_narrative_sync_idempotency.py \
+  tests/unit/application/engine/test_chapter_continuity.py \
+  tests/unit/application/services/test_chapter_indexing_service.py \
+  tests/unit/application/ai_invocation/test_chapter_prose_generation_contract.py \
+  tests/unit/infrastructure/ai/test_chapter_narrative_sync_prompt.py \
+  tests/unit/infrastructure/ai/test_prompt_package_sync.py \
+  tests/unit/infrastructure/ai/test_prompt_seed_loader.py \
+  tests/unit/infrastructure/ai/test_required_cpms_prompts.py \
+  tests/unit/infrastructure/persistence/database/test_chapter_narrative_commit_migration.py \
+  tests/unit/infrastructure/persistence/database/test_migration_runner.py \
+  tests/unit/infrastructure/persistence/database/test_sqlite_knowledge_orphan_triples.py
+
+77 passed, 48 existing datetime.utcnow() deprecation warnings
+```
+
+`python -m compileall -q` passed for the changed Python modules and `git diff --check` passed.
