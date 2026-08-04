@@ -1,4 +1,6 @@
 import hashlib
+import json
+import sqlite3
 
 import pytest
 
@@ -321,3 +323,41 @@ def test_safe_snapshot_rewrite_invalidates_derived_memory_state(tmp_path):
         "SELECT entity_id FROM memory_projections ORDER BY entity_id"
     )] == ["entity-stable"]
     assert db.fetch_all("SELECT * FROM memory_engine_state") == []
+
+
+def test_invalidate_foreshadows_tolerates_legacy_table_without_updated_at():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE foreshadows ("
+        "id TEXT PRIMARY KEY, novel_id TEXT, planted_chapter INTEGER, "
+        "resolved_chapter INTEGER, status TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO foreshadows VALUES ('foreshadow-1', 'novel-legacy', 1, 3, 'resolved')"
+    )
+    coordinator = ChapterRewriteCoordinator(db=None, chapter_repository=None)
+
+    coordinator._invalidate_foreshadows(conn, "novel-legacy", 2)
+
+    assert conn.execute(
+        "SELECT resolved_chapter, status FROM foreshadows WHERE id = 'foreshadow-1'"
+    ).fetchone() == (None, "planted")
+
+
+def test_invalidate_story_nodes_tolerates_legacy_table_without_updated_at():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE story_nodes ("
+        "id TEXT PRIMARY KEY, novel_id TEXT, node_type TEXT, metadata TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO story_nodes VALUES ('act-1', 'novel-legacy', 'act', '{\"summary\": \"old\"}')"
+    )
+    coordinator = ChapterRewriteCoordinator(db=None, chapter_repository=None)
+
+    coordinator._invalidate_story_nodes(conn, "novel-legacy", 2)
+
+    metadata = json.loads(
+        conn.execute("SELECT metadata FROM story_nodes WHERE id = 'act-1'").fetchone()[0]
+    )
+    assert metadata["summary_status"] == "stale"

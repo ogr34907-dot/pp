@@ -242,6 +242,7 @@ class BaseStoryPipeline(ABC):
                 [n for n in nodes if getattr(n, 'node_type', None) and n.node_type.value == "chapter"],
                 key=lambda n: n.number,
             )
+            canonical_history_missing = False
             for node in chapter_nodes:
                 # 找到第一个未完成的章节
                 existing = None
@@ -253,31 +254,133 @@ class BaseStoryPipeline(ABC):
                         )
                     except Exception:
                         pass
-                if existing is None or getattr(existing, 'status', '') != 'completed':
-                    ctx.chapter_node = node
-                    ctx.chapter_number = node.number
-                    ctx.outline = node.outline or node.description or node.title or ""
-                    if existing is not None:
-                        old_draft = str(getattr(existing, "content", "") or "").strip()
-                        if old_draft:
-                            ctx.metadata["ignored_existing_draft_chars"] = len(old_draft)
-                        ctx.existing_content = ""
-                    try:
-                        from domain.novel.value_objects.novel_id import NovelId
-
-                        novel = (
-                            ctx.novel_repository.get_by_id(NovelId(ctx.novel_id))
-                            if ctx.novel_repository is not None
-                            else None
+                status = getattr(existing, "status", "") if existing is not None else ""
+                status_value = str(getattr(status, "value", status) or "")
+                if status_value == "completed":
+                    if not self._is_chapter_narrative_ready(ctx, node.number):
+                        canonical_history_missing = True
+                    continue
+                if canonical_history_missing or self._has_completed_history_before(
+                    ctx,
+                    node.number,
+                ):
+                    history = await self._ensure_prior_canonical_history(ctx, node.number)
+                    if not history.get("ready", False):
+                        failure_reason = str(
+                            history.get("failure_reason")
+                            or "canonical_history_not_ready"
                         )
-                        ctx.start_beat_index = int(getattr(novel, "current_beat_index", 0) or 0) if novel else 0
-                    except Exception:
-                        ctx.start_beat_index = 0
-                    return StepResult.ok(f"定位到第 {node.number} 章")
+                        ctx.metadata["canonical_history_failure_reason"] = failure_reason
+                        return StepResult.fail(failure_reason)
+                    ctx.metadata["canonical_history_replayed_chapters"] = list(
+                        history.get("replayed_chapters") or []
+                    )
+                ctx.chapter_node = node
+                ctx.chapter_number = node.number
+                ctx.outline = node.outline or node.description or node.title or ""
+                if existing is not None:
+                    old_draft = str(getattr(existing, "content", "") or "").strip()
+                    if old_draft:
+                        ctx.metadata["ignored_existing_draft_chars"] = len(old_draft)
+                    ctx.existing_content = ""
+                try:
+                    from domain.novel.value_objects.novel_id import NovelId
 
+                    novel = (
+                        ctx.novel_repository.get_by_id(NovelId(ctx.novel_id))
+                        if ctx.novel_repository is not None
+                        else None
+                    )
+                    ctx.start_beat_index = int(getattr(novel, "current_beat_index", 0) or 0) if novel else 0
+                except Exception:
+                    ctx.start_beat_index = 0
+                return StepResult.ok(f"定位到第 {node.number} 章")
+
+            history_before_next_boundary = self._has_completed_history_before(
+                ctx,
+                max((int(node.number) for node in chapter_nodes), default=0) + 1,
+            )
+            if canonical_history_missing or history_before_next_boundary:
+                history = await self._ensure_prior_canonical_history(
+                    ctx,
+                    max((int(node.number) for node in chapter_nodes), default=0) + 1,
+                )
+                if not history.get("ready", False):
+                    failure_reason = str(
+                        history.get("failure_reason")
+                        or "canonical_history_not_ready"
+                    )
+                    ctx.metadata["canonical_history_failure_reason"] = failure_reason
+                    return StepResult.fail(failure_reason)
             return StepResult.fail("所有章节已写完，无需继续")
         except Exception as e:
             return StepResult.fail(f"章节定位失败: {e}")
+
+    async def _ensure_prior_canonical_history(
+        self,
+        ctx: PipelineContext,
+        before_chapter_number: int,
+    ) -> Dict[str, Any]:
+        aftermath = ctx.aftermath_pipeline
+        ensure_history = getattr(aftermath, "ensure_prior_chapters_committed", None)
+        if not callable(ensure_history):
+            return {
+                "ready": False,
+                "failure_reason": "canonical_history_rebuild_unavailable",
+            }
+        try:
+            result = await ensure_history(ctx.novel_id, before_chapter_number)
+        except Exception as exc:
+            logger.warning(
+                "[%s] 规范历史确认失败 before=%s: %s",
+                ctx.novel_id,
+                before_chapter_number,
+                exc,
+            )
+            return {"ready": False, "failure_reason": "canonical_history_check_failed"}
+        return result if isinstance(result, dict) else {
+            "ready": False,
+            "failure_reason": "canonical_history_check_failed",
+        }
+
+    @staticmethod
+    def _has_completed_history_before(
+        ctx: PipelineContext,
+        before_chapter_number: int,
+    ) -> bool:
+        repository = ctx.chapter_repository
+        if repository is None:
+            return False
+        db = getattr(repository, "db", None)
+        if db is not None:
+            try:
+                row = db.fetch_one(
+                    """
+                    SELECT 1
+                    FROM chapters
+                    WHERE novel_id = ? AND number < ? AND status = 'completed'
+                    LIMIT 1
+                    """,
+                    (ctx.novel_id, int(before_chapter_number)),
+                )
+                return row is not None
+            except Exception:
+                pass
+        try:
+            from domain.novel.value_objects.novel_id import NovelId
+
+            chapters = repository.list_by_novel(NovelId(ctx.novel_id))
+            return any(
+                int(getattr(chapter, "number", 0) or 0) < int(before_chapter_number)
+                and str(
+                    getattr(getattr(chapter, "status", ""), "value", getattr(chapter, "status", ""))
+                    or ""
+                )
+                == "completed"
+                for chapter in chapters
+            )
+        except Exception:
+            return False
 
     async def _step_prepare_governance(self, ctx: PipelineContext) -> StepResult:
         """步骤1b：从叙事治理层领取本章预算。
@@ -1006,7 +1109,11 @@ class BaseStoryPipeline(ABC):
             return StepResult.fail("canonical_aftermath_not_ready")
         return StepResult.ok()
 
-    def _is_chapter_narrative_ready(self, ctx: PipelineContext) -> bool:
+    def _is_chapter_narrative_ready(
+        self,
+        ctx: PipelineContext,
+        chapter_number: Optional[int] = None,
+    ) -> bool:
         from application.world.services.chapter_narrative_sync import (
             CHAPTER_NARRATIVE_PIPELINE_VERSION,
         )
@@ -1020,7 +1127,7 @@ class BaseStoryPipeline(ABC):
         try:
             return SqliteChapterNarrativeCommitRepository(db).is_current_version_ready(
                 novel_id=ctx.novel_id,
-                chapter_number=ctx.chapter_number,
+                chapter_number=chapter_number or ctx.chapter_number,
                 pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
             )
         except Exception:

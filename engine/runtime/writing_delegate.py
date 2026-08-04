@@ -181,6 +181,23 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
         logger.info("[%s] StoryPipeline 正文生成中断，未提交正式章节", novel_id)
         return
 
+    error = result.error or "unknown"
+    if not result.success and (
+        error == "canonical_aftermath_not_ready"
+        or error.startswith("canonical_history_")
+    ):
+        novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+        novel.last_audit_narrative_ok = False
+        daemon._update_shared_state(
+            novel_id,
+            current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+            last_audit_narrative_ok=False,
+            autopilot_pause_reason=error,
+        )
+        daemon._flush_novel(novel)
+        logger.warning("[%s] StoryPipeline 因规范记忆未提交而暂停: %s", novel_id, error)
+        return
+
     if result.success:
         chapter_num = result.chapter_number or ctx.chapter_number
         if getattr(result, "audit_snapshot", None):
@@ -222,7 +239,6 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
         )
         return
 
-    error = result.error or "unknown"
     if "所有章节已写完" in error:
         logger.info("[%s] StoryPipeline：当前幕章节已全部写完", novel_id)
         if await daemon._current_act_fully_written(novel):

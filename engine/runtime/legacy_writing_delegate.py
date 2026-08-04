@@ -200,6 +200,25 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
     # 3. 找下一个未写章节
     next_chapter_node = await host._find_next_unwritten_chapter_async(novel)
     if not next_chapter_node:
+        history_block_reason = str(
+            getattr(host, "_canonical_history_block_reason", "") or ""
+        )
+        if history_block_reason:
+            novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+            novel.last_audit_narrative_ok = False
+            host._update_shared_state(
+                novel.novel_id.value,
+                current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+                last_audit_narrative_ok=False,
+                autopilot_pause_reason=history_block_reason,
+            )
+            host._flush_novel(novel)
+            logger.warning(
+                "[%s] legacy 写作因规范历史未确认而暂停: %s",
+                novel.novel_id,
+                history_block_reason,
+            )
+            return
         # 🔥 修复：找不到下一章时，检查当前幕是否全部写完
         if await host._current_act_fully_written(novel):
             # 当前幕已完成，进入下一幕规划

@@ -1054,6 +1054,65 @@ class DaemonHostMixin:
         except Exception:
             return False
 
+    async def _ensure_prior_chapters_committed(
+        self,
+        novel_id: str,
+        before_chapter_number: int,
+    ) -> str:
+        aftermath = getattr(self, "aftermath_pipeline", None)
+        ensure_history = getattr(aftermath, "ensure_prior_chapters_committed", None)
+        if not callable(ensure_history):
+            return "canonical_history_rebuild_unavailable"
+        try:
+            result = await ensure_history(novel_id, before_chapter_number)
+        except Exception as exc:
+            logger.warning(
+                "[%s] legacy canonical history confirmation failed before=%s: %s",
+                novel_id,
+                before_chapter_number,
+                exc,
+            )
+            return "canonical_history_check_failed"
+        if isinstance(result, dict) and result.get("ready", False):
+            return ""
+        if isinstance(result, dict):
+            return str(result.get("failure_reason") or "canonical_history_not_ready")
+        return "canonical_history_check_failed"
+
+    def _has_completed_history_before(
+        self,
+        novel_id: str,
+        before_chapter_number: int,
+    ) -> bool:
+        repository = self.chapter_repository
+        db = getattr(repository, "db", None)
+        if db is not None:
+            try:
+                row = db.fetch_one(
+                    """
+                    SELECT 1
+                    FROM chapters
+                    WHERE novel_id = ? AND number < ? AND status = 'completed'
+                    LIMIT 1
+                    """,
+                    (novel_id, int(before_chapter_number)),
+                )
+                return row is not None
+            except Exception:
+                pass
+        try:
+            return any(
+                int(getattr(chapter, "number", 0) or 0) < int(before_chapter_number)
+                and str(
+                    getattr(getattr(chapter, "status", ""), "value", getattr(chapter, "status", ""))
+                    or ""
+                )
+                == "completed"
+                for chapter in repository.list_by_novel(NovelId(novel_id))
+            )
+        except Exception:
+            return False
+
 
     def _count_completed_chapters(self, novel_id: NovelId) -> int:
         """轻量 COUNT 查询：只返回已完成章节数，不加载全部章节对象。
@@ -2314,17 +2373,47 @@ class DaemonHostMixin:
             [n for n in all_nodes if n.node_type.value == "chapter"],
             key=lambda n: n.number
         )
+        self._canonical_history_block_reason = ""
 
         for node in chapter_nodes:
             chapter = self.chapter_repository.get_by_novel_and_number(
                 NovelId(novel_id), node.number
             )
-            if (
-                not chapter
-                or chapter.status.value != "completed"
-                or not self._is_chapter_narrative_ready(novel_id, node.number)
-            ):
+            status = getattr(chapter, "status", "") if chapter is not None else ""
+            status_value = str(getattr(status, "value", status) or "")
+            if not chapter or status_value != "completed":
+                if self._has_completed_history_before(novel_id, node.number):
+                    block_reason = await self._ensure_prior_chapters_committed(
+                        novel_id,
+                        int(node.number),
+                    )
+                    if block_reason:
+                        self._canonical_history_block_reason = block_reason
+                        return None
                 return node
+            if self._is_chapter_narrative_ready(novel_id, node.number):
+                continue
+            block_reason = await self._ensure_prior_chapters_committed(
+                novel_id,
+                int(node.number) + 1,
+            )
+            if block_reason:
+                self._canonical_history_block_reason = block_reason
+                return None
+            if not self._is_chapter_narrative_ready(novel_id, node.number):
+                self._canonical_history_block_reason = "canonical_history_replay_uncommitted"
+                return None
+        if self._has_completed_history_before(
+            novel_id,
+            max((int(node.number) for node in chapter_nodes), default=0) + 1,
+        ):
+            block_reason = await self._ensure_prior_chapters_committed(
+                novel_id,
+                max((int(node.number) for node in chapter_nodes), default=0) + 1,
+            )
+            if block_reason:
+                self._canonical_history_block_reason = block_reason
+                return None
         return None
 
     async def _current_act_fully_written(self, novel) -> bool:

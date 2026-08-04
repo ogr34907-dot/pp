@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from domain.ai.services.llm_service import LLMService
@@ -394,6 +396,181 @@ class ChapterAftermathPipeline:
         )
 
         return out
+
+    async def ensure_prior_chapters_committed(
+        self,
+        novel_id: str,
+        before_chapter_number: int,
+    ) -> Dict[str, Any]:
+        """Confirm or rebuild canonical history needed before a later chapter writes.
+
+        A legacy novel with no canonical commit chain may only replay from a
+        trusted active checkpoint or a contiguous committed boundary. This
+        prevents an automatic continuation from silently issuing an LLM pass
+        over the entire book.
+        """
+        before_chapter_number = int(before_chapter_number or 0)
+        if before_chapter_number <= 1:
+            return {"ready": True, "replayed_chapters": [], "anchor_chapter": 0}
+
+        repository = self._chapter_repository
+        db = getattr(repository, "db", None) if repository is not None else None
+        if repository is None or db is None:
+            return {
+                "ready": False,
+                "failure_reason": "canonical_history_rebuild_unavailable",
+            }
+
+        try:
+            from application.world.services.chapter_narrative_sync import (
+                CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            )
+            from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+                SqliteChapterNarrativeCommitRepository,
+            )
+
+            chapters = sorted(
+                (
+                    SimpleNamespace(
+                        number=int(row["number"] or 0),
+                        content=str(row["content"] or ""),
+                        content_sha256=str(row["content_sha256"] or ""),
+                        content_revision=int(row["content_revision"] or 0),
+                        status=str(row["status"] or ""),
+                    )
+                    for row in db.fetch_all(
+                        """
+                        SELECT number, content, content_sha256, content_revision, status
+                        FROM chapters
+                        WHERE novel_id = ? AND number < ? AND status = 'completed'
+                        ORDER BY number ASC
+                        """,
+                        (novel_id, before_chapter_number),
+                    )
+                ),
+                key=lambda chapter: int(getattr(chapter, "number", 0) or 0),
+            )
+        except Exception as exc:
+            logger.warning(
+                "读取待确认章节失败 novel=%s before=%s: %s",
+                novel_id,
+                before_chapter_number,
+                exc,
+            )
+            return {"ready": False, "failure_reason": "canonical_history_unavailable"}
+
+        if not chapters:
+            return {"ready": True, "replayed_chapters": [], "anchor_chapter": 0}
+
+        commit_repository = SqliteChapterNarrativeCommitRepository(db)
+        readiness = {
+            int(getattr(chapter, "number", 0) or 0): commit_repository.is_current_version_ready(
+                novel_id=novel_id,
+                chapter_number=int(getattr(chapter, "number", 0) or 0),
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            )
+            for chapter in chapters
+        }
+        if all(readiness.values()):
+            return {
+                "ready": True,
+                "replayed_chapters": [],
+                "anchor_chapter": max(readiness),
+            }
+
+        contiguous_anchor = 0
+        for chapter in chapters:
+            chapter_number = int(getattr(chapter, "number", 0) or 0)
+            if chapter_number != contiguous_anchor + 1 or not readiness[chapter_number]:
+                break
+            contiguous_anchor = chapter_number
+
+        checkpoint_anchor = self._active_history_checkpoint_anchor(
+            db,
+            novel_id,
+            before_chapter_number,
+        )
+        trusted_anchor = max(contiguous_anchor, checkpoint_anchor)
+        if trusted_anchor <= 0:
+            return {
+                "ready": False,
+                "failure_reason": "canonical_history_checkpoint_required",
+            }
+
+        replayed_chapters: List[int] = []
+        for chapter in chapters:
+            chapter_number = int(getattr(chapter, "number", 0) or 0)
+            if chapter_number <= trusted_anchor or readiness[chapter_number]:
+                continue
+
+            content = str(getattr(chapter, "content", "") or "")
+            if not content.strip():
+                return {
+                    "ready": False,
+                    "failure_reason": "canonical_history_content_missing",
+                    "chapter_number": chapter_number,
+                }
+            content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            content_revision = int(getattr(chapter, "content_revision", 0) or 0)
+            outcome = await self.run_after_chapter_saved(
+                novel_id,
+                chapter_number,
+                content,
+                expected_content_sha256=content_sha256,
+                expected_content_revision=content_revision or None,
+            )
+            if not isinstance(outcome, dict) or not outcome.get("narrative_sync_ok", False):
+                failure_cause = (
+                    str(outcome.get("failure_reason") or "")
+                    if isinstance(outcome, dict)
+                    else ""
+                )
+                return {
+                    "ready": False,
+                    "failure_reason": "canonical_history_replay_failed",
+                    "failure_cause": failure_cause,
+                    "chapter_number": chapter_number,
+                }
+            if not commit_repository.is_current_version_ready(
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            ):
+                return {
+                    "ready": False,
+                    "failure_reason": "canonical_history_replay_uncommitted",
+                    "chapter_number": chapter_number,
+                }
+            replayed_chapters.append(chapter_number)
+
+        return {
+            "ready": True,
+            "replayed_chapters": replayed_chapters,
+            "anchor_chapter": trusted_anchor,
+        }
+
+    @staticmethod
+    def _active_history_checkpoint_anchor(
+        db: Any,
+        novel_id: str,
+        before_chapter_number: int,
+    ) -> int:
+        try:
+            row = db.fetch_one(
+                """
+                SELECT MAX(anchor_chapter) AS anchor_chapter
+                FROM novel_checkpoints
+                WHERE novel_id = ?
+                  AND is_active = 1
+                  AND branch_name = 'main'
+                  AND anchor_chapter > 0
+                  AND anchor_chapter < ?
+                """,
+                (novel_id, before_chapter_number),
+            )
+            return max(0, int(row["anchor_chapter"] or 0)) if row else 0
+        except Exception:
+            return 0
 
     def _is_current_content_version(
         self,

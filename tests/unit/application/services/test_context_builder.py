@@ -320,10 +320,22 @@ class TestContextBuilder:
             max_tokens=35000,
         )
 
-    def test_vector_recall_filters_current_chapter_hits(self):
+    def test_vector_recall_excludes_current_and_recent_chapter_hits(self):
         mock_embedding = Mock()
         mock_embedding.embed = AsyncMock(return_value=[0.1] * 768)
         mock_embedding.get_dimension = Mock(return_value=768)
+
+        source_chapter = Mock()
+        source_chapter.number = 5
+        source_chapter.title = "Chapter 5"
+        source_chapter.content = "Older canonical prose"
+        source_chapter.content_sha256 = "hash-5"
+        source_chapter.content_revision = 1
+        chapter_repo = Mock()
+        chapter_repo.list_by_novel.return_value = [source_chapter]
+        chapter_repo.get_by_novel_and_number.side_effect = (
+            lambda _novel_id, number: source_chapter if number == 5 else None
+        )
 
         mock_vector_store = Mock()
         mock_vector_store.list_collections = AsyncMock(
@@ -341,12 +353,25 @@ class TestContextBuilder:
                     "score": 0.85,
                     "payload": {"text": "Near chapter hit", "chapter_number": 10},
                 },
+                {
+                    "id": "c3",
+                    "score": 0.8,
+                    "payload": {
+                        "text": "Older valid hit",
+                        "chapter_number": 5,
+                        "sync_status": "committed",
+                        "content_sha256": "hash-5",
+                        "content_revision": 1,
+                        "pipeline_version": "chapter-narrative-sync:v1",
+                    },
+                },
             ]
         )
 
         builder = _make_builder(
             embedding_service=mock_embedding,
             vector_store=mock_vector_store,
+            chapter_repo=chapter_repo,
         )
         structured = builder.build_structured_context(
             novel_id="novel-1",
@@ -355,7 +380,8 @@ class TestContextBuilder:
             max_tokens=35000,
         )
         layer3 = structured["layer3_text"]
-        assert "Near chapter hit" in layer3
+        assert "Older valid hit" in layer3
+        assert "Near chapter hit" not in layer3
         assert "Same chapter hit" not in layer3
 
     def test_layer1_has_character_anchors_when_vector_disabled(self):

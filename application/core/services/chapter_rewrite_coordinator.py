@@ -475,8 +475,10 @@ class ChapterRewriteCoordinator:
                 assignments = ["resolved_chapter = NULL"]
                 if "status" in columns:
                     assignments.append("status = 'planted'")
+                if "updated_at" in columns:
+                    assignments.append("updated_at = CURRENT_TIMESTAMP")
                 conn.execute(
-                    f"UPDATE foreshadows SET {', '.join(assignments)}, updated_at = CURRENT_TIMESTAMP "
+                    f"UPDATE foreshadows SET {', '.join(assignments)} "
                     "WHERE novel_id = ? AND COALESCE(resolved_chapter, 0) >= ?",
                     (novel_id, chapter_number),
                 )
@@ -573,8 +575,11 @@ class ChapterRewriteCoordinator:
                 provenance = metadata.get(key)
                 if isinstance(provenance, dict):
                     provenance["status"] = "stale"
+            assignments = ["metadata = ?"]
+            if "updated_at" in columns:
+                assignments.append("updated_at = CURRENT_TIMESTAMP")
             conn.execute(
-                "UPDATE story_nodes SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                f"UPDATE story_nodes SET {', '.join(assignments)} WHERE id = ?",
                 (json.dumps(metadata, ensure_ascii=False), row[0]),
             )
 

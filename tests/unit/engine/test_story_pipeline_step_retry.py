@@ -63,6 +63,70 @@ class _ChapterRepo:
         return SimpleNamespace(status="draft", content="旧半章正文", outline="旧大纲")
 
 
+class _HistoryStoryNodeRepo:
+    async def get_by_novel(self, novel_id):
+        return [
+            SimpleNamespace(
+                node_type=SimpleNamespace(value="chapter"),
+                number=1,
+                title="第一章",
+                description="第一章大纲",
+                outline="第一章大纲",
+            ),
+            SimpleNamespace(
+                node_type=SimpleNamespace(value="chapter"),
+                number=2,
+                title="第二章",
+                description="第二章大纲",
+                outline="第二章大纲",
+            ),
+        ]
+
+
+class _HistoryChapterRepo:
+    def get_by_novel_and_number(self, novel_id, number):
+        if number == 1:
+            return SimpleNamespace(status="completed", content="第一章正文")
+        return SimpleNamespace(status="draft", content="")
+
+
+class _BlockedHistoryAftermath:
+    async def ensure_prior_chapters_committed(self, novel_id, before_chapter_number):
+        return {
+            "ready": False,
+            "failure_reason": "canonical_history_checkpoint_required",
+        }
+
+
+class _DetachedHistoryStoryNodeRepo:
+    async def get_by_novel(self, novel_id):
+        return [
+            SimpleNamespace(
+                node_type=SimpleNamespace(value="chapter"),
+                number=2,
+                title="第二章",
+                description="第二章大纲",
+                outline="第二章大纲",
+            )
+        ]
+
+
+class _DetachedHistoryChapterRepo:
+    def get_by_novel_and_number(self, novel_id, number):
+        return SimpleNamespace(status="draft", content="")
+
+    def list_by_novel(self, novel_id):
+        return [SimpleNamespace(number=1, status="completed", content="第一章正文")]
+
+
+class _DetachedCompletedHistoryChapterRepo:
+    def get_by_novel_and_number(self, novel_id, number):
+        return SimpleNamespace(status="completed", content="第二章正文")
+
+    def list_by_novel(self, novel_id):
+        return [SimpleNamespace(number=1, status="completed", content="第一章正文")]
+
+
 @pytest.mark.asyncio
 async def test_story_pipeline_interrupted_generate_discards_workspace_and_does_not_commit_content():
     workspace = _Workspace()
@@ -101,3 +165,45 @@ async def test_story_pipeline_find_next_chapter_ignores_existing_draft_for_regen
     assert ctx.outline == "新大纲"
     assert ctx.existing_content == ""
     assert ctx.metadata["ignored_existing_draft_chars"] == len("旧半章正文")
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_blocks_next_generation_when_prior_canonical_history_is_unavailable():
+    ctx = PipelineContext(novel_id="novel-history")
+    ctx.story_node_repo = _HistoryStoryNodeRepo()
+    ctx.chapter_repository = _HistoryChapterRepo()
+    ctx.aftermath_pipeline = _BlockedHistoryAftermath()
+
+    result = await _Pipeline()._step_find_next_chapter(ctx)
+
+    assert not result.passed
+    assert result.message == "canonical_history_checkpoint_required"
+    assert ctx.chapter_number == 0
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_checks_completed_history_not_present_in_story_nodes():
+    ctx = PipelineContext(novel_id="novel-detached-history")
+    ctx.story_node_repo = _DetachedHistoryStoryNodeRepo()
+    ctx.chapter_repository = _DetachedHistoryChapterRepo()
+    ctx.aftermath_pipeline = _BlockedHistoryAftermath()
+
+    result = await _Pipeline()._step_find_next_chapter(ctx)
+
+    assert not result.passed
+    assert result.message == "canonical_history_checkpoint_required"
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_checks_detached_history_before_act_transition():
+    ctx = PipelineContext(novel_id="novel-detached-history")
+    ctx.story_node_repo = _DetachedHistoryStoryNodeRepo()
+    ctx.chapter_repository = _DetachedCompletedHistoryChapterRepo()
+    ctx.aftermath_pipeline = _BlockedHistoryAftermath()
+    pipeline = _Pipeline()
+    pipeline._is_chapter_narrative_ready = lambda *_args: True
+
+    result = await pipeline._step_find_next_chapter(ctx)
+
+    assert not result.passed
+    assert result.message == "canonical_history_checkpoint_required"

@@ -169,6 +169,48 @@ async def test_run_story_pipeline_writing_all_chapters_done_without_full_act_rep
 
 
 @pytest.mark.asyncio
+async def test_run_story_pipeline_writing_pauses_on_canonical_history_failure():
+    novel = MagicMock()
+    novel.novel_id.value = "novel-history"
+    novel.genre = ""
+    novel.target_words_per_chapter = 2500
+    novel.auto_approve_mode = True
+    novel.era = "ancient"
+
+    daemon = MagicMock()
+    daemon._update_shared_state = MagicMock()
+    daemon._flush_novel = MagicMock()
+
+    mock_runner = MagicMock()
+    mock_runner.DEFAULT_TARGET_WORDS = 2500
+    mock_runner._make_context.return_value = MagicMock(chapter_number=2)
+    mock_runner._get_novel_phase.return_value = "development"
+    mock_pipeline = MagicMock()
+    mock_pipeline.run_chapter = AsyncMock(
+        return_value=PipelineResult(
+            success=False,
+            error="canonical_history_checkpoint_required",
+        )
+    )
+
+    with patch("engine.runtime.writing_delegate._build_runner", return_value=mock_runner), patch(
+        "engine.pipelines.registry.get_pipeline_registry"
+    ) as mock_registry:
+        mock_registry.return_value.create_pipeline.return_value = mock_pipeline
+        await run_story_pipeline_writing(daemon, novel)
+
+    assert novel.current_stage == NovelStage.PAUSED_FOR_REVIEW
+    assert novel.last_audit_narrative_ok is False
+    daemon._update_shared_state.assert_any_call(
+        "novel-history",
+        current_stage="paused_for_review",
+        last_audit_narrative_ok=False,
+        autopilot_pause_reason="canonical_history_checkpoint_required",
+    )
+    daemon._flush_novel.assert_called_once_with(novel)
+
+
+@pytest.mark.asyncio
 async def test_run_writing_dispatches_legacy_when_pipeline_disabled():
     host = MagicMock()
     host.use_story_pipeline_for_writing = False

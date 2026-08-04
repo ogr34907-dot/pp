@@ -112,6 +112,69 @@ async def test_audit_number_cannot_force_draft_chapter_completed_without_canonic
 
 
 @pytest.mark.asyncio
+async def test_legacy_lookup_blocks_completed_chapter_without_canonical_history():
+    host = DaemonHostMixin.__new__(DaemonHostMixin)
+    first = SimpleNamespace(number=1, node_type=SimpleNamespace(value="chapter"))
+    second = SimpleNamespace(number=2, node_type=SimpleNamespace(value="chapter"))
+    completed = SimpleNamespace(status=ChapterStatus.COMPLETED)
+    draft = SimpleNamespace(status=ChapterStatus.DRAFT)
+    host.story_node_repo = SimpleNamespace(get_by_novel=AsyncMock(return_value=[first, second]))
+    host.chapter_repository = SimpleNamespace(
+        get_by_novel_and_number=MagicMock(
+            side_effect=lambda _novel_id, number: completed if number == 1 else draft
+        )
+    )
+    host._is_chapter_narrative_ready = MagicMock(return_value=False)
+    host.aftermath_pipeline = SimpleNamespace(
+        ensure_prior_chapters_committed=AsyncMock(
+            return_value={
+                "ready": False,
+                "failure_reason": "canonical_history_checkpoint_required",
+            }
+        )
+    )
+    novel = SimpleNamespace(novel_id=SimpleNamespace(value="novel-legacy"))
+
+    result = await host._find_next_unwritten_chapter_async(novel)
+
+    assert result is None
+    assert host._canonical_history_block_reason == "canonical_history_checkpoint_required"
+
+
+@pytest.mark.asyncio
+async def test_legacy_lookup_checks_detached_completed_history_before_new_chapter():
+    host = DaemonHostMixin.__new__(DaemonHostMixin)
+    second = SimpleNamespace(number=2, node_type=SimpleNamespace(value="chapter"))
+    completed = SimpleNamespace(number=1, status=ChapterStatus.COMPLETED)
+    draft = SimpleNamespace(status=ChapterStatus.DRAFT)
+
+    class Repository:
+        def get_by_novel_and_number(self, _novel_id, _number):
+            return draft
+
+        def list_by_novel(self, _novel_id):
+            return [completed]
+
+    host.story_node_repo = SimpleNamespace(get_by_novel=AsyncMock(return_value=[second]))
+    host.chapter_repository = Repository()
+    host._is_chapter_narrative_ready = MagicMock(return_value=True)
+    host.aftermath_pipeline = SimpleNamespace(
+        ensure_prior_chapters_committed=AsyncMock(
+            return_value={
+                "ready": False,
+                "failure_reason": "canonical_history_checkpoint_required",
+            }
+        )
+    )
+    novel = SimpleNamespace(novel_id=SimpleNamespace(value="novel-legacy"))
+
+    result = await host._find_next_unwritten_chapter_async(novel)
+
+    assert result is None
+    assert host._canonical_history_block_reason == "canonical_history_checkpoint_required"
+
+
+@pytest.mark.asyncio
 async def test_summary_trigger_rebuilds_completed_act_with_stale_summary():
     host = DaemonHostMixin.__new__(DaemonHostMixin)
     act = StoryNode(
