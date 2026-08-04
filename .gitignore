@@ -29,6 +29,7 @@ out/
 *.log
 *.pid
 .superpowers/
+.worktrees/
 
 # ── 前端 ──
 frontend/node_modules/
