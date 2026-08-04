@@ -34,6 +34,7 @@ from application.engine.services.context_budget_models import (
     BudgetAllocation,
     ContextBudgetExceededError,
     ContextSlot,
+    FactLockUnavailableError,
     PriorityTier,
 )
 from application.engine.services.context_budget_policy import (
@@ -271,6 +272,7 @@ class ContextBudgetAllocator:
         *,
         header: str,
         total_budget: int,
+        required: bool = False,
     ) -> str:
         """Append a low-priority block without exceeding the emitted-context budget."""
         base = str(base_context or "").strip()
@@ -292,6 +294,11 @@ class ContextBudgetAllocator:
         full = prefix + "\n" + additional
         if self.estimate_tokens(full) <= total_budget:
             return full
+        if required:
+            raise ContextBudgetExceededError(
+                f"context budget {total_budget} cannot fit required additional context "
+                f"{header!r}"
+            )
 
         low, high = 1, len(additional)
         best = base
@@ -706,7 +713,7 @@ class ContextBudgetAllocator:
                     novel_id, chapter_number
                 )
             except Exception as e:
-                raise RuntimeError(
+                raise FactLockUnavailableError(
                     f"configured MemoryEngine FACT_LOCK 构建失败: {e}"
                 ) from e
         slots["fact_lock"] = ContextSlot(

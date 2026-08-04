@@ -7,6 +7,7 @@ import logging
 import re
 from typing import Tuple, Dict, Any, AsyncIterator, Optional, List, Callable, Awaitable
 from application.engine.services.context_builder import ContextBuilder
+from application.engine.services.context_budget_models import FactLockUnavailableError
 from application.analyst.services.state_extractor import StateExtractor
 from application.analyst.services.state_updater import StateUpdater
 from application.audit.services.conflict_detection_service import ConflictDetectionService
@@ -1160,7 +1161,7 @@ class AutoNovelGenerationWorkflow:
                 parts = [p for p in [fl, beats, clues] if p.strip()]
                 fact_lock = "\n\n".join(parts) if parts else ""
             except Exception as e:
-                raise RuntimeError(
+                raise FactLockUnavailableError(
                     f"configured MemoryEngine fact_lock 构建失败: {e}"
                 ) from e
 

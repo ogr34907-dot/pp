@@ -9,6 +9,7 @@ from engine.pipeline.base import BaseStoryPipeline
 from engine.pipeline.context import PipelineContext
 from engine.pipeline.prose_composer import ChapterProseInvocationComposer, ProseCompositionRequest, ProseCompositionResult
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
+from application.engine.services.context_budget_models import FactLockUnavailableError
 
 
 class _Pipeline(BaseStoryPipeline):
@@ -49,6 +50,174 @@ async def test_story_pipeline_carries_workflow_context_budget_to_prose_metadata(
     assert result.passed
     assert ctx.context_text == "已预算主上下文"
     assert ctx.metadata["context_budget_tokens"] == 123
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_does_not_fallback_after_configured_fact_lock_failure(monkeypatch):
+    class BrokenMemoryEngine:
+        def build_fact_lock_section(self, novel_id, chapter_number):
+            raise RuntimeError("configured fact lock unavailable")
+
+    allocator = ContextBudgetAllocator(memory_engine=BrokenMemoryEngine())
+    monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 100)
+
+    class ChapterWorkflow:
+        def prepare_chapter_generation(self, *args, **kwargs):
+            allocator.allocate("novel-1", 2, "outline", total_budget=1000)
+
+    class FallbackBuilder:
+        used = False
+
+        def build_context(self, **kwargs):
+            self.used = True
+            return "fallback without facts"
+
+        def build_voice_anchor_system_section(self, novel_id):
+            return ""
+
+    fallback_builder = FallbackBuilder()
+    ctx = PipelineContext(novel_id="novel-1", chapter_number=2, outline="本章大纲")
+    ctx.chapter_workflow = ChapterWorkflow()
+    ctx.context_builder = fallback_builder
+
+    result = await _Pipeline()._step_build_context(ctx)
+
+    assert not result.passed
+    assert "configured fact lock unavailable" in result.message
+    assert fallback_builder.used is False
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_preserves_generic_context_builder_fallback():
+    class ChapterWorkflow:
+        def prepare_chapter_generation(self, *args, **kwargs):
+            raise ValueError("recoverable planning failure")
+
+    class FallbackBuilder:
+        def build_context(self, **kwargs):
+            return "fallback context"
+
+        def build_voice_anchor_system_section(self, novel_id):
+            return ""
+
+    ctx = PipelineContext(novel_id="novel-1", chapter_number=2, outline="本章大纲")
+    ctx.chapter_workflow = ChapterWorkflow()
+    ctx.context_builder = FallbackBuilder()
+
+    result = await _Pipeline()._step_build_context(ctx)
+
+    assert result.passed
+    assert ctx.context_text == "fallback context"
+    assert ctx.metadata["context_budget_tokens"] == 20000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary_failure", [None, ValueError("recoverable planning failure")])
+async def test_story_pipeline_rejects_fact_lock_failure_from_context_builder(primary_failure):
+    class ChapterWorkflow:
+        def prepare_chapter_generation(self, *args, **kwargs):
+            raise primary_failure
+
+    class BrokenContextBuilder:
+        def build_context(self, **kwargs):
+            raise FactLockUnavailableError("fallback fact lock unavailable")
+
+        def build_voice_anchor_system_section(self, novel_id):
+            return ""
+
+    ctx = PipelineContext(novel_id="novel-1", chapter_number=2, outline="本章大纲")
+    if primary_failure is not None:
+        ctx.chapter_workflow = ChapterWorkflow()
+    ctx.context_builder = BrokenContextBuilder()
+
+    result = await _Pipeline()._step_build_context(ctx)
+
+    assert not result.passed
+    assert "fallback fact lock unavailable" in result.message
+    assert ctx.context_text == ""
+
+
+def _budgeted_chapter_workflow(context: str, budget: int):
+    return SimpleNamespace(
+        prepare_chapter_generation=lambda *args, **kwargs: {
+            "context": context,
+            "context_tokens": ContextBudgetAllocator().estimate_tokens(context),
+            "context_budget_tokens": budget,
+            "voice_anchors": "",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_rejects_governance_that_cannot_fit_context_budget():
+    base_context = "b" * 360  # 90 tokens
+    ctx = PipelineContext(novel_id="novel-1", chapter_number=2, outline="本章大纲")
+    ctx.chapter_workflow = _budgeted_chapter_workflow(base_context, 100)
+    ctx.governance_budget = {
+        "max_new_storylines": 1,
+        "max_debt_closures": 1,
+        "allowed_reveal_level": "hint",
+        "notes": ["治理约束" * 100],
+    }
+
+    result = await _Pipeline()._step_build_context(ctx)
+
+    assert not result.passed
+    assert "context budget" in result.message
+    assert ContextBudgetAllocator().estimate_tokens(ctx.context_text) <= 100
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_rejects_due_foreshadowing_that_cannot_fit_context_budget():
+    entry = SimpleNamespace(
+        status="pending",
+        suggested_resolve_chapter=2,
+        importance="critical",
+        question="钟楼暗门必须推进" * 100,
+        chapter=1,
+    )
+    registry = SimpleNamespace(subtext_entries=[entry])
+    ctx = PipelineContext(novel_id="novel-1", chapter_number=2, outline="本章大纲")
+    ctx.chapter_workflow = _budgeted_chapter_workflow("b" * 360, 100)
+    ctx.foreshadowing_repository = SimpleNamespace(
+        get_by_novel_id=lambda novel_id: registry
+    )
+
+    result = await _Pipeline()._step_build_context(ctx)
+
+    assert not result.passed
+    assert "context budget" in result.message
+    assert ContextBudgetAllocator().estimate_tokens(ctx.context_text) <= 100
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_emits_governance_and_due_foreshadowing_once_within_budget():
+    entry = SimpleNamespace(
+        status="pending",
+        suggested_resolve_chapter=2,
+        importance="critical",
+        question="钟楼暗门必须推进",
+        chapter=1,
+    )
+    ctx = PipelineContext(novel_id="novel-1", chapter_number=2, outline="本章大纲")
+    ctx.chapter_workflow = _budgeted_chapter_workflow("主上下文", 1000)
+    ctx.governance_budget = {
+        "max_new_storylines": 1,
+        "max_debt_closures": 1,
+        "allowed_reveal_level": "hint",
+        "notes": ["保持事实一致"],
+    }
+    ctx.foreshadowing_repository = SimpleNamespace(
+        get_by_novel_id=lambda novel_id: SimpleNamespace(subtext_entries=[entry])
+    )
+
+    result = await _Pipeline()._step_build_context(ctx)
+
+    assert result.passed
+    assert ctx.context_text.count("=== 本章叙事治理预算 ===") == 1
+    assert ctx.context_text.count("=== 本章应推进的伏笔 ===") == 1
+    assert "钟楼暗门必须推进" in ctx.context_text
+    assert ContextBudgetAllocator().estimate_tokens(ctx.context_text) <= 1000
 
 
 def test_story_pipeline_prose_fallback_uses_full_continuity_ledger():

@@ -12,6 +12,10 @@ class ContextBudgetExceededError(ValueError):
     """Raised when required emitted context cannot fit the configured budget."""
 
 
+class FactLockUnavailableError(RuntimeError):
+    """Raised when a configured MemoryEngine cannot provide its fact lock."""
+
+
 class PriorityTier(str, Enum):
     """优先级层级（洋葱模型）"""
 

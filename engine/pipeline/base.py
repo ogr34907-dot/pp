@@ -25,6 +25,10 @@ from engine.pipeline.context import PipelineContext, PipelineResult
 from engine.pipeline.recovery import StepCommitKind, boundary_for
 from engine.pipeline.steps import StepResult
 from engine.pipeline.telemetry import story_pipeline_wave_meta
+from application.engine.services.context_budget_models import (
+    ContextBudgetExceededError,
+    FactLockUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +365,9 @@ class BaseStoryPipeline(ABC):
                     f"[{ctx.novel_id}] 上下文（workflow）: {len(ctx.context_text)} 字符, "
                     f"约 {ctx.context_tokens} tokens"
                 )
+            except FactLockUnavailableError as e:
+                logger.error("chapter_workflow FACT_LOCK 准备失败，禁止无锁降级: %s", e)
+                return StepResult.fail(str(e))
             except Exception as e:
                 logger.warning(f"chapter_workflow 准备失败，降级到 context_builder: {e}")
                 bundle = None
@@ -376,6 +383,9 @@ class BaseStoryPipeline(ABC):
                 )
                 ctx.metadata["context_budget_tokens"] = 20000
                 logger.info(f"[{ctx.novel_id}] 上下文（builder）: {len(ctx.context_text)} 字符")
+            except FactLockUnavailableError as e:
+                logger.error("context_builder FACT_LOCK 构建失败，禁止无锁继续: %s", e)
+                return StepResult.fail(str(e))
             except Exception as e:
                 logger.warning(f"context_builder 构建失败: {e}")
 
@@ -392,7 +402,6 @@ class BaseStoryPipeline(ABC):
             tags = "、".join(budget.get("must_serve_promise_tags") or [])
             notes = "\n".join(f"- {note}" for note in (budget.get("notes") or []))
             lines = [
-                "\n\n=== 本章叙事治理预算 ===",
                 f"- 最多新增故事线：{budget.get('max_new_storylines', 0)}",
                 f"- 最多回收叙事债务：{budget.get('max_debt_closures', 0)}",
                 f"- 允许揭秘等级：{budget.get('allowed_reveal_level', 'hint')}",
@@ -404,7 +413,20 @@ class BaseStoryPipeline(ABC):
                 lines.append(f"- 必须服务承诺标签：{tags}")
             if notes:
                 lines.append(notes)
-            ctx.context_text = (ctx.context_text or "") + "\n".join(lines)
+            try:
+                from application.engine.services.context_budget_allocator import ContextBudgetAllocator
+
+                allocator = ContextBudgetAllocator()
+                ctx.context_text = allocator.append_budgeted_additional_context(
+                    ctx.context_text,
+                    "\n".join(lines),
+                    header="本章叙事治理预算",
+                    total_budget=int(ctx.metadata.get("context_budget_tokens") or 35000),
+                    required=True,
+                )
+                ctx.context_tokens = allocator.estimate_tokens(ctx.context_text)
+            except ContextBudgetExceededError as e:
+                return StepResult.fail(str(e))
 
         # ─── 伏笔主动注入（T0 强制层）：本章应推进/兑现的待回收伏笔 ────
         if ctx.foreshadowing_repository is not None:
@@ -426,12 +448,23 @@ class BaseStoryPipeline(ABC):
                             f"- {e.question}（埋于第{e.chapter}章）"
                             for e in _due[:3]
                         )
-                        _fshadow_block = f"\n\n=== 本章应推进的伏笔 ===\n{_lines}"
-                        ctx.context_text = (ctx.context_text or "") + _fshadow_block
+                        from application.engine.services.context_budget_allocator import ContextBudgetAllocator
+
+                        allocator = ContextBudgetAllocator()
+                        ctx.context_text = allocator.append_budgeted_additional_context(
+                            ctx.context_text,
+                            _lines,
+                            header="本章应推进的伏笔",
+                            total_budget=int(ctx.metadata.get("context_budget_tokens") or 35000),
+                            required=True,
+                        )
+                        ctx.context_tokens = allocator.estimate_tokens(ctx.context_text)
                         logger.info(
                             "[%s] 注入 %d 条待兑现伏笔到生成上下文",
                             ctx.novel_id, len(_due[:3]),
                         )
+            except ContextBudgetExceededError as _fse:
+                return StepResult.fail(str(_fse))
             except Exception as _fse:
                 logger.debug("伏笔注入失败（跳过）: %s", _fse)
 
