@@ -1,4 +1,5 @@
 """SQLite 数据库连接"""
+import hashlib
 import logging
 import sqlite3
 import sys
@@ -344,6 +345,105 @@ def _apply_chapter_summaries_enhancements(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
+    """Add canonical source provenance and mechanically classify legacy rows."""
+    chapter_cols = {row[1] for row in conn.execute("PRAGMA table_info(chapters)")}
+    chapter_migrations = {
+        "content_sha256": (
+            "ALTER TABLE chapters ADD COLUMN content_sha256 TEXT NOT NULL DEFAULT ''"
+        ),
+        "content_revision": (
+            "ALTER TABLE chapters ADD COLUMN content_revision INTEGER NOT NULL DEFAULT 0"
+        ),
+    }
+    for column, sql in chapter_migrations.items():
+        if column not in chapter_cols:
+            conn.execute(sql)
+
+    summary_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(chapter_summaries)")
+    }
+    summary_migrations = {
+        "source_content_sha256": (
+            "ALTER TABLE chapter_summaries ADD COLUMN "
+            "source_content_sha256 TEXT NOT NULL DEFAULT ''"
+        ),
+        "pipeline_version": (
+            "ALTER TABLE chapter_summaries ADD COLUMN "
+            "pipeline_version TEXT NOT NULL DEFAULT ''"
+        ),
+        "sync_error": (
+            "ALTER TABLE chapter_summaries ADD COLUMN sync_error TEXT NOT NULL DEFAULT ''"
+        ),
+        "sync_attempts": (
+            "ALTER TABLE chapter_summaries ADD COLUMN "
+            "sync_attempts INTEGER NOT NULL DEFAULT 0"
+        ),
+    }
+    for column, sql in summary_migrations.items():
+        if column not in summary_cols:
+            conn.execute(sql)
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chapter_narrative_commits (
+            novel_id TEXT NOT NULL,
+            chapter_number INTEGER NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            pipeline_version TEXT NOT NULL,
+            content_revision INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'in_progress',
+            failure_reason TEXT NOT NULL DEFAULT '',
+            attempt_count INTEGER NOT NULL DEFAULT 1,
+            vector_status TEXT NOT NULL DEFAULT 'not_started',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            committed_at TIMESTAMP,
+            PRIMARY KEY (novel_id, chapter_number, content_sha256, pipeline_version),
+            FOREIGN KEY (novel_id, chapter_number)
+                REFERENCES chapters(novel_id, number) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_chapter_narrative_commits_chapter
+        ON chapter_narrative_commits(novel_id, chapter_number, content_revision)
+        """
+    )
+
+    rows = conn.execute(
+        "SELECT id, content, content_sha256, content_revision FROM chapters"
+    ).fetchall()
+    for row in rows:
+        actual_hash = hashlib.sha256((row[1] or "").encode("utf-8")).hexdigest()
+        if row[2] != actual_hash or int(row[3] or 0) < 1:
+            conn.execute(
+                "UPDATE chapters SET content_sha256 = ?, content_revision = ? WHERE id = ?",
+                (actual_hash, max(1, int(row[3] or 0)), row[0]),
+            )
+
+    conn.execute(
+        """
+        UPDATE chapter_summaries
+        SET source_content_sha256 = COALESCE((
+                SELECT c.content_sha256
+                FROM knowledge k
+                JOIN chapters c
+                  ON c.novel_id = k.novel_id
+                 AND c.number = chapter_summaries.chapter_number
+                WHERE k.id = chapter_summaries.knowledge_id
+            ), ''),
+            pipeline_version = 'legacy',
+            sync_status = 'legacy',
+            sync_error = '',
+            sync_attempts = 0
+        WHERE pipeline_version = ''
+        """
+    )
+    conn.commit()
+
+
 
 def _apply_migration_files(conn: sqlite3.Connection) -> None:
     """兼容入口：SQL migration 执行已迁到 migration_runner。"""
@@ -483,6 +583,7 @@ class DatabaseConnection:
         _apply_unified_character_profile_fields(conn)
         _apply_bible_character_four_d_sqlite(conn)
         _apply_chapter_summaries_enhancements(conn)
+        _apply_chapter_narrative_commit_migration(conn)
         _apply_chapters_word_count_migration(conn)
         _apply_chapters_generation_hint_migration(conn)
         _apply_bible_props_is_key_migration(conn)

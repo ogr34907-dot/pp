@@ -81,6 +81,30 @@ class TestChapterIndexingService:
         assert payload["novel_id"] == novel_id
 
     @pytest.mark.asyncio
+    async def test_index_chapter_summary_persists_canonical_provenance(
+        self, service, mock_vector_store
+    ):
+        await service.index_chapter_summary(
+            novel_id="novel-123",
+            chapter_number=2,
+            summary="第二章摘要",
+            content_sha256="a" * 64,
+            content_revision=3,
+            pipeline_version="chapter-narrative-sync:v1",
+        )
+
+        payload = mock_vector_store.insert.call_args.kwargs["payload"]
+        assert payload == {
+            "chapter_number": 2,
+            "text": "第二章摘要",
+            "kind": "chapter_summary",
+            "novel_id": "novel-123",
+            "content_sha256": "a" * 64,
+            "content_revision": 3,
+            "pipeline_version": "chapter-narrative-sync:v1",
+        }
+
+    @pytest.mark.asyncio
     async def test_ensure_collection_creates_if_not_exists(
         self, service, mock_vector_store
     ):

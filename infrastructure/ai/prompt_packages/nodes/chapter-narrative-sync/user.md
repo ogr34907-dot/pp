@@ -1,3 +1,3 @@
-第 {content} 章正文如下：
+第 {chapter_number} 章正文如下：
 
 {content}

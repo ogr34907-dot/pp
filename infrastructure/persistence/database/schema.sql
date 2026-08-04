@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS chapters (
     number INTEGER NOT NULL,
     title TEXT,
     content TEXT,
+    content_sha256 TEXT NOT NULL DEFAULT '',
+    content_revision INTEGER NOT NULL DEFAULT 0,
     outline TEXT,
     status TEXT DEFAULT 'draft',
     tension_score REAL DEFAULT 50.0,
@@ -123,6 +125,11 @@ CREATE TABLE IF NOT EXISTS chapter_summaries (
     knowledge_id TEXT NOT NULL,
     chapter_number INTEGER NOT NULL,
     summary TEXT,
+    source_content_sha256 TEXT NOT NULL DEFAULT '',
+    pipeline_version TEXT NOT NULL DEFAULT '',
+    sync_status TEXT NOT NULL DEFAULT 'draft',
+    sync_error TEXT NOT NULL DEFAULT '',
+    sync_attempts INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (knowledge_id) REFERENCES knowledge(id) ON DELETE CASCADE,
@@ -157,6 +164,27 @@ CREATE INDEX IF NOT EXISTS idx_triple_more_chapters_triple ON triple_more_chapte
 CREATE INDEX IF NOT EXISTS idx_triple_tags_triple ON triple_tags(triple_id);
 CREATE INDEX IF NOT EXISTS idx_triple_attr_triple ON triple_attr(triple_id);
 CREATE INDEX IF NOT EXISTS idx_chapter_summaries_knowledge_id ON chapter_summaries(knowledge_id);
+
+CREATE TABLE IF NOT EXISTS chapter_narrative_commits (
+    novel_id TEXT NOT NULL,
+    chapter_number INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    pipeline_version TEXT NOT NULL,
+    content_revision INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'in_progress',
+    failure_reason TEXT NOT NULL DEFAULT '',
+    attempt_count INTEGER NOT NULL DEFAULT 1,
+    vector_status TEXT NOT NULL DEFAULT 'not_started',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    committed_at TIMESTAMP,
+    PRIMARY KEY (novel_id, chapter_number, content_sha256, pipeline_version),
+    FOREIGN KEY (novel_id, chapter_number)
+        REFERENCES chapters(novel_id, number) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_chapter_narrative_commits_chapter
+ON chapter_narrative_commits(novel_id, chapter_number, content_revision);
 
 -- 三元组溯源：关联 story_nodes / chapter_elements（推断证据链，非 JSON 列）
 CREATE TABLE IF NOT EXISTS triple_provenance (

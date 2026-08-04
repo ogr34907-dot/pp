@@ -15,7 +15,11 @@ class ChapterSummary(BaseEntity):
         consistency_note: str = "",
         beat_sections: List[str] = None,
         micro_beats: List[Dict[str, Any]] = None,
-        sync_status: str = "draft"
+        sync_status: str = "draft",
+        source_content_sha256: str = "",
+        pipeline_version: str = "",
+        sync_error: str = "",
+        sync_attempts: int = 0,
     ):
         """初始化章节摘要
 
@@ -38,6 +42,10 @@ class ChapterSummary(BaseEntity):
         self.beat_sections = beat_sections or []
         self.micro_beats = micro_beats or []
         self.sync_status = sync_status
+        self.source_content_sha256 = source_content_sha256
+        self.pipeline_version = pipeline_version
+        self.sync_error = sync_error
+        self.sync_attempts = sync_attempts
 
     def __repr__(self) -> str:
         return f"<ChapterSummary chapter_id={self.chapter_id} status={self.sync_status}>"

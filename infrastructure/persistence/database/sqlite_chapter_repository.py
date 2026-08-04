@@ -1,4 +1,5 @@
 """SQLite Chapter Repository 实现"""
+import hashlib
 import logging
 import sqlite3
 from typing import Optional, List
@@ -24,13 +25,20 @@ class SqliteChapterRepository(ChapterRepository):
     def save(self, chapter: Chapter) -> None:
         """保存章节"""
         sql = """
-            INSERT INTO chapters (id, novel_id, number, title, content, outline, status,
+            INSERT INTO chapters (id, novel_id, number, title, content,
+                                  content_sha256, content_revision, outline, status,
                                   tension_score, plot_tension, emotional_tension, pacing_tension,
                                   generation_hint, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 content = excluded.content,
+                content_sha256 = excluded.content_sha256,
+                content_revision = CASE
+                    WHEN chapters.content_sha256 = excluded.content_sha256
+                        THEN MAX(chapters.content_revision, 1)
+                    ELSE MAX(chapters.content_revision + 1, 1)
+                END,
                 outline = excluded.outline,
                 status = excluded.status,
                 tension_score = excluded.tension_score,
@@ -44,12 +52,14 @@ class SqliteChapterRepository(ChapterRepository):
         chapter_id = chapter.id.value if hasattr(chapter.id, 'value') else chapter.id
         novel_id = chapter.novel_id.value if hasattr(chapter.novel_id, 'value') else chapter.novel_id
         status = chapter.status.value if hasattr(chapter.status, 'value') else chapter.status
+        content_sha256 = hashlib.sha256((chapter.content or "").encode("utf-8")).hexdigest()
         self.db.execute(sql, (
             chapter_id,
             novel_id,
             chapter.number,
             chapter.title,
             chapter.content,
+            content_sha256,
             chapter.outline,
             status,
             chapter.tension_score,
@@ -619,4 +629,6 @@ class SqliteChapterRepository(ChapterRepository):
             emotional_tension=row.get('emotional_tension', 50.0),
             pacing_tension=row.get('pacing_tension', 50.0),
             generation_hint=row.get('generation_hint', '') or '',
+            content_sha256=row.get('content_sha256', '') or '',
+            content_revision=int(row.get('content_revision', 0) or 0),
         )

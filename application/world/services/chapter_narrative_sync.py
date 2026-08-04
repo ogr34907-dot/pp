@@ -6,10 +6,13 @@ micro_beats：写作指挥器快照或 bundle；**不作为** magnify_outline �
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import uuid
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +34,75 @@ from application.world.services.storyline_normalization import (
 )
 
 logger = logging.getLogger(__name__)
+
+CHAPTER_NARRATIVE_PIPELINE_VERSION = "chapter-narrative-sync:v1"
+
+
+@dataclass(frozen=True)
+class AftermathCommitResult(Mapping[str, Any]):
+    """Canonical outcome with a dict-compatible projection for existing callers."""
+
+    content_sha256: str
+    pipeline_version: str
+    commit_status: str
+    failure_reason: str = ""
+    attempt_count: int = 0
+    vector_status: str = "not_started"
+    content_revision: int = 0
+    flags: Dict[str, Any] = field(default_factory=dict)
+
+    def _projection(self) -> Dict[str, Any]:
+        projected = dict(self.flags)
+        projected.update(
+            {
+                "content_sha256": self.content_sha256,
+                "content_hash": self.content_sha256,
+                "pipeline_version": self.pipeline_version,
+                "commit_status": self.commit_status,
+                "failure_reason": self.failure_reason,
+                "attempt_count": self.attempt_count,
+                "vector_status": self.vector_status,
+                "content_revision": self.content_revision,
+                "narrative_sync_ok": self.commit_status in {"committed", "reused"},
+                "vector_stored": self.vector_status == "stored",
+            }
+        )
+        return projected
+
+    def __getitem__(self, key: str) -> Any:
+        return self._projection()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._projection())
+
+    def __len__(self) -> int:
+        return len(self._projection())
+
+
+def _aftermath_flags() -> Dict[str, Any]:
+    return {
+        "vector_stored": False,
+        "foreshadow_stored": False,
+        "triples_extracted": False,
+        "causal_edges_stored": False,
+        "character_mutations_stored": False,
+        "memory_atoms_stored": False,
+        "debt_updated": False,
+    }
+
+
+def _resolve_commit_repository(knowledge_service: Any, chapter_repository: Any):
+    db = getattr(chapter_repository, "db", None)
+    if db is None:
+        knowledge_repository = getattr(knowledge_service, "knowledge_repository", None)
+        db = getattr(knowledge_repository, "db", None)
+    if db is None:
+        return None
+    from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+        SqliteChapterNarrativeCommitRepository,
+    )
+
+    return SqliteChapterNarrativeCommitRepository(db)
 
 
 def _stable_artifact_id(prefix: str, novel_id: str, chapter_number: int, *parts: Any) -> str:
@@ -319,6 +391,7 @@ async def llm_chapter_extract_bundle(
     from infrastructure.ai.prompt_utils import render_required_prompt
 
     variables = {
+        "chapter_number": chapter_number,
         "content": body,
         "foreshadow_context": foreshadow_context,
     }
@@ -428,6 +501,8 @@ def persist_bundle_triples_and_foreshadows(
     bundle: dict,
     triple_repository: Any,
     foreshadowing_repo: Any,
+    *,
+    strict: bool = False,
 ) -> None:
     """将 bundle 中的三元组与伏笔写入表，并处理伏笔消费状态更新。
     
@@ -476,6 +551,8 @@ def persist_bundle_triples_and_foreshadows(
                 try:
                     kr.save_triple(novel_id, row)
                 except Exception as e:
+                    if strict:
+                        raise
                     logger.debug("三元组落库跳过: %s", e)
 
     if foreshadowing_repo and hints:
@@ -639,6 +716,8 @@ def persist_bundle_triples_and_foreshadows(
             
             foreshadowing_repo.save(registry)
         except Exception as e:
+            if strict:
+                raise
             logger.warning("伏笔落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
 
 
@@ -2131,7 +2210,7 @@ async def sync_chapter_narrative_after_save(
     debt_repository: Any = None,
     bible_repository: Any = None,
     chapter_micro_beats: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, bool]:
+) -> AftermathCommitResult:
     """异步：LLM bundle + 向量等落库。
 
     ``chapter_micro_beats``：全托管等管线传入的写作侧 Beat 快照；若缺省则仅从 bundle 继承，
@@ -2139,28 +2218,64 @@ async def sync_chapter_narrative_after_save(
 
     返回各子步骤是否成功落库，供章后管线写入 last_audit_* 审阅快照。
     """
-    empty_flags: Dict[str, bool] = {
-        "vector_stored": False,
-        "foreshadow_stored": False,
-        "triples_extracted": False,
-        "causal_edges_stored": False,
-        "character_mutations_stored": False,
-        "memory_atoms_stored": False,
-        "debt_updated": False,
-    }
+    content_sha256 = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+    empty_flags = _aftermath_flags()
     if not content or not str(content).strip():
         logger.debug("跳过叙事同步：正文为空 novel=%s ch=%s", novel_id, chapter_number)
-        return empty_flags
+        return AftermathCommitResult(
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            commit_status="failed",
+            failure_reason="empty_content",
+            flags=empty_flags,
+        )
 
-    flags: Dict[str, bool] = {
-        "vector_stored": False,
-        "foreshadow_stored": False,
-        "triples_extracted": False,
-        "causal_edges_stored": False,
-        "character_mutations_stored": False,
-        "memory_atoms_stored": False,
-        "debt_updated": False,
-    }
+    flags = _aftermath_flags()
+    commit_repository = _resolve_commit_repository(knowledge_service, chapter_repository)
+    if commit_repository is None:
+        return AftermathCommitResult(
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            commit_status="failed",
+            failure_reason="sqlite_claim_unavailable",
+            flags=flags,
+        )
+
+    claim = commit_repository.claim(
+        novel_id=novel_id,
+        chapter_number=chapter_number,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+    )
+    if claim.disposition != "claimed":
+        return AftermathCommitResult(
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            commit_status=claim.disposition,
+            failure_reason=claim.failure_reason,
+            attempt_count=claim.attempt_count,
+            vector_status=claim.vector_status,
+            content_revision=claim.content_revision,
+            flags=flags,
+        )
+
+    def failed_result(reason: str) -> AftermathCommitResult:
+        commit_repository.fail(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            failure_reason=reason,
+        )
+        return AftermathCommitResult(
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            commit_status="failed",
+            failure_reason=reason,
+            attempt_count=claim.attempt_count,
+            content_revision=claim.content_revision,
+            flags=flags,
+        )
 
     existing = None
     existing_beats: List[str] = []
@@ -2207,8 +2322,23 @@ async def sync_chapter_narrative_after_save(
         open_threads = bundle.get("open_threads") or ""
     except Exception as e:
         logger.warning("LLM 章末 bundle 失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
-        summary, key_events, open_threads = "", "", ""
-        bundle = {"relation_triples": [], "foreshadow_hints": []}
+        return failed_result(str(e) or type(e).__name__)
+
+    if not summary.strip():
+        return failed_result("empty_summary")
+    for field_name in (
+        "relation_triples",
+        "foreshadow_hints",
+        "consumed_foreshadows",
+        "storyline_progress",
+        "dialogues",
+        "timeline_events",
+        "causal_edges",
+        "character_mutations",
+        "character_states",
+    ):
+        if not isinstance(bundle.get(field_name, []), list):
+            return failed_result(f"invalid_structure:{field_name}")
 
     # --- 独立多维张力评分 ---
     from application.analyst.services.tension_scoring_service import TensionScoringService
@@ -2294,17 +2424,30 @@ async def sync_chapter_narrative_after_save(
     except Exception as e:
         logger.debug("微观节拍赋值失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
     
-    knowledge_service.upsert_chapter_summary(
-        novel_id=novel_id,
-        chapter_id=chapter_number,
-        summary=summary,
-        key_events=key_events or "（未提取）",
-        open_threads=open_threads or "无",
-        consistency_note=consistency_note,
-        beat_sections=beat_sections,
-        micro_beats=mb_out if mb_out else None,
-        sync_status="synced" if summary else "draft",
-    )
+    try:
+        knowledge_service.upsert_chapter_summary(
+            novel_id=novel_id,
+            chapter_id=chapter_number,
+            summary=summary,
+            key_events=key_events or "（未提取）",
+            open_threads=open_threads or "无",
+            consistency_note=consistency_note,
+            beat_sections=beat_sections,
+            micro_beats=mb_out if mb_out else None,
+            sync_status="in_progress",
+        )
+    except Exception as e:
+        return failed_result(str(e) or type(e).__name__)
+    try:
+        commit_repository.prepare_summary(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            attempt_count=claim.attempt_count,
+        )
+    except Exception as e:
+        return failed_result(str(e) or type(e).__name__)
 
     if triple_repository is not None or foreshadowing_repo is not None:
         try:
@@ -2314,6 +2457,7 @@ async def sync_chapter_narrative_after_save(
                 bundle,
                 triple_repository,
                 foreshadowing_repo,
+                strict=True,
             )
             if triple_repository is not None:
                 flags["triples_extracted"] = True
@@ -2323,6 +2467,7 @@ async def sync_chapter_narrative_after_save(
             logger.warning(
                 "bundle 三元组/伏笔落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
             )
+            return failed_result(str(e) or type(e).__name__)
 
     if storyline_repository is not None or chapter_repository is not None or narrative_event_repository is not None:
         try:
@@ -2339,6 +2484,7 @@ async def sync_chapter_narrative_after_save(
             logger.warning(
                 "bundle 故事线/张力/对话落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
             )
+            return failed_result(str(e) or type(e).__name__)
 
     # ★ V8 Feed-forward: 因果边提取 + 人物状态突变 + 叙事债务更新
     if causal_edge_repository is not None:
@@ -2352,6 +2498,7 @@ async def sync_chapter_narrative_after_save(
             logger.warning(
                 "因果边落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
             )
+            return failed_result(str(e) or type(e).__name__)
 
     if character_state_repository is not None:
         try:
@@ -2364,6 +2511,7 @@ async def sync_chapter_narrative_after_save(
             logger.warning(
                 "人物状态突变落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
             )
+            return failed_result(str(e) or type(e).__name__)
         try:
             persist_character_end_states(
                 novel_id, chapter_number, bundle, character_state_repository, bible_repository
@@ -2372,6 +2520,7 @@ async def sync_chapter_narrative_after_save(
             logger.warning(
                 "章末人物状态落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
             )
+            return failed_result(str(e) or type(e).__name__)
 
     try:
         memory_saved = persist_bundle_memory_atoms(
@@ -2383,6 +2532,7 @@ async def sync_chapter_narrative_after_save(
         logger.warning(
             "MemoryAtom 双写失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
         )
+        return failed_result(str(e) or type(e).__name__)
 
     if debt_repository is not None:
         try:
@@ -2395,6 +2545,7 @@ async def sync_chapter_narrative_after_save(
             logger.warning(
                 "叙事债务更新失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
             )
+            return failed_result(str(e) or type(e).__name__)
 
     logger.info(
         "分章叙事已落库 novel=%s ch=%s beats=%d(src=planning/knowledge) summary_len=%d",
@@ -2404,22 +2555,74 @@ async def sync_chapter_narrative_after_save(
         len(summary),
     )
 
+    try:
+        commit_repository.commit(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            attempt_count=claim.attempt_count,
+        )
+    except Exception as e:
+        failure_reason = str(e) or type(e).__name__
+        commit_repository.fail(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            failure_reason=failure_reason,
+        )
+        return AftermathCommitResult(
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            commit_status="failed",
+            failure_reason=failure_reason,
+            attempt_count=claim.attempt_count,
+            content_revision=claim.content_revision,
+            flags=flags,
+        )
+
+    vector_status = "not_started"
     if indexing_svc is not None:
         text_for_vector = summary.strip() if summary.strip() else "；".join(beat_sections) if beat_sections else content[:800]
         try:
             await indexing_svc.ensure_collection(novel_id)
-            await indexing_svc.index_chapter_summary(novel_id, chapter_number, text_for_vector)
+            await indexing_svc.index_chapter_summary(
+                novel_id,
+                chapter_number,
+                text_for_vector,
+                content_sha256=content_sha256,
+                content_revision=claim.content_revision,
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            )
             flags["vector_stored"] = True
+            vector_status = "stored"
             logger.debug("章节向量索引完成 novel=%s ch=%s", novel_id, chapter_number)
         except Exception as e:
+            vector_status = "failed"
             logger.warning("章节向量索引失败 novel=%s ch=%s: [%s] %s", novel_id, chapter_number, type(e).__name__, e, exc_info=True)
+        commit_repository.set_vector_status(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            vector_status=vector_status,
+        )
 
     # 🔥 将多维张力评分（0-100）传递给调用方，供审计流程替代旧式 _score_tension
     tension_composite = bundle.get("tension_score")
     if tension_composite is not None and tension_composite != UNEVALUATED:
         flags["tension_composite"] = tension_composite
 
-    return flags
+    return AftermathCommitResult(
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        commit_status="committed",
+        attempt_count=claim.attempt_count,
+        vector_status=vector_status,
+        content_revision=claim.content_revision,
+        flags=flags,
+    )
 
 
 def sync_chapter_narrative_after_save_blocking(

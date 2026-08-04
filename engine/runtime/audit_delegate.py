@@ -54,6 +54,17 @@ def _extract_commit_continuation(outcome_payload: Mapping[str, Any] | None) -> d
     return dict(continuation or {}) if isinstance(continuation, Mapping) else {}
 
 
+def _merge_aftermath_review(
+    canonical_result: Mapping[str, Any],
+    review_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Attach review-only output without replacing canonical narrative fields."""
+    return {
+        **canonical_result,
+        "chapter_aftermath_review": dict(review_payload),
+    }
+
+
 def _consume_pending_payload(
     host: Any,
     *,
@@ -412,11 +423,7 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
         )
 
     if aftermath_payload:
-        drift_result = {
-            **drift_result,
-            "chapter_aftermath_review": aftermath_payload,
-            "chapter_summary": aftermath_payload.get("chapter.summary", ""),
-        }
+        drift_result = _merge_aftermath_review(drift_result, aftermath_payload)
 
     # ── 停止检查：章后管线和文风预检完成后 ──
     if not host._is_still_running(novel):

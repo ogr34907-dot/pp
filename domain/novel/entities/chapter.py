@@ -31,6 +31,8 @@ class Chapter(BaseEntity):
         emotional_tension: float = 50.0,
         pacing_tension: float = 50.0,
         generation_hint: str = "",
+        content_sha256: str = "",
+        content_revision: int = 0,
     ):
         super().__init__(id)
         self.novel_id = novel_id
@@ -44,6 +46,8 @@ class Chapter(BaseEntity):
         self.emotional_tension = emotional_tension  # 情绪张力 0-100
         self.pacing_tension = pacing_tension  # 节奏张力 0-100
         self.generation_hint = generation_hint  # 用户手写的本章生成约束（直注 AI 上下文）
+        self.content_sha256 = content_sha256
+        self.content_revision = content_revision
 
     @property
     def content(self) -> str:

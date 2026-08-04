@@ -1,6 +1,6 @@
 name: 章节叙事同步提取
 category: extraction
-source: infrastructure/ai/prompts/prompts_defaults.json
+source: infrastructure/ai/prompt_packages/nodes/chapter-narrative-sync/
 description: 增强版叙事提取：为后续大纲修正提供极其精准的"状态机"快照
 builtin: true
 tags:
@@ -9,6 +9,10 @@ tags:
 - JSON
 output_format: json
 variables:
+- name: chapter_number
+  desc: 章节号
+  type: integer
+  required: true
 - name: content
   desc: 章节正文
   type: string

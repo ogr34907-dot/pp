@@ -71,7 +71,11 @@ class ChapterIndexingService:
         self,
         novel_id: str,
         chapter_number: int,
-        summary: str
+        summary: str,
+        *,
+        content_sha256: Optional[str] = None,
+        content_revision: Optional[int] = None,
+        pipeline_version: Optional[str] = None,
     ) -> None:
         """索引章节摘要到向量存储
 
@@ -104,6 +108,12 @@ class ChapterIndexingService:
             "kind": "chapter_summary",
             "novel_id": novel_id
         }
+        if content_sha256 is not None:
+            payload["content_sha256"] = content_sha256
+        if content_revision is not None:
+            payload["content_revision"] = content_revision
+        if pipeline_version is not None:
+            payload["pipeline_version"] = pipeline_version
 
         # 领域层使用可读、确定性的业务 ID；具体存储若要求 UUID，由适配器内部转换。
         point_id = f"{novel_id}_ch{chapter_number}_summary"

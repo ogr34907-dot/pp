@@ -63,7 +63,11 @@ class KnowledgeService:
                 consistency_note=ch.get("consistency_note", ""),
                 beat_sections=ch.get("beat_sections", []),
                 micro_beats=ch.get("micro_beats", []),
-                sync_status=ch.get("sync_status", "draft")
+                sync_status=ch.get("sync_status", "draft"),
+                source_content_sha256=ch.get("source_content_sha256", ""),
+                pipeline_version=ch.get("pipeline_version", ""),
+                sync_error=ch.get("sync_error", ""),
+                sync_attempts=int(ch.get("sync_attempts", 0) or 0),
             )
             for ch in data.get("chapters", [])
         ]
@@ -397,6 +401,10 @@ class KnowledgeService:
                 beat_sections=list(existing.beat_sections or []),
                 micro_beats=list(micro_beats or []),
                 sync_status=existing.sync_status or "draft",
+                source_content_sha256=getattr(existing, "source_content_sha256", "") or "",
+                pipeline_version=getattr(existing, "pipeline_version", "") or "",
+                sync_error=getattr(existing, "sync_error", "") or "",
+                sync_attempts=int(getattr(existing, "sync_attempts", 0) or 0),
             )
         else:
             chapter = ChapterSummary(
