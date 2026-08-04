@@ -15,6 +15,7 @@
 - 防止大模型出现"死人复活"、"时间倒流"等低级 Bug
 """
 import logging
+import hashlib
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -98,6 +99,7 @@ class VolumeSummaryService:
     
     # 检查点阈值
     CHECKPOINT_CHAPTER_THRESHOLD = 20    # 每 20 章强制生成检查点
+    SUMMARY_PIPELINE_VERSION = "node-summary/v1"
     
     def __init__(
         self,
@@ -138,6 +140,7 @@ class VolumeSummaryService:
             
             # 收集章节信息
             chapter_info = []
+            source_chapters = []
             for ch in sorted(chapter_nodes, key=lambda x: x.number):
                 content_preview = ""
                 if self.chapter_repo:
@@ -145,6 +148,8 @@ class VolumeSummaryService:
                     chapter = self.chapter_repo.get_by_id(ChapterId(ch.id))
                     if chapter and chapter.content:
                         content_preview = chapter.content[:500]
+                    if chapter is not None:
+                        source_chapters.append(chapter)
                 
                 chapter_info.append({
                     "number": ch.number,
@@ -168,9 +173,7 @@ class VolumeSummaryService:
             summary = response.content.strip() if hasattr(response, 'content') else str(response).strip()
             
             # 保存摘要到节点
-            act_node.metadata = act_node.metadata or {}
-            act_node.metadata["summary"] = summary
-            act_node.metadata["summary_generated_at"] = datetime.now().isoformat()
+            self._store_node_summary(act_node, summary, source_chapters)
             await self.story_node_repo.update(act_node)
             
             logger.info(f"[VolumeSummaryService] 幕摘要生成成功: {act_node.title} ({len(summary)} 字)")
@@ -222,12 +225,19 @@ class VolumeSummaryService:
             # Map: 收集所有幕摘要
             act_summaries = []
             for act in act_nodes:
-                summary = act.metadata.get("summary", "") if act.metadata else ""
+                summary = self._get_current_node_summary(act)
                 if not summary:
-                    # 尝试生成幕摘要
+                    # 失效或缺失的幕摘要必须先从当前正文重建。
                     result = await self.generate_act_summary(novel_id, act.id)
-                    if result.success:
-                        summary = result.summary
+                    if not result.success or not result.summary.strip():
+                        return SummaryResult(
+                            success=False,
+                            error=(
+                                f"幕摘要不可用，无法生成卷摘要: {act.title}; "
+                                f"{result.error or '摘要为空'}"
+                            ),
+                        )
+                    summary = result.summary
                 
                 act_summaries.append({
                     "number": act.number,
@@ -246,9 +256,15 @@ class VolumeSummaryService:
             summary = response.content.strip() if hasattr(response, 'content') else str(response).strip()
             
             # 保存到卷节点
-            volume_node.metadata = volume_node.metadata or {}
-            volume_node.metadata["summary"] = summary
-            volume_node.metadata["summary_generated_at"] = datetime.now().isoformat()
+            self._store_node_summary(
+                volume_node,
+                summary,
+                self._chapters_in_range(
+                    novel_id,
+                    volume_node.chapter_start,
+                    volume_node.chapter_end,
+                ),
+            )
             await self.story_node_repo.update(volume_node)
             
             logger.info(f"[VolumeSummaryService] 卷摘要生成成功: {volume_node.title} ({len(summary)} 字)")
@@ -379,6 +395,29 @@ class VolumeSummaryService:
             )
             
             summary = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+
+            all_nodes = await self.story_node_repo.get_by_novel(novel_id)
+            checkpoint_node = next(
+                (
+                    node
+                    for node in all_nodes
+                    if node.node_type == NodeType.CHAPTER
+                    and node.number == current_chapter
+                ),
+                None,
+            )
+            if checkpoint_node is None:
+                return SummaryResult(
+                    success=False,
+                    error=f"检查点章节节点不存在: {current_chapter}",
+                )
+            checkpoint_node.metadata = checkpoint_node.metadata or {}
+            checkpoint_node.metadata["checkpoint_summary"] = summary
+            checkpoint_node.metadata["checkpoint_summary_state"] = self._build_summary_state(
+                recent,
+            )
+            checkpoint_node.metadata["checkpoint_summary_generated_at"] = datetime.now().isoformat()
+            await self.story_node_repo.update(checkpoint_node)
             
             logger.info(f"[VolumeSummaryService] 检查点摘要生成成功: 第 {current_chapter} 章")
             
@@ -402,8 +441,8 @@ class VolumeSummaryService:
                 None
             )
             
-            if volume_node and volume_node.metadata:
-                return volume_node.metadata.get("summary")
+            if volume_node:
+                return self._get_current_node_summary(volume_node) or None
             
         except Exception as e:
             logger.warning(f"获取卷摘要失败: {e}")
@@ -419,8 +458,8 @@ class VolumeSummaryService:
                 None
             )
             
-            if act_node and act_node.metadata:
-                return act_node.metadata.get("summary")
+            if act_node:
+                return self._get_current_node_summary(act_node) or None
             
         except Exception as e:
             logger.warning(f"获取幕摘要失败: {e}")
@@ -605,9 +644,7 @@ class VolumeSummaryService:
             summary = response.content.strip() if hasattr(response, 'content') else str(response).strip()
             
             # 保存
-            volume_node.metadata = volume_node.metadata or {}
-            volume_node.metadata["summary"] = summary
-            volume_node.metadata["summary_generated_at"] = datetime.now().isoformat()
+            self._store_node_summary(volume_node, summary, volume_chapters)
             await self.story_node_repo.update(volume_node)
             
             return SummaryResult(
@@ -619,3 +656,94 @@ class VolumeSummaryService:
         except Exception as e:
             logger.error(f"从章节生成卷摘要失败: {e}", exc_info=True)
             return SummaryResult(success=False, error=str(e))
+
+    def _chapters_in_range(
+        self,
+        novel_id: str,
+        chapter_start: Optional[int],
+        chapter_end: Optional[int],
+    ) -> List[Any]:
+        if self.chapter_repo is None or chapter_start is None or chapter_end is None:
+            return []
+        try:
+            chapters = self.chapter_repo.list_by_novel(NovelId(novel_id))
+        except Exception:
+            return []
+        return [
+            chapter
+            for chapter in chapters or []
+            if int(chapter_start) <= int(getattr(chapter, "number", 0) or 0) <= int(chapter_end)
+        ]
+
+    def _store_node_summary(
+        self,
+        node: Any,
+        summary: str,
+        source_chapters: List[Any],
+    ) -> None:
+        node.metadata = node.metadata or {}
+        node.metadata["summary"] = summary
+        node.metadata["summary_state"] = self._build_summary_state(source_chapters)
+        node.metadata["summary_generated_at"] = datetime.now().isoformat()
+
+    def _get_current_node_summary(self, node: Any) -> str:
+        metadata = getattr(node, "metadata", None) or {}
+        summary = str(metadata.get("summary", "") or "").strip()
+        state = metadata.get("summary_state") or {}
+        if not summary or not isinstance(state, dict):
+            return ""
+        if state.get("status") != "committed":
+            return ""
+        chapter_start = state.get("chapter_start")
+        chapter_end = state.get("chapter_end")
+        source_version = str(state.get("source_version", "") or "")
+        if chapter_start is None or chapter_end is None or not source_version:
+            return ""
+        source_chapters = self._chapters_in_range(
+            node.novel_id,
+            int(chapter_start),
+            int(chapter_end),
+        )
+        current_state = self._build_summary_state(source_chapters)
+        if current_state.get("status") != "committed":
+            return ""
+        if state.get("pipeline_version") != self.SUMMARY_PIPELINE_VERSION:
+            return ""
+        if current_state.get("source_version") != source_version:
+            return ""
+        return summary
+
+    def is_node_summary_current(self, node: Any) -> bool:
+        return bool(self._get_current_node_summary(node))
+
+    def _build_summary_state(self, source_chapters: List[Any]) -> Dict[str, Any]:
+        rows = []
+        for chapter in sorted(source_chapters or [], key=lambda item: int(getattr(item, "number", 0) or 0)):
+            number = int(getattr(chapter, "number", 0) or 0)
+            if number < 1:
+                continue
+            content = str(getattr(chapter, "content", "") or "")
+            content_sha256 = str(getattr(chapter, "content_sha256", "") or "")
+            if not content_sha256:
+                content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            revision = int(getattr(chapter, "content_revision", 0) or 0)
+            rows.append((number, content_sha256, revision))
+        if not rows:
+            return {
+                "status": "legacy",
+                "chapter_start": None,
+                "chapter_end": None,
+                "source_version": "",
+                "pipeline_version": self.SUMMARY_PIPELINE_VERSION,
+            }
+        payload = "|".join(
+            f"{number}:{content_sha256}:{revision}"
+            for number, content_sha256, revision in rows
+        )
+        return {
+            "status": "committed",
+            "chapter_start": rows[0][0],
+            "chapter_end": rows[-1][0],
+            "source_version": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            "pipeline_version": self.SUMMARY_PIPELINE_VERSION,
+        }

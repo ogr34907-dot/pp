@@ -1,3 +1,5 @@
+import hashlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -11,6 +13,7 @@ from application.blueprint.services.continuous_planning_service import (
 )
 from domain.ai.value_objects.prompt import Prompt
 from domain.novel.value_objects.generation_preferences import GenerationPreferences
+from domain.structure.story_node import NodeType, StoryNode
 
 
 def _make_service() -> ContinuousPlanningService:
@@ -19,6 +22,60 @@ def _make_service() -> ContinuousPlanningService:
         chapter_element_repo=Mock(),
         llm_service=Mock(),
     )
+
+
+def _story_node(
+    node_id: str,
+    node_type: NodeType,
+    number: int,
+    *,
+    parent_id: str | None = None,
+    order_index: int | None = None,
+    chapter_start: int | None = None,
+    chapter_end: int | None = None,
+    description: str = "",
+    metadata: dict | None = None,
+) -> StoryNode:
+    return StoryNode(
+        id=node_id,
+        novel_id="novel-1",
+        node_type=node_type,
+        number=number,
+        title=node_id,
+        order_index=order_index if order_index is not None else number,
+        parent_id=parent_id,
+        chapter_start=chapter_start,
+        chapter_end=chapter_end,
+        description=description,
+        metadata=metadata or {},
+    )
+
+
+def _summary_source_version(*chapters: SimpleNamespace) -> str:
+    payload = "|".join(
+        f"{chapter.number}:{chapter.content_sha256}:{chapter.content_revision}"
+        for chapter in sorted(chapters, key=lambda item: item.number)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class _AsyncStoryNodeRepo:
+    def __init__(self, nodes: list[StoryNode]):
+        self.nodes = nodes
+
+    async def get_by_novel(self, _novel_id: str):
+        return list(self.nodes)
+
+    def get_tree(self, _novel_id: str):
+        return SimpleNamespace(nodes=list(self.nodes))
+
+
+class _VersionedChapterRepo:
+    def __init__(self, chapters: list[SimpleNamespace]):
+        self.chapters = chapters
+
+    def list_by_novel(self, _novel_id):
+        return list(self.chapters)
 
 
 def test_quick_macro_prompt_for_long_book_uses_leading_volume_detail():
@@ -30,6 +87,198 @@ def test_quick_macro_prompt_for_long_book_uses_leading_volume_detail():
     assert "后续卷的幕节点留给写作过程中动态生成" in prompt.system
     assert "开篇前导卷标题" in prompt.user
     assert "前 1-2 部" not in prompt.system
+
+
+@pytest.mark.asyncio
+async def test_previous_act_summaries_use_committed_metadata_and_stale_fallback():
+    chapters = [
+        SimpleNamespace(number=1, content_sha256="hash-1", content_revision=1),
+        SimpleNamespace(number=2, content_sha256="hash-2", content_revision=1),
+    ]
+    committed = _story_node(
+        "act-committed",
+        NodeType.ACT,
+        1,
+        parent_id="volume-1",
+        chapter_start=1,
+        chapter_end=2,
+        metadata={
+            "summary": "已提交的前幕摘要",
+            "summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 2,
+                "source_version": _summary_source_version(*chapters),
+            },
+        },
+    )
+    previous_volume = _story_node(
+        "volume-1",
+        NodeType.VOLUME,
+        1,
+        chapter_start=1,
+        chapter_end=2,
+        metadata={
+            "summary": "已提交的前卷摘要",
+            "summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 2,
+                "source_version": _summary_source_version(*chapters),
+            },
+        },
+    )
+    checkpoint = _story_node("chapter-2", NodeType.CHAPTER, 2, parent_id="act-committed")
+    checkpoint.metadata = {
+        "checkpoint_summary": "最近有效检查点摘要",
+        "checkpoint_summary_state": {
+            "status": "committed",
+            "chapter_start": 1,
+            "chapter_end": 2,
+            "source_version": _summary_source_version(*chapters),
+        },
+    }
+    stale = _story_node(
+        "act-stale",
+        NodeType.ACT,
+        2,
+        parent_id="volume-1",
+        chapter_start=3,
+        chapter_end=4,
+        description="失效幕描述",
+        metadata={
+            "summary": "失效幕摘要",
+            "summary_state": {"status": "stale"},
+        },
+    )
+    current = _story_node(
+        "act-current",
+        NodeType.ACT,
+        3,
+        parent_id="volume-1",
+        chapter_start=5,
+        chapter_end=6,
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=_AsyncStoryNodeRepo([previous_volume, committed, checkpoint, stale, current]),
+        chapter_element_repo=Mock(),
+        chapter_repository=_VersionedChapterRepo(chapters),
+        llm_service=Mock(),
+    )
+
+    previous = await service._get_previous_acts_summary(current)
+
+    assert "已提交的前幕摘要" in previous
+    assert "已提交的前卷摘要" in previous
+    assert "最近有效检查点摘要" in previous
+    assert "失效幕摘要" not in previous
+    assert "失效幕描述" in previous
+
+
+@pytest.mark.asyncio
+async def test_find_act_for_chapter_uses_chapter_parent_before_range_fallback():
+    parent_act = _story_node(
+        "act-parent",
+        NodeType.ACT,
+        1,
+        chapter_start=1,
+        chapter_end=20,
+    )
+    misleading_range = _story_node(
+        "act-range",
+        NodeType.ACT,
+        99,
+        chapter_start=9,
+        chapter_end=9,
+    )
+    chapter = _story_node(
+        "chapter-9",
+        NodeType.CHAPTER,
+        9,
+        parent_id="act-parent",
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=_AsyncStoryNodeRepo([parent_act, misleading_range, chapter]),
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+    )
+
+    resolved = await service._find_act_for_chapter("novel-1", 9)
+
+    assert resolved is parent_act
+
+
+@pytest.mark.asyncio
+async def test_dual_track_context_uses_only_current_source_matched_volume_summaries():
+    chapters = [
+        SimpleNamespace(number=number, content_sha256=f"hash-{number}", content_revision=1)
+        for number in range(1, 7)
+    ]
+    older_volume = _story_node(
+        "volume-older",
+        NodeType.VOLUME,
+        1,
+        chapter_start=1,
+        chapter_end=2,
+        metadata={
+            "summary": "最近有效前卷摘要",
+            "summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 2,
+                "source_version": _summary_source_version(*chapters[:2]),
+            },
+        },
+    )
+    stale_volume = _story_node(
+        "volume-stale",
+        NodeType.VOLUME,
+        2,
+        chapter_start=3,
+        chapter_end=4,
+        metadata={
+            "summary": "不应进入规划的失效卷摘要",
+            "summary_state": {"status": "stale"},
+        },
+    )
+    current_volume = _story_node(
+        "volume-current",
+        NodeType.VOLUME,
+        3,
+        chapter_start=5,
+        chapter_end=6,
+        metadata={
+            "summary": "当前有效卷摘要",
+            "summary_state": {
+                "status": "committed",
+                "chapter_start": 5,
+                "chapter_end": 6,
+                "source_version": _summary_source_version(*chapters[4:]),
+            },
+        },
+    )
+    current_act = _story_node(
+        "act-current",
+        NodeType.ACT,
+        3,
+        parent_id="volume-current",
+        chapter_start=5,
+        chapter_end=6,
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=_AsyncStoryNodeRepo(
+            [older_volume, stale_volume, current_volume, current_act]
+        ),
+        chapter_element_repo=Mock(),
+        chapter_repository=_VersionedChapterRepo(chapters),
+        llm_service=Mock(),
+    )
+
+    context = await service._collect_dual_track_context("novel-1", current_act, {})
+
+    assert "当前有效卷摘要" in context["current_volume_summary"]
+    assert "最近有效前卷摘要" in context["volume_summary"]
+    assert "不应进入规划的失效卷摘要" not in context["volume_summary"]
 
 
 def test_parse_llm_response_repairs_truncated_macro_plan_json():

@@ -76,6 +76,7 @@ class ChapterIndexingService:
         content_sha256: Optional[str] = None,
         content_revision: Optional[int] = None,
         pipeline_version: Optional[str] = None,
+        sync_status: str = "committed",
     ) -> None:
         """索引章节摘要到向量存储
 
@@ -114,6 +115,7 @@ class ChapterIndexingService:
             payload["content_revision"] = content_revision
         if pipeline_version is not None:
             payload["pipeline_version"] = pipeline_version
+        payload["sync_status"] = sync_status
 
         # 领域层使用可读、确定性的业务 ID；具体存储若要求 UUID，由适配器内部转换。
         point_id = f"{novel_id}_ch{chapter_number}_summary"

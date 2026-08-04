@@ -13,6 +13,7 @@
 
 当 Token 预算紧张时，从 T3 → T2 → T1 逐层挤压，T0 绝对保护。
 """
+import hashlib
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,7 @@ from application.engine.dtos.scene_director_dto import SceneDirectorInput, coerc
 
 from domain.novel.value_objects.novel_id import NovelId
 from domain.novel.value_objects.chapter_id import ChapterId
+from domain.structure.story_node import NodeType
 from engine.core.entities.story import StoryPhase
 from domain.novel.repositories.foreshadowing_repository import ForeshadowingRepository
 from domain.novel.repositories.chapter_repository import ChapterRepository
@@ -127,6 +129,8 @@ class ContextBudgetAllocator:
     MAX_RECENT_CHAPTERS_TOKENS = 8000   # 扩容：N-1 完整 + N-2 半量 + N-3~5 预览
     MAX_VECTOR_RECALL_TOKENS = 5000
     MAX_NARRATIVE_CONTRACT_TOKENS = 1400  # 向导五维 + 文风公约 + Bible 规则条目
+    VECTOR_RECALL_CANDIDATES = 8
+    RECENT_VECTOR_EXCLUSION_CHAPTERS = 5
 
     # 最近章节槽位：紧邻上一章侧重章末承接；更早章节仅章首短预览以省预算
     # V8 优化：增加章末保留量，提升章节间连贯性
@@ -1160,19 +1164,14 @@ class ContextBudgetAllocator:
         
         try:
             nodes = self.story_node_repo.get_by_novel_sync(novel_id)
-            act_nodes = [n for n in nodes if n.node_type.value == "act"]
-            
-            # 找到包含当前章节的幕
-            current_act = None
-            for act in act_nodes:
-                if act.chapter_start and act.chapter_end:
-                    if act.chapter_start <= chapter_number <= act.chapter_end:
-                        current_act = act
-                        break
+            current_act = self._resolve_act_for_chapter(nodes, chapter_number)
             
             if current_act:
                 parts = [f"【{current_act.title}】"]
-                if current_act.description:
+                summary = self._get_valid_node_summary(novel_id, current_act)
+                if summary:
+                    parts.append(summary)
+                elif current_act.description:
                     parts.append(current_act.description)
                 if current_act.narrative_arc:
                     parts.append(f"叙事弧线: {current_act.narrative_arc}")
@@ -2011,20 +2010,80 @@ class ContextBudgetAllocator:
         
         try:
             nodes = self.story_node_repo.get_by_novel_sync(novel_id)
-            act_nodes = sorted(
-                [n for n in nodes if n.node_type.value == "act" and n.number < chapter_number],
-                key=lambda n: n.number,
-                reverse=True
-            )[:limit]
-            
-            if not act_nodes:
-                return ""
-            
-            lines = ["【近期幕摘要】"]
-            for act in reversed(act_nodes):  # 按时间顺序
-                lines.append(f"\n{act.title}")
-                if act.description:
-                    lines.append(f"  {act.description[:200]}")
+            current_act = self._resolve_act_for_chapter(nodes, chapter_number)
+            if current_act is not None:
+                current_order = self._node_order(current_act)
+                act_nodes = [
+                    node
+                    for node in nodes
+                    if self._is_node_type(node, NodeType.ACT)
+                    and self._node_order(node) < current_order
+                ]
+            else:
+                act_nodes = [
+                    node
+                    for node in nodes
+                    if self._is_node_type(node, NodeType.ACT)
+                    and getattr(node, "chapter_end", None) is not None
+                    and int(node.chapter_end) < int(chapter_number)
+                ]
+            act_nodes = sorted(act_nodes, key=self._node_order, reverse=True)[:limit]
+
+            if current_act is not None:
+                volume_nodes = [
+                    node
+                    for node in nodes
+                    if self._is_node_type(node, NodeType.VOLUME)
+                    and (
+                        (
+                            getattr(node, "chapter_end", None) is not None
+                            and int(node.chapter_end) < int(chapter_number)
+                        )
+                        or (
+                            getattr(node, "chapter_end", None) is None
+                            and self._node_order(node) < current_order
+                        )
+                    )
+                ]
+            else:
+                volume_nodes = [
+                    node
+                    for node in nodes
+                    if self._is_node_type(node, NodeType.VOLUME)
+                    and getattr(node, "chapter_end", None) is not None
+                    and int(node.chapter_end) < int(chapter_number)
+                ]
+            volume_nodes = sorted(volume_nodes, key=self._node_order, reverse=True)[:limit]
+
+            lines = []
+            if act_nodes:
+                lines.append("【近期幕摘要】")
+                for act in reversed(act_nodes):  # 按时间顺序
+                    lines.append(f"\n{act.title}")
+                    summary = self._get_valid_node_summary(novel_id, act)
+                    if summary:
+                        lines.append(f"  {summary[:600]}")
+                    elif act.description:
+                        lines.append(f"  {act.description[:200]}")
+
+            if volume_nodes:
+                lines.append("\n【近期卷摘要】")
+                for volume in reversed(volume_nodes):
+                    lines.append(f"\n{volume.title}")
+                    summary = self._get_valid_node_summary(novel_id, volume)
+                    if summary:
+                        lines.append(f"  {summary[:800]}")
+                    elif volume.description:
+                        lines.append(f"  {volume.description[:200]}")
+
+            checkpoint = self._get_latest_valid_checkpoint_summary(
+                novel_id,
+                nodes,
+                chapter_number,
+            )
+            if checkpoint:
+                lines.append("\n【最近有效检查点】")
+                lines.append(checkpoint[:800])
             
             return "\n".join(lines)
             
@@ -2108,18 +2167,52 @@ class ContextBudgetAllocator:
 
             results = self.vector_facade.sync_search(
                 collection=collection_name,
-                query_text=outline,
-                limit=5,
+                query_text=self._build_vector_recall_query(
+                    novel_id,
+                    chapter_number,
+                    outline,
+                ),
+                limit=self.VECTOR_RECALL_CANDIDATES,
             )
             
             if not results:
                 return ""
             
-            # 过滤：排除当前章节，优先相近章节
-            filtered = [
-                hit for hit in results
-                if hit.get("payload", {}).get("chapter_number") != chapter_number
-            ]
+            filtered = []
+            seen_text = set()
+            for hit in sorted(
+                results,
+                key=lambda item: float(item.get("score", 0) or 0),
+                reverse=True,
+            ):
+                if float(hit.get("score", 0) or 0) < 0.5:
+                    continue
+                payload = hit.get("payload", {}) or {}
+                try:
+                    source_chapter = int(payload.get("chapter_number"))
+                except (TypeError, ValueError):
+                    continue
+                if source_chapter >= chapter_number:
+                    continue
+                if source_chapter >= chapter_number - self.RECENT_VECTOR_EXCLUSION_CHAPTERS:
+                    continue
+                sync_status = str(payload.get("sync_status", "") or "").lower()
+                if sync_status != "committed":
+                    continue
+                if not self._vector_payload_matches_current_chapter(
+                    novel_id,
+                    source_chapter,
+                    payload,
+                ):
+                    continue
+                text = str(payload.get("text", "") or "").strip()
+                text_key = text.casefold()
+                if not text or text_key in seen_text:
+                    continue
+                seen_text.add(text_key)
+                filtered.append(hit)
+                if len(filtered) == 3:
+                    break
             
             if not filtered:
                 return ""
@@ -2136,6 +2229,205 @@ class ContextBudgetAllocator:
             logger.warning(f"向量召回失败: {e}")
         
         return ""
+
+    def _build_vector_recall_query(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        outline: str,
+    ) -> str:
+        parts = [str(outline or "").strip()]
+        if self.bible_repo is not None:
+            try:
+                bible = self.bible_repo.get_by_novel_id(NovelId(novel_id))
+                character_names = [
+                    str(getattr(character, "name", "") or "").strip()
+                    for character in list(getattr(bible, "characters", None) or [])[:5]
+                ]
+                location_names = [
+                    str(getattr(location, "name", "") or "").strip()
+                    for location in list(getattr(bible, "locations", None) or [])[:5]
+                ]
+                if character_names:
+                    parts.append("主要人物：" + "、".join(name for name in character_names if name))
+                if location_names:
+                    parts.append("地点：" + "、".join(name for name in location_names if name))
+            except Exception as exc:
+                logger.debug("构建向量人物地点查询失败 novel=%s: %s", novel_id, exc)
+        unresolved = self._get_pending_foreshadowings(novel_id, chapter_number)
+        if unresolved:
+            parts.append("未解线索：" + str(unresolved).strip()[:600])
+        return "\n".join(part for part in parts if part)
+
+    def _vector_payload_matches_current_chapter(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        payload: Dict[str, Any],
+    ) -> bool:
+        if self.chapter_repo is None:
+            return False
+        try:
+            chapter = self.chapter_repo.get_by_novel_and_number(
+                NovelId(novel_id),
+                chapter_number,
+            )
+        except Exception:
+            return False
+        if chapter is None:
+            return False
+        content_sha256 = str(getattr(chapter, "content_sha256", "") or "")
+        if not content_sha256:
+            content_sha256 = hashlib.sha256(
+                str(getattr(chapter, "content", "") or "").encode("utf-8")
+            ).hexdigest()
+        payload_hash = str(payload.get("content_sha256", "") or "")
+        if not payload_hash or payload_hash != content_sha256:
+            return False
+        payload_revision = payload.get("content_revision")
+        if payload_revision is None:
+            return False
+        try:
+            if int(payload_revision) != int(
+                getattr(chapter, "content_revision", 0) or 0
+            ):
+                return False
+        except (TypeError, ValueError):
+            return False
+        pipeline_version = str(payload.get("pipeline_version", "") or "")
+        from application.world.services.chapter_narrative_sync import (
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        )
+
+        if pipeline_version != CHAPTER_NARRATIVE_PIPELINE_VERSION:
+            return False
+        return True
+
+    @staticmethod
+    def _is_node_type(node: Any, node_type: NodeType) -> bool:
+        value = getattr(node, "node_type", None)
+        value = value.value if hasattr(value, "value") else value
+        return value == node_type.value
+
+    @staticmethod
+    def _node_order(node: Any) -> int:
+        return int(
+            getattr(node, "order_index", 0)
+            or getattr(node, "number", 0)
+            or 0
+        )
+
+    def _resolve_act_for_chapter(self, nodes: List[Any], chapter_number: int) -> Optional[Any]:
+        acts_by_id = {
+            node.id: node
+            for node in nodes
+            if self._is_node_type(node, NodeType.ACT)
+        }
+        for node in nodes:
+            if not self._is_node_type(node, NodeType.CHAPTER):
+                continue
+            if int(getattr(node, "number", 0) or 0) != int(chapter_number):
+                continue
+            parent_id = getattr(node, "parent_id", None)
+            if parent_id in acts_by_id:
+                return acts_by_id[parent_id]
+        range_matches = [
+            act
+            for act in acts_by_id.values()
+            if getattr(act, "chapter_start", None) is not None
+            and getattr(act, "chapter_end", None) is not None
+            and int(act.chapter_start) <= int(chapter_number) <= int(act.chapter_end)
+        ]
+        if not range_matches:
+            return None
+        return min(
+            range_matches,
+            key=lambda act: (
+                int(act.chapter_end) - int(act.chapter_start),
+                self._node_order(act),
+            ),
+        )
+
+    def _get_valid_node_summary(self, novel_id: str, node: Any) -> str:
+        metadata = getattr(node, "metadata", None) or {}
+        summary = str(metadata.get("summary", "") or "").strip()
+        state = metadata.get("summary_state") or {}
+        if not summary or state.get("status") != "committed":
+            return ""
+        source_version = str(state.get("source_version", "") or "")
+        chapter_start = state.get("chapter_start")
+        chapter_end = state.get("chapter_end")
+        if not source_version or chapter_start is None or chapter_end is None:
+            return ""
+        current_version = self._chapter_source_version(
+            novel_id,
+            int(chapter_start),
+            int(chapter_end),
+        )
+        return summary if current_version == source_version else ""
+
+    def _get_latest_valid_checkpoint_summary(
+        self,
+        novel_id: str,
+        nodes: List[Any],
+        chapter_number: int,
+    ) -> str:
+        checkpoints = []
+        for node in nodes:
+            if not self._is_node_type(node, NodeType.CHAPTER):
+                continue
+            if int(getattr(node, "number", 0) or 0) >= int(chapter_number):
+                continue
+            metadata = getattr(node, "metadata", None) or {}
+            state = metadata.get("checkpoint_summary_state") or {}
+            summary = str(metadata.get("checkpoint_summary", "") or "").strip()
+            if not summary or state.get("status") != "committed":
+                continue
+            source_version = str(state.get("source_version", "") or "")
+            chapter_start = state.get("chapter_start")
+            chapter_end = state.get("chapter_end")
+            if not source_version or chapter_start is None or chapter_end is None:
+                continue
+            if self._chapter_source_version(
+                novel_id,
+                int(chapter_start),
+                int(chapter_end),
+            ) != source_version:
+                continue
+            checkpoints.append(node)
+        if not checkpoints:
+            return ""
+        latest = max(checkpoints, key=lambda item: int(getattr(item, "number", 0) or 0))
+        return str(latest.metadata["checkpoint_summary"] or "").strip()
+
+    def _chapter_source_version(
+        self,
+        novel_id: str,
+        chapter_start: int,
+        chapter_end: int,
+    ) -> str:
+        if self.chapter_repo is None:
+            return ""
+        try:
+            chapters = self.chapter_repo.list_by_novel(NovelId(novel_id))
+        except Exception:
+            return ""
+        rows = []
+        for chapter in sorted(chapters or [], key=lambda item: int(getattr(item, "number", 0) or 0)):
+            number = int(getattr(chapter, "number", 0) or 0)
+            if number < chapter_start or number > chapter_end:
+                continue
+            content_sha256 = str(getattr(chapter, "content_sha256", "") or "")
+            if not content_sha256:
+                content_sha256 = hashlib.sha256(
+                    str(getattr(chapter, "content", "") or "").encode("utf-8")
+                ).hexdigest()
+            rows.append(
+                f"{number}:{content_sha256}:{int(getattr(chapter, 'content_revision', 0) or 0)}"
+            )
+        if not rows:
+            return ""
+        return hashlib.sha256("|".join(rows).encode("utf-8")).hexdigest()
     
     def _get_diagnosis_breakpoints(
         self,

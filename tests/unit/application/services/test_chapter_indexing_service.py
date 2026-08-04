@@ -102,6 +102,7 @@ class TestChapterIndexingService:
             "content_sha256": "a" * 64,
             "content_revision": 3,
             "pipeline_version": "chapter-narrative-sync:v1",
+            "sync_status": "committed",
         }
 
     @pytest.mark.asyncio

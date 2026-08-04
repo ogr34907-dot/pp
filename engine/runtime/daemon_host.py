@@ -2320,8 +2320,12 @@ class DaemonHostMixin:
                 # 找到最近完成的幕
                 for act in reversed(act_nodes):
                     if act.chapter_end and act.chapter_end <= completed_count:
-                        # 检查是否已生成摘要
-                        has_summary = act.metadata.get("summary") if act.metadata else None
+                        is_current = getattr(
+                            self.volume_summary_service,
+                            "is_node_summary_current",
+                            None,
+                        )
+                        has_summary = bool(is_current(act)) if callable(is_current) else False
                         if not has_summary:
                             logger.info(f"[{novel_id}] 生成幕摘要: {act.title}")
                             result = await self.volume_summary_service.generate_act_summary(novel_id, act.id)
@@ -2337,7 +2341,12 @@ class DaemonHostMixin:
             
             for vol in volume_nodes:
                 if vol.chapter_end and vol.chapter_end <= completed_count:
-                    has_summary = vol.metadata.get("summary") if vol.metadata else None
+                    is_current = getattr(
+                        self.volume_summary_service,
+                        "is_node_summary_current",
+                        None,
+                    )
+                    has_summary = bool(is_current(vol)) if callable(is_current) else False
                     if not has_summary:
                         logger.info(f"[{novel_id}] 生成卷摘要: {vol.title}")
                         result = await self.volume_summary_service.generate_volume_summary(novel_id, vol.number)

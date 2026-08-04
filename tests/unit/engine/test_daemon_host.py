@@ -6,6 +6,7 @@ import pytest
 
 from application.engine.services.autopilot_daemon import AutopilotDaemon
 from domain.novel.entities.chapter import ChapterStatus
+from domain.structure.story_node import NodeType, StoryNode
 from engine.runtime.daemon_host import DaemonHostMixin
 from engine.runtime.runner import StoryPipelineRunner
 
@@ -83,4 +84,46 @@ async def test_audit_number_cannot_force_draft_chapter_completed_without_canonic
     assert result is node
     assert chapter.status == ChapterStatus.DRAFT
     host._save_chapter_ephemeral.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_summary_trigger_rebuilds_completed_act_with_stale_summary():
+    host = DaemonHostMixin.__new__(DaemonHostMixin)
+    act = StoryNode(
+        id="act-1",
+        novel_id="novel-1",
+        node_type=NodeType.ACT,
+        number=1,
+        title="第一幕",
+        order_index=1,
+        chapter_start=1,
+        chapter_end=1,
+        metadata={
+            "summary": "过期幕摘要",
+            "summary_state": {"status": "stale"},
+        },
+    )
+
+    class SummaryService:
+        def __init__(self):
+            self.generated_act_ids = []
+
+        async def should_generate_checkpoint(self, _novel_id, _chapter_number):
+            return False
+
+        def is_node_summary_current(self, node):
+            return node.metadata.get("summary_state", {}).get("status") == "committed"
+
+        async def generate_act_summary(self, _novel_id, act_id):
+            self.generated_act_ids.append(act_id)
+            return SimpleNamespace(success=True, error=None)
+
+    summary_service = SummaryService()
+    host.volume_summary_service = summary_service
+    host.story_node_repo = SimpleNamespace(get_by_novel=AsyncMock(return_value=[act]))
+    novel = SimpleNamespace(novel_id=SimpleNamespace(value="novel-1"))
+
+    await host._maybe_generate_summaries(novel, completed_count=1)
+
+    assert summary_service.generated_act_ids == ["act-1"]
 

@@ -9,6 +9,8 @@ import logging
 import re
 import sys
 import copy
+import hashlib
+import inspect
 from typing import Dict, List, Optional
 from datetime import datetime
 from json_repair import repair_json
@@ -2644,14 +2646,209 @@ class ContinuousPlanningService:
         return getattr(novel, "generation_prefs", None) if novel is not None else None
 
     async def _get_previous_acts_summary(self, act_node: StoryNode) -> Optional[str]:
-        """获取前面幕的摘要"""
-        return None
+        """Return earlier committed structural and checkpoint summaries."""
+        nodes = await self._get_story_nodes(act_node.novel_id)
+        current_order = int(getattr(act_node, "order_index", 0) or 0)
+        if current_order <= 0:
+            current_order = int(getattr(act_node, "number", 0) or 0)
+
+        previous_acts = sorted(
+            (
+                node
+                for node in nodes
+                if self._is_story_node_type(node, NodeType.ACT)
+                and node.id != act_node.id
+                and self._node_precedes_act(node, act_node, current_order)
+            ),
+            key=self._story_node_order,
+        )
+        previous_volumes = sorted(
+            (
+                node
+                for node in nodes
+                if self._is_story_node_type(node, NodeType.VOLUME)
+                and self._node_precedes_act(node, act_node, current_order)
+            ),
+            key=self._story_node_order,
+        )
+        parts = []
+        for previous_act in previous_acts[-3:]:
+            summary = self._get_current_node_summary(previous_act)
+            fallback = str(getattr(previous_act, "description", "") or "").strip()
+            content = summary or fallback
+            if content:
+                parts.append(f"【{previous_act.title}】\n{content}")
+
+        for previous_volume in previous_volumes[-3:]:
+            summary = self._get_current_node_summary(previous_volume)
+            fallback = str(getattr(previous_volume, "description", "") or "").strip()
+            content = summary or fallback
+            if content:
+                parts.append(f"【{previous_volume.title}】\n{content}")
+
+        checkpoint_summary = self._get_latest_checkpoint_summary(
+            act_node,
+            nodes,
+            current_order,
+        )
+        if checkpoint_summary:
+            parts.append(f"【最近有效检查点】\n{checkpoint_summary}")
+        return "\n\n".join(parts) or None
 
     async def _find_act_for_chapter(self, novel_id: str, chapter_number: int) -> Optional[StoryNode]:
-        """查找章节所属的幕"""
-        tree = self.story_node_repo.get_tree(novel_id)
-        acts = [n for n in tree.nodes if n.node_type == NodeType.ACT]
-        return max(acts, key=lambda x: x.number) if acts else None
+        """Resolve a chapter's act through its parent before using planned ranges."""
+        nodes = await self._get_story_nodes(novel_id)
+        acts_by_id = {
+            node.id: node
+            for node in nodes
+            if self._is_story_node_type(node, NodeType.ACT)
+        }
+        chapters = [
+            node
+            for node in nodes
+            if self._is_story_node_type(node, NodeType.CHAPTER)
+            and int(getattr(node, "number", 0) or 0) == int(chapter_number)
+        ]
+        for chapter in chapters:
+            parent_id = getattr(chapter, "parent_id", None)
+            if parent_id and parent_id in acts_by_id:
+                return acts_by_id[parent_id]
+
+        range_matches = [
+            act
+            for act in acts_by_id.values()
+            if getattr(act, "chapter_start", None) is not None
+            and getattr(act, "chapter_end", None) is not None
+            and int(act.chapter_start) <= int(chapter_number) <= int(act.chapter_end)
+        ]
+        if not range_matches:
+            return None
+        return min(
+            range_matches,
+            key=lambda act: (
+                int(act.chapter_end) - int(act.chapter_start),
+                self._story_node_order(act),
+            ),
+        )
+
+    async def _get_story_nodes(self, novel_id: str) -> List[StoryNode]:
+        getter = getattr(self.story_node_repo, "get_by_novel", None)
+        if getter is None:
+            return []
+        nodes = getter(novel_id)
+        if inspect.isawaitable(nodes):
+            nodes = await nodes
+        return list(nodes or [])
+
+    @staticmethod
+    def _is_story_node_type(node: StoryNode, node_type: NodeType) -> bool:
+        value = getattr(node, "node_type", None)
+        value = value.value if hasattr(value, "value") else value
+        return value == node_type.value
+
+    @staticmethod
+    def _story_node_order(node: StoryNode) -> int:
+        return int(
+            getattr(node, "order_index", 0)
+            or getattr(node, "number", 0)
+            or 0
+        )
+
+    def _node_precedes_act(
+        self,
+        node: StoryNode,
+        act_node: StoryNode,
+        current_order: int,
+    ) -> bool:
+        current_chapter_start = getattr(act_node, "chapter_start", None)
+        chapter_end = getattr(node, "chapter_end", None)
+        if current_chapter_start is not None and chapter_end is not None:
+            return int(chapter_end) < int(current_chapter_start)
+        return self._story_node_order(node) < current_order
+
+    def _get_current_node_summary(self, node: StoryNode) -> str:
+        return self._get_current_summary(node, "summary", "summary_state")
+
+    def _get_latest_checkpoint_summary(
+        self,
+        act_node: StoryNode,
+        nodes: List[StoryNode],
+        current_order: int,
+    ) -> str:
+        current_chapter_start = getattr(act_node, "chapter_start", None)
+        checkpoints = []
+        for node in nodes:
+            if not self._is_story_node_type(node, NodeType.CHAPTER):
+                continue
+            if current_chapter_start is not None:
+                if int(getattr(node, "number", 0) or 0) >= int(current_chapter_start):
+                    continue
+            elif self._story_node_order(node) >= current_order:
+                continue
+            summary = self._get_current_summary(
+                node,
+                "checkpoint_summary",
+                "checkpoint_summary_state",
+            )
+            if summary:
+                checkpoints.append((node, summary))
+        if not checkpoints:
+            return ""
+        return max(
+            checkpoints,
+            key=lambda item: int(getattr(item[0], "number", 0) or 0),
+        )[1]
+
+    def _get_current_summary(
+        self,
+        node: StoryNode,
+        summary_key: str,
+        state_key: str,
+    ) -> str:
+        metadata = getattr(node, "metadata", None) or {}
+        summary = str(metadata.get(summary_key) or "").strip()
+        state = metadata.get(state_key) or {}
+        if not summary or state.get("status") != "committed":
+            return ""
+        source_version = str(state.get("source_version") or "")
+        chapter_start = state.get("chapter_start")
+        chapter_end = state.get("chapter_end")
+        if not source_version or chapter_start is None or chapter_end is None:
+            return ""
+        current_version = self._chapter_source_version(
+            node.novel_id,
+            int(chapter_start),
+            int(chapter_end),
+        )
+        return summary if current_version == source_version else ""
+
+    def _chapter_source_version(
+        self,
+        novel_id: str,
+        chapter_start: int,
+        chapter_end: int,
+    ) -> str:
+        if self.chapter_repository is None:
+            return ""
+        try:
+            chapters = self.chapter_repository.list_by_novel(NovelId(novel_id))
+        except Exception:
+            return ""
+        source_rows = []
+        for chapter in sorted(chapters or [], key=lambda item: int(getattr(item, "number", 0) or 0)):
+            number = int(getattr(chapter, "number", 0) or 0)
+            if number < chapter_start or number > chapter_end:
+                continue
+            content = str(getattr(chapter, "content", "") or "")
+            content_sha256 = str(getattr(chapter, "content_sha256", "") or "")
+            if not content_sha256:
+                content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            source_rows.append(
+                f"{number}:{content_sha256}:{int(getattr(chapter, 'content_revision', 0) or 0)}"
+            )
+        if not source_rows:
+            return ""
+        return hashlib.sha256("|".join(source_rows).encode("utf-8")).hexdigest()
 
     async def _count_written_chapters_in_act(self, act_id: str) -> int:
         """统计已写章节数"""
@@ -2750,22 +2947,22 @@ class ContinuousPlanningService:
             
             # 轨道一：获取卷摘要
             if current_volume:
-                vol_summary = current_volume.metadata.get("summary", "") if current_volume.metadata else ""
+                vol_summary = self._get_current_node_summary(current_volume)
                 if vol_summary:
                     context["current_volume_summary"] = f"【当前卷进度】{current_volume.title}\n{vol_summary}"
             
             # 获取前一卷的摘要
             volume_nodes = sorted(
-                [n for n in all_nodes if n.node_type.value == "volume"],
+                [n for n in all_nodes if self._is_story_node_type(n, NodeType.VOLUME)],
                 key=lambda x: x.number
             )
             if current_volume:
                 prev_volumes = [v for v in volume_nodes if v.number < (current_volume.number or 0)]
-                if prev_volumes:
-                    prev_vol = prev_volumes[-1]
-                    prev_summary = prev_vol.metadata.get("summary", "") if prev_vol.metadata else ""
+                for prev_vol in reversed(prev_volumes):
+                    prev_summary = self._get_current_node_summary(prev_vol)
                     if prev_summary:
                         context["volume_summary"] = f"【前一卷回顾】{prev_vol.title}\n{prev_summary}"
+                        break
             
             # 轨道二：获取待回收伏笔
             if hasattr(self, 'chapter_repository') and self.chapter_repository:
