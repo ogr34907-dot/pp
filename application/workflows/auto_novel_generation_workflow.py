@@ -3,6 +3,7 @@
 整合所有子项目组件，实现完整的章节生成流程。
 """
 import asyncio
+import json
 import logging
 import re
 from typing import Tuple, Dict, Any, AsyncIterator, Optional, List, Callable, Awaitable
@@ -1025,6 +1026,9 @@ class AutoNovelGenerationWorkflow:
         storyline_context: str = "",
         plot_tension: str = "",
         style_summary: str = "",
+        genre_opening_profile: Optional[Dict[str, Any]] = None,
+        genre_reader_contract: Optional[Dict[str, Any]] = None,
+        genre_rhythm_constraints: Optional[Dict[str, Any]] = None,
         beat_prompt: Optional[str] = None,
         beat_index: Optional[int] = None,
         total_beats: Optional[int] = None,
@@ -1039,6 +1043,9 @@ class AutoNovelGenerationWorkflow:
             storyline_context=storyline_context,
             plot_tension=plot_tension,
             style_summary=style_summary,
+            genre_opening_profile=genre_opening_profile,
+            genre_reader_contract=genre_reader_contract,
+            genre_rhythm_constraints=genre_rhythm_constraints,
             beat_prompt=beat_prompt,
             beat_index=beat_index,
             total_beats=total_beats,
@@ -1055,6 +1062,9 @@ class AutoNovelGenerationWorkflow:
         storyline_context: str = "",
         plot_tension: str = "",
         style_summary: str = "",
+        genre_opening_profile: Optional[Dict[str, Any]] = None,
+        genre_reader_contract: Optional[Dict[str, Any]] = None,
+        genre_rhythm_constraints: Optional[Dict[str, Any]] = None,
         beat_prompt: Optional[str] = None,
         beat_index: Optional[int] = None,
         total_beats: Optional[int] = None,
@@ -1072,6 +1082,9 @@ class AutoNovelGenerationWorkflow:
             storyline_context: 当前章相关故事线与里程碑（Phase 1）
             plot_tension: 情节弧期望张力与下一锚点（Phase 1）
             style_summary: 风格指纹摘要（Phase 2.5）
+            genre_opening_profile: 类型开篇画像（可选）
+            genre_reader_contract: 读者留存契约（可选）
+            genre_rhythm_constraints: 类型节奏约束（可选）
             beat_prompt: 非空时进入「分节拍」模式（托管断点续写）
             beat_index / total_beats: 节拍序号（0-based / 总数）
             beat_target_words: 本段目标字数（分节拍时覆盖整章说明）
@@ -1086,6 +1099,18 @@ class AutoNovelGenerationWorkflow:
         pt = (plot_tension or "").strip()
         ss = (style_summary or "").strip()
         va = (voice_anchors or "").strip()
+        genre_profile_payload = {
+            "genre_opening_profile": genre_opening_profile or {},
+            "genre_reader_contract": genre_reader_contract or {},
+            "genre_rhythm_constraints": genre_rhythm_constraints or {},
+        }
+        genre_profile_block = ""
+        if any(genre_profile_payload.values()):
+            genre_profile_block = (
+                "【类型开篇画像 / 读者契约 / 节奏约束】\n"
+                + json.dumps(genre_profile_payload, ensure_ascii=False, indent=2)
+                + "\n\n"
+            )
         beat_mode = bool((beat_prompt or "").strip())
         planning_parts: list[str] = []
         if sc and sc not in ("Storyline context unavailable",):
@@ -1217,6 +1242,7 @@ class AutoNovelGenerationWorkflow:
             "theme_rules": theme_rules,
             "planning_section": planning_section,
             "voice_block": voice_block,
+            "genre_profile_block": genre_profile_block,
             "context": context,
             "fact_lock": fact_lock,
             "shuangwen_directive": shuangwen_directive,
@@ -1226,6 +1252,9 @@ class AutoNovelGenerationWorkflow:
             "format_rules": format_rules,
         }
         system_message = _safe_format(system_template, system_vars)
+
+        if genre_profile_block and "类型开篇画像" not in system_message:
+            system_message = system_message.rstrip() + "\n\n" + genre_profile_block.rstrip()
 
         # 旧版 CPMS 模板可能未含 {prose_discipline} 占位符：仍注入反八股块，避免升级后长期不生效
         if "行文戒律（反八股 / 控水分）" not in system_message:
