@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from engine.pipeline.base import BaseStoryPipeline
 from engine.pipeline.context import PipelineContext
+from engine.pipeline.steps import StepResult
 from engine.pipeline.prose_composer import ChapterProseInvocationComposer, ProseCompositionRequest, ProseCompositionResult
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
 from application.engine.services.context_budget_models import FactLockUnavailableError
+from domain.novel.entities.chapter import ChapterStatus
+from domain.novel.value_objects.novel_id import NovelId
 
 
 class _Pipeline(BaseStoryPipeline):
@@ -458,9 +463,19 @@ async def test_story_pipeline_save_falls_back_when_queue_write_not_visible(monke
     async def _save_via_repo(_ctx):
         saved.append((_ctx.novel_id, _ctx.chapter_number, _ctx.chapter_content))
 
+    monkeypatch.setattr(
+        pipeline,
+        "_prepare_chapter_persistence_receipt",
+        lambda _ctx: None,
+    )
     monkeypatch.setattr(pipeline, "_push_persistence_command", lambda _ctx: True)
     monkeypatch.setattr(pipeline, "_wait_for_chapter_persistence", lambda _ctx: None)
-    monkeypatch.setattr(pipeline, "_chapter_completed_in_repository", lambda _ctx: False)
+    receipts = iter([False, True])
+    monkeypatch.setattr(
+        pipeline,
+        "_chapter_completed_in_repository",
+        lambda _ctx: next(receipts),
+    )
     monkeypatch.setattr(pipeline, "_save_chapter_via_repository", _save_via_repo)
 
     result = await pipeline._step_save_chapter(ctx)
@@ -469,6 +484,133 @@ async def test_story_pipeline_save_falls_back_when_queue_write_not_visible(monke
     assert saved == [("novel-save", 1, "正文")]
     assert ctx.chapter_saved is True
     assert ctx.save_method == "queue"
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_queue_idle_without_durable_receipt_is_not_saved(monkeypatch):
+    pipeline = _Pipeline()
+    ctx = PipelineContext(
+        novel_id="novel-save",
+        chapter_number=1,
+        chapter_content="正文",
+        word_count=2,
+    )
+    ctx.chapter_repository = object()
+
+    monkeypatch.setattr(
+        pipeline,
+        "_prepare_chapter_persistence_receipt",
+        lambda _ctx: None,
+    )
+    monkeypatch.setattr(pipeline, "_push_persistence_command", lambda _ctx: True)
+    monkeypatch.setattr(pipeline, "_wait_for_chapter_persistence", lambda _ctx: None)
+    monkeypatch.setattr(pipeline, "_chapter_completed_in_repository", lambda _ctx: False)
+    monkeypatch.setattr(
+        pipeline,
+        "_save_chapter_via_repository",
+        AsyncMock(return_value=None),
+    )
+
+    result = await pipeline._step_save_chapter(ctx)
+
+    assert not result.passed
+    assert "matching_chapter_receipt_unavailable" in result.message
+    assert ctx.chapter_saved is False
+
+
+def test_story_pipeline_accepts_only_matching_durable_chapter_receipt():
+    content = "正文"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    ctx = PipelineContext(
+        novel_id="novel-save",
+        chapter_number=1,
+        chapter_content=content,
+    )
+    persisted = SimpleNamespace(
+        novel_id=NovelId("other-novel"),
+        number=1,
+        status=ChapterStatus.COMPLETED,
+        content=content,
+        content_sha256=content_sha256,
+        content_revision=1,
+    )
+    ctx.chapter_repository = SimpleNamespace(
+        get_by_novel_and_number=lambda *_args: persisted
+    )
+    ctx.metadata["chapter_persistence_receipt"] = {
+        "novel_id": "novel-save",
+        "chapter_number": 1,
+        "content_sha256": content_sha256,
+        "content_revision": 2,
+    }
+    pipeline = _Pipeline()
+
+    assert pipeline._chapter_completed_in_repository(ctx) is False
+
+    persisted.novel_id = NovelId("novel-save")
+    persisted.content_revision = 3
+    assert pipeline._chapter_completed_in_repository(ctx) is False
+
+    persisted.content_revision = 2
+    assert pipeline._chapter_completed_in_repository(ctx) is True
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_post_commit_fails_closed_without_canonical_readiness():
+    class _Aftermath:
+        async def run_after_chapter_saved(self, *args, **kwargs):
+            return {}
+
+    pipeline = _Pipeline()
+    ctx = PipelineContext(
+        novel_id="novel-canonical-failure",
+        chapter_number=1,
+        chapter_content="正文",
+        word_count=2,
+    )
+    ctx.chapter_repository = object()
+    ctx.aftermath_pipeline = _Aftermath()
+
+    result = await pipeline._step_run_post_commit(ctx)
+
+    assert not result.passed
+    assert result.message == "canonical_aftermath_not_ready"
+    assert ctx.narrative_sync_ok is False
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_does_not_finalize_after_canonical_failure(monkeypatch):
+    pipeline = _Pipeline()
+    ok_steps = (
+        "_step_find_next_chapter",
+        "_step_prepare_governance",
+        "_step_prepare_chapter_plan",
+        "_step_build_context",
+        "_step_generate",
+        "_step_validate_content",
+        "_step_save_chapter",
+        "_step_validate_voice",
+        "_step_score_tension",
+    )
+    for step_name in ok_steps:
+        monkeypatch.setattr(
+            pipeline,
+            step_name,
+            AsyncMock(return_value=StepResult.ok()),
+        )
+    monkeypatch.setattr(
+        pipeline,
+        "_step_run_post_commit",
+        AsyncMock(return_value=StepResult.fail("canonical_aftermath_not_ready")),
+    )
+    finalize = AsyncMock(return_value=StepResult.ok())
+    monkeypatch.setattr(pipeline, "_step_finalize", finalize)
+
+    result = await pipeline.run_chapter(PipelineContext(novel_id="novel-1"))
+
+    assert result.success is False
+    assert result.error == "canonical_aftermath_not_ready"
+    finalize.assert_not_awaited()
 
 
 @pytest.mark.asyncio

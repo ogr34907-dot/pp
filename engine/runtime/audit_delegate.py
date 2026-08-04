@@ -14,6 +14,29 @@ from domain.novel.value_objects.generation_preferences import GenerationPreferen
 logger = logging.getLogger(__name__)
 
 
+def _audit_pause_gate(
+    *,
+    canonical_ready: bool,
+    auto: bool,
+    prefs: GenerationPreferences,
+    hard_fail: bool,
+    anti_ai_severe: bool,
+) -> bool:
+    if not canonical_ready:
+        return True
+    return (not auto) and (
+        bool(getattr(prefs, "pause_after_each_chapter_audit", False))
+        or (
+            bool(getattr(prefs, "audit_pause_on_hard_fail", False))
+            and hard_fail
+        )
+        or (
+            bool(getattr(prefs, "audit_pause_on_anti_ai_severe", False))
+            and anti_ai_severe
+        )
+    )
+
+
 def _read_shared_state(novel_id: str) -> dict[str, Any]:
     from application.ai_invocation.autopilot.shared_state import read_autopilot_shared_state
 
@@ -499,6 +522,13 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
     if tension_evaluated:
         logger.info(f"[{novel.novel_id}] 章节 {chapter_num} 张力值：{tension}/100（共享内存 + 章节表已对齐）")
 
+    canonical_ready = host._is_chapter_narrative_ready(
+        novel.novel_id.value,
+        chapter_num,
+    )
+    drift_result = dict(drift_result or {})
+    drift_result["narrative_sync_ok"] = canonical_ready
+
     # 章末审阅快照（写入 novels，供 /autopilot/status 与前台「章节状态 / 章节元素」）
     previous_same_chapter_drift = (
         novel.last_audit_chapter_number == chapter_num
@@ -507,7 +537,7 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
     novel.last_audit_chapter_number = chapter_num
     novel.last_audit_similarity = drift_result.get("similarity_score")
     novel.last_audit_drift_alert = bool(drift_result.get("drift_alert", False))
-    novel.last_audit_narrative_ok = bool(drift_result.get("narrative_sync_ok", True))
+    novel.last_audit_narrative_ok = canonical_ready
     novel.last_audit_vector_stored = bool(drift_result.get("vector_stored", False))
     novel.last_audit_foreshadow_stored = bool(drift_result.get("foreshadow_stored", False))
     novel.last_audit_triples_extracted = bool(drift_result.get("triples_extracted", False))
@@ -549,7 +579,7 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
     prefs = getattr(novel, "generation_prefs", None) or GenerationPreferences()
     auto = bool(getattr(novel, "auto_approve_mode", False))
 
-    hard_narrative = not bool(drift_result.get("narrative_sync_ok", True))
+    hard_narrative = not canonical_ready
     hard_voice = drift_too_high and similarity_below_threshold
     hard_tension = not bool(drift_result.get("tension_evaluated", False))
     hard_fail = hard_narrative or hard_voice or hard_tension
@@ -561,16 +591,12 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
         )
     anti_ai_severe = anti_assessment == "严重"
 
-    pause_gate = (not auto) and (
-        bool(getattr(prefs, "pause_after_each_chapter_audit", False))
-        or (
-            bool(getattr(prefs, "audit_pause_on_hard_fail", False))
-            and hard_fail
-        )
-        or (
-            bool(getattr(prefs, "audit_pause_on_anti_ai_severe", False))
-            and anti_ai_severe
-        )
+    pause_gate = _audit_pause_gate(
+        canonical_ready=canonical_ready,
+        auto=auto,
+        prefs=prefs,
+        hard_fail=hard_fail,
+        anti_ai_severe=anti_ai_severe,
     )
 
     novel.audit_progress = None  # 审计完成，清除进度标记
@@ -591,7 +617,7 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
             bool(getattr(prefs, "audit_pause_on_hard_fail", False)) and hard_fail,
             bool(getattr(prefs, "audit_pause_on_anti_ai_severe", False))
             and anti_ai_severe,
-            drift_result.get("narrative_sync_ok", True),
+            drift_result.get("narrative_sync_ok", False),
             hard_voice,
             drift_result.get("tension_evaluated", False),
             anti_assessment,

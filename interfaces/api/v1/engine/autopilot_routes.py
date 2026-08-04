@@ -251,6 +251,42 @@ def _persist_autopilot_resume_sync(
     return result
 
 
+def _canonical_resume_block_reason(
+    novel_id: str,
+    *,
+    db: Any = None,
+) -> Optional[str]:
+    from application.paths import get_db_path
+    from application.world.services.chapter_narrative_sync import (
+        CHAPTER_NARRATIVE_PIPELINE_VERSION,
+    )
+    from infrastructure.persistence.database.connection import get_database
+    from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+        SqliteChapterNarrativeCommitRepository,
+    )
+
+    database = db or get_database(get_db_path())
+    try:
+        row = database.fetch_one(
+            "SELECT MAX(number) AS chapter_number FROM chapters "
+            "WHERE novel_id = ? AND status = 'completed'",
+            (novel_id,),
+        )
+        chapter_number = (row or {}).get("chapter_number")
+        if chapter_number is None:
+            return None
+        ready = SqliteChapterNarrativeCommitRepository(
+            database
+        ).is_current_version_ready(
+            novel_id=novel_id,
+            chapter_number=int(chapter_number),
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        )
+        return None if ready else "canonical_aftermath_not_ready"
+    except Exception:
+        return "canonical_aftermath_not_ready"
+
+
 def _macro_structure_exists(novel_id: str) -> bool:
     """Macro planning is usable when it has at least a volume root for act planning."""
     try:
@@ -381,7 +417,7 @@ def _build_fallback_status(novel) -> Dict[str, Any]:
             "tension": last_tension,
             "drift_alert": bool(getattr(novel, "last_audit_drift_alert", False)),
             "similarity_score": getattr(novel, "last_audit_similarity", None),
-            "narrative_sync_ok": bool(getattr(novel, "last_audit_narrative_ok", True)),
+            "narrative_sync_ok": bool(getattr(novel, "last_audit_narrative_ok", False)),
             "at": getattr(novel, "last_audit_at", None),
             "vector_stored": bool(getattr(novel, "last_audit_vector_stored", False)),
             "foreshadow_stored": bool(getattr(novel, "last_audit_foreshadow_stored", False)),
@@ -561,7 +597,7 @@ def _build_autopilot_status_sync(novel_id: str) -> Optional[Dict[str, Any]]:
             "tension": last_tension,
             "drift_alert": bool((novel.get("last_audit_drift_alert") if isinstance(novel, dict) else getattr(novel, "last_audit_drift_alert", False))),
             "similarity_score": novel.get("last_audit_similarity") if isinstance(novel, dict) else getattr(novel, "last_audit_similarity", None),
-            "narrative_sync_ok": bool((novel.get("last_audit_narrative_ok") if isinstance(novel, dict) else getattr(novel, "last_audit_narrative_ok", True))),
+            "narrative_sync_ok": bool((novel.get("last_audit_narrative_ok") if isinstance(novel, dict) else getattr(novel, "last_audit_narrative_ok", False))),
             "at": novel.get("last_audit_at") if isinstance(novel, dict) else getattr(novel, "last_audit_at", None),
             "vector_stored": bool((novel.get("last_audit_vector_stored") if isinstance(novel, dict) else getattr(novel, "last_audit_vector_stored", False))),
             "foreshadow_stored": bool((novel.get("last_audit_foreshadow_stored") if isinstance(novel, dict) else getattr(novel, "last_audit_foreshadow_stored", False))),
@@ -700,7 +736,7 @@ def _build_status_pure_memory(novel_id: str, shared: Dict[str, Any]) -> Dict[str
             "tension": last_tension,
             "drift_alert": bool(shared.get("last_audit_drift_alert", False)),
             "similarity_score": shared.get("last_audit_similarity"),
-            "narrative_sync_ok": bool(shared.get("last_audit_narrative_ok", True)),
+            "narrative_sync_ok": bool(shared.get("last_audit_narrative_ok", False)),
             "at": shared.get("last_audit_at"),
             "vector_stored": bool(shared.get("last_audit_vector_stored", False)),
             "foreshadow_stored": bool(shared.get("last_audit_foreshadow_stored", False)),
@@ -898,7 +934,7 @@ def _build_status_with_shared(novel_id: str, shared: Dict[str, Any]) -> Dict[str
             "tension": last_tension,
             "drift_alert": bool(shared.get("last_audit_drift_alert", False)),
             "similarity_score": shared.get("last_audit_similarity"),
-            "narrative_sync_ok": bool(shared.get("last_audit_narrative_ok", True)),
+            "narrative_sync_ok": bool(shared.get("last_audit_narrative_ok", False)),
             "at": shared.get("last_audit_at"),
             "vector_stored": bool(shared.get("last_audit_vector_stored", False)),
             "foreshadow_stored": bool(shared.get("last_audit_foreshadow_stored", False)),
@@ -1744,6 +1780,20 @@ async def resume_from_review(novel_id: str):
 
         if not stage_needs_human_review(current_stage_str):
             raise HTTPException(400, f"当前不在审阅等待状态（当前：{current_stage_str}）")
+
+    try:
+        canonical_block_reason = await asyncio.wait_for(
+            loop.run_in_executor(
+                _SSE_THREAD_POOL,
+                _canonical_resume_block_reason,
+                novel_id,
+            ),
+            timeout=runtime_settings.db_read_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(503, "数据库繁忙，请稍后重试")
+    if canonical_block_reason:
+        raise HTTPException(409, canonical_block_reason)
 
     # 计算下一阶段
     if _has_chapter_nodes_under_current_act(novel_id, current_act):

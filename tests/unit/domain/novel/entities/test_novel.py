@@ -20,6 +20,17 @@ def test_novel_creation():
     assert novel.stage == NovelStage.PLANNING
 
 
+def test_novel_narrative_audit_defaults_fail_closed():
+    novel = Novel(
+        id=NovelId("novel-1"),
+        title="测试小说",
+        author="测试作者",
+        target_chapters=10,
+    )
+
+    assert novel.last_audit_narrative_ok is False
+
+
 def test_novel_add_chapter():
     """测试添加章节"""
     novel = Novel(

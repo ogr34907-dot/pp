@@ -1,9 +1,4 @@
-"""Observability baselines for the memory-stability rollout.
-
-The strict xfail below is intentional: it preserves the recovery contract that
-later memory work must satisfy without pretending the current implementation
-already recovers a failed vector write.
-"""
+"""Observability baselines for the memory-stability rollout."""
 from __future__ import annotations
 
 import json
@@ -17,16 +12,28 @@ import pytest
 from application.ai_invocation.dtos import InvocationPolicy, InvocationSessionStatus
 from application.analyst.services.chapter_indexing_service import ChapterIndexingService
 from application.engine.services.chapter_aftermath_pipeline import ChapterAftermathPipeline
+from application.world.services.chapter_narrative_sync import (
+    sync_chapter_narrative_after_save,
+)
+from application.world.services.knowledge_service import KnowledgeService
 from domain.ai.services.llm_service import GenerationResult
 from domain.ai.value_objects.prompt import Prompt
 from domain.ai.value_objects.token_usage import TokenUsage
 from domain.novel.entities.chapter import Chapter, ChapterStatus
+from domain.novel.value_objects.novel_id import NovelId
 from engine.pipeline.base import BaseStoryPipeline
 from engine.pipeline.context import PipelineContext
 from engine.pipeline.prose_composer import (
     ChapterProseInvocationComposer,
     ProseCompositionRequest,
     ProseCompositionResult,
+)
+from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.sqlite_chapter_repository import (
+    SqliteChapterRepository,
+)
+from infrastructure.persistence.database.sqlite_knowledge_repository import (
+    SqliteKnowledgeRepository,
 )
 
 
@@ -111,6 +118,7 @@ class _ControllableVectorStore:
 
     async def insert(self, collection, id, vector, payload):
         if payload["chapter_number"] in self.fail_chapters:
+            self.fail_chapters.remove(payload["chapter_number"])
             raise RuntimeError(f"injected vector failure for chapter {payload['chapter_number']}")
         with sqlite3.connect(self.database_path) as connection:
             connection.execute(
@@ -141,7 +149,8 @@ class _DeterministicLLM:
 
     async def generate(self, prompt: Prompt, config):
         body = prompt.user
-        if "[EXTRACTION_FAIL]" in body:
+        # Exhaust the canonical retry budget before the explicit recovery call.
+        if "[EXTRACTION_FAIL]" in body and self.extraction_failures < 3:
             self.extraction_failures += 1
             raise RuntimeError("injected extraction failure for chapter 17")
         markers = [
@@ -199,39 +208,37 @@ class _DeterministicComposer:
 
 
 class _ChapterRepository:
-    def __init__(self, connection):
-        self._connection = connection
+    def __init__(self, db):
+        self.db = db
+        self._connection = db.get_connection()
+        self._repository = SqliteChapterRepository(db)
         self.chapters: dict[int, Chapter] = {}
 
     def get_by_novel_and_number(self, novel_id, number):
         number = int(number)
         if number in self.chapters:
             return self.chapters[number]
-        row = self._connection.execute(
-            "SELECT content, status FROM chapter_snapshots WHERE chapter_number = ?", (number,)
-        ).fetchone()
-        if row is None:
+        chapter = self._repository.get_by_novel_and_number(novel_id, number)
+        if chapter is None:
             return None
-        chapter = Chapter(
-            id=f"memory-stability:{number}",
-            novel_id=NovelId("memory-stability"),
-            number=number,
-            title=f"第{number}章",
-            content=row[0],
-            status=ChapterStatus(row[1]),
-        )
         self.chapters[number] = chapter
         return chapter
 
     def save(self, chapter):
-        self.chapters[chapter.number] = chapter
+        self._repository.save(chapter)
+        self.db.commit()
+        persisted = self._repository.get_by_novel_and_number(
+            chapter.novel_id,
+            chapter.number,
+        )
+        self.chapters[chapter.number] = persisted
         self._connection.execute(
             """
             INSERT INTO chapter_snapshots (chapter_number, content, status)
             VALUES (?, ?, ?)
             ON CONFLICT(chapter_number) DO UPDATE SET content = excluded.content, status = excluded.status
             """,
-            (chapter.number, chapter.content, chapter.status.value),
+            (persisted.number, persisted.content, persisted.status.value),
         )
         self._connection.commit()
 
@@ -359,14 +366,15 @@ def _execution_plan(chapter_number: int) -> str:
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason="memory stability follow-up must replay the failed chapter-12 vector write after recovery",
-)
 async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_path: Path, monkeypatch):
     """Exercise persisted extraction evidence across restart, failure, and rewrite boundaries."""
     database_path = tmp_path / "memory-stability-regression.sqlite"
-    connection = sqlite3.connect(database_path)
+    database = DatabaseConnection(str(database_path))
+    connection = database.get_connection()
+    database.execute(
+        "INSERT INTO novels (id, title, slug) "
+        "VALUES ('memory-stability', 'Memory Stability', 'memory-stability')"
+    )
     connection.execute(
         "CREATE TABLE chapter_snapshots (chapter_number INTEGER PRIMARY KEY, content TEXT NOT NULL, status TEXT NOT NULL)"
     )
@@ -383,19 +391,21 @@ async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_pa
     )
     connection.commit()
 
-    def _build_runtime(active_connection):
+    def _build_runtime(active_database, active_connection, active_chapter_repository):
         vector_store = _ControllableVectorStore(database_path, fail_chapters={12})
         llm = _DeterministicLLM()
+        knowledge = KnowledgeService(SqliteKnowledgeRepository(active_database))
         aftermath = ChapterAftermathPipeline(
-            knowledge_service=_SqliteKnowledgeService(active_connection),
+            knowledge_service=knowledge,
             chapter_indexing_service=ChapterIndexingService(vector_store, _DeterministicEmbeddingService()),
             llm_service=llm,
             triple_repository=_SqliteTripleRepository(active_connection),
             foreshadowing_repository=_SqliteForeshadowingRepository(active_connection),
             causal_edge_repository=_SqliteCausalEdgeRepository(active_connection),
             character_state_repository=_SqliteCharacterStateRepository(active_connection),
+            chapter_repository=active_chapter_repository,
         )
-        return vector_store, llm, aftermath
+        return vector_store, llm, aftermath, knowledge
 
     async def _observed_bridge(self, novel_id, chapter_number, content):
         connection.execute("INSERT INTO aftermath_calls (stage, chapter_number) VALUES ('bridge', ?)", (chapter_number,))
@@ -408,19 +418,28 @@ async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_pa
     monkeypatch.setattr(ChapterAftermathPipeline, "_extract_chapter_bridge", _observed_bridge)
     monkeypatch.setattr(ChapterAftermathPipeline, "_run_auxiliary_stages", _observed_auxiliary)
 
-    vector_store, llm, aftermath = _build_runtime(connection)
-    chapter_repository = _ChapterRepository(connection)
+    chapter_repository = _ChapterRepository(database)
+    vector_store, llm, aftermath, knowledge = _build_runtime(
+        database,
+        connection,
+        chapter_repository,
+    )
     story_node_repository = _CurrentStoryNodeRepository()
     novel_repository = _NovelRepository()
     pipeline = BaseStoryPipeline()
     for chapter_number in range(1, 31):
         if chapter_number == 10:
-            connection.close()
-            connection = sqlite3.connect(database_path)
-            chapter_repository = _ChapterRepository(connection)
+            database.close()
+            database = DatabaseConnection(str(database_path))
+            connection = database.get_connection()
+            chapter_repository = _ChapterRepository(database)
             story_node_repository = _CurrentStoryNodeRepository()
             novel_repository = _NovelRepository()
-            vector_store, llm, aftermath = _build_runtime(connection)
+            vector_store, llm, aftermath, knowledge = _build_runtime(
+                database,
+                connection,
+                chapter_repository,
+            )
             pipeline = BaseStoryPipeline()
         story_node_repository.node = SimpleNamespace(
             node_type=SimpleNamespace(value="chapter"),
@@ -441,10 +460,33 @@ async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_pa
             aftermath_pipeline=aftermath,
         )
         result = await pipeline.run_chapter(context)
-        assert result.success
+        if chapter_number == 17:
+            assert result.success is False
+            recovered_content = f"{context.chapter_content}\n人工修复后的补充。"
+            chapter = chapter_repository.chapters[chapter_number]
+            chapter.update_content(recovered_content)
+            chapter_repository.save(chapter)
+            recovered = await sync_chapter_narrative_after_save(
+                "memory-stability",
+                chapter_number,
+                recovered_content,
+                knowledge,
+                aftermath._indexing,
+                llm,
+                triple_repository=aftermath._triple_repository,
+                foreshadowing_repo=aftermath._foreshadowing_repository,
+                chapter_repository=chapter_repository,
+                causal_edge_repository=aftermath._causal_edge_repository,
+                character_state_repository=aftermath._character_state_repository,
+            )
+            assert recovered["narrative_sync_ok"] is True
+            assert recovered["content_revision"] == 2
+            assert recovered["attempt_count"] == 1
+        else:
+            assert result.success
         assert chapter_repository.chapters[chapter_number].status == ChapterStatus.COMPLETED
         if chapter_number == 17:
-            assert llm.extraction_failures >= 1
+            assert llm.extraction_failures == 3
 
         if chapter_number == 20:
             chapter_repository.chapters[10].update_content("第10章重写后的正文")
@@ -454,12 +496,24 @@ async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_pa
             )
             assert rewrite_result["vector_stored"] is True
 
+        if chapter_number == 12:
+            vector_recovery = await sync_chapter_narrative_after_save(
+                "memory-stability",
+                chapter_number,
+                context.chapter_content,
+                knowledge,
+                aftermath._indexing,
+                llm,
+                chapter_repository=chapter_repository,
+            )
+            assert vector_recovery["vector_stored"] is True
+
     await aftermath.drain_auxiliary_stages()
     triple_payloads = [row[0] for row in connection.execute("SELECT payload_json FROM extracted_triples")]
     persisted_chapters = connection.execute("SELECT chapter_number, content FROM chapter_snapshots").fetchall()
     foreshadows = {row[0] for row in connection.execute("SELECT description FROM extracted_foreshadows")}
     aftermath_calls = connection.execute("SELECT stage, chapter_number FROM aftermath_calls").fetchall()
-    connection.close()
+    database.close()
 
     assert database_path.exists()
     assert len(persisted_chapters) == 30

@@ -57,7 +57,7 @@ class Novel(BaseEntity):
         last_audit_chapter_number: Optional[int] = None,
         last_audit_similarity: Optional[float] = None,
         last_audit_drift_alert: bool = False,
-        last_audit_narrative_ok: bool = True,
+        last_audit_narrative_ok: bool = False,
         last_audit_at: Optional[str] = None,
         # 章后管线状态
         last_audit_vector_stored: bool = False,

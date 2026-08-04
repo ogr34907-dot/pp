@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from abc import ABC
@@ -186,9 +187,15 @@ class BaseStoryPipeline(ABC):
             # 8. 章后管线（叙事同步/向量索引/KG推断/伏笔/因果边/人物状态/债务）
             self._mark_pipeline_step(ctx, "run_post_commit")
             r = await self._step_run_post_commit(ctx)
-            step_status["run_post_commit"] = "ok" if r.passed else "warning"
+            step_status["run_post_commit"] = "ok" if r.passed else "failed"
             if not r.passed:
                 logger.warning(f"[{ctx.novel_id}] 章后管线失败: {r.message}")
+                return self._make_result(
+                    ctx,
+                    success=False,
+                    error=r.message,
+                    step_status=step_status,
+                )
 
             # 9. 张力打分（0-100 多维评分）
             self._mark_pipeline_step(ctx, "score_tension")
@@ -735,12 +742,15 @@ class BaseStoryPipeline(ABC):
         )
 
         try:
+            self._prepare_chapter_persistence_receipt(ctx)
             # 尝试推持久化队列
             pushed = self._push_persistence_command(ctx)
             if pushed:
                 self._wait_for_chapter_persistence(ctx)
                 if not self._chapter_completed_in_repository(ctx):
                     await self._save_chapter_via_repository(ctx)
+                if not self._chapter_completed_in_repository(ctx):
+                    raise RuntimeError("matching_chapter_receipt_unavailable")
                 ctx.chapter_saved = True
                 ctx.save_method = "queue"
                 self._discard_generation_workspace(ctx)
@@ -748,6 +758,8 @@ class BaseStoryPipeline(ABC):
 
             # 降级：通过 repository 直接写库
             await self._save_chapter_via_repository(ctx)
+            if not self._chapter_completed_in_repository(ctx):
+                raise RuntimeError("matching_chapter_receipt_unavailable")
             ctx.chapter_saved = True
             ctx.save_method = "repository"
             self._discard_generation_workspace(ctx)
@@ -766,6 +778,9 @@ class BaseStoryPipeline(ABC):
             logger.debug("[%s] wait chapter persistence skipped: %s", ctx.novel_id, exc)
 
     def _chapter_completed_in_repository(self, ctx: PipelineContext) -> bool:
+        expected = ctx.metadata.get("chapter_persistence_receipt")
+        if not isinstance(expected, dict):
+            return False
         try:
             from domain.novel.value_objects.novel_id import NovelId
 
@@ -777,9 +792,56 @@ class BaseStoryPipeline(ABC):
             return False
         if chapter is None:
             return False
+        persisted_novel_id = getattr(chapter, "novel_id", "")
+        if hasattr(persisted_novel_id, "value"):
+            persisted_novel_id = persisted_novel_id.value
+        if (
+            str(persisted_novel_id) != str(ctx.novel_id)
+            or int(getattr(chapter, "number", 0) or 0) != int(ctx.chapter_number)
+            or str(expected.get("novel_id") or "") != str(ctx.novel_id)
+            or int(expected.get("chapter_number") or 0) != int(ctx.chapter_number)
+        ):
+            return False
         status = getattr(chapter, "status", "")
         status_value = status.value if hasattr(status, "value") else str(status)
-        return status_value == "completed" and bool(str(getattr(chapter, "content", "") or "").strip())
+        content = str(getattr(chapter, "content", "") or "")
+        expected_hash = str(expected.get("content_sha256") or "")
+        expected_revision = int(expected.get("content_revision") or 0)
+        actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return (
+            status_value == "completed"
+            and actual_hash == expected_hash
+            and str(getattr(chapter, "content_sha256", "") or "") == expected_hash
+            and int(getattr(chapter, "content_revision", 0) or 0) == expected_revision
+            and expected_revision >= 1
+        )
+
+    def _prepare_chapter_persistence_receipt(self, ctx: PipelineContext) -> None:
+        from domain.novel.value_objects.novel_id import NovelId
+
+        existing = ctx.chapter_repository.get_by_novel_and_number(
+            NovelId(ctx.novel_id),
+            int(ctx.chapter_number),
+        )
+        content_sha256 = hashlib.sha256(
+            (ctx.chapter_content or "").encode("utf-8")
+        ).hexdigest()
+        if existing is None:
+            content_revision = 1
+        else:
+            existing_hash = str(getattr(existing, "content_sha256", "") or "")
+            existing_revision = int(getattr(existing, "content_revision", 0) or 0)
+            content_revision = (
+                max(existing_revision, 1)
+                if existing_hash == content_sha256
+                else max(existing_revision + 1, 1)
+            )
+        ctx.metadata["chapter_persistence_receipt"] = {
+            "novel_id": ctx.novel_id,
+            "chapter_number": int(ctx.chapter_number),
+            "content_sha256": content_sha256,
+            "content_revision": content_revision,
+        }
 
     async def _step_validate_voice(self, ctx: PipelineContext) -> StepResult:
         """步骤7：文风审计（声线漂移检测+定向改写）
@@ -868,7 +930,7 @@ class BaseStoryPipeline(ABC):
                     ctx.chapter_content,
                     voice_result=voice_result,
                 )
-                ctx.narrative_sync_ok = bool(result.get("narrative_sync_ok", False))
+                ctx.narrative_sync_ok = self._is_chapter_narrative_ready(ctx)
                 ctx.vector_stored = bool(result.get("vector_stored", False))
                 ctx.foreshadow_stored = bool(result.get("foreshadow_stored", False))
                 ctx.triples_extracted = bool(result.get("triples_extracted", False))
@@ -899,6 +961,8 @@ class BaseStoryPipeline(ABC):
                     debt_updated=ctx.debt_updated,
                     tension_composite=ctx.tension_composite,
                 )
+                if not ctx.narrative_sync_ok:
+                    return StepResult.fail("canonical_aftermath_not_ready")
             except Exception as e:
                 logger.warning(f"章后管线失败: {e}")
                 _writing_progress(
@@ -914,7 +978,29 @@ class BaseStoryPipeline(ABC):
 
         await self._update_emotion_ledger(ctx)
 
+        if not ctx.narrative_sync_ok:
+            return StepResult.fail("canonical_aftermath_not_ready")
         return StepResult.ok()
+
+    def _is_chapter_narrative_ready(self, ctx: PipelineContext) -> bool:
+        from application.world.services.chapter_narrative_sync import (
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        )
+        from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+            SqliteChapterNarrativeCommitRepository,
+        )
+
+        db = getattr(ctx.chapter_repository, "db", None)
+        if db is None:
+            return False
+        try:
+            return SqliteChapterNarrativeCommitRepository(db).is_current_version_ready(
+                novel_id=ctx.novel_id,
+                chapter_number=ctx.chapter_number,
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            )
+        except Exception:
+            return False
 
     async def _update_emotion_ledger(self, ctx: PipelineContext) -> None:
         """章后更新 T1 情绪账本（可选，依赖 memory_orchestrator 注入）"""
@@ -1140,6 +1226,7 @@ class BaseStoryPipeline(ABC):
         try:
             from application.engine.services.persistence_queue import get_persistence_queue
             pq = get_persistence_queue()
+            receipt = ctx.metadata.get("chapter_persistence_receipt") or {}
             return pq.push("upsert_chapter", {
                 "chapter_id": f"autopilot:{ctx.novel_id}:{ctx.chapter_number}",
                 "novel_id": ctx.novel_id,
@@ -1147,6 +1234,8 @@ class BaseStoryPipeline(ABC):
                 "title": str(getattr(ctx.chapter_node, "title", "") or f"第{ctx.chapter_number}章"),
                 "outline": ctx.outline or "",
                 "content": ctx.chapter_content,
+                "content_sha256": receipt.get("content_sha256", ""),
+                "content_revision": receipt.get("content_revision", 0),
                 "word_count": ctx.word_count,
                 "status": "completed",
             })

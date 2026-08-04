@@ -177,7 +177,7 @@ def _apply_last_chapter_audit_columns(conn: sqlite3.Connection) -> None:
             "ALTER TABLE novels ADD COLUMN last_audit_drift_alert INTEGER DEFAULT 0"
         ),
         "last_audit_narrative_ok": (
-            "ALTER TABLE novels ADD COLUMN last_audit_narrative_ok INTEGER DEFAULT 1"
+            "ALTER TABLE novels ADD COLUMN last_audit_narrative_ok INTEGER DEFAULT 0"
         ),
         "last_audit_at": "ALTER TABLE novels ADD COLUMN last_audit_at TEXT",
         # 章后管线状态

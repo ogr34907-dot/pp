@@ -112,6 +112,79 @@ class SqliteChapterNarrativeCommitRepository:
                     """,
                     (novel_id, chapter_number, content_sha256, pipeline_version),
                 ).fetchone()
+                if int(row[1]) != revision:
+                    reclaim_cursor = conn.execute(
+                        """
+                        UPDATE chapter_narrative_commits
+                        SET content_revision = ?, status = 'in_progress',
+                            failure_reason = '', attempt_count = 1,
+                            vector_status = 'not_started', committed_at = NULL,
+                            updated_at = ?
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND pipeline_version = ?
+                          AND content_revision = ?
+                        """,
+                        (
+                            revision,
+                            now,
+                            novel_id,
+                            chapter_number,
+                            content_sha256,
+                            pipeline_version,
+                            int(row[1]),
+                        ),
+                    )
+                    if reclaim_cursor.rowcount == 1:
+                        return NarrativeClaim("claimed", revision)
+                    row = conn.execute(
+                        """
+                        SELECT status, content_revision, attempt_count, vector_status,
+                               failure_reason
+                        FROM chapter_narrative_commits
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND pipeline_version = ?
+                        """,
+                        (novel_id, chapter_number, content_sha256, pipeline_version),
+                    ).fetchone()
+                if row[0] == "failed" and int(row[2]) < 3:
+                    next_attempt = int(row[2]) + 1
+                    retry_cursor = conn.execute(
+                        """
+                        UPDATE chapter_narrative_commits
+                        SET status = 'in_progress', failure_reason = '',
+                            attempt_count = ?, updated_at = ?
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND pipeline_version = ?
+                          AND status = 'failed' AND attempt_count = ?
+                        """,
+                        (
+                            next_attempt,
+                            now,
+                            novel_id,
+                            chapter_number,
+                            content_sha256,
+                            pipeline_version,
+                            int(row[2]),
+                        ),
+                    )
+                    if retry_cursor.rowcount == 1:
+                        return NarrativeClaim(
+                            "claimed",
+                            int(row[1]),
+                            next_attempt,
+                            row[3] or "not_started",
+                        )
+                    row = conn.execute(
+                        """
+                        SELECT status, content_revision, attempt_count, vector_status,
+                               failure_reason
+                        FROM chapter_narrative_commits
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND pipeline_version = ?
+                        """,
+                        (novel_id, chapter_number, content_sha256, pipeline_version),
+                    ).fetchone()
+
                 disposition = "reused" if row[0] == "committed" else row[0]
                 return NarrativeClaim(
                     disposition,
@@ -307,6 +380,7 @@ class SqliteChapterNarrativeCommitRepository:
         chapter_number: int,
         content_sha256: str,
         pipeline_version: str,
+        content_revision: int,
         failure_reason: str,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -319,6 +393,7 @@ class SqliteChapterNarrativeCommitRepository:
                     SET status = 'failed', failure_reason = ?, updated_at = ?
                     WHERE novel_id = ? AND chapter_number = ?
                       AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ?
                       AND status = 'in_progress'
                     """,
                     (
@@ -328,6 +403,7 @@ class SqliteChapterNarrativeCommitRepository:
                         chapter_number,
                         content_sha256,
                         pipeline_version,
+                        content_revision,
                     ),
                 )
                 conn.execute(
@@ -337,6 +413,13 @@ class SqliteChapterNarrativeCommitRepository:
                     WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?)
                       AND chapter_number = ?
                       AND source_content_sha256 = ? AND pipeline_version = ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM chapter_narrative_commits
+                          WHERE novel_id = ? AND chapter_number = ?
+                            AND content_sha256 = ? AND pipeline_version = ?
+                            AND content_revision = ?
+                      )
                     """,
                     (
                         reason,
@@ -345,6 +428,11 @@ class SqliteChapterNarrativeCommitRepository:
                         chapter_number,
                         content_sha256,
                         pipeline_version,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        content_revision,
                     ),
                 )
 
@@ -375,3 +463,81 @@ class SqliteChapterNarrativeCommitRepository:
                 ),
             )
             self._db.commit()
+
+    def is_current_version_ready(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        pipeline_version: str,
+    ) -> bool:
+        source = self._db.fetch_one(
+            "SELECT content, content_sha256, content_revision FROM chapters "
+            "WHERE novel_id = ? AND number = ?",
+            (novel_id, chapter_number),
+        )
+        if source is None:
+            return False
+
+        content_sha256 = hashlib.sha256(
+            (source["content"] or "").encode("utf-8")
+        ).hexdigest()
+        content_revision = int(source["content_revision"] or 0)
+        if source["content_sha256"] != content_sha256 or content_revision < 1:
+            return False
+
+        claim = self._db.fetch_one(
+            """
+            SELECT 1
+            FROM chapter_narrative_commits
+            WHERE novel_id = ? AND chapter_number = ?
+              AND content_sha256 = ? AND pipeline_version = ?
+              AND content_revision = ? AND status = 'committed'
+            """,
+            (
+                novel_id,
+                chapter_number,
+                content_sha256,
+                pipeline_version,
+                content_revision,
+            ),
+        )
+        return claim is not None
+
+    def get_committed_summary(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+    ) -> str | None:
+        """Return only the summary proven by the same committed canonical version."""
+        with sqlite_writes_bypass_queue():
+            row = self._db.fetch_one(
+                """
+                SELECT summaries.summary
+                FROM chapter_narrative_commits AS commits
+                JOIN knowledge
+                  ON knowledge.novel_id = commits.novel_id
+                JOIN chapter_summaries AS summaries
+                  ON summaries.knowledge_id = knowledge.id
+                 AND summaries.chapter_number = commits.chapter_number
+                WHERE commits.novel_id = ? AND commits.chapter_number = ?
+                  AND commits.content_sha256 = ? AND commits.pipeline_version = ?
+                  AND commits.status = 'committed'
+                  AND summaries.source_content_sha256 = ?
+                  AND summaries.pipeline_version = ?
+                  AND summaries.sync_status = 'committed'
+                  AND summaries.summary IS NOT NULL AND TRIM(summaries.summary) != ''
+                """,
+                (
+                    novel_id,
+                    chapter_number,
+                    content_sha256,
+                    pipeline_version,
+                    content_sha256,
+                    pipeline_version,
+                ),
+            )
+        return str(row["summary"]) if row is not None else None

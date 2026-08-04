@@ -104,6 +104,23 @@ async def process_novel(host: Any, novel: Novel) -> None:
             logger.info("[%s] 开始审计", novel.novel_id)
             await run_chapter_audit(host, novel)
         elif novel.current_stage == NovelStage.PAUSED_FOR_REVIEW:
+            completed_chapter = host._latest_completed_chapter_number(novel.novel_id)
+            if (
+                completed_chapter is not None
+                and not host._is_chapter_narrative_ready(
+                    novel.novel_id.value,
+                    completed_chapter,
+                )
+            ):
+                novel.last_audit_narrative_ok = False
+                host._update_shared_state(
+                    novel.novel_id.value,
+                    current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+                    last_audit_narrative_ok=False,
+                    autopilot_pause_reason="canonical_aftermath_not_ready",
+                )
+                host._save_novel_state(novel)
+                return
             if getattr(novel, "auto_approve_mode", False):
                 logger.info("[%s] 全自动模式：跳过人工审阅", novel.novel_id)
                 novel.current_stage = NovelStage.ACT_PLANNING

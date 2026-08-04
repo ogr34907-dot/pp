@@ -256,6 +256,142 @@ async def test_canonical_sync_reuses_same_version_and_claims_changed_content(
 
 
 @pytest.mark.asyncio
+async def test_returning_to_prior_hash_reclaims_claim_for_current_revision(
+    tmp_path, monkeypatch
+):
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    extract = AsyncMock(
+        side_effect=[
+            _canonical_bundle("第一版摘要"),
+            _canonical_bundle("第二版摘要"),
+            _canonical_bundle("回到第一版摘要"),
+        ]
+    )
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        extract,
+    )
+
+    first = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+    chapter.update_content("第二版正文")
+    chapter_repo.save(chapter)
+    second = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+    chapter.update_content("第一版正文")
+    chapter_repo.save(chapter)
+    returned = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+
+    assert [first.content_revision, second.content_revision, returned.content_revision] == [
+        1,
+        2,
+        3,
+    ]
+    assert returned.commit_status == "committed"
+    assert returned.attempt_count == 1
+    assert extract.await_count == 3
+    current_claim = db.fetch_one(
+        "SELECT content_revision, status, attempt_count "
+        "FROM chapter_narrative_commits WHERE content_sha256 = ?",
+        (hashlib.sha256("第一版正文".encode("utf-8")).hexdigest(),),
+    )
+    assert dict(current_claim) == {
+        "content_revision": 3,
+        "status": "committed",
+        "attempt_count": 1,
+    }
+
+
+def test_stale_failure_cannot_poison_reclaimed_hash_revision(tmp_path):
+    """An old async attempt must not fail a later revision with the same hash."""
+    db, chapter_repo, chapter, _knowledge = _canonical_services(tmp_path)
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    content_sha256 = hashlib.sha256(chapter.content.encode("utf-8")).hexdigest()
+
+    original = repository.claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+    )
+    chapter.update_content("第二版正文")
+    chapter_repo.save(chapter)
+    chapter.update_content("第一版正文")
+    chapter_repo.save(chapter)
+    reclaimed = repository.claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+    )
+
+    assert original.content_revision == 1
+    assert reclaimed.content_revision == 3
+    repository.fail(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+        content_revision=original.content_revision,
+        failure_reason="stale provider failure",
+    )
+
+    current = db.fetch_one(
+        "SELECT content_revision, status, failure_reason FROM chapter_narrative_commits"
+    )
+    assert dict(current) == {
+        "content_revision": 3,
+        "status": "in_progress",
+        "failure_reason": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_current_version_readiness_requires_exact_committed_hash_and_revision(
+    tmp_path, monkeypatch
+):
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=_canonical_bundle()),
+    )
+    committed = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+    commit_repo = SqliteChapterNarrativeCommitRepository(db)
+    commit_repo.set_vector_status(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=committed.content_sha256,
+        pipeline_version=committed.pipeline_version,
+        vector_status="failed",
+    )
+
+    assert commit_repo.is_current_version_ready(
+        novel_id="novel-1",
+        chapter_number=1,
+        pipeline_version=committed.pipeline_version,
+    ) is True
+
+    chapter.update_content("第二版正文")
+    chapter_repo.save(chapter)
+
+    assert commit_repo.is_current_version_ready(
+        novel_id="novel-1",
+        chapter_number=1,
+        pipeline_version=committed.pipeline_version,
+    ) is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("extract_result", "extract_error", "expected_reason"),
     [
@@ -495,6 +631,12 @@ async def test_source_hash_mismatch_fails_before_llm(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
         extract,
+    )
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync._retry_delay_seconds",
+        lambda _attempt: (_ for _ in ()).throw(
+            AssertionError("source hash mismatch must not retry")
+        ),
     )
 
     result = await sync_chapter_narrative_after_save(
@@ -903,3 +1045,114 @@ async def test_canonical_dialogue_event_is_durable_when_dispatch_only_accepts_ba
         "SELECT event_summary FROM narrative_events WHERE novel_id = ? AND chapter_number = ?",
         ("novel-1", 1),
     )["event_summary"] == "林澈: 城门会在子时关闭。"
+
+
+@pytest.mark.asyncio
+async def test_canonical_sync_retries_same_version_exactly_three_times(
+    tmp_path, monkeypatch
+):
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    extract = AsyncMock(side_effect=RuntimeError("provider unavailable"))
+    delays = []
+
+    async def capture_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        extract,
+    )
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.asyncio.sleep",
+        capture_sleep,
+    )
+
+    terminal = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+    repeated = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+
+    assert terminal.get("commit_status") == "failed"
+    assert terminal.get("attempt_count") == 3
+    assert repeated.get("commit_status") == "failed"
+    assert repeated.get("attempt_count") == 3
+    assert delays == [1.5, 3.0]
+    assert extract.await_count == 3
+    claim = db.fetch_one(
+        "SELECT status, attempt_count, failure_reason FROM chapter_narrative_commits"
+    )
+    assert dict(claim) == {
+        "status": "failed",
+        "attempt_count": 3,
+        "failure_reason": "provider unavailable",
+    }
+
+    extract.side_effect = None
+    extract.return_value = _canonical_bundle()
+    chapter.update_content("changed content")
+    chapter_repo.save(chapter)
+    changed = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+
+    assert changed.get("commit_status") == "committed"
+    assert changed.get("attempt_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_reused_commit_retries_failed_vector_without_reextracting(
+    tmp_path, monkeypatch
+):
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    extract = AsyncMock(return_value=_canonical_bundle())
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        extract,
+    )
+
+    class FailingIndexer:
+        async def ensure_collection(self, novel_id):
+            return None
+
+        async def index_chapter_summary(self, *args, **kwargs):
+            raise RuntimeError("vector offline")
+
+    class WorkingIndexer:
+        def __init__(self):
+            self.calls = []
+
+        async def ensure_collection(self, novel_id):
+            return None
+
+        async def index_chapter_summary(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    initial = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, FailingIndexer(), SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+    recovered_indexer = WorkingIndexer()
+    recovered = await sync_chapter_narrative_after_save(
+        "novel-1", 1, chapter.content, knowledge, recovered_indexer, SimpleNamespace(),
+        chapter_repository=chapter_repo,
+    )
+
+    assert initial.get("commit_status") == "committed"
+    assert initial.get("vector_status") == "failed"
+    assert recovered.get("commit_status") == "reused"
+    assert recovered.get("vector_status") == "stored"
+    assert extract.await_count == 1
+    assert len(recovered_indexer.calls) == 1
+    claim = db.fetch_one(
+        "SELECT status, vector_status, attempt_count FROM chapter_narrative_commits"
+    )
+    assert dict(claim) == {
+        "status": "committed",
+        "vector_status": "stored",
+        "attempt_count": 1,
+    }

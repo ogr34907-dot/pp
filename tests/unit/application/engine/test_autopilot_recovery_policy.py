@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import hashlib
 
 from application.engine.services.autopilot_recovery_policy import AutopilotRecoveryPolicy
 
@@ -21,10 +22,24 @@ class _Db:
                 number INTEGER NOT NULL,
                 status TEXT DEFAULT 'draft',
                 content TEXT DEFAULT '',
+                content_sha256 TEXT NOT NULL DEFAULT '',
+                content_revision INTEGER NOT NULL DEFAULT 0,
                 outline TEXT DEFAULT '',
                 word_count INTEGER DEFAULT 0,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(novel_id, number)
+            );
+            CREATE TABLE chapter_narrative_commits (
+                novel_id TEXT NOT NULL,
+                chapter_number INTEGER NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                pipeline_version TEXT NOT NULL,
+                content_revision INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                failure_reason TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                vector_status TEXT NOT NULL DEFAULT 'not_started',
+                PRIMARY KEY (novel_id, chapter_number, content_sha256, pipeline_version)
             );
             CREATE TABLE story_nodes (
                 id TEXT PRIMARY KEY,
@@ -119,6 +134,37 @@ def test_recovery_policy_preserves_paused_review_gate():
     assert decision.preserve_review_gate is True
     assert decision.clear_pending_invocation is False
     assert decision.discard_transient_invocations is False
+
+
+def test_recovery_policy_preserves_terminal_canonical_failure_gate():
+    db = _Db()
+    content = "已完成但章后失败的正文"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO novels (id, current_stage, autopilot_status) "
+        "VALUES ('novel-1', 'paused_for_review', 'stopped')"
+    )
+    db.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, status, content, content_sha256, content_revision) "
+        "VALUES ('c1', 'novel-1', 1, 'completed', ?, ?, 1)",
+        (content, content_sha256),
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status, failure_reason, attempt_count) "
+        "VALUES ('novel-1', 1, ?, 'chapter-narrative-sync:v1', "
+        "1, 'failed', 'provider unavailable', 3)",
+        (content_sha256,),
+    )
+
+    decision = AutopilotRecoveryPolicy(db).decide_on_start("novel-1")
+
+    assert decision.next_stage == "paused_for_review"
+    assert decision.preserve_review_gate is True
+    assert decision.clear_pending_invocation is False
+    assert decision.reason == "canonical_aftermath_not_ready"
 
 
 def test_recovery_policy_discards_stopped_paused_prose_review_gate():

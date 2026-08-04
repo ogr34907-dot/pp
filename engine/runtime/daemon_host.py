@@ -236,7 +236,7 @@ class DaemonHostMixin:
             "last_audit_chapter_number": getattr(novel, 'last_audit_chapter_number', None),
             "last_audit_similarity": getattr(novel, 'last_audit_similarity', None),
             "last_audit_drift_alert": 1 if getattr(novel, 'last_audit_drift_alert', False) else 0,
-            "last_audit_narrative_ok": 1 if getattr(novel, 'last_audit_narrative_ok', True) else 0,
+            "last_audit_narrative_ok": 1 if getattr(novel, 'last_audit_narrative_ok', False) else 0,
             "last_audit_at": getattr(novel, 'last_audit_at', None),
             "last_audit_vector_stored": 1 if getattr(novel, 'last_audit_vector_stored', False) else 0,
             "last_audit_foreshadow_stored": 1 if getattr(novel, 'last_audit_foreshadow_stored', False) else 0,
@@ -563,7 +563,7 @@ class DaemonHostMixin:
             patch_fields["last_audit_chapter_number"] = novel.last_audit_chapter_number
             patch_fields["last_audit_similarity"] = getattr(novel, "last_audit_similarity", None)
             patch_fields["last_audit_drift_alert"] = getattr(novel, "last_audit_drift_alert", False)
-            patch_fields["last_audit_narrative_ok"] = getattr(novel, "last_audit_narrative_ok", True)
+            patch_fields["last_audit_narrative_ok"] = getattr(novel, "last_audit_narrative_ok", False)
             patch_fields["last_audit_vector_stored"] = getattr(novel, "last_audit_vector_stored", False)
             patch_fields["last_audit_foreshadow_stored"] = getattr(novel, "last_audit_foreshadow_stored", False)
             patch_fields["last_audit_triples_extracted"] = getattr(novel, "last_audit_triples_extracted", False)
@@ -1017,6 +1017,30 @@ class DaemonHostMixin:
         if not completed:
             return None
         return max(c.number for c in completed)
+
+    def _is_chapter_narrative_ready(
+        self,
+        novel_id: str,
+        chapter_number: int,
+    ) -> bool:
+        from application.world.services.chapter_narrative_sync import (
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        )
+        from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+            SqliteChapterNarrativeCommitRepository,
+        )
+
+        db = getattr(self.chapter_repository, "db", None)
+        if db is None:
+            return False
+        try:
+            return SqliteChapterNarrativeCommitRepository(db).is_current_version_ready(
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            )
+        except Exception:
+            return False
 
 
     def _count_completed_chapters(self, novel_id: NovelId) -> int:
@@ -2198,10 +2222,8 @@ class DaemonHostMixin:
     async def _find_next_unwritten_chapter_async(self, novel):
         """找到下一个未写的章节节点
 
-        🔥 修复：增加已审计章节的跳过逻辑。
-        当持久化队列延迟导致章节在 DB 中仍为 draft 时，
-        通过 last_audit_chapter_number 判断该章节已经审计完成，
-        避免重复生成同一章节。
+        审计显示字段不能证明章节已完成。只有章节状态和精确当前版本的
+        canonical claim 都已持久化时，才允许跳过到下一章。
         """
         novel_id = novel.novel_id.value
         all_nodes = await self.story_node_repo.get_by_novel(novel_id)
@@ -2210,29 +2232,15 @@ class DaemonHostMixin:
             key=lambda n: n.number
         )
 
-        last_audited_num = getattr(novel, 'last_audit_chapter_number', None)
-
         for node in chapter_nodes:
-            # 🔥 跳过已审计的章节（即使 DB 中仍为 draft，也视为已完成）
-            if last_audited_num is not None and node.number <= last_audited_num:
-                # 确保已审计但 DB 仍为 draft 的章节被强制标记为 completed
-                chapter = self.chapter_repository.get_by_novel_and_number(
-                    NovelId(novel_id), node.number
-                )
-                if chapter and chapter.status.value != "completed":
-                    logger.warning(
-                        f"[{novel_id}] 章节 {node.number} 已审计但 DB 仍为 {chapter.status.value}，"
-                        f"强制修正为 completed"
-                    )
-                    chapter.status = ChapterStatus.COMPLETED
-                    # 🔥 核心修复：使用独立短连接写入 completed 状态
-                    self._save_chapter_ephemeral(novel_id, node.number, status="completed")
-                continue
-
             chapter = self.chapter_repository.get_by_novel_and_number(
                 NovelId(novel_id), node.number
             )
-            if not chapter or chapter.status.value != "completed":
+            if (
+                not chapter
+                or chapter.status.value != "completed"
+                or not self._is_chapter_narrative_ready(novel_id, node.number)
+            ):
                 return node
         return None
 

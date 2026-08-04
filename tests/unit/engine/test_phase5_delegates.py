@@ -5,9 +5,40 @@ from types import SimpleNamespace
 import pytest
 
 from engine.runtime.act_planning_delegate import run_act_planning
+from engine.runtime.audit_delegate import _audit_pause_gate
+from engine.runtime.legacy_writing_delegate import _legacy_chapter_is_continuation_ready
 from engine.runtime.macro_planning_delegate import run_macro_planning
 from engine.runtime.novel_lifecycle import process_novel
 from engine.runtime.writing_delegate import run_writing
+
+
+def test_audit_pause_gate_always_blocks_canonical_failure():
+    prefs = SimpleNamespace(
+        pause_after_each_chapter_audit=False,
+        audit_pause_on_hard_fail=False,
+        audit_pause_on_anti_ai_severe=False,
+    )
+
+    assert _audit_pause_gate(
+        canonical_ready=False,
+        auto=True,
+        prefs=prefs,
+        hard_fail=False,
+        anti_ai_severe=False,
+    ) is True
+
+
+def test_legacy_chapter_cannot_skip_from_audit_number_without_canonical_claim():
+    host = MagicMock()
+    host._is_chapter_narrative_ready.return_value = False
+    chapter = SimpleNamespace(status=SimpleNamespace(value="completed"))
+
+    assert _legacy_chapter_is_continuation_ready(
+        host,
+        "novel-1",
+        1,
+        chapter,
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -242,3 +273,30 @@ async def test_process_novel_routes_writing_via_run_writing():
     ) as mock_writing:
         await process_novel(host, novel)
         mock_writing.assert_awaited_once_with(host, novel)
+
+
+@pytest.mark.asyncio
+async def test_process_novel_auto_mode_keeps_canonical_failure_paused():
+    from domain.novel.entities.novel import AutopilotStatus, NovelStage
+
+    host = MagicMock()
+    host._is_still_running.return_value = True
+    host._latest_completed_chapter_number.return_value = 1
+    host._is_chapter_narrative_ready.return_value = False
+    host.circuit_breaker = None
+    novel = MagicMock()
+    novel.novel_id.value = "n-1"
+    novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+    novel.autopilot_status = AutopilotStatus.RUNNING
+    novel.auto_approve_mode = True
+
+    await process_novel(host, novel)
+
+    assert novel.current_stage == NovelStage.PAUSED_FOR_REVIEW
+    assert novel.last_audit_narrative_ok is False
+    host._update_shared_state.assert_any_call(
+        "n-1",
+        current_stage="paused_for_review",
+        last_audit_narrative_ok=False,
+        autopilot_pause_reason="canonical_aftermath_not_ready",
+    )

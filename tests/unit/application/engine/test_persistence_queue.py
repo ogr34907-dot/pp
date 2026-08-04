@@ -1,9 +1,16 @@
+import hashlib
 import sqlite3
 
 import pytest
 
 from application.core.config.config_loader import reload_config
-from application.engine.services.persistence_queue import PersistenceQueue
+from application.engine.services import persistence_queue as persistence_queue_module
+from application.engine.services.persistence_queue import (
+    PersistenceCommandType,
+    PersistenceQueue,
+    register_persistence_handlers,
+)
+from infrastructure.persistence.database.connection import DatabaseConnection
 
 
 def test_legacy_persistence_queue_uses_configured_lock_backoff(tmp_path, monkeypatch):
@@ -41,3 +48,61 @@ persistence_queue:
         assert sleeps == pytest.approx([0.1, 0.15])
     finally:
         reload_config()
+
+
+def test_upsert_chapter_handler_commits_hash_and_revision(tmp_path, monkeypatch):
+    db = DatabaseConnection(str(tmp_path / "queue.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    )
+    queue = PersistenceQueue()
+    monkeypatch.setattr(persistence_queue_module, "_persistence_queue", queue)
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_database",
+        lambda *args, **kwargs: db,
+    )
+    register_persistence_handlers()
+
+    queue._handlers[PersistenceCommandType.UPSERT_CHAPTER.value](
+        {
+            "chapter_id": "chapter-1",
+            "novel_id": "novel-1",
+            "chapter_number": 1,
+            "content": "队列正文",
+            "status": "completed",
+            "word_count": 4,
+        }
+    )
+
+    row = db.fetch_one(
+        "SELECT content_sha256, content_revision FROM chapters "
+        "WHERE novel_id = 'novel-1' AND number = 1"
+    )
+    assert dict(row) == {
+        "content_sha256": hashlib.sha256("队列正文".encode("utf-8")).hexdigest(),
+        "content_revision": 1,
+    }
+
+
+def test_upsert_chapter_handler_propagates_non_lock_failure(monkeypatch):
+    class _FailingDatabase:
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("disk unavailable")
+
+    queue = PersistenceQueue()
+    monkeypatch.setattr(persistence_queue_module, "_persistence_queue", queue)
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_database",
+        lambda *args, **kwargs: _FailingDatabase(),
+    )
+    register_persistence_handlers()
+
+    with pytest.raises(RuntimeError, match="disk unavailable"):
+        queue._handlers[PersistenceCommandType.UPSERT_CHAPTER.value](
+            {
+                "novel_id": "novel-1",
+                "chapter_number": 1,
+                "content": "正文",
+                "status": "completed",
+            }
+        )

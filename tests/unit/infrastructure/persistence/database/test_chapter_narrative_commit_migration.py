@@ -11,6 +11,9 @@ from infrastructure.persistence.database.connection import (
 from infrastructure.persistence.database.sqlite_chapter_repository import (
     SqliteChapterRepository,
 )
+from infrastructure.persistence.database.sqlite_novel_repository import (
+    SqliteNovelRepository,
+)
 
 
 def _columns(db: DatabaseConnection, table: str) -> set[str]:
@@ -40,6 +43,26 @@ def test_clean_install_has_content_versions_summary_provenance_and_claim_table(t
         "attempt_count",
         "vector_status",
     } <= _columns(db, "chapter_narrative_commits")
+    narrative_default = next(
+        row["dflt_value"]
+        for row in db.fetch_all("PRAGMA table_info(novels)")
+        if row["name"] == "last_audit_narrative_ok"
+    )
+    assert narrative_default == "0"
+
+
+def test_novel_hydration_treats_unknown_narrative_audit_as_failed(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "unknown-audit.db"))
+    db.execute(
+        "INSERT INTO novels "
+        "(id, title, slug, last_audit_narrative_ok) "
+        "VALUES ('novel-1', 'Novel', 'novel-1', NULL)"
+    )
+
+    novel = SqliteNovelRepository(db).get_by_id(NovelId("novel-1"))
+
+    assert novel is not None
+    assert novel.last_audit_narrative_ok is False
 
 
 def test_existing_chapter_and_summary_receive_mechanical_legacy_backfill(tmp_path):

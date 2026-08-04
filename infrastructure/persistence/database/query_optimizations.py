@@ -192,7 +192,7 @@ def _build_novel_from_dict(data: Dict) -> Novel:
         last_audit_chapter_number=data.get("last_audit_chapter_number"),
         last_audit_similarity=data.get("last_audit_similarity"),
         last_audit_drift_alert=bool(_lad) if _lad is not None else False,
-        last_audit_narrative_ok=bool(_lano) if _lano is not None else True,
+        last_audit_narrative_ok=bool(_lano) if _lano is not None else False,
         last_audit_at=data.get("last_audit_at"),
         last_audit_vector_stored=bool(data.get("last_audit_vector_stored", 0)),
         last_audit_foreshadow_stored=bool(data.get("last_audit_foreshadow_stored", 0)),

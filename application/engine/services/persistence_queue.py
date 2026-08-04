@@ -10,6 +10,7 @@
 - 一致性：所有写操作序列化，无锁竞争
 - 数据安全：队列中的命令在内存中排队，亚秒级落盘
 """
+import hashlib
 import json
 import logging
 import multiprocessing as mp
@@ -476,19 +477,42 @@ def register_persistence_handlers() -> None:
             content = payload.get("content", "")
             status = payload.get("status", "draft")
             word_count = int(payload.get("word_count") or len(str(content or "")))
+            content_sha256 = hashlib.sha256(
+                str(content or "").encode("utf-8")
+            ).hexdigest()
 
             # 使用轻量 SQL 更新
             db.execute(
-                """INSERT INTO chapters (id, novel_id, number, title, outline, content, status, word_count, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """INSERT INTO chapters (
+                    id, novel_id, number, title, outline, content,
+                    content_sha256, content_revision, status, word_count,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT(novel_id, number) DO UPDATE SET
                     title = COALESCE(NULLIF(excluded.title, ''), chapters.title),
                     outline = COALESCE(NULLIF(excluded.outline, ''), chapters.outline),
                     content = excluded.content,
+                    content_revision = CASE
+                        WHEN chapters.content_sha256 = excluded.content_sha256
+                            THEN MAX(chapters.content_revision, 1)
+                        ELSE MAX(chapters.content_revision + 1, 1)
+                    END,
+                    content_sha256 = excluded.content_sha256,
                     status = excluded.status,
                     word_count = excluded.word_count,
                     updated_at = CURRENT_TIMESTAMP""",
-                (chapter_id, novel_id, chapter_number, title, outline, content, status, word_count)
+                (
+                    chapter_id,
+                    novel_id,
+                    chapter_number,
+                    title,
+                    outline,
+                    content,
+                    content_sha256,
+                    status,
+                    word_count,
+                )
             )
             db.get_connection().commit()
             logger.debug(f"[PersistenceQueue] 章节已持久化: novel={novel_id} ch={chapter_number}")
@@ -497,6 +521,7 @@ def register_persistence_handlers() -> None:
             raise
         except Exception as e:
             logger.error(f"[PersistenceQueue] 章节持久化失败: {e}")
+            raise
 
     def handle_update_chapter_tension(payload: Dict) -> None:
         """处理章节张力值更新"""

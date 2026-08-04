@@ -22,6 +22,20 @@ from domain.structure.story_node import StoryNode
 logger = logging.getLogger(__name__)
 
 
+def _legacy_chapter_is_continuation_ready(
+    host: Any,
+    novel_id: str,
+    chapter_number: int,
+    chapter: Any,
+) -> bool:
+    status = getattr(chapter, "status", "")
+    status_value = status.value if hasattr(status, "value") else str(status)
+    return status_value == "completed" and host._is_chapter_narrative_ready(
+        novel_id,
+        chapter_number,
+    )
+
+
 def _get_autopilot_orchestrator(host: Any) -> AutopilotInvocationOrchestrator:
     from application.ai_invocation.contracts import ensure_invocation_contract
     from application.ai_invocation.autopilot.factory import get_or_create_autopilot_orchestrator
@@ -572,50 +586,27 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
     existing_chapter = host.chapter_repository.get_by_novel_and_number(
         NovelId(novel.novel_id.value), chapter_num
     )
-    already_audited = (
-        getattr(novel, 'last_audit_chapter_number', None) == chapter_num
-    )
     if existing_chapter and existing_chapter.status == ChapterStatus.COMPLETED:
-        if already_audited:
-            # 审计完的 completed 章节，直接跳过（下一轮 _find_next_unwritten_chapter_async 会跳过 completed）
+        if _legacy_chapter_is_continuation_ready(
+            host,
+            novel.novel_id.value,
+            chapter_num,
+            existing_chapter,
+        ):
             logger.info(
-                f"[{novel.novel_id}] 章节 {chapter_num} 已写完且已审计，等待下一轮找新章节"
+                f"[{novel.novel_id}] 章节 {chapter_num} 已写完且 canonical ready，等待下一轮找新章节"
             )
             return
         else:
-            # 写完但未审计 → 正常进入审计
             logger.info(
-                f"[{novel.novel_id}] 章节 {chapter_num} 已是 completed 状态但未审计，进入审计"
+                f"[{novel.novel_id}] 章节 {chapter_num} 已完成但 canonical 未就绪，进入审计"
             )
             novel.current_stage = NovelStage.AUDITING
             host._flush_novel(novel)
             return
 
     # 检查已有内容是否达标（>= 70%）
-    # 🔥 修复：如果这一章已经审计过（last_audit_chapter_number 匹配），
-    # 说明是从审计回来后持久化队列延迟导致章节还是 draft，
-    # 不应再次标记完成+审计，应确保 DB 状态正确后等下一轮找新章节
     if existing_content and len(existing_content) >= target_word_count * 0.7:
-        if already_audited:
-            logger.warning(
-                f"[{novel.novel_id}] 章节 {chapter_num} 已审计过但 DB 仍为 draft "
-                f"(持久化队列延迟)，强制补写 completed 后等下一轮"
-            )
-            # 🔥 关键修复：强制直接写 DB 确保章节状态为 completed
-            # 这样下一轮 _find_next_unwritten_chapter_async 就不会再找到这一章
-            if existing_chapter:
-                # 🔥 核心修复：使用独立短连接写入 completed 状态
-                host._save_chapter_ephemeral(
-                    novel.novel_id.value, chapter_num,
-                    status="completed",
-                )
-            else:
-                await host._upsert_chapter_content(
-                    novel, next_chapter_node, existing_content, status="completed"
-                )
-            # return 让下一轮主循环重新进入 _handle_writing
-            # 此时 DB 中章节已是 completed，_find_next_unwritten_chapter_async 会跳过它
-            return
         # ★ 禁止「字数够 70% 但节拍未跑完」提前结章——否则会断在章纲中段就去写下一章
         nb = len(beats)
         cidx = novel.current_beat_index or 0

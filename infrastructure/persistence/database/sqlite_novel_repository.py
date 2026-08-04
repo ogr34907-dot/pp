@@ -99,7 +99,7 @@ class SqliteNovelRepository(NovelRepository):
         lacn = getattr(novel, "last_audit_chapter_number", None)
         lasim = getattr(novel, "last_audit_similarity", None)
         ladr = 1 if getattr(novel, "last_audit_drift_alert", False) else 0
-        lano = 1 if getattr(novel, "last_audit_narrative_ok", True) else 0
+        lano = 1 if getattr(novel, "last_audit_narrative_ok", False) else 0
         laat = getattr(novel, "last_audit_at", None)
         # 新增字段
         lavs = 1 if getattr(novel, "last_audit_vector_stored", False) else 0
@@ -351,7 +351,7 @@ class SqliteNovelRepository(NovelRepository):
             last_audit_chapter_number=row.get("last_audit_chapter_number"),
             last_audit_similarity=row.get("last_audit_similarity"),
             last_audit_drift_alert=bool(_lad) if _lad is not None else False,
-            last_audit_narrative_ok=bool(_lano) if _lano is not None else True,
+            last_audit_narrative_ok=bool(_lano) if _lano is not None else False,
             last_audit_at=row.get("last_audit_at"),
             last_audit_vector_stored=bool(row.get("last_audit_vector_stored", 0)),
             last_audit_foreshadow_stored=bool(row.get("last_audit_foreshadow_stored", 0)),

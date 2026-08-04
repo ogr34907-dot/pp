@@ -27,6 +27,7 @@ from domain.novel.value_objects.foreshadowing import (
 from domain.novel.value_objects.novel_id import NovelId
 from domain.structure.story_node import NodeType
 from application.ai.structured_json_pipeline import (
+    _retry_delay_seconds,
     parse_and_repair_json,
     sanitize_llm_output,
 )
@@ -50,6 +51,7 @@ class AftermathCommitResult(Mapping[str, Any]):
     attempt_count: int = 0
     vector_status: str = "not_started"
     content_revision: int = 0
+    retryable: bool = False
     flags: Dict[str, Any] = field(default_factory=dict)
 
     def _projection(self) -> Dict[str, Any]:
@@ -2247,7 +2249,7 @@ def persist_bundle_extras(
     return True
 
 
-async def sync_chapter_narrative_after_save(
+async def _sync_chapter_narrative_after_save_once(
     novel_id: str,
     chapter_number: int,
     content: str,
@@ -2303,13 +2305,62 @@ async def sync_chapter_narrative_after_save(
         pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
     )
     if claim.disposition != "claimed":
+        vector_status = claim.vector_status
+        if (
+            claim.disposition == "reused"
+            and indexing_svc is not None
+            and vector_status != "stored"
+        ):
+            try:
+                committed_summary = commit_repository.get_committed_summary(
+                    novel_id=novel_id,
+                    chapter_number=chapter_number,
+                    content_sha256=content_sha256,
+                    pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                )
+                if not committed_summary:
+                    raise RuntimeError("committed_summary_unavailable")
+                await indexing_svc.ensure_collection(novel_id)
+                await indexing_svc.index_chapter_summary(
+                    novel_id,
+                    chapter_number,
+                    committed_summary,
+                    content_sha256=content_sha256,
+                    content_revision=claim.content_revision,
+                    pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                )
+                vector_status = "stored"
+            except Exception as e:
+                vector_status = "failed"
+                logger.warning(
+                    "已提交章节向量重试失败 novel=%s ch=%s: %s",
+                    novel_id,
+                    chapter_number,
+                    e,
+                )
+            try:
+                commit_repository.set_vector_status(
+                    novel_id=novel_id,
+                    chapter_number=chapter_number,
+                    content_sha256=content_sha256,
+                    pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                    vector_status=vector_status,
+                )
+            except Exception as e:
+                vector_status = "failed"
+                logger.warning(
+                    "已提交章节向量状态写入失败 novel=%s ch=%s: %s",
+                    novel_id,
+                    chapter_number,
+                    e,
+                )
         return AftermathCommitResult(
             content_sha256=content_sha256,
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
             commit_status=claim.disposition,
             failure_reason=claim.failure_reason,
             attempt_count=claim.attempt_count,
-            vector_status=claim.vector_status,
+            vector_status=vector_status,
             content_revision=claim.content_revision,
             flags=flags,
         )
@@ -2320,6 +2371,7 @@ async def sync_chapter_narrative_after_save(
             chapter_number=chapter_number,
             content_sha256=content_sha256,
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision=claim.content_revision,
             failure_reason=reason,
         )
         return AftermathCommitResult(
@@ -2329,6 +2381,7 @@ async def sync_chapter_narrative_after_save(
             failure_reason=reason,
             attempt_count=claim.attempt_count,
             content_revision=claim.content_revision,
+            retryable=True,
             flags=flags,
         )
 
@@ -2644,6 +2697,7 @@ async def sync_chapter_narrative_after_save(
             chapter_number=chapter_number,
             content_sha256=content_sha256,
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision=claim.content_revision,
             failure_reason=failure_reason,
         )
         return AftermathCommitResult(
@@ -2653,6 +2707,7 @@ async def sync_chapter_narrative_after_save(
             failure_reason=failure_reason,
             attempt_count=claim.attempt_count,
             content_revision=claim.content_revision,
+            retryable=True,
             flags=flags,
         )
 
@@ -2706,6 +2761,58 @@ async def sync_chapter_narrative_after_save(
         content_revision=claim.content_revision,
         flags=flags,
     )
+
+
+async def sync_chapter_narrative_after_save(
+    novel_id: str,
+    chapter_number: int,
+    content: str,
+    knowledge_service: Any,
+    indexing_svc: Any,
+    llm_service: LLMService,
+    triple_repository: Any = None,
+    foreshadowing_repo: Any = None,
+    storyline_repository: Any = None,
+    chapter_repository: Any = None,
+    plot_arc_repository: Any = None,
+    narrative_event_repository: Any = None,
+    causal_edge_repository: Any = None,
+    character_state_repository: Any = None,
+    debt_repository: Any = None,
+    bible_repository: Any = None,
+    chapter_micro_beats: Optional[List[Dict[str, Any]]] = None,
+) -> AftermathCommitResult:
+    """Run at most three durable canonical attempts with exponential backoff."""
+    kwargs = dict(
+        triple_repository=triple_repository,
+        foreshadowing_repo=foreshadowing_repo,
+        storyline_repository=storyline_repository,
+        chapter_repository=chapter_repository,
+        plot_arc_repository=plot_arc_repository,
+        narrative_event_repository=narrative_event_repository,
+        causal_edge_repository=causal_edge_repository,
+        character_state_repository=character_state_repository,
+        debt_repository=debt_repository,
+        bible_repository=bible_repository,
+        chapter_micro_beats=chapter_micro_beats,
+    )
+    while True:
+        result = await _sync_chapter_narrative_after_save_once(
+            novel_id,
+            chapter_number,
+            content,
+            knowledge_service,
+            indexing_svc,
+            llm_service,
+            **kwargs,
+        )
+        if (
+            result.commit_status != "failed"
+            or not result.retryable
+            or result.attempt_count not in {1, 2}
+        ):
+            return result
+        await asyncio.sleep(_retry_delay_seconds(result.attempt_count - 1))
 
 
 def sync_chapter_narrative_after_save_blocking(

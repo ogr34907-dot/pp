@@ -89,6 +89,24 @@ class AutopilotRecoveryPolicy:
 
         pending = self._find_pending_invocation(novel_id)
         if stage == NovelStage.PAUSED_FOR_REVIEW.value:
+            completed_chapter = self._latest_completed_chapter_number(novel_id)
+            if (
+                completed_chapter is not None
+                and not self._is_current_chapter_narrative_ready(
+                    novel_id,
+                    completed_chapter,
+                )
+            ):
+                return AutopilotRecoveryDecision(
+                    novel_id=novel_id,
+                    next_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+                    chapter_number=completed_chapter,
+                    clear_stop_signal=True,
+                    clear_pending_invocation=False,
+                    preserve_review_gate=True,
+                    story_pipeline_mode=self._is_story_pipeline_writing_enabled(),
+                    reason="canonical_aftermath_not_ready",
+                )
             if for_start and autopilot_stopped:
                 next_stage = self._retry_stage_after_interrupted_review(novel_id)
                 chapter_number = self._current_chapter_number(novel_id)
@@ -224,6 +242,29 @@ class AutopilotRecoveryPolicy:
             (novel_id,),
         )
         return int(row["n"]) if row and row.get("n") is not None else None
+
+    def _is_current_chapter_narrative_ready(
+        self,
+        novel_id: str,
+        chapter_number: int,
+    ) -> bool:
+        from application.world.services.chapter_narrative_sync import (
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        )
+        from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+            SqliteChapterNarrativeCommitRepository,
+        )
+
+        try:
+            return SqliteChapterNarrativeCommitRepository(
+                self._get_db()
+            ).is_current_version_ready(
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            )
+        except Exception:
+            return False
 
     def _current_uncompleted_chapter_number(self, novel_id: str) -> Optional[int]:
         row = self._get_db().fetch_one(
