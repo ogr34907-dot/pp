@@ -152,21 +152,18 @@ class TestPerformance:
     """性能测试"""
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
     async def test_100_chapter_generation_simulation(self, workflow):
-        """模拟生成 100 章的性能（快速测试，不实际调用 LLM）"""
+        """模拟生成完整 100 章的性能（不实际调用 LLM）。"""
         novel_id = "performance-test-novel"
 
-        # 只测试前 10 章以节省时间
-        for i in range(1, 11):
+        for i in range(1, 101):
             result = await workflow.generate_chapter(
                 novel_id=novel_id,
                 chapter_number=i,
                 outline=f"Chapter {i} outline"
             )
             assert isinstance(result, GenerationResult)
-
-        # 在实际使用中，应该测试完整的 100 章
-        # 但在单元测试中，我们只验证流程正确性
 
 
 class TestErrorHandling:
