@@ -131,6 +131,65 @@ def test_orphan_cleanup_does_not_kill_other_workspace_backend(monkeypatch):
     assert killed_pids == [202]
 
 
+def test_orphan_cleanup_does_not_kill_current_uvicorn_parent(monkeypatch):
+    local_executable = sys.executable
+    listed_processes = "\n".join(
+        [
+            f'101\t0\t"{local_executable}" -m uvicorn interfaces.main:app --port 8015',
+            f'107\t101\t"{local_executable}" -m uvicorn interfaces.main:app --port 8015',
+            f'202\t0\t"{local_executable}" -m uvicorn interfaces.main:app --port 8015',
+        ]
+    )
+    killed_pids = []
+
+    def fake_run(args, **_kwargs):
+        if args[0] == "powershell":
+            return subprocess.CompletedProcess(args, 0, stdout=listed_processes, stderr="")
+        if args[0] == "taskkill":
+            killed_pids.append(int(args[-1]))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess: {args}")
+
+    monkeypatch.setattr("interfaces.daemon_manager.os.getpid", lambda: 107)
+    monkeypatch.setattr("interfaces.daemon_manager.get_daemon_lifecycle_settings", DaemonLifecycleSettings)
+    monkeypatch.setattr("interfaces.daemon_manager.subprocess.run", fake_run)
+
+    cleanup_orphan_python_processes()
+
+    assert killed_pids == [202]
+
+
+def test_orphan_cleanup_wmic_fallback_does_not_kill_current_parent(monkeypatch):
+    local_executable = sys.executable
+    wmic_processes = "\n".join(
+        [
+            f'"{local_executable}" -m uvicorn interfaces.main:app --port 8015 101',
+            f'"{local_executable}" -m uvicorn interfaces.main:app --port 8015 107',
+            f'"{local_executable}" -m uvicorn interfaces.main:app --port 8015 202',
+        ]
+    )
+    killed_pids = []
+
+    def fake_run(args, **_kwargs):
+        if args[0] == "powershell":
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[0] == "wmic":
+            return subprocess.CompletedProcess(args, 0, stdout=wmic_processes, stderr="")
+        if args[0] == "taskkill":
+            killed_pids.append(int(args[-1]))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess: {args}")
+
+    monkeypatch.setattr("interfaces.daemon_manager.os.getpid", lambda: 107)
+    monkeypatch.setattr("interfaces.daemon_manager.os.getppid", lambda: 101)
+    monkeypatch.setattr("interfaces.daemon_manager.get_daemon_lifecycle_settings", DaemonLifecycleSettings)
+    monkeypatch.setattr("interfaces.daemon_manager.subprocess.run", fake_run)
+
+    cleanup_orphan_python_processes()
+
+    assert killed_pids == [202]
+
+
 def test_daemon_manager_stop_respects_disabled_orphan_cleanup(monkeypatch):
     cleanup_calls = []
     manager = AutopilotDaemonManager(

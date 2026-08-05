@@ -246,11 +246,11 @@ Get-CimInstance Win32_Process | ForEach-Object {
   if ($nl -notin @('python.exe','python3.exe','pythonw.exe','plotpilot-backend.exe')) { return }
   $cl = if ($null -eq $_.CommandLine) { '' } else { [string]$_.CommandLine }
   $cl = $cl -replace "`t", ' '
-  [Console]::Out.WriteLine($_.ProcessId.ToString() + [char]9 + $cl)
+  [Console]::Out.WriteLine($_.ProcessId.ToString() + [char]9 + $_.ParentProcessId.ToString() + [char]9 + $cl)
 }
 """
 
-    def _list_via_powershell() -> list[tuple[int, str]]:
+    def _list_via_powershell() -> list[tuple[int, int | None, str]]:
         result = subprocess.run(
             [
                 "powershell",
@@ -269,17 +269,25 @@ Get-CimInstance Win32_Process | ForEach-Object {
         )
         if result.returncode != 0:
             return []
-        rows: list[tuple[int, str]] = []
+        rows: list[tuple[int, int | None, str]] = []
         for line in result.stdout.splitlines():
             line = line.strip()
             if not line or "\t" not in line:
                 continue
-            pid_str, _, cmd = line.partition("\t")
+            parts = line.split("\t", maxsplit=2)
+            pid_str = parts[0]
+            parent_pid = None
+            if len(parts) == 3 and parts[1].strip().isdigit():
+                parent_pid = int(parts[1].strip())
+                cmd = parts[2]
+            else:
+                # Keep the parser compatible with the older two-column output.
+                cmd = parts[1]
             if pid_str.strip().isdigit():
-                rows.append((int(pid_str), cmd.strip()))
+                rows.append((int(pid_str), parent_pid, cmd.strip()))
         return rows
 
-    def _list_via_wmic() -> list[tuple[int, str]]:
+    def _list_via_wmic() -> list[tuple[int, int | None, str]]:
         result = subprocess.run(
             [
                 "wmic",
@@ -296,7 +304,7 @@ Get-CimInstance Win32_Process | ForEach-Object {
         )
         if result.returncode != 0:
             return []
-        rows: list[tuple[int, str]] = []
+        rows: list[tuple[int, int | None, str]] = []
         for line in result.stdout.strip().split("\n"):
             line = line.strip()
             if not line or "CommandLine" in line:
@@ -305,7 +313,7 @@ Get-CimInstance Win32_Process | ForEach-Object {
                 parts = line.split()
                 for part in reversed(parts):
                     if part.isdigit():
-                        rows.append((int(part), line))
+                        rows.append((int(part), None, line))
                         break
         return rows
 
@@ -313,7 +321,7 @@ Get-CimInstance Win32_Process | ForEach-Object {
     killed_count = 0
 
     try:
-        candidates: list[tuple[int, str]] = []
+        candidates: list[tuple[int, int | None, str]] = []
         try:
             candidates = _list_via_powershell()
         except OSError as exc:
@@ -328,9 +336,19 @@ Get-CimInstance Win32_Process | ForEach-Object {
             except subprocess.TimeoutExpired:
                 log.warning("wmic 枚举进程超时")
 
-        for pid, cmdline in candidates:
+        parent_by_pid = {pid: parent_pid for pid, parent_pid, _ in candidates}
+        protected_pids = {current_pid}
+        current_parent_pid = os.getppid()
+        if current_parent_pid > 0:
+            protected_pids.add(current_parent_pid)
+        ancestor_pid = parent_by_pid.get(current_pid)
+        while ancestor_pid is not None and ancestor_pid not in protected_pids:
+            protected_pids.add(ancestor_pid)
+            ancestor_pid = parent_by_pid.get(ancestor_pid)
+
+        for pid, _parent_pid, cmdline in candidates:
             low = cmdline.lower()
-            if not any(k in low for k in keywords) or pid == current_pid:
+            if not any(k in low for k in keywords) or pid in protected_pids:
                 continue
             # A second PlotPilot checkout or installed copy must never be
             # considered an orphan of this backend instance.
