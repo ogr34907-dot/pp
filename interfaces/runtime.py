@@ -18,6 +18,10 @@ from application.core.config.runtime_settings_utils import (
 )
 
 
+def _is_orphan_cleanup_disabled() -> bool:
+    return os.getenv("DISABLE_ORPHAN_CLEANUP", "").strip().lower() in {"1", "true", "yes"}
+
+
 @dataclass(frozen=True)
 class BackendLifecycleSettings:
     startup_reset_max_retries: int = 3
@@ -143,7 +147,11 @@ class BackendLifecycle:
         self._logger.info("Startup: FastAPI application is ready")
         self._logger.info("Startup: registered routes=%s", registered_route_count)
 
-        if os.name == "nt" and self._cleanup_orphans is not None:
+        if (
+            os.name == "nt"
+            and self._cleanup_orphans is not None
+            and not _is_orphan_cleanup_disabled()
+        ):
             self._logger.info("Startup: checking for orphan Windows backend processes")
             self._cleanup_orphans()
 

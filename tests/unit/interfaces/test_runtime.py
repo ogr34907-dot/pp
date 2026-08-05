@@ -75,6 +75,35 @@ def test_backend_lifecycle_startup_orchestrates_runtime_steps(monkeypatch):
     ]
 
 
+def test_backend_lifecycle_skips_orphan_cleanup_when_disabled_by_environment(monkeypatch):
+    calls = []
+    lifecycle = BackendLifecycle(
+        start_daemon=lambda: calls.append("start_daemon"),
+        stop_daemon=lambda: calls.append("stop_daemon"),
+        cleanup_orphans=lambda: calls.append("cleanup_orphans"),
+    )
+    monkeypatch.setattr("interfaces.runtime.os.name", "nt")
+    monkeypatch.setenv("DISABLE_ORPHAN_CLEANUP", "1")
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.write_dispatch.startup_sqlite_writes_bypass_queue",
+        lambda: nullcontext(),
+    )
+    monkeypatch.setattr(lifecycle, "stop_all_running_novels", lambda: calls.append("stop_running"))
+    monkeypatch.setattr(lifecycle, "bootstrap_persistence_consumer", lambda: calls.append("persistence"))
+    monkeypatch.setattr(lifecycle, "recover_drafts", lambda: calls.append("recover_drafts"))
+    monkeypatch.setattr(lifecycle, "init_dag_node_registry", lambda: calls.append("dag_registry"))
+
+    lifecycle.startup(registered_route_count=3)
+
+    assert calls == [
+        "stop_running",
+        "persistence",
+        "recover_drafts",
+        "start_daemon",
+        "dag_registry",
+    ]
+
+
 def test_backend_lifecycle_shutdown_orchestrates_cleanup(monkeypatch):
     calls = []
     lifecycle = BackendLifecycle(

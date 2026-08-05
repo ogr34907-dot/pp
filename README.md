@@ -239,6 +239,7 @@ cd frontend && npm install && npm run dev
 | `VECTOR_STORE_ENABLED` / `VECTOR_STORE_TYPE` / `VECTOR_STORE_PATH` | 向量索引开关、类型与持久化目录 |
 | `CORS_ORIGINS` | 生产环境前端域名，逗号分隔 |
 | `DISABLE_AUTO_DAEMON` | 设为 `1` 禁止启动时自动拉起守护进程 |
+| `DISABLE_ORPHAN_CLEANUP` | 设为 `1` 跳过 Windows 启动时的残留后端进程清理；仅用于受控多进程启动 |
 | `LOG_LEVEL` / `LOG_FILE` | 日志级别与路径 |
 
 完整说明见 [`.env.example`](.env.example)。
