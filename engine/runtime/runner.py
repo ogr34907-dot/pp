@@ -94,6 +94,9 @@ class StoryPipelineRunner(DaemonHostMixin, BaseStoryPipeline):
             volume_summary_service=self.volume_summary_service,
             autopilot_host=self.host,
         )
+        ctx.metadata["requires_narrative_memory"] = bool(
+            self.use_story_pipeline_for_writing
+        )
 
         try:
             from engine.runtime.policy_validator import PolicyValidator

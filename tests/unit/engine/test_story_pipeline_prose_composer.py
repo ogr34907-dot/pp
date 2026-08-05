@@ -33,6 +33,111 @@ class _Composer:
         return self.result
 
 
+class _CountingLLM:
+    def __init__(self):
+        self.calls = 0
+
+    async def generate(self, *args, **kwargs):
+        self.calls += 1
+        return SimpleNamespace(content="不应调用")
+
+
+def _required_memory_context(*, memory_engine, aftermath_pipeline):
+    context = PipelineContext(
+        novel_id="novel-required-memory",
+        chapter_number=2,
+        outline="本章大纲",
+    )
+    context.llm_service = _CountingLLM()
+    context.context_builder = SimpleNamespace(
+        budget_allocator=SimpleNamespace(memory_engine=memory_engine)
+    )
+    context.chapter_repository = SimpleNamespace(db=object())
+    context.aftermath_pipeline = aftermath_pipeline
+    context.metadata["requires_narrative_memory"] = True
+    return context
+
+
+@pytest.mark.asyncio
+async def test_long_form_context_stops_before_llm_when_memory_engine_is_missing():
+    context = _required_memory_context(
+        memory_engine=None,
+        aftermath_pipeline=SimpleNamespace(_memory_engine=None),
+    )
+
+    result = await _Pipeline()._step_build_context(context)
+
+    assert not result.passed
+    assert "memory_engine" in result.message
+    assert context.llm_service.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_long_form_context_stops_before_llm_when_fact_lock_source_is_missing():
+    memory_engine = SimpleNamespace(bible_repository=None, llm_service=object())
+    context = _required_memory_context(
+        memory_engine=memory_engine,
+        aftermath_pipeline=SimpleNamespace(_memory_engine=memory_engine),
+    )
+
+    result = await _Pipeline()._step_build_context(context)
+
+    assert not result.passed
+    assert "fact_lock_data_source" in result.message
+    assert context.llm_service.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_long_form_context_stops_before_llm_when_aftermath_pipeline_is_missing():
+    memory_engine = SimpleNamespace(bible_repository=object(), llm_service=object())
+    context = _required_memory_context(
+        memory_engine=memory_engine,
+        aftermath_pipeline=None,
+    )
+
+    result = await _Pipeline()._step_build_context(context)
+
+    assert not result.passed
+    assert "aftermath_pipeline" in result.message
+    assert context.llm_service.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_long_form_context_does_not_fallback_after_required_builder_failure():
+    memory_engine = SimpleNamespace(bible_repository=object(), llm_service=object())
+    fallback_used = False
+
+    class Workflow:
+        context_builder = SimpleNamespace(
+            budget_allocator=SimpleNamespace(memory_engine=memory_engine)
+        )
+
+        def prepare_chapter_generation(self, *args, **kwargs):
+            raise RuntimeError("context backend unavailable")
+
+    class FallbackBuilder:
+        budget_allocator = SimpleNamespace(memory_engine=memory_engine)
+
+        def build_context(self, **kwargs):
+            nonlocal fallback_used
+            fallback_used = True
+            return "weak fallback"
+
+    context = _required_memory_context(
+        memory_engine=memory_engine,
+        aftermath_pipeline=SimpleNamespace(_memory_engine=memory_engine),
+    )
+    context.chapter_workflow = Workflow()
+    context.context_builder = FallbackBuilder()
+
+    result = await _Pipeline()._step_build_context(context)
+
+    assert not result.passed
+    assert "context backend unavailable" in result.message
+    assert fallback_used is False
+    assert context.llm_service.calls == 0
+
+
 @pytest.mark.asyncio
 async def test_story_pipeline_carries_workflow_context_budget_to_prose_metadata():
     chapter_workflow = SimpleNamespace(

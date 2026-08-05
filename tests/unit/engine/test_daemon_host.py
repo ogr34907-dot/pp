@@ -60,6 +60,23 @@ def test_story_pipeline_runner_is_self_hosted():
     assert runner.use_story_pipeline_for_writing is True
 
 
+def test_story_pipeline_runner_marks_writing_context_as_requiring_narrative_memory():
+    runner = StoryPipelineRunner(
+        novel_repository=object(),
+        llm_service=object(),
+        context_builder=None,
+        background_task_service=None,
+        planning_service=None,
+        story_node_repo=None,
+        chapter_repository=None,
+        use_story_pipeline_for_writing=True,
+    )
+
+    context = runner._make_context("novel-1", chapter_number=1)
+
+    assert context.metadata["requires_narrative_memory"] is True
+
+
 def test_parent_volume_selection_does_not_overflow_last_full_volume():
     volumes = [
         SimpleNamespace(id="volume-1", number=1),

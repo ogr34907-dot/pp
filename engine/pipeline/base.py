@@ -443,6 +443,45 @@ class BaseStoryPipeline(ABC):
             logger.warning("[%s] 叙事治理预算准备失败: %s", ctx.novel_id, e)
             return StepResult.skip_step(f"叙事治理预算准备失败: {e}")
 
+    @staticmethod
+    def _missing_required_narrative_dependencies(ctx: PipelineContext) -> List[str]:
+        """Return production memory dependencies that must not silently degrade."""
+        if not ctx.metadata.get("requires_narrative_memory", False):
+            return []
+
+        missing: List[str] = []
+        workflow_builder = getattr(ctx.chapter_workflow, "context_builder", None)
+        context_builder = workflow_builder or ctx.context_builder
+        if context_builder is None:
+            missing.append("context_builder")
+            return missing
+
+        allocator = getattr(context_builder, "budget_allocator", None)
+        if allocator is None:
+            missing.append("context_budget_allocator")
+            return missing
+
+        memory_engine = getattr(allocator, "memory_engine", None)
+        if memory_engine is None:
+            missing.append("memory_engine")
+        else:
+            if getattr(memory_engine, "bible_repository", None) is None:
+                missing.append("fact_lock_data_source")
+            if getattr(memory_engine, "llm_service", None) is None:
+                missing.append("memory_engine_llm_service")
+
+        aftermath = ctx.aftermath_pipeline
+        if aftermath is None:
+            missing.append("aftermath_pipeline")
+        elif memory_engine is not None and getattr(
+            aftermath, "_memory_engine", None
+        ) is not memory_engine:
+            missing.append("shared_memory_engine")
+
+        if getattr(ctx.chapter_repository, "db", None) is None:
+            missing.append("canonical_commit_repository")
+        return missing
+
     async def _step_build_context(self, ctx: PipelineContext) -> StepResult:
         """步骤2：组装上下文（四层洋葱挤压）
 
@@ -455,6 +494,14 @@ class BaseStoryPipeline(ABC):
         - 武侠引擎：注入修炼体系设定
         """
         self._log_step("build_context", f"组装上下文，目标 {ctx.target_word_count} 字")
+
+        missing_dependencies = self._missing_required_narrative_dependencies(ctx)
+        if missing_dependencies:
+            reason = "required_narrative_memory_unavailable:" + ",".join(
+                missing_dependencies
+            )
+            logger.error("[%s] 长篇生成拒绝弱上下文：%s", ctx.novel_id, reason)
+            return StepResult.fail(reason)
 
         bundle = None
 
@@ -479,6 +526,8 @@ class BaseStoryPipeline(ABC):
                 logger.error("chapter_workflow FACT_LOCK 准备失败，禁止无锁降级: %s", e)
                 return StepResult.fail(str(e))
             except Exception as e:
+                if ctx.metadata.get("requires_narrative_memory", False):
+                    return StepResult.fail(f"required_context_build_failed:{e}")
                 logger.warning(f"chapter_workflow 准备失败，降级到 context_builder: {e}")
                 bundle = None
 
@@ -497,6 +546,8 @@ class BaseStoryPipeline(ABC):
                 logger.error("context_builder FACT_LOCK 构建失败，禁止无锁继续: %s", e)
                 return StepResult.fail(str(e))
             except Exception as e:
+                if ctx.metadata.get("requires_narrative_memory", False):
+                    return StepResult.fail(f"required_context_build_failed:{e}")
                 logger.warning(f"context_builder 构建失败: {e}")
 
         # 声线锚点补充
