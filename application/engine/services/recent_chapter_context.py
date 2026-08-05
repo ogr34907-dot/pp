@@ -1,7 +1,7 @@
 """Recent chapter excerpt policy for generation context."""
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 def excerpt_immediate_previous_chapter(
@@ -35,6 +35,7 @@ def build_recent_chapters_context(
     prev_head_chars: int,
     prev_tail_chars: int,
     older_head_chars: int,
+    older_chapter_summaries: Mapping[int, str] | None = None,
 ) -> str:
     """Build the recent-chapter block used by dynamic T2 context."""
     all_chapters = list(chapters)
@@ -67,10 +68,16 @@ def build_recent_chapters_context(
             tail = body[-tail_n:] if len(body) > tail_n else body
             lines.append(f"【章末节选，供跨章一致性参考】\n{tail}")
             continue
-        preview = body[:older_head_chars]
-        if len(body) > older_head_chars:
-            preview = f"{preview}..."
-        lines.append(f"【章首预览】\n{preview}")
+        summary = str((older_chapter_summaries or {}).get(chapter.number, "") or "").strip()
+        if summary:
+            if len(summary) > older_head_chars:
+                summary = f"{summary[:older_head_chars]}..."
+            lines.append(f"【规范章节摘要（已提交）】\n{summary}")
+        else:
+            preview = body[:older_head_chars]
+            if len(body) > older_head_chars:
+                preview = f"{preview}..."
+            lines.append(f"【章首预览】\n{preview}")
 
     if current_beat_index > 0:
         current_chapter = next(

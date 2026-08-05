@@ -3,7 +3,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
+from application.world.services.chapter_narrative_sync import (
+    CHAPTER_NARRATIVE_PIPELINE_VERSION,
+)
+from domain.novel.entities.chapter import Chapter, ChapterStatus
+from domain.novel.value_objects.novel_id import NovelId
 from domain.structure.story_node import NodeType, StoryNode
+from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.sqlite_chapter_repository import (
+    SqliteChapterRepository,
+)
 
 
 def _node(
@@ -194,3 +203,76 @@ def test_vector_recall_combines_narrative_query_and_filters_invalid_evidence():
     assert context.count("有效证据 A") == 1
     for forbidden in ("当前章", "未来章", "T2 已含", "失效向量", "旧版本", "无来源向量", "低分向量", "不应超过三条"):
         assert forbidden not in context
+
+
+def test_recent_chapters_use_only_current_committed_summaries_for_n3_to_n5(tmp_path):
+    novel_id = "novel-1"
+    db = DatabaseConnection(str(tmp_path / "recent-summaries.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES (?, ?, ?)",
+        (novel_id, "Novel", novel_id),
+    )
+    chapter_repository = SqliteChapterRepository(db)
+    for number in range(5, 10):
+        chapter_repository.save(
+            Chapter(
+                id=f"chapter-{number}",
+                novel_id=NovelId(novel_id),
+                number=number,
+                title=f"第{number}章",
+                content=f"第{number}章正文，原始预览内容。",
+                status=ChapterStatus.COMPLETED,
+            )
+        )
+    db.execute("INSERT INTO knowledge (id, novel_id) VALUES ('knowledge-1', ?)", (novel_id,))
+
+    def seed_summary(number, summary, open_threads, *, source_hash=None, sync_status="committed"):
+        source = db.fetch_one(
+            "SELECT content_sha256, content_revision FROM chapters WHERE novel_id = ? AND number = ?",
+            (novel_id, number),
+        )
+        canonical_hash = source_hash or source["content_sha256"]
+        db.execute(
+            "INSERT INTO chapter_summaries "
+            "(id, knowledge_id, chapter_number, summary, open_threads, source_content_sha256, "
+            "pipeline_version, sync_status, sync_attempts) "
+            "VALUES (?, 'knowledge-1', ?, ?, ?, ?, ?, ?, 1)",
+            (
+                f"summary-{number}",
+                number,
+                summary,
+                open_threads,
+                canonical_hash,
+                CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                sync_status,
+            ),
+        )
+        db.execute(
+            "INSERT INTO chapter_narrative_commits "
+            "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status) "
+            "VALUES (?, ?, ?, ?, ?, 'committed')",
+            (
+                novel_id,
+                number,
+                source["content_sha256"],
+                CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                source["content_revision"],
+            ),
+        )
+
+    seed_summary(7, "第七章有效摘要", "第七章未解线程")
+    seed_summary(6, "第六章失效摘要", "不应注入", sync_status="stale")
+    seed_summary(5, "第五章旧哈希摘要", "不应注入", source_hash="wrong-hash")
+    allocator = ContextBudgetAllocator(chapter_repository=chapter_repository)
+
+    context = allocator._get_recent_chapters(novel_id, 10)
+
+    assert "第七章有效摘要" in context
+    assert "第七章未解线程" in context
+    assert "第7章正文" not in context
+    assert "第六章失效摘要" not in context
+    assert "第6章正文" in context
+    assert "第五章旧哈希摘要" not in context
+    assert "第5章正文" in context
+    assert "第9章正文" in context
+    assert "第8章正文" in context

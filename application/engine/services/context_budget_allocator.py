@@ -2121,6 +2121,11 @@ class ContextBudgetAllocator:
         try:
             nid = NovelId(novel_id)
             all_chapters = self.chapter_repo.list_by_novel(nid)
+            older_chapter_summaries = self._get_current_committed_chapter_summaries(
+                novel_id,
+                chapter_number,
+                limit=limit,
+            )
 
             return build_recent_chapters_context(
                 all_chapters,
@@ -2130,6 +2135,7 @@ class ContextBudgetAllocator:
                 prev_head_chars=self.PREV_CHAPTER_BRIDGE_HEAD_CHARS,
                 prev_tail_chars=self.PREV_CHAPTER_BRIDGE_TAIL_CHARS,
                 older_head_chars=self.OLDER_CHAPTER_HEAD_PREVIEW_CHARS,
+                older_chapter_summaries=older_chapter_summaries,
             )
 
         except Exception as e:
@@ -2229,6 +2235,89 @@ class ContextBudgetAllocator:
             logger.warning(f"向量召回失败: {e}")
         
         return ""
+
+    def _get_current_committed_chapter_summaries(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        *,
+        limit: int,
+    ) -> Dict[int, str]:
+        """Read only canonical summaries matching the live chapter version."""
+        db = getattr(self.chapter_repo, "db", None)
+        if db is None:
+            return {}
+
+        lower_bound = max(1, int(chapter_number) - max(1, int(limit)))
+        candidate_numbers = list(range(lower_bound, int(chapter_number) - 2))
+        if not candidate_numbers:
+            return {}
+
+        try:
+            from application.world.services.chapter_narrative_sync import (
+                CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            )
+            from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+                SqliteChapterNarrativeCommitRepository,
+            )
+
+            commit_repository = SqliteChapterNarrativeCommitRepository(db)
+            ready_numbers = [
+                number
+                for number in candidate_numbers
+                if commit_repository.is_current_version_ready(
+                    novel_id=novel_id,
+                    chapter_number=number,
+                    pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                )
+            ]
+            if not ready_numbers:
+                return {}
+
+            placeholders = ", ".join("?" for _ in ready_numbers)
+            rows = db.fetch_all(
+                f"""
+                SELECT chapters.number AS chapter_number,
+                       summaries.summary,
+                       summaries.open_threads
+                FROM chapters
+                JOIN chapter_narrative_commits AS commits
+                  ON commits.novel_id = chapters.novel_id
+                 AND commits.chapter_number = chapters.number
+                 AND commits.content_sha256 = chapters.content_sha256
+                 AND commits.content_revision = chapters.content_revision
+                 AND commits.pipeline_version = ?
+                 AND commits.status = 'committed'
+                JOIN knowledge
+                  ON knowledge.novel_id = chapters.novel_id
+                JOIN chapter_summaries AS summaries
+                  ON summaries.knowledge_id = knowledge.id
+                 AND summaries.chapter_number = chapters.number
+                 AND summaries.source_content_sha256 = chapters.content_sha256
+                 AND summaries.pipeline_version = commits.pipeline_version
+                 AND summaries.sync_status = 'committed'
+                WHERE chapters.novel_id = ?
+                  AND chapters.number IN ({placeholders})
+                  AND summaries.summary IS NOT NULL
+                  AND TRIM(summaries.summary) != ''
+                """,
+                (CHAPTER_NARRATIVE_PIPELINE_VERSION, novel_id, *ready_numbers),
+            )
+        except Exception as exc:
+            logger.debug("读取规范章节摘要失败 novel=%s: %s", novel_id, exc)
+            return {}
+
+        summaries: Dict[int, str] = {}
+        for row in rows:
+            number = int(row.get("chapter_number") or 0)
+            summary = str(row.get("summary") or "").strip()
+            if not number or not summary:
+                continue
+            open_threads = str(row.get("open_threads") or "").strip()
+            if open_threads and open_threads.casefold() not in {"无", "none", "n/a"}:
+                summary = f"{summary}\n【未解线程】\n{open_threads}"
+            summaries[number] = summary
+        return summaries
 
     def _build_vector_recall_query(
         self,

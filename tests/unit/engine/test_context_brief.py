@@ -60,6 +60,27 @@ def test_debt_hint_keeps_only_first_two_bullets():
     assert hint == "叙事备忘：玉佩发热尚未解释；黑衣人的身份需要推进。如果合适可以推进，不必强求回收。"
 
 
+def test_debt_hint_keeps_first_two_unbulleted_content_lines():
+    hint = build_debt_hint(
+        FakeAssembler(
+            debt="\n".join(
+                [
+                    "【叙事债务到期提醒】",
+                    "  逾期 [秘密] 玉佩发热尚未解释",
+                    "  Ch12到期 [身份] 黑衣人的身份需要推进",
+                    "━━",
+                    "【如果你无视此指令，长篇小说的情节网将陷入崩溃】",
+                ]
+            )
+        ),
+        "novel-1",
+        12,
+        "outline",
+    )
+
+    assert hint == "叙事备忘：逾期 [秘密] 玉佩发热尚未解释；Ch12到期 [身份] 黑衣人的身份需要推进。如果合适可以推进，不必强求回收。"
+
+
 def test_context_brief_orders_author_bridge_character_and_debt():
     brief = build_context_brief(
         context_assembler=FakeAssembler(

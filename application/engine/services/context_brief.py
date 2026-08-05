@@ -105,7 +105,11 @@ def build_debt_hint(
             return ""
 
         lines = [line.strip() for line in debt_content.split("\n") if line.strip()]
-        debt_lines = [line for line in lines if line.startswith("-") or line.startswith("•")]
+        debt_lines = [
+            line
+            for line in lines
+            if not line.startswith(("【", "═", "━━", "---"))
+        ]
 
         if not debt_lines:
             return ""
