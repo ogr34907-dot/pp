@@ -2,6 +2,7 @@
 import os
 import pytest
 from unittest.mock import patch, MagicMock
+from application.paths import DATA_DIR
 import interfaces.api.dependencies as dependencies
 
 
@@ -21,7 +22,7 @@ class TestGetVectorStore:
                 result = dependencies.get_vector_store()
 
                 assert result is mock_instance
-                mock_chromadb.assert_called_once_with(persist_directory="./data/chromadb")
+                mock_chromadb.assert_called_once_with(persist_directory=str(DATA_DIR / "chromadb"))
 
     def test_get_vector_store_returns_none_when_disabled(self):
         """VECTOR_STORE_ENABLED 为 false 时返回 None。"""
@@ -139,4 +140,4 @@ class TestGetVectorStore:
                 result = dependencies.get_vector_store()
 
                 assert result is mock_instance
-                mock_chromadb.assert_called_once_with(persist_directory="./data/chromadb")
+                mock_chromadb.assert_called_once_with(persist_directory=str(DATA_DIR / "chromadb"))

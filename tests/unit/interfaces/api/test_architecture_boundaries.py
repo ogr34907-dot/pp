@@ -1,6 +1,22 @@
 from pathlib import Path
 
 
+def _registered_paths(routes, prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    for route in routes:
+        path = getattr(route, "path", None)
+        if isinstance(path, str):
+            paths.add(f"{prefix}{path}")
+            continue
+
+        original_router = getattr(route, "original_router", None)
+        include_context = getattr(route, "include_context", None)
+        if original_router is not None and include_context is not None:
+            nested_prefix = f"{prefix}{getattr(include_context, 'prefix', '')}"
+            paths.update(_registered_paths(original_router.routes, nested_prefix))
+    return paths
+
+
 def test_main_no_longer_hardcodes_api_router_prefixes():
     source = Path("interfaces/main.py").read_text(encoding="utf-8")
 
@@ -206,7 +222,7 @@ def test_app_factory_registers_legacy_and_api_routes(tmp_path):
     from interfaces.main import create_app
 
     app = create_app(BackendSettings(frontend_dir=tmp_path / "dist"))
-    routes = {route.path for route in app.routes}
+    routes = _registered_paths(app.routes)
 
     assert "/" in routes
     assert "/health" in routes
