@@ -165,6 +165,7 @@ class ChapterAftermathPipeline:
         prop_lifecycle_syncer: Any = None,
         evolution_snapshot_service: Any = None,
         character_narrative_kernel: Any = None,
+        memory_engine: Any = None,
     ) -> None:
         self._knowledge = knowledge_service
         self._indexing = chapter_indexing_service
@@ -185,6 +186,11 @@ class ChapterAftermathPipeline:
         self._prop_syncer = prop_lifecycle_syncer
         self._evolution_snapshot_service = evolution_snapshot_service
         self._character_kernel = character_narrative_kernel
+        self._memory_engine = memory_engine
+        if hasattr(self._memory_engine, "llm_service") and getattr(
+            self._memory_engine, "llm_service", None
+        ) is None:
+            self._memory_engine.llm_service = llm_service
 
     async def run_after_chapter_saved(
         self,
@@ -195,6 +201,7 @@ class ChapterAftermathPipeline:
         voice_result: Optional[Dict[str, Any]] = None,
         expected_content_sha256: Optional[str] = None,
         expected_content_revision: Optional[int] = None,
+        outline: str = "",
     ) -> Dict[str, Any]:
         """保存正文后执行完整管线。返回文风结果供托管/审计门控使用。
 
@@ -218,6 +225,9 @@ class ChapterAftermathPipeline:
             "evolution_snapshot_id": None,
             "character_reconcile_ok": False,
             "character_reconcile": None,
+            "memory_engine_ok": None,
+            "memory_engine_new_beats": 0,
+            "memory_engine_new_clues": 0,
         }
 
         if not self._is_current_content_version(
@@ -323,6 +333,74 @@ class ChapterAftermathPipeline:
             logger.warning(
                 "叙事同步/向量失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
             )
+
+        # MemoryEngine is part of the writing context, so it must consume the
+        # same final chapter version only after the canonical sync has committed.
+        if out["narrative_sync_ok"] and self._memory_engine is not None:
+            memory_content_sha256 = expected_content_sha256 or str(
+                out.get("content_sha256") or out.get("content_hash") or ""
+            )
+            memory_content_revision = (
+                expected_content_revision
+                if expected_content_revision is not None
+                else out.get("content_revision")
+            )
+            if not self._is_current_content_version(
+                novel_id,
+                chapter_number,
+                content,
+                expected_content_sha256=memory_content_sha256 or None,
+                expected_content_revision=memory_content_revision,
+            ):
+                out.update(
+                    {
+                        "narrative_sync_ok": False,
+                        "discarded_stale": True,
+                        "failure_reason": "source_version_mismatch",
+                    }
+                )
+                logger.info(
+                    "discard stale memory update novel=%s ch=%s",
+                    novel_id,
+                    chapter_number,
+                )
+            else:
+                try:
+                    memory_delta = await self._memory_engine.update_from_chapter(
+                        novel_id,
+                        chapter_number,
+                        content,
+                        outline,
+                    )
+                    memory_errors = (
+                        list(memory_delta.get("errors") or [])
+                        if isinstance(memory_delta, dict)
+                        else ["MemoryEngine returned an invalid update result"]
+                    )
+                    if memory_errors:
+                        raise RuntimeError("; ".join(str(error) for error in memory_errors))
+                    out["memory_engine_ok"] = True
+                    out["memory_engine_new_beats"] = int(
+                        memory_delta.get("new_beats", 0)
+                    )
+                    out["memory_engine_new_clues"] = int(
+                        memory_delta.get("new_clues", 0)
+                    )
+                except Exception as exc:
+                    out.update(
+                        {
+                            "memory_engine_ok": False,
+                            "narrative_sync_ok": False,
+                            "failure_reason": "memory_engine_update_failed",
+                            "memory_engine_error": str(exc),
+                        }
+                    )
+                    logger.warning(
+                        "MemoryEngine 回写失败 novel=%s ch=%s: %s",
+                        novel_id,
+                        chapter_number,
+                        exc,
+                    )
 
         # 1b) 角色叙事内核对账：cast plan vs 正文，自动投影状态与风险。
         try:

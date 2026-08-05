@@ -74,8 +74,16 @@ def build_daemon():
     foreshadow_repo = SqliteForeshadowingRepository(db)
 
     llm_service = get_llm_service()
-    chapter_workflow = build_auto_workflow(llm_service)
     context_builder = get_context_builder()
+    chapter_workflow = build_auto_workflow(
+        llm_service,
+        context_builder=context_builder,
+    )
+    memory_engine = getattr(
+        getattr(context_builder, "budget_allocator", None),
+        "memory_engine",
+        None,
+    )
 
     planning_service = ContinuousPlanningService(
         story_node_repo=story_node_repo,
@@ -171,6 +179,7 @@ def build_daemon():
             debt_repository=debt_repo,
             bible_repository=bible_repo,
             unified_checkpoint_service=unified_checkpoint_svc,
+            memory_engine=memory_engine,
         )
         logger.info("ChapterAftermathPipeline 已注入（叙事/向量/文风/KG；三元组/伏笔/故事线/张力/对话/因果边/人物状态/债务 单次 LLM）")
     except Exception as e:

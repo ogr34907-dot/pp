@@ -422,6 +422,12 @@ def get_chapter_aftermath_pipeline():
     from infrastructure.persistence.database.connection import get_database
 
     db = get_database()
+    context_builder = get_context_builder()
+    memory_engine = getattr(
+        getattr(context_builder, "budget_allocator", None),
+        "memory_engine",
+        None,
+    )
 
     # ★ V8 Feed-forward: 因果边 / 人物状态 / 叙事债务 仓储
     causal_edge_repo = None
@@ -472,6 +478,7 @@ def get_chapter_aftermath_pipeline():
         prop_lifecycle_syncer=_get_prop_lifecycle_syncer_safe(),
         evolution_snapshot_service=get_evolution_snapshot_service(),
         character_narrative_kernel=get_character_narrative_kernel(),
+        memory_engine=memory_engine,
     )
 
 
@@ -779,17 +786,22 @@ def get_context_builder() -> ContextBuilder:
     )
 
 
-def build_auto_workflow(llm_service: LLMService) -> AutoNovelGenerationWorkflow:
+def build_auto_workflow(
+    llm_service: LLMService,
+    context_builder: ContextBuilder | None = None,
+) -> AutoNovelGenerationWorkflow:
     """用指定 LLM 实例构造章节工作流（与守护进程、API 共用同一 provider 时注入同一实例）。"""
     from application.audit.services.conflict_detection_service import ConflictDetectionService
     from application.audit.services.cliche_scanner import ClicheScanner
 
-    context_builder = get_context_builder()
+    context_builder = context_builder or get_context_builder()
     memory_engine = getattr(
         getattr(context_builder, "budget_allocator", None),
         "memory_engine",
         None,
     )
+    if hasattr(memory_engine, "llm_service") and getattr(memory_engine, "llm_service", None) is None:
+        memory_engine.llm_service = llm_service
 
     return AutoNovelGenerationWorkflow(
         context_builder=context_builder,

@@ -1056,8 +1056,15 @@ class BaseStoryPipeline(ABC):
                     voice_result=voice_result,
                     expected_content_sha256=expected_content_sha256 or None,
                     expected_content_revision=expected_content_revision or None,
+                    outline=ctx.outline,
                 )
-                ctx.narrative_sync_ok = self._is_chapter_narrative_ready(ctx)
+                memory_engine_ok = result.get("memory_engine_ok")
+                ctx.metadata["memory_engine_ok"] = memory_engine_ok
+                if result.get("failure_reason"):
+                    ctx.metadata["aftermath_failure_reason"] = result["failure_reason"]
+                ctx.narrative_sync_ok = bool(
+                    result.get("narrative_sync_ok", False)
+                ) and memory_engine_ok is not False and self._is_chapter_narrative_ready(ctx)
                 ctx.vector_stored = bool(result.get("vector_stored", False))
                 ctx.foreshadow_stored = bool(result.get("foreshadow_stored", False))
                 ctx.triples_extracted = bool(result.get("triples_extracted", False))

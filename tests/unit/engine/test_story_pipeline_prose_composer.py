@@ -618,6 +618,33 @@ async def test_story_pipeline_post_commit_passes_persisted_content_version():
 
 
 @pytest.mark.asyncio
+async def test_story_pipeline_post_commit_blocks_when_memory_state_write_failed():
+    class _Aftermath:
+        async def run_after_chapter_saved(self, *args, **kwargs):
+            return {
+                "narrative_sync_ok": False,
+                "memory_engine_ok": False,
+                "failure_reason": "memory_engine_update_failed",
+            }
+
+    pipeline = _Pipeline()
+    pipeline._is_chapter_narrative_ready = lambda _ctx: True
+    ctx = PipelineContext(
+        novel_id="novel-memory-write-failure",
+        chapter_number=1,
+        chapter_content="正文",
+        word_count=2,
+    )
+    ctx.aftermath_pipeline = _Aftermath()
+
+    result = await pipeline._step_run_post_commit(ctx)
+
+    assert not result.passed
+    assert result.message == "canonical_aftermath_not_ready"
+    assert ctx.narrative_sync_ok is False
+
+
+@pytest.mark.asyncio
 async def test_story_pipeline_does_not_finalize_after_canonical_failure(monkeypatch):
     pipeline = _Pipeline()
     ok_steps = (

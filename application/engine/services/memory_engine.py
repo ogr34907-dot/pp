@@ -31,6 +31,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -57,6 +58,10 @@ logger = logging.getLogger(__name__)
 
 _MAX_BEATS = 50
 _MAX_CLUES = 100
+_MAX_STORED_BEATS = 500
+_MAX_STORED_CLUES = 800
+_COMPLETED_BEATS_RENDER_TOKEN_BUDGET = 1000
+_REVEALED_CLUES_RENDER_TOKEN_BUDGET = 800
 
 
 class CompletedBeatItem(BaseModel):
@@ -370,16 +375,18 @@ class MemoryEngine:
         if not state.completed_beats:
             return ""
 
-        lines = ["【已完成节拍（以下事件已经发生过了，禁止在本章重复写一遍）】\n"]
+        lines = []
         for beat in state.completed_beats:
             ch = beat.get("chapter", "?")
             summary = beat.get("summary", "")
-            beat_id = beat.get("beat_id", "")
-            lines.append(f"   [第{ch}章] {summary}")
-        lines.append(
-            "\n如果你需要'回顾'这些事件，用角色的回忆/一句话带过，不要重新展开写。"
+            if str(summary).strip():
+                lines.append(f"   [第{ch}章] {summary}")
+        return self._render_recent_memory_section(
+            header="【已完成节拍（以下事件已经发生过了，禁止在本章重复写一遍）】",
+            lines=lines,
+            directive="如果你需要'回顾'这些事件，用角色的回忆/一句话带过，不要重新展开写。",
+            token_budget=_COMPLETED_BEATS_RENDER_TOKEN_BUDGET,
         )
-        return "\n".join(lines)
 
     def get_revealed_clues_section(self, novel_id: str) -> str:
         """构建 T0-γ: 已揭露线索清单"""
@@ -392,7 +399,7 @@ class MemoryEngine:
         if not valid_clues:
             return ""
 
-        lines = ["【截至目前已知的线索（读者和主角已经知道的信息）】\n"]
+        lines = []
         for clue in valid_clues:
             ch = clue.get("revealed_at_chapter", "?")
             content = clue.get("content", "")
@@ -401,11 +408,78 @@ class MemoryEngine:
                 "truth": "真相", "relationship": "关系",
                 "identity": "身份", "ability": "能力", "other": "信息"
             }.get(category, "信息")
-            lines.append(f"   [{category_label}] [第{ch}章] {content}")
-        lines.append(
-            "\n以上信息已经是'已知'的，不要再把它们当作'新发现'来写。你可以在此基础上推进，但不能推翻。"
+            if str(content).strip():
+                lines.append(f"   [{category_label}] [第{ch}章] {content}")
+        return self._render_recent_memory_section(
+            header="【截至目前已知的线索（读者和主角已经知道的信息）】",
+            lines=lines,
+            directive="以上信息已经是'已知'的，不要再把它们当作'新发现'来写。你可以在此基础上推进，但不能推翻。",
+            token_budget=_REVEALED_CLUES_RENDER_TOKEN_BUDGET,
         )
-        return "\n".join(lines)
+
+    @staticmethod
+    def _estimate_context_tokens(text: str) -> int:
+        """Match ContextBudgetAllocator's mixed Chinese/English token estimate."""
+        value = str(text or "")
+        if not value:
+            return 0
+        chinese_chars = sum(1 for char in value if "\u4e00" <= char <= "\u9fff")
+        english_chars = len(value) - chinese_chars
+        return int(chinese_chars / 1.5 + english_chars / 4.0 + 0.5)
+
+    @classmethod
+    def _truncate_memory_line(cls, line: str, token_budget: int) -> str:
+        value = str(line or "")
+        if token_budget <= 0:
+            return ""
+        if cls._estimate_context_tokens(value) <= token_budget:
+            return value
+
+        low, high = 0, len(value)
+        best = ""
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = value[:middle]
+            if middle < len(value):
+                candidate += "..."
+            if cls._estimate_context_tokens(candidate) <= token_budget:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
+    @classmethod
+    def _render_recent_memory_section(
+        cls,
+        *,
+        header: str,
+        lines: List[str],
+        directive: str,
+        token_budget: int,
+    ) -> str:
+        """Keep recent memory under the receiving ContextSlot's exact budget."""
+        def render(ordered_lines: List[str]) -> str:
+            return "\n".join([header, "", *ordered_lines, "", directive])
+
+        selected_recent_first: List[str] = []
+        for line in reversed(lines):
+            candidate_recent_first = [*selected_recent_first, line]
+            candidate = render(list(reversed(candidate_recent_first)))
+            if cls._estimate_context_tokens(candidate) <= token_budget:
+                selected_recent_first = candidate_recent_first
+                continue
+
+            base = render(list(reversed(selected_recent_first)))
+            remaining = token_budget - cls._estimate_context_tokens(base)
+            truncated = cls._truncate_memory_line(line, remaining)
+            if truncated:
+                candidate = render(list(reversed([*selected_recent_first, truncated])))
+                if cls._estimate_context_tokens(candidate) <= token_budget:
+                    selected_recent_first.append(truncated)
+            break
+
+        return render(list(reversed(selected_recent_first)))
 
     # ============================================================
     # 章后状态回写（生成后调用，LLM 驱动）
@@ -438,7 +512,7 @@ class MemoryEngine:
 
         try:
             # 1. 准备上下文
-            state = self._get_or_load_state(novel_id)
+            state = deepcopy(self._get_or_load_state(novel_id))
             fact_lock = self.build_fact_lock_section(novel_id, chapter_number)
             existing_beats = self._summarize_beats_for_prompt(state.completed_beats)
             existing_clues = self._summarize_clues_for_prompt(state.revealed_clues)
@@ -510,9 +584,9 @@ class MemoryEngine:
                 )
 
             # 6. 更新状态并持久化
-            state.last_updated_chapter = chapter_number
-            self._remember_state(novel_id, state)
+            state.last_updated_chapter = max(state.last_updated_chapter, chapter_number)
             self._persist_state(novel_id, state)
+            self._remember_state(novel_id, state)
 
             logger.info(
                 f"MemoryEngine 更新完成 @ ch{chapter_number}: "
@@ -660,8 +734,12 @@ class MemoryEngine:
                     self._upsert_state_row(novel_id, state)
                 except Exception as retry_err:
                     logger.error(f"MemoryEngine 持久化重试失败: {retry_err}")
+                    raise RuntimeError(
+                        f"MemoryEngine state persistence failed: {retry_err}"
+                    ) from retry_err
             else:
                 logger.error(f"MemoryEngine 持久化失败: {e}")
+                raise RuntimeError(f"MemoryEngine state persistence failed: {e}") from e
 
     def _ensure_table_exists(self) -> None:
         """自动创建 memory_engine_state 表"""
@@ -710,6 +788,9 @@ class MemoryEngine:
             state.completed_beats.append(beat_data)
             count += 1
 
+        if len(state.completed_beats) > _MAX_STORED_BEATS:
+            del state.completed_beats[:-_MAX_STORED_BEATS]
+
         return count
 
     def _merge_clues(
@@ -738,6 +819,9 @@ class MemoryEngine:
 
             state.revealed_clues.append(clue_data)
             count += 1
+
+        if len(state.revealed_clues) > _MAX_STORED_CLUES:
+            del state.revealed_clues[:-_MAX_STORED_CLUES]
 
         return count
 
