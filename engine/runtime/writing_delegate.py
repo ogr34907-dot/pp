@@ -67,6 +67,50 @@ def _build_runner(daemon: Any):
     )
 
 
+def _get_story_pipeline_commit_repository(runner: Any):
+    db = getattr(getattr(runner, "chapter_repository", None), "db", None)
+    if db is None:
+        return None
+    from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+        SqliteChapterNarrativeCommitRepository,
+    )
+
+    return SqliteChapterNarrativeCommitRepository(db)
+
+
+def _apply_story_pipeline_advance(novel: Any, advance: Any) -> None:
+    from domain.novel.entities.novel import NovelStage
+
+    novel.current_auto_chapters = int(advance.current_auto_chapters)
+    novel.current_chapter_in_act = int(advance.current_chapter_in_act)
+    novel.current_beat_index = 0
+    novel.beats_completed = False
+    stage = str(getattr(advance, "current_stage", "") or "auditing")
+    try:
+        novel.current_stage = NovelStage(stage)
+    except ValueError:
+        novel.current_stage = stage
+
+
+def _pause_for_story_pipeline_advance_failure(
+    daemon: Any,
+    novel: Any,
+    novel_id: str,
+    reason: str,
+) -> None:
+    from domain.novel.entities.novel import NovelStage
+
+    novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+    novel.last_audit_narrative_ok = False
+    daemon._update_shared_state(
+        novel_id,
+        current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+        last_audit_narrative_ok=False,
+        autopilot_pause_reason=reason,
+    )
+    daemon._flush_novel(novel)
+
+
 async def run_writing(host: Any, novel: Any) -> None:
     """写作阶段统一入口 — 按 host 配置或环境变量选择新/旧管线"""
     if getattr(host, "use_story_pipeline_for_writing", False):
@@ -81,13 +125,68 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
     """执行单章写作（新管线），并同步 novel 状态到 daemon 模型"""
     from domain.novel.entities.novel import NovelStage
     from engine.pipelines.registry import get_pipeline_registry
+    from application.world.services.chapter_narrative_sync import (
+        CHAPTER_NARRATIVE_PIPELINE_VERSION,
+    )
 
     novel_id = novel.novel_id.value if hasattr(novel.novel_id, "value") else str(novel.novel_id)
     runner = _build_runner(daemon)
     target_words = int(getattr(novel, "target_words_per_chapter", None) or runner.DEFAULT_TARGET_WORDS)
     genre = (getattr(novel, "genre", "") or "").strip().lower()
+    commit_repository = _get_story_pipeline_commit_repository(runner)
 
     logger.info("[%s] StoryPipeline 写作模式 genre=%s", novel_id, genre or "(default)")
+
+    if commit_repository is None:
+        _pause_for_story_pipeline_advance_failure(
+            daemon,
+            novel,
+            novel_id,
+            "required_narrative_memory_unavailable:canonical_commit_repository",
+        )
+        return
+
+    try:
+        recovered_advances = commit_repository.recover_pending_story_pipeline_advances(
+            novel_id=novel_id,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        )
+    except Exception as exc:
+        _pause_for_story_pipeline_advance_failure(
+            daemon,
+            novel,
+            novel_id,
+            f"story_pipeline_advance_recovery_failed:{exc}",
+        )
+        return
+
+    if recovered_advances:
+        recovery = recovered_advances[-1]
+        if recovery.disposition not in {"applied", "already_applied"}:
+            _pause_for_story_pipeline_advance_failure(
+                daemon,
+                novel,
+                novel_id,
+                "story_pipeline_advance_recovery_failed:"
+                f"{recovery.disposition}:{recovery.failure_reason}",
+            )
+            return
+        _apply_story_pipeline_advance(novel, recovery)
+        daemon._update_shared_state(
+            novel_id,
+            writing_substep="pipeline_done",
+            writing_substep_label="恢复已提交章节的审计",
+            current_chapter_number=recovery.chapter_number,
+            audit_aftermath_reused=True,
+            audit_aftermath_rebuilt=False,
+        )
+        daemon._flush_novel(novel)
+        logger.info(
+            "[%s] StoryPipeline 恢复已提交第%s章的状态推进",
+            novel_id,
+            recovery.chapter_number,
+        )
+        return
 
     def _writing_sink(substep: str, label: str, extra: Dict[str, Any]) -> None:
         merged = dict(extra)
@@ -202,6 +301,20 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
 
     if result.success:
         chapter_num = result.chapter_number or ctx.chapter_number
+        advance = commit_repository.advance_story_pipeline_once(
+            novel_id=novel_id,
+            chapter_number=chapter_num,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        )
+        if advance.disposition not in {"applied", "already_applied"}:
+            _pause_for_story_pipeline_advance_failure(
+                daemon,
+                novel,
+                novel_id,
+                "story_pipeline_advance_failed:"
+                f"{advance.disposition}:{advance.failure_reason}",
+            )
+            return
         if getattr(result, "audit_snapshot", None):
             pending = getattr(daemon, "_pending_story_pipeline_aftermath", None)
             if pending is not None:
@@ -214,13 +327,9 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
                     "source": "story_pipeline",
                     "reused": False,
                 }
-        novel.current_auto_chapters = (novel.current_auto_chapters or 0) + 1
-        novel.current_chapter_in_act = (novel.current_chapter_in_act or 0) + 1
-        novel.current_beat_index = 0
-        novel.beats_completed = False
+        _apply_story_pipeline_advance(novel, advance)
         if result.tension:
             novel.last_chapter_tension = result.tension
-        novel.current_stage = NovelStage.AUDITING
 
         daemon._update_shared_state(
             novel_id,

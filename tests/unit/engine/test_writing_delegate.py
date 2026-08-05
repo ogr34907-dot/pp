@@ -1,4 +1,5 @@
 """StoryPipeline 写作委托测试"""
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,6 +12,7 @@ from engine.runtime.writing_delegate import (
     run_story_pipeline_writing,
     story_pipeline_mode_was_unset,
 )
+import engine.runtime.writing_delegate as writing_delegate
 from engine.pipeline.context import PipelineResult
 
 
@@ -50,7 +52,7 @@ def test_get_story_pipeline_mode_unknown_warns_and_defaults(monkeypatch, caplog)
 
 
 @pytest.mark.asyncio
-async def test_run_story_pipeline_writing_success_updates_novel():
+async def test_run_story_pipeline_writing_success_updates_novel(monkeypatch):
     novel = MagicMock()
     novel.novel_id.value = "novel-1"
     novel.genre = "wuxia"
@@ -81,6 +83,21 @@ async def test_run_story_pipeline_writing_success_updates_novel():
             word_count=2800,
             tension=72,
         )
+    )
+    commit_repository = MagicMock()
+    commit_repository.recover_pending_story_pipeline_advances.return_value = []
+    commit_repository.advance_story_pipeline_once.return_value = SimpleNamespace(
+        disposition="applied",
+        current_auto_chapters=3,
+        current_chapter_in_act=2,
+        current_stage="auditing",
+        failure_reason="",
+    )
+    monkeypatch.setattr(
+        writing_delegate,
+        "_get_story_pipeline_commit_repository",
+        lambda _runner: commit_repository,
+        raising=False,
     )
 
     with patch("engine.runtime.writing_delegate._build_runner", return_value=mock_runner), patch(
@@ -207,6 +224,114 @@ async def test_run_story_pipeline_writing_pauses_on_canonical_history_failure():
         last_audit_narrative_ok=False,
         autopilot_pause_reason="canonical_history_checkpoint_required",
     )
+    daemon._flush_novel.assert_called_once_with(novel)
+
+
+@pytest.mark.asyncio
+async def test_run_story_pipeline_writing_recovers_pending_advance_without_regenerating_prose(
+    monkeypatch,
+):
+    novel = MagicMock()
+    novel.novel_id.value = "novel-recovery"
+    novel.genre = ""
+    novel.target_words_per_chapter = 2500
+    novel.auto_approve_mode = True
+    novel.era = "ancient"
+    novel.current_auto_chapters = 2
+    novel.current_chapter_in_act = 1
+    novel.current_beat_index = 3
+    novel.beats_completed = True
+
+    daemon = MagicMock()
+    daemon._update_shared_state = MagicMock()
+    daemon._flush_novel = MagicMock()
+
+    mock_runner = MagicMock()
+    mock_runner.DEFAULT_TARGET_WORDS = 2500
+    commit_repository = MagicMock()
+    commit_repository.recover_pending_story_pipeline_advances.return_value = [
+        SimpleNamespace(
+            disposition="applied",
+            chapter_number=3,
+            current_auto_chapters=3,
+            current_chapter_in_act=2,
+            current_stage="auditing",
+            failure_reason="",
+        )
+    ]
+    monkeypatch.setattr(
+        writing_delegate,
+        "_get_story_pipeline_commit_repository",
+        lambda _runner: commit_repository,
+        raising=False,
+    )
+    mock_pipeline = MagicMock()
+    mock_pipeline.run_chapter = AsyncMock(
+        side_effect=AssertionError("canonical prose must not be regenerated")
+    )
+
+    with patch("engine.runtime.writing_delegate._build_runner", return_value=mock_runner), patch(
+        "engine.pipelines.registry.get_pipeline_registry"
+    ) as mock_registry:
+        mock_registry.return_value.create_pipeline.return_value = mock_pipeline
+        await run_story_pipeline_writing(daemon, novel)
+
+    assert novel.current_auto_chapters == 3
+    assert novel.current_chapter_in_act == 2
+    assert novel.current_beat_index == 0
+    assert novel.beats_completed is False
+    assert novel.current_stage == NovelStage.AUDITING
+    mock_registry.assert_not_called()
+    daemon._flush_novel.assert_called_once_with(novel)
+
+
+@pytest.mark.asyncio
+async def test_run_story_pipeline_writing_pauses_when_canonical_advance_is_not_current(
+    monkeypatch,
+):
+    novel = MagicMock()
+    novel.novel_id.value = "novel-stale-advance"
+    novel.genre = ""
+    novel.target_words_per_chapter = 2500
+    novel.auto_approve_mode = True
+    novel.era = "ancient"
+    novel.current_auto_chapters = 2
+    novel.current_chapter_in_act = 1
+
+    daemon = MagicMock()
+    daemon._update_shared_state = MagicMock()
+    daemon._flush_novel = MagicMock()
+
+    mock_runner = MagicMock()
+    mock_runner.DEFAULT_TARGET_WORDS = 2500
+    mock_runner._make_context.return_value = MagicMock(chapter_number=3)
+    mock_runner._get_novel_phase.return_value = "development"
+    commit_repository = MagicMock()
+    commit_repository.recover_pending_story_pipeline_advances.return_value = []
+    commit_repository.advance_story_pipeline_once.return_value = SimpleNamespace(
+        disposition="source_version_mismatch",
+        failure_reason="canonical_commit_not_current",
+    )
+    monkeypatch.setattr(
+        writing_delegate,
+        "_get_story_pipeline_commit_repository",
+        lambda _runner: commit_repository,
+        raising=False,
+    )
+    mock_pipeline = MagicMock()
+    mock_pipeline.run_chapter = AsyncMock(
+        return_value=PipelineResult(success=True, chapter_number=3, word_count=2800)
+    )
+
+    with patch("engine.runtime.writing_delegate._build_runner", return_value=mock_runner), patch(
+        "engine.pipelines.registry.get_pipeline_registry"
+    ) as mock_registry:
+        mock_registry.return_value.create_pipeline.return_value = mock_pipeline
+        await run_story_pipeline_writing(daemon, novel)
+
+    assert novel.current_stage == NovelStage.PAUSED_FOR_REVIEW
+    assert novel.current_auto_chapters == 2
+    assert novel.current_chapter_in_act == 1
     daemon._flush_novel.assert_called_once_with(novel)
 
 

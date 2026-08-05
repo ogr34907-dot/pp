@@ -20,6 +20,17 @@ class NarrativeClaim:
     failure_reason: str = ""
 
 
+@dataclass(frozen=True)
+class StoryPipelineAdvance:
+    disposition: str
+    chapter_number: int
+    content_revision: int
+    current_auto_chapters: int
+    current_chapter_in_act: int
+    current_stage: str
+    failure_reason: str = ""
+
+
 def _payload_sha256_from_summary_row(row) -> str:
     try:
         beat_sections = json.loads(row["beat_sections"]) if row["beat_sections"] else []
@@ -128,7 +139,8 @@ class SqliteChapterNarrativeCommitRepository:
                         UPDATE chapter_narrative_commits
                         SET content_revision = ?, status = 'in_progress',
                             failure_reason = '', attempt_count = 1,
-                            vector_status = 'not_started', committed_at = NULL,
+                            vector_status = 'not_started', advance_status = 'pending',
+                            advance_applied_at = NULL, committed_at = NULL,
                             updated_at = ?
                         WHERE novel_id = ? AND chapter_number = ?
                           AND content_sha256 = ? AND pipeline_version = ?
@@ -161,7 +173,8 @@ class SqliteChapterNarrativeCommitRepository:
                         """
                         UPDATE chapter_narrative_commits
                         SET status = 'in_progress', failure_reason = '', attempt_count = 1,
-                            vector_status = 'not_started', committed_at = NULL, updated_at = ?
+                            vector_status = 'not_started', advance_status = 'pending',
+                            advance_applied_at = NULL, committed_at = NULL, updated_at = ?
                         WHERE novel_id = ? AND chapter_number = ?
                           AND content_sha256 = ? AND pipeline_version = ?
                           AND status = 'stale'
@@ -476,6 +489,245 @@ class SqliteChapterNarrativeCommitRepository:
                         content_revision,
                     ),
                 )
+
+    def advance_story_pipeline_once(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        pipeline_version: str,
+    ) -> StoryPipelineAdvance:
+        """Advance the durable novel cursor once for the current canonical chapter."""
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                novel = conn.execute(
+                    """
+                    SELECT current_auto_chapters, current_chapter_in_act, current_stage
+                    FROM novels WHERE id = ?
+                    """,
+                    (novel_id,),
+                ).fetchone()
+                if novel is None:
+                    return StoryPipelineAdvance(
+                        "novel_not_found", chapter_number, 0, 0, 0, "",
+                        "novel_not_found",
+                    )
+
+                current_auto_chapters = int(novel[0] or 0)
+                current_chapter_in_act = int(novel[1] or 0)
+                current_stage = str(novel[2] or "")
+                source = conn.execute(
+                    """
+                    SELECT content, content_sha256, content_revision
+                    FROM chapters WHERE novel_id = ? AND number = ?
+                    """,
+                    (novel_id, chapter_number),
+                ).fetchone()
+                if source is None:
+                    return StoryPipelineAdvance(
+                        "chapter_not_found",
+                        chapter_number,
+                        0,
+                        current_auto_chapters,
+                        current_chapter_in_act,
+                        current_stage,
+                        "chapter_not_found",
+                    )
+
+                actual_sha256 = hashlib.sha256(
+                    (source[0] or "").encode("utf-8")
+                ).hexdigest()
+                content_revision = int(source[2] or 0)
+                if source[1] != actual_sha256 or content_revision < 1:
+                    return StoryPipelineAdvance(
+                        "source_version_mismatch",
+                        chapter_number,
+                        content_revision,
+                        current_auto_chapters,
+                        current_chapter_in_act,
+                        current_stage,
+                        "source_version_mismatch",
+                    )
+
+                claim = conn.execute(
+                    """
+                    SELECT advance_status
+                    FROM chapter_narrative_commits
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ? AND status = 'committed'
+                    """,
+                    (
+                        novel_id,
+                        chapter_number,
+                        actual_sha256,
+                        pipeline_version,
+                        content_revision,
+                    ),
+                ).fetchone()
+                if claim is None:
+                    return StoryPipelineAdvance(
+                        "source_version_mismatch",
+                        chapter_number,
+                        content_revision,
+                        current_auto_chapters,
+                        current_chapter_in_act,
+                        current_stage,
+                        "canonical_commit_not_current",
+                    )
+                if claim[0] == "applied":
+                    return StoryPipelineAdvance(
+                        "already_applied",
+                        chapter_number,
+                        content_revision,
+                        current_auto_chapters,
+                        current_chapter_in_act,
+                        current_stage,
+                    )
+                if claim[0] != "pending":
+                    return StoryPipelineAdvance(
+                        "advance_not_pending",
+                        chapter_number,
+                        content_revision,
+                        current_auto_chapters,
+                        current_chapter_in_act,
+                        current_stage,
+                        f"advance_status={claim[0]}",
+                    )
+                if current_auto_chapters >= chapter_number:
+                    cursor = conn.execute(
+                        """
+                        UPDATE chapter_narrative_commits
+                        SET advance_status = 'applied', advance_applied_at = ?,
+                            updated_at = ?
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND pipeline_version = ?
+                          AND content_revision = ? AND status = 'committed'
+                          AND advance_status = 'pending'
+                        """,
+                        (
+                            now,
+                            now,
+                            novel_id,
+                            chapter_number,
+                            actual_sha256,
+                            pipeline_version,
+                            content_revision,
+                        ),
+                    )
+                    return StoryPipelineAdvance(
+                        "already_applied" if cursor.rowcount == 1 else "advance_conflict",
+                        chapter_number,
+                        content_revision,
+                        current_auto_chapters,
+                        current_chapter_in_act,
+                        current_stage,
+                    )
+                if current_auto_chapters + 1 != chapter_number:
+                    return StoryPipelineAdvance(
+                        "advance_out_of_sequence",
+                        chapter_number,
+                        content_revision,
+                        current_auto_chapters,
+                        current_chapter_in_act,
+                        current_stage,
+                        "chapter_number_is_not_next",
+                    )
+
+                cursor = conn.execute(
+                    """
+                    UPDATE chapter_narrative_commits
+                    SET advance_status = 'applied', advance_applied_at = ?,
+                        updated_at = ?
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ? AND status = 'committed'
+                      AND advance_status = 'pending'
+                    """,
+                    (
+                        now,
+                        now,
+                        novel_id,
+                        chapter_number,
+                        actual_sha256,
+                        pipeline_version,
+                        content_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    return StoryPipelineAdvance(
+                        "advance_conflict",
+                        chapter_number,
+                        content_revision,
+                        current_auto_chapters,
+                        current_chapter_in_act,
+                        current_stage,
+                        "advance_claim_changed",
+                    )
+
+                next_auto_chapters = current_auto_chapters + 1
+                next_chapter_in_act = current_chapter_in_act + 1
+                conn.execute(
+                    """
+                    UPDATE novels
+                    SET current_auto_chapters = ?, current_chapter_in_act = ?,
+                        current_beat_index = 0, beats_completed = 0,
+                        current_stage = 'auditing', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        next_auto_chapters,
+                        next_chapter_in_act,
+                        now,
+                        novel_id,
+                    ),
+                )
+                return StoryPipelineAdvance(
+                    "applied",
+                    chapter_number,
+                    content_revision,
+                    next_auto_chapters,
+                    next_chapter_in_act,
+                    "auditing",
+                )
+
+    def recover_pending_story_pipeline_advances(
+        self,
+        *,
+        novel_id: str,
+        pipeline_version: str,
+    ) -> list[StoryPipelineAdvance]:
+        """Replay consecutive pending advances without regenerating canonical prose."""
+        novel = self._db.fetch_one(
+            "SELECT current_auto_chapters FROM novels WHERE id = ?",
+            (novel_id,),
+        )
+        if novel is None:
+            return []
+        current_auto_chapters = int(novel["current_auto_chapters"] or 0)
+        rows = self._db.fetch_all(
+            """
+            SELECT chapter_number
+            FROM chapter_narrative_commits
+            WHERE novel_id = ? AND pipeline_version = ?
+              AND status = 'committed' AND advance_status = 'pending'
+              AND chapter_number > ?
+            ORDER BY chapter_number ASC
+            """,
+            (novel_id, pipeline_version, current_auto_chapters),
+        )
+        recovered: list[StoryPipelineAdvance] = []
+        for row in rows:
+            advance = self.advance_story_pipeline_once(
+                novel_id=novel_id,
+                chapter_number=int(row["chapter_number"]),
+                pipeline_version=pipeline_version,
+            )
+            recovered.append(advance)
+            if advance.disposition not in {"applied", "already_applied"}:
+                break
+        return recovered
 
     def set_vector_status(
         self,

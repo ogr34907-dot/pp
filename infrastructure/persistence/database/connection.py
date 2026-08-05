@@ -400,6 +400,8 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
             failure_reason TEXT NOT NULL DEFAULT '',
             attempt_count INTEGER NOT NULL DEFAULT 1,
             vector_status TEXT NOT NULL DEFAULT 'not_started',
+            advance_status TEXT NOT NULL DEFAULT 'pending',
+            advance_applied_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             committed_at TIMESTAMP,
@@ -415,6 +417,39 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
         ON chapter_narrative_commits(novel_id, chapter_number, content_revision)
         """
     )
+
+    commit_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(chapter_narrative_commits)")
+    }
+    advance_columns_added = False
+    for column, sql in {
+        "advance_status": (
+            "ALTER TABLE chapter_narrative_commits ADD COLUMN "
+            "advance_status TEXT NOT NULL DEFAULT 'pending'"
+        ),
+        "advance_applied_at": (
+            "ALTER TABLE chapter_narrative_commits ADD COLUMN "
+            "advance_applied_at TIMESTAMP"
+        ),
+    }.items():
+        if column not in commit_cols:
+            conn.execute(sql)
+            advance_columns_added = True
+
+    # Only legacy databases that received the columns during this run need a
+    # backfill. Fresh commits retain the pending default until their first
+    # durable StoryPipeline advancement.
+    if advance_columns_added:
+        conn.execute(
+            """
+            UPDATE chapter_narrative_commits
+            SET advance_status = 'applied',
+                advance_applied_at = COALESCE(
+                    advance_applied_at, committed_at, updated_at, CURRENT_TIMESTAMP
+                )
+            WHERE status = 'committed'
+            """
+        )
 
     rows = conn.execute(
         "SELECT id, content, content_sha256, content_revision FROM chapters"
