@@ -1,6 +1,6 @@
 """Chapter 应用服务"""
 from typing import List, Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 from domain.novel.entities.chapter import Chapter, ChapterStatus
 from domain.novel.value_objects.chapter_id import ChapterId
@@ -236,7 +236,7 @@ class ChapterService:
                 return review
 
         # 返回默认审阅
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         return ChapterReviewDTO(
             status="draft",
             memo="",
@@ -288,7 +288,7 @@ class ChapterService:
             )
 
         # 降级：返回临时对象（不应该到达这里）
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         return ChapterReviewDTO(
             status=status,
             memo=memo,

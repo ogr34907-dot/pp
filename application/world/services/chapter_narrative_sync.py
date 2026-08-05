@@ -13,7 +13,7 @@ import re
 import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1790,7 +1790,7 @@ def _initialize_first_chapter_snapshot(
 
         # 创建初始快照
         snapshot_id = f"snapshot-{uuid.uuid4()}"
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         cursor.execute("""
             INSERT INTO novel_snapshots (
