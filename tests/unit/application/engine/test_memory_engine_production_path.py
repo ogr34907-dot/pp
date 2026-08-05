@@ -158,6 +158,23 @@ async def test_memory_engine_failure_stays_durable_until_the_same_version_retrie
     )
     chapter_repository.save(chapter)
     chapter = chapter_repository.get_by_novel_and_number(NovelId("novel-1"), 1)
+    db.execute("INSERT INTO knowledge (id, novel_id) VALUES ('knowledge-1', 'novel-1')")
+    db.execute(
+        "INSERT INTO chapter_summaries "
+        "(id, knowledge_id, chapter_number, summary, source_content_sha256, "
+        "pipeline_version, sync_status, sync_attempts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "summary-1",
+            "knowledge-1",
+            1,
+            "已提交的规范摘要",
+            chapter.content_sha256,
+            "chapter-narrative-sync:v1",
+            "committed",
+            1,
+        ),
+    )
     db.execute(
         "INSERT INTO chapter_narrative_commits "
         "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, "

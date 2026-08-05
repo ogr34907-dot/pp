@@ -1213,3 +1213,85 @@ async def test_reused_commit_retries_failed_vector_without_reextracting(
         "vector_status": "stored",
         "attempt_count": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_stale_extraction_cannot_replace_the_newer_canonical_summary(
+    tmp_path, monkeypatch
+):
+    """An older async extraction must lose its CAS race before touching summaries."""
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    old_content = chapter.content
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+
+    async def extract_with_delayed_old_version(_llm, content, _chapter_number, **_kwargs):
+        if content == old_content:
+            old_started.set()
+            await release_old.wait()
+            return {
+                **_canonical_bundle(summary="旧版本摘要"),
+                "dialogues": [
+                    {"speaker": "旧角色", "content": "旧版本事件", "context": "旧场景"}
+                ],
+            }
+        return {
+            **_canonical_bundle(summary="新版本摘要"),
+            "dialogues": [
+                {"speaker": "新角色", "content": "新版本事件", "context": "新场景"}
+            ],
+        }
+
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        extract_with_delayed_old_version,
+    )
+    event_repository = SqliteNarrativeEventRepository(db)
+
+    old_task = asyncio.create_task(
+        sync_chapter_narrative_after_save(
+            "novel-1",
+            1,
+            old_content,
+            knowledge,
+            None,
+            SimpleNamespace(),
+            chapter_repository=chapter_repo,
+            narrative_event_repository=event_repository,
+        )
+    )
+    await old_started.wait()
+
+    chapter.update_content("第二版正文")
+    chapter_repo.save(chapter)
+    newer = await sync_chapter_narrative_after_save(
+        "novel-1",
+        1,
+        chapter.content,
+        knowledge,
+        None,
+        SimpleNamespace(),
+        chapter_repository=chapter_repo,
+        narrative_event_repository=event_repository,
+    )
+
+    release_old.set()
+    stale = await old_task
+
+    assert newer.commit_status == "committed"
+    assert stale.commit_status == "failed"
+    assert stale.failure_reason == "source_hash_mismatch"
+    summary = db.fetch_one(
+        "SELECT summary, source_content_sha256, sync_status FROM chapter_summaries "
+        "WHERE chapter_number = 1"
+    )
+    assert dict(summary) == {
+        "summary": "新版本摘要",
+        "source_content_sha256": newer.content_sha256,
+        "sync_status": "committed",
+    }
+    assert [row["event_summary"] for row in db.fetch_all(
+        "SELECT event_summary FROM narrative_events WHERE novel_id = ? "
+        "AND chapter_number = ? ORDER BY event_summary",
+        ("novel-1", 1),
+    )] == ["新角色: 新版本事件"]

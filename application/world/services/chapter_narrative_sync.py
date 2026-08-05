@@ -2421,6 +2421,18 @@ async def _sync_chapter_narrative_after_save_once(
             flags=flags,
         )
 
+    def stale_claim_result() -> AftermathCommitResult | None:
+        """Fail closed when a long-running extraction lost its source version."""
+        if commit_repository.is_current_claim_in_progress(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision=claim.content_revision,
+        ):
+            return None
+        return failed_result("source_hash_mismatch")
+
     existing = None
     existing_beats: List[str] = []
     try:
@@ -2483,6 +2495,10 @@ async def _sync_chapter_narrative_after_save_once(
     ):
         if not isinstance(bundle.get(field_name, []), list):
             return failed_result(f"invalid_structure:{field_name}")
+
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
 
     # --- 独立多维张力评分 ---
     from application.analyst.services.tension_scoring_service import TensionScoringService
@@ -2567,7 +2583,11 @@ async def _sync_chapter_narrative_after_save_once(
             mb_out = list(existing.micro_beats or [])
     except Exception as e:
         logger.debug("微观节拍赋值失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
-    
+
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
+
     try:
         from infrastructure.persistence.database.write_dispatch import (
             sqlite_writes_bypass_queue,
@@ -2595,6 +2615,10 @@ async def _sync_chapter_narrative_after_save_once(
             )
     except Exception as e:
         return failed_result(str(e) or type(e).__name__)
+
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
     try:
         commit_repository.prepare_summary(
             novel_id=novel_id,
@@ -2606,6 +2630,10 @@ async def _sync_chapter_narrative_after_save_once(
         )
     except Exception as e:
         return failed_result(str(e) or type(e).__name__)
+
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
 
     if triple_repository is not None or foreshadowing_repo is not None:
         try:
@@ -2632,6 +2660,10 @@ async def _sync_chapter_narrative_after_save_once(
             )
             return failed_result(str(e) or type(e).__name__)
 
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
+
     if storyline_repository is not None or chapter_repository is not None or narrative_event_repository is not None:
         try:
             extras_persisted = persist_bundle_extras(
@@ -2653,6 +2685,10 @@ async def _sync_chapter_narrative_after_save_once(
             return failed_result(str(e) or type(e).__name__)
 
     # ★ V8 Feed-forward: 因果边提取 + 人物状态突变 + 叙事债务更新
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
+
     if causal_edge_repository is not None:
         try:
             from infrastructure.persistence.database.write_dispatch import (
@@ -2674,6 +2710,10 @@ async def _sync_chapter_narrative_after_save_once(
                 "因果边落库失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
             )
             return failed_result(str(e) or type(e).__name__)
+
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
 
     if character_state_repository is not None:
         try:
@@ -2717,6 +2757,10 @@ async def _sync_chapter_narrative_after_save_once(
             )
             return failed_result(str(e) or type(e).__name__)
 
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
+
     try:
         from infrastructure.persistence.database.write_dispatch import (
             sqlite_writes_bypass_queue,
@@ -2737,6 +2781,10 @@ async def _sync_chapter_narrative_after_save_once(
             "MemoryAtom 双写失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
         )
         return failed_result(str(e) or type(e).__name__)
+
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
 
     if debt_repository is not None:
         try:
