@@ -312,6 +312,23 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
                 f"约 {bundle['context_tokens']} tokens"
             )
         except Exception as e:
+            if str(e).startswith("required_narrative_memory_unavailable:"):
+                reason = str(e)
+                novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+                novel.last_audit_narrative_ok = False
+                host._update_shared_state(
+                    novel.novel_id.value,
+                    current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+                    last_audit_narrative_ok=False,
+                    autopilot_pause_reason=reason,
+                )
+                host._flush_novel(novel)
+                logger.warning(
+                    "[%s] legacy 写作因必需记忆不可用而暂停: %s",
+                    novel.novel_id,
+                    reason,
+                )
+                return
             if str(e).startswith("evolution_gate_blocked:"):
                 logger.warning(
                     "[%s] EvolutionGate blocking，第 %s 章暂停托管写作：%s",

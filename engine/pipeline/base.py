@@ -100,6 +100,16 @@ class BaseStoryPipeline(ABC):
         step_status: Dict[str, str] = {}
 
         try:
+            narrative_memory_result = self._check_required_narrative_memory(ctx)
+            if not narrative_memory_result.passed:
+                step_status["required_narrative_memory"] = "failed"
+                return self._make_result(
+                    ctx,
+                    success=False,
+                    error=narrative_memory_result.message,
+                    step_status=step_status,
+                )
+
             # 1. 定位下一个待写章节
             self._mark_pipeline_step(ctx, "find_next_chapter")
             r = await self._step_find_next_chapter(ctx)
@@ -494,6 +504,18 @@ class BaseStoryPipeline(ABC):
             missing.append("canonical_commit_repository")
         return missing
 
+    def _check_required_narrative_memory(self, ctx: PipelineContext) -> StepResult:
+        """Fail closed before any LLM-capable chapter preparation stage."""
+        missing_dependencies = self._missing_required_narrative_dependencies(ctx)
+        if not missing_dependencies:
+            return StepResult.ok()
+
+        reason = "required_narrative_memory_unavailable:" + ",".join(
+            missing_dependencies
+        )
+        logger.error("[%s] 长篇生成拒绝弱上下文：%s", ctx.novel_id, reason)
+        return StepResult.fail(reason)
+
     async def _ensure_auxiliary_stages_drained(self, ctx: PipelineContext) -> StepResult:
         """Wait once for prior chapter state that this context can read."""
         marker = "_auxiliary_stages_drained"
@@ -532,13 +554,9 @@ class BaseStoryPipeline(ABC):
         if not drain_result.passed:
             return drain_result
 
-        missing_dependencies = self._missing_required_narrative_dependencies(ctx)
-        if missing_dependencies:
-            reason = "required_narrative_memory_unavailable:" + ",".join(
-                missing_dependencies
-            )
-            logger.error("[%s] 长篇生成拒绝弱上下文：%s", ctx.novel_id, reason)
-            return StepResult.fail(reason)
+        narrative_memory_result = self._check_required_narrative_memory(ctx)
+        if not narrative_memory_result.passed:
+            return narrative_memory_result
 
         bundle = None
 

@@ -21,8 +21,26 @@ from domain.ai.services.llm_service import LLMService, GenerationResult as LLMRe
 from domain.ai.value_objects.token_usage import TokenUsage
 
 
+class _ConfiguredMemoryEngine:
+    def __init__(self, llm_service):
+        self.bible_repository = object()
+        self.llm_service = llm_service
+
+    def build_fact_lock_section(self, _novel_id, _chapter_number):
+        return ""
+
+    def get_completed_beats_section(self, _novel_id):
+        return ""
+
+    def get_revealed_clues_section(self, _novel_id):
+        return ""
+
+    async def update_from_chapter(self, **_kwargs):
+        return {"new_beats": 0, "new_clues": 0, "violations": 0}
+
+
 @pytest.fixture
-def mock_context_builder():
+def mock_context_builder(mock_llm_service):
     """Mock ContextBuilder"""
     builder = Mock(spec=ContextBuilder)
     builder.build_structured_context.return_value = {
@@ -45,6 +63,9 @@ def mock_context_builder():
         premise="都市异能成长故事",
         target_words_per_chapter=2500,
         generation_prefs=SimpleNamespace(inline_prose_aggregation_enabled=False),
+    )
+    builder.budget_allocator = SimpleNamespace(
+        memory_engine=_ConfiguredMemoryEngine(mock_llm_service)
     )
     # 不再需要 estimate_tokens 方法
     return builder

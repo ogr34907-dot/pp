@@ -269,6 +269,13 @@ class AutoNovelGenerationWorkflow:
         self.evolution_gate_service = evolution_gate_service
 
         # ★ V6 记忆引擎（跨章节状态机）
+        # Prefer the ContextBudgetAllocator's configured instance so prompt
+        # construction and chapter-after state updates cannot diverge.
+        memory_engine = memory_engine or getattr(
+            getattr(context_builder, "budget_allocator", None),
+            "memory_engine",
+            None,
+        )
         self.memory_engine = memory_engine
         if memory_engine and bible_repository:
             # 将 memory_engine 注入 context_builder 的 budget_allocator
@@ -315,6 +322,38 @@ class AutoNovelGenerationWorkflow:
         self._genre = genre
         self._initialize_theme()
 
+    def _required_narrative_memory_failure(self) -> str:
+        """Return a diagnosable reason when long-form memory cannot be trusted."""
+        context_builder = self.context_builder
+        if context_builder is None:
+            return "required_narrative_memory_unavailable:context_builder"
+
+        allocator = getattr(context_builder, "budget_allocator", None)
+        if allocator is None:
+            return "required_narrative_memory_unavailable:context_budget_allocator"
+
+        memory_engine = self.memory_engine
+        if memory_engine is None:
+            return "required_narrative_memory_unavailable:memory_engine"
+
+        if getattr(allocator, "memory_engine", None) is not memory_engine:
+            return "required_narrative_memory_unavailable:shared_memory_engine"
+
+        if getattr(memory_engine, "bible_repository", None) is None:
+            return "required_narrative_memory_unavailable:fact_lock_data_source"
+
+        if getattr(memory_engine, "llm_service", None) is None:
+            return "required_narrative_memory_unavailable:memory_engine_llm_service"
+
+        return ""
+
+    def _require_narrative_memory(self) -> None:
+        failure_reason = self._required_narrative_memory_failure()
+        if not failure_reason:
+            return
+        logger.error("长篇生成拒绝弱上下文：%s", failure_reason)
+        raise RuntimeError(failure_reason)
+
     def _initialize_theme(self) -> None:
         """延迟初始化 Theme 集成器"""
         if self._theme_integrator is not None:
@@ -345,6 +384,7 @@ class AutoNovelGenerationWorkflow:
 
         托管守护进程与 HTTP 接口应复用此方法，避免「两套基建」。
         """
+        self._require_narrative_memory()
         storyline_context = self._get_storyline_context(novel_id, chapter_number)
         plot_tension = self._get_plot_tension(novel_id, chapter_number)
         evolution_gate_report = None
@@ -460,6 +500,7 @@ class AutoNovelGenerationWorkflow:
 
         供全托管等场景在「故事线/张力等」子步骤异常时保持与主路径一致的上下文形态。
         """
+        self._require_narrative_memory()
         payload = self.context_builder.build_structured_context(
             novel_id=novel_id,
             chapter_number=chapter_number,
@@ -544,6 +585,9 @@ class AutoNovelGenerationWorkflow:
                     )
             except Exception as e:
                 logger.warning("MemoryEngine 章后回写失败: %s", e)
+                raise RuntimeError(
+                    "required_narrative_memory_writeback_failed:" + str(e)
+                ) from e
 
         return {
             "style_warnings": style_warnings,
@@ -582,6 +626,8 @@ class AutoNovelGenerationWorkflow:
             raise ValueError("chapter_number must be positive")
         if not outline or not outline.strip():
             raise ValueError("outline cannot be empty")
+
+        self._require_narrative_memory()
 
         logger.info(f"========================================")
         logger.info(f"开始生成章节: 小说={novel_id}, 章节={chapter_number}")
@@ -690,6 +736,8 @@ class AutoNovelGenerationWorkflow:
                 raise ValueError("chapter_number must be positive")
             if not outline or not outline.strip():
                 raise ValueError("outline cannot be empty")
+
+            self._require_narrative_memory()
 
             logger.info(f"========================================")
             logger.info(f"开始流式生成章节: 小说={novel_id}, 章节={chapter_number}")
@@ -826,6 +874,10 @@ class AutoNovelGenerationWorkflow:
     async def suggest_outline(self, novel_id: str, chapter_number: int) -> str:
         """托管模式：用全书上下文让模型生成本章要点大纲；失败则回退为简短占位。"""
         seed = f"第{chapter_number}章：承接前情，推进主线与人物节拍；保持人设与叙事节奏一致。"
+        failure_reason = self._required_narrative_memory_failure()
+        if failure_reason:
+            logger.error("托管大纲拒绝弱上下文：%s", failure_reason)
+            return seed
         try:
             context = self.context_builder.build_context(
                 novel_id=novel_id,
