@@ -124,6 +124,39 @@ async def test_aftermath_defers_auxiliary_stages(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_aftermath_drain_surfaces_its_auxiliary_stage_failure(monkeypatch):
+    async def fake_bridge(self, novel_id, chapter_number, content):
+        return None
+
+    async def fake_sync(*args, **kwargs):
+        return {"narrative_sync_ok": True}
+
+    async def failing_auxiliary(self, novel_id, chapter_number, content, evidence):
+        raise RuntimeError("evolution snapshot persistence failed")
+
+    monkeypatch.setattr(ChapterAftermathPipeline, "_extract_chapter_bridge", fake_bridge)
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.sync_chapter_narrative_after_save",
+        fake_sync,
+    )
+    monkeypatch.setattr(
+        ChapterAftermathPipeline,
+        "_run_auxiliary_stages",
+        failing_auxiliary,
+    )
+    pipeline = ChapterAftermathPipeline(
+        knowledge_service=None,
+        chapter_indexing_service=None,
+        llm_service=object(),
+    )
+
+    await pipeline.run_after_chapter_saved("novel-1", 7, "正文内容")
+
+    with pytest.raises(RuntimeError, match="evolution snapshot persistence failed"):
+        await pipeline.drain_auxiliary_stages()
+
+
+@pytest.mark.asyncio
 async def test_aftermath_reuses_precomputed_voice_result(monkeypatch):
     async def fake_bridge(self, novel_id, chapter_number, content):
         return None

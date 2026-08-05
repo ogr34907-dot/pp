@@ -102,7 +102,7 @@ async def test_aftermath_discards_memory_update_when_content_changes_after_sync(
             return {"errors": []}
 
     memory_engine = MemoryEngine()
-    checks = iter((True, False))
+    checks = iter((True, False, False))
     monkeypatch.setattr(ChapterAftermathPipeline, "_extract_chapter_bridge", _skip_bridge)
     monkeypatch.setattr(ChapterAftermathPipeline, "_run_auxiliary_stages", _skip_auxiliary)
     monkeypatch.setattr(

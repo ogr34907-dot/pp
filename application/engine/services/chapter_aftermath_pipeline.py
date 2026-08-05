@@ -67,17 +67,18 @@ class _SerializedAuxiliaryQueue:
         novel_id: str,
         chapter_number: int,
         work: Callable[[], Awaitable[Any]],
-    ) -> None:
+    ) -> asyncio.Task[Any]:
         loop = asyncio.get_running_loop()
         previous = self._tail if self._loop is loop and self._tail and not self._tail.done() else None
         self._loop = loop
         self._tail = loop.create_task(
             self._run_after(previous, stage, novel_id, chapter_number, work)
         )
+        return self._tail
 
     async def drain(self) -> None:
         tail = self._tail
-        if tail and not tail.done():
+        if tail:
             await tail
 
     async def _run_after(
@@ -104,6 +105,7 @@ class _SerializedAuxiliaryQueue:
                 chapter_number,
                 e,
             )
+            raise
 
 
 _AUXILIARY_QUEUE = _SerializedAuxiliaryQueue()
@@ -187,6 +189,7 @@ class ChapterAftermathPipeline:
         self._evolution_snapshot_service = evolution_snapshot_service
         self._character_kernel = character_narrative_kernel
         self._memory_engine = memory_engine
+        self._auxiliary_tasks: set[asyncio.Task[Any]] = set()
         if hasattr(self._memory_engine, "llm_service") and getattr(
             self._memory_engine, "llm_service", None
         ) is None:
@@ -702,12 +705,16 @@ class ChapterAftermathPipeline:
         out["voice_mode"] = result.get("mode", "statistics")
 
     async def drain_auxiliary_stages(self) -> None:
-        """Wait for queued auxiliary aftermath work.
+        """Wait for this pipeline's queued auxiliary aftermath work."""
+        tasks = tuple(self._auxiliary_tasks)
+        if not tasks:
+            return
 
-        Intended for tests and controlled shutdown paths; normal callers should
-        not await this on the writing critical path.
-        """
-        await _AUXILIARY_QUEUE.drain()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        self._auxiliary_tasks.difference_update(tasks)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
 
     def _schedule_auxiliary_stages(
         self,
@@ -735,12 +742,13 @@ class ChapterAftermathPipeline:
                 return
             await self._run_auxiliary_stages(novel_id, chapter_number, content, evidence)
 
-        _AUXILIARY_QUEUE.enqueue(
+        task = _AUXILIARY_QUEUE.enqueue(
             "auxiliary_after_chapter",
             novel_id,
             chapter_number,
             _job,
         )
+        self._auxiliary_tasks.add(task)
 
     async def _run_auxiliary_stages(
         self,
@@ -838,6 +846,7 @@ class ChapterAftermathPipeline:
             evidence["governance_should_pause"] = report.should_pause_autopilot
         except Exception as e:
             logger.warning("叙事治理评估失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
+            raise
 
         # 6) 故事演进硬状态快照 — 只消费 evidence，不把 read model 当真源
         try:
@@ -861,6 +870,7 @@ class ChapterAftermathPipeline:
                 )
         except Exception as e:
             logger.warning("[Evolution] 快照创建失败（非致命）novel=%s ch=%s: %s", novel_id, chapter_number, e)
+            raise
 
         # 7) 世界线快照 — 章节完成后自动打 CHAPTER checkpoint
         try:

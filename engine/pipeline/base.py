@@ -116,9 +116,21 @@ class BaseStoryPipeline(ABC):
                     chapter_target_words=ctx.target_word_count,
                 )
 
+            # 1a. 上一章的治理/演进状态必须先完成，避免本章读取滞后一章的派生状态。
+            self._mark_pipeline_step(ctx, "drain_auxiliary_stages")
+            r = await self._ensure_auxiliary_stages_drained(ctx)
+            step_status["drain_auxiliary_stages"] = "ok" if r.passed else "failed"
+            if not r.passed:
+                return self._make_result(ctx, success=False, error=r.message, step_status=step_status)
+
             # 1b. 叙事治理准备：生成章节预算与上下文请求，作为后续上下文组装的硬约束输入。
             self._mark_pipeline_step(ctx, "prepare_governance")
-            await self._step_prepare_governance(ctx)
+            r = await self._step_prepare_governance(ctx)
+            step_status["prepare_governance"] = "ok" if r.passed else (
+                "skipped" if r.skip else "failed"
+            )
+            if not r.passed and not r.skip:
+                return self._make_result(ctx, success=False, error=r.message, step_status=step_status)
 
             # 2. 章节执行剧本准备：旧数据直接复用七段，新幕级轻量链条在这里补成七段。
             self._mark_pipeline_step(ctx, "prepare_chapter_plan")
@@ -482,6 +494,27 @@ class BaseStoryPipeline(ABC):
             missing.append("canonical_commit_repository")
         return missing
 
+    async def _ensure_auxiliary_stages_drained(self, ctx: PipelineContext) -> StepResult:
+        """Wait once for prior chapter state that this context can read."""
+        marker = "_auxiliary_stages_drained"
+        if ctx.metadata.get(marker):
+            return StepResult.ok()
+
+        aftermath = ctx.aftermath_pipeline
+        drain = getattr(aftermath, "drain_auxiliary_stages", None)
+        if not callable(drain):
+            return StepResult.ok()
+
+        try:
+            await drain()
+        except Exception as exc:
+            reason = f"required_auxiliary_state_sync_failed:{exc}"
+            logger.error("[%s] 章间辅助状态未完成: %s", ctx.novel_id, reason)
+            return StepResult.fail(reason)
+
+        ctx.metadata[marker] = True
+        return StepResult.ok()
+
     async def _step_build_context(self, ctx: PipelineContext) -> StepResult:
         """步骤2：组装上下文（四层洋葱挤压）
 
@@ -494,6 +527,10 @@ class BaseStoryPipeline(ABC):
         - 武侠引擎：注入修炼体系设定
         """
         self._log_step("build_context", f"组装上下文，目标 {ctx.target_word_count} 字")
+
+        drain_result = await self._ensure_auxiliary_stages_drained(ctx)
+        if not drain_result.passed:
+            return drain_result
 
         missing_dependencies = self._missing_required_narrative_dependencies(ctx)
         if missing_dependencies:

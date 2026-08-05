@@ -163,6 +163,34 @@ async def test_story_pipeline_carries_workflow_context_budget_to_prose_metadata(
 
 
 @pytest.mark.asyncio
+async def test_story_pipeline_drains_auxiliary_stages_before_building_context():
+    events = []
+
+    class Aftermath:
+        async def drain_auxiliary_stages(self):
+            events.append("drain")
+
+    class ChapterWorkflow:
+        def prepare_chapter_generation(self, *args, **kwargs):
+            events.append("build")
+            return {
+                "context": "最新演进状态",
+                "context_tokens": 4,
+                "context_budget_tokens": 100,
+                "voice_anchors": "",
+            }
+
+    ctx = PipelineContext(novel_id="novel-1", chapter_number=2, outline="本章大纲")
+    ctx.aftermath_pipeline = Aftermath()
+    ctx.chapter_workflow = ChapterWorkflow()
+
+    result = await _Pipeline()._step_build_context(ctx)
+
+    assert result.passed
+    assert events == ["drain", "build"]
+
+
+@pytest.mark.asyncio
 async def test_story_pipeline_does_not_fallback_after_configured_fact_lock_failure(monkeypatch):
     class BrokenMemoryEngine:
         def build_fact_lock_section(self, novel_id, chapter_number):
@@ -747,6 +775,50 @@ async def test_story_pipeline_post_commit_blocks_when_memory_state_write_failed(
     assert not result.passed
     assert result.message == "canonical_aftermath_not_ready"
     assert ctx.narrative_sync_ok is False
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_stops_before_governance_when_auxiliary_sync_fails(monkeypatch):
+    class FailingAftermath:
+        async def drain_auxiliary_stages(self):
+            raise RuntimeError("evolution state unavailable")
+
+    pipeline = _Pipeline()
+    find_next = AsyncMock(return_value=StepResult.ok())
+    prepare_governance = AsyncMock(return_value=StepResult.ok())
+    prepare_plan = AsyncMock(return_value=StepResult.fail("should not reach planning"))
+    monkeypatch.setattr(pipeline, "_step_find_next_chapter", find_next)
+    monkeypatch.setattr(pipeline, "_step_prepare_governance", prepare_governance)
+    monkeypatch.setattr(pipeline, "_step_prepare_chapter_plan", prepare_plan)
+
+    ctx = PipelineContext(novel_id="novel-1", chapter_number=2, outline="本章大纲")
+    ctx.aftermath_pipeline = FailingAftermath()
+
+    result = await pipeline.run_chapter(ctx)
+
+    assert result.success is False
+    assert result.error == "required_auxiliary_state_sync_failed:evolution state unavailable"
+    prepare_governance.assert_not_awaited()
+    prepare_plan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_stops_when_governance_rejects_continuity(monkeypatch):
+    pipeline = _Pipeline()
+    find_next = AsyncMock(return_value=StepResult.ok())
+    prepare_governance = AsyncMock(
+        return_value=StepResult.fail("写前连续性检查未通过：需要暂停")
+    )
+    prepare_plan = AsyncMock(return_value=StepResult.fail("should not reach planning"))
+    monkeypatch.setattr(pipeline, "_step_find_next_chapter", find_next)
+    monkeypatch.setattr(pipeline, "_step_prepare_governance", prepare_governance)
+    monkeypatch.setattr(pipeline, "_step_prepare_chapter_plan", prepare_plan)
+
+    result = await pipeline.run_chapter(PipelineContext(novel_id="novel-1"))
+
+    assert result.success is False
+    assert result.error == "写前连续性检查未通过：需要暂停"
+    prepare_plan.assert_not_awaited()
 
 
 @pytest.mark.asyncio

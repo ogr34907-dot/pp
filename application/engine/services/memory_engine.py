@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections import OrderedDict
 from copy import deepcopy
@@ -164,7 +165,7 @@ class FactLockBuilder:
             lines.append(f"   允许: {', '.join(names)}")
             lines.append("   禁止: 创造任何其他有名字的角色！路人可以无名但不许命名！\n")
 
-        # ── 2. 已死亡角色（从描述/关系中推断，或标记为 dead 的）──
+        # ── 2. 已死亡角色（仅接受显式状态或明确的本人死亡事实）──
         dead_chars = self._extract_dead_characters(characters)
         if dead_chars:
             lines.append("已死亡角色（绝对不可复活、不可在当下时间线中出现）：")
@@ -198,49 +199,67 @@ class FactLockBuilder:
         return "\n".join(lines)
 
     def _extract_dead_characters(self, characters: list) -> list[Dict]:
-        """从角色列表中推断已死亡角色
-        
-        策略：
-        - 检查 description 中是否包含死亡相关关键词
-        - 检查 relationships 中是否有 "dead/died/死亡/已故" 关系
-        - 后续可扩展为 Bible 的 is_dead 显式字段
+        """Return only authoritative death facts for the T0 fact lock.
+
+        Legacy Bible records may not carry ``is_dead``. Their descriptions can
+        still supply a death fact, but only when a sentence clearly describes
+        the character's own death. Generic danger, sacrifice, and another
+        person's death are continuity hints rather than a T0 resurrection ban.
         """
-        dead_keywords = [
-            "死亡", " died ", "身亡", "去世", "已故", "牺牲",
-            " killed ", "被杀", "遇害", "丧命", "殒命",
-        ]
+        clear_self_death_markers = (
+            "已故",
+            "已死",
+            "死于",
+            "殒命",
+            "遇害身亡",
+            "被害身亡",
+            "已经死亡",
+            "已经去世",
+            "已死亡",
+            "已去世",
+        )
+        third_party_terms = re.compile(r"父亲|母亲|父母|兄弟|姐妹|儿子|女儿|丈夫|妻子|同伴|朋友")
         dead_chars = []
 
         for char in characters:
-            # 检查描述
-            desc_lower = (char.description or "").lower()
-            name = char.name
+            name = str(getattr(char, "name", "") or "")
+            status = str(getattr(char, "status", "") or "").strip().casefold()
+            is_dead_value = getattr(char, "is_dead", False)
+            explicitly_dead = is_dead_value is True or (
+                isinstance(is_dead_value, str)
+                and is_dead_value.strip().casefold() in {"true", "1", "yes", "dead"}
+            )
 
-            # 检查关系标签
-            is_dead = False
-            death_info = {"name": name, "role": char.public_profile or ""}
-
-            for kw in dead_keywords:
-                if kw in desc_lower:
-                    is_dead = True
-                    # 尝试提取死亡原因片段
-                    death_info["cause"] = char.description[:80]
+            cause = ""
+            if explicitly_dead:
+                cause = "Bible is_dead=true"
+            elif status in {"dead", "deceased", "已故", "死亡"}:
+                cause = f"Bible status={status}"
+            elif status not in {"alive", "living", "生存", "存活"}:
+                description = str(getattr(char, "description", "") or "")
+                for sentence in re.split(r"[。；;\n]", description):
+                    candidate = sentence.strip()
+                    marker_indexes = [
+                        candidate.find(marker)
+                        for marker in clear_self_death_markers
+                        if marker in candidate
+                    ]
+                    if not candidate or not marker_indexes:
+                        continue
+                    subject = candidate[: min(marker_indexes)]
+                    if third_party_terms.search(subject):
+                        continue
+                    cause = candidate[:80]
                     break
 
-            # 检查 relationships
-            if not is_dead and char.relationships:
-                for rel in char.relationships:
-                    rel_str = str(rel).lower()
-                    for kw in dead_keywords:
-                        if kw in rel_str:
-                            is_dead = True
-                            death_info["cause"] = str(rel)[:80]
-                            break
-                    if is_dead:
-                        break
-
-            if is_dead:
-                dead_chars.append(death_info)
+            if cause:
+                dead_chars.append(
+                    {
+                        "name": name,
+                        "role": str(getattr(char, "public_profile", "") or ""),
+                        "cause": cause,
+                    }
+                )
 
         return dead_chars
 

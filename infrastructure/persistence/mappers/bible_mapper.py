@@ -54,6 +54,8 @@ class BibleMapper:
                     "moral_taboos": list(getattr(char, "moral_taboos", None) or []),
                     "voice_profile": dict(getattr(char, "voice_profile", None) or {}),
                     "active_wounds": list(getattr(char, "active_wounds", None) or []),
+                    "is_dead": bool(getattr(char, "is_dead", False)),
+                    "status": str(getattr(char, "status", "") or ""),
                 }
                 for char in bible.characters
             ],
@@ -158,6 +160,8 @@ class BibleMapper:
                     moral_taboos=list(char_data.get("moral_taboos") or []),
                     voice_profile=dict(char_data.get("voice_profile") or {}),
                     active_wounds=active_wounds,
+                    is_dead=bool(char_data.get("is_dead", False)),
+                    status=char_data.get("status") or "",
                 )
                 bible.add_character(character)
 

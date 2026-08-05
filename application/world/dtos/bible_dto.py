@@ -42,6 +42,8 @@ class CharacterDTO:
     moral_taboos: List[str] = field(default_factory=list)
     voice_profile: Dict[str, Any] = field(default_factory=dict)
     active_wounds: List[Dict[str, Any]] = field(default_factory=list)
+    is_dead: bool = False
+    status: str = ""
 
     def __post_init__(self):
         """验证字段"""
@@ -81,6 +83,8 @@ class CharacterDTO:
             moral_taboos=list(getattr(character, "moral_taboos", None) or []),
             voice_profile=dict(getattr(character, "voice_profile", None) or {}),
             active_wounds=list(getattr(character, "active_wounds", None) or []),
+            is_dead=bool(getattr(character, "is_dead", False)),
+            status=str(getattr(character, "status", "") or ""),
         )
 
 

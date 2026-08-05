@@ -37,6 +37,8 @@ class Character(BaseEntity):
         moral_taboos: Optional[List[str]] = None,
         voice_profile: Optional[Dict[str, Any]] = None,
         active_wounds: Optional[List[Dict[str, str]]] = None,
+        is_dead: bool = False,
+        status: str = "",
     ):
         super().__init__(id.value)
         self.character_id = id
@@ -61,6 +63,8 @@ class Character(BaseEntity):
         self.moral_taboos = list(moral_taboos or [])
         self.voice_profile = dict(voice_profile or {})
         self.active_wounds = list(active_wounds or [])
+        self.is_dead = bool(is_dead)
+        self.status = str(status or "").strip().lower()
 
         # 验证 reveal_chapter
         if self.reveal_chapter is not None and self.reveal_chapter < 1:

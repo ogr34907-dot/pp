@@ -286,6 +286,7 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
         or error.startswith("canonical_history_")
         or error.startswith("required_narrative_memory_unavailable:")
         or error.startswith("required_context_build_failed:")
+        or error.startswith("required_auxiliary_state_sync_failed:")
     ):
         novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
         novel.last_audit_narrative_ok = False
