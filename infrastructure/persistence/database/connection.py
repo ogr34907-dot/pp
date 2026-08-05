@@ -451,16 +451,17 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
             """
         )
 
-    rows = conn.execute(
-        "SELECT id, content, content_sha256, content_revision FROM chapters"
-    ).fetchall()
-    for row in rows:
-        actual_hash = hashlib.sha256((row[1] or "").encode("utf-8")).hexdigest()
-        if row[2] != actual_hash or int(row[3] or 0) < 1:
-            conn.execute(
-                "UPDATE chapters SET content_sha256 = ?, content_revision = ? WHERE id = ?",
-                (actual_hash, max(1, int(row[3] or 0)), row[0]),
-            )
+    if "content" in chapter_cols:
+        rows = conn.execute(
+            "SELECT id, content, content_sha256, content_revision FROM chapters"
+        ).fetchall()
+        for row in rows:
+            actual_hash = hashlib.sha256((row[1] or "").encode("utf-8")).hexdigest()
+            if row[2] != actual_hash or int(row[3] or 0) < 1:
+                conn.execute(
+                    "UPDATE chapters SET content_sha256 = ?, content_revision = ? WHERE id = ?",
+                    (actual_hash, max(1, int(row[3] or 0)), row[0]),
+                )
 
     conn.execute(
         """

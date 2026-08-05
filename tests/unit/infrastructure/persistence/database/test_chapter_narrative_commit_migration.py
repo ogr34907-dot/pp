@@ -6,6 +6,7 @@ from domain.novel.entities.chapter import Chapter
 from domain.novel.value_objects.novel_id import NovelId
 from infrastructure.persistence.database.connection import (
     DatabaseConnection,
+    _apply_chapter_narrative_commit_migration,
     _apply_migration_files,
 )
 from infrastructure.persistence.database.sqlite_chapter_repository import (
@@ -113,6 +114,37 @@ def test_existing_chapter_and_summary_receive_mechanical_legacy_backfill(tmp_pat
         "canonical_payload_sha256": "",
     }
     assert db.fetch_all("SELECT * FROM chapter_narrative_commits") == []
+
+
+def test_migration_skips_hash_backfill_for_legacy_chapters_without_content(tmp_path):
+    db_path = tmp_path / "legacy-without-content.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE chapters (
+                id TEXT PRIMARY KEY,
+                novel_id TEXT NOT NULL,
+                number INTEGER NOT NULL
+            );
+            CREATE TABLE knowledge (
+                id TEXT PRIMARY KEY,
+                novel_id TEXT NOT NULL
+            );
+            CREATE TABLE chapter_summaries (
+                id TEXT PRIMARY KEY,
+                knowledge_id TEXT NOT NULL,
+                chapter_number INTEGER NOT NULL,
+                summary TEXT,
+                sync_status TEXT NOT NULL DEFAULT 'draft'
+            );
+            """
+        )
+
+        _apply_chapter_narrative_commit_migration(conn)
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(chapters)")}
+
+    assert {"content_sha256", "content_revision"} <= columns
 
 
 def test_story_pipeline_advance_is_applied_exactly_once_per_committed_revision(tmp_path):
