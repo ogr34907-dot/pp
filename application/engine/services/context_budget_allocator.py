@@ -2291,6 +2291,7 @@ class ContextBudgetAllocator:
                   ON summaries.knowledge_id = knowledge.id
                  AND summaries.chapter_number = chapters.number
                  AND summaries.source_content_sha256 = chapters.content_sha256
+                 AND summaries.source_content_revision = chapters.content_revision
                  AND summaries.pipeline_version = commits.pipeline_version
                  AND summaries.sync_status = 'committed'
                 WHERE chapters.novel_id = ?

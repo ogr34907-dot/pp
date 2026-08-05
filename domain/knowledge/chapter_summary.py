@@ -48,6 +48,7 @@ class ChapterSummary(BaseEntity):
         micro_beats: List[Dict[str, Any]] = None,
         sync_status: str = "draft",
         source_content_sha256: str = "",
+        source_content_revision: int = 0,
         pipeline_version: str = "",
         sync_error: str = "",
         sync_attempts: int = 0,
@@ -75,6 +76,7 @@ class ChapterSummary(BaseEntity):
         self.micro_beats = micro_beats or []
         self.sync_status = sync_status
         self.source_content_sha256 = source_content_sha256
+        self.source_content_revision = source_content_revision
         self.pipeline_version = pipeline_version
         self.sync_error = sync_error
         self.sync_attempts = sync_attempts

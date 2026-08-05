@@ -225,8 +225,24 @@ def test_recent_chapters_use_only_current_committed_summaries_for_n3_to_n5(tmp_p
             )
         )
     db.execute("INSERT INTO knowledge (id, novel_id) VALUES ('knowledge-1', ?)", (novel_id,))
+    summary_columns = {
+        row["name"] for row in db.fetch_all("PRAGMA table_info(chapter_summaries)")
+    }
+    if "source_content_revision" not in summary_columns:
+        db.execute(
+            "ALTER TABLE chapter_summaries ADD COLUMN "
+            "source_content_revision INTEGER NOT NULL DEFAULT 0"
+        )
 
-    def seed_summary(number, summary, open_threads, *, source_hash=None, sync_status="committed"):
+    def seed_summary(
+        number,
+        summary,
+        open_threads,
+        *,
+        source_hash=None,
+        source_revision=None,
+        sync_status="committed",
+    ):
         source = db.fetch_one(
             "SELECT content_sha256, content_revision FROM chapters WHERE novel_id = ? AND number = ?",
             (novel_id, number),
@@ -235,14 +251,15 @@ def test_recent_chapters_use_only_current_committed_summaries_for_n3_to_n5(tmp_p
         db.execute(
             "INSERT INTO chapter_summaries "
             "(id, knowledge_id, chapter_number, summary, open_threads, source_content_sha256, "
-            "pipeline_version, sync_status, sync_attempts) "
-            "VALUES (?, 'knowledge-1', ?, ?, ?, ?, ?, ?, 1)",
+            "source_content_revision, pipeline_version, sync_status, sync_attempts) "
+            "VALUES (?, 'knowledge-1', ?, ?, ?, ?, ?, ?, ?, 1)",
             (
                 f"summary-{number}",
                 number,
                 summary,
                 open_threads,
                 canonical_hash,
+                source["content_revision"] if source_revision is None else source_revision,
                 CHAPTER_NARRATIVE_PIPELINE_VERSION,
                 sync_status,
             ),
@@ -261,7 +278,7 @@ def test_recent_chapters_use_only_current_committed_summaries_for_n3_to_n5(tmp_p
         )
 
     seed_summary(7, "第七章有效摘要", "第七章未解线程")
-    seed_summary(6, "第六章失效摘要", "不应注入", sync_status="stale")
+    seed_summary(6, "第六章旧修订摘要", "不应注入", source_revision=0)
     seed_summary(5, "第五章旧哈希摘要", "不应注入", source_hash="wrong-hash")
     allocator = ContextBudgetAllocator(chapter_repository=chapter_repository)
 
@@ -270,7 +287,7 @@ def test_recent_chapters_use_only_current_committed_summaries_for_n3_to_n5(tmp_p
     assert "第七章有效摘要" in context
     assert "第七章未解线程" in context
     assert "第7章正文" not in context
-    assert "第六章失效摘要" not in context
+    assert "第六章旧修订摘要" not in context
     assert "第6章正文" in context
     assert "第五章旧哈希摘要" not in context
     assert "第5章正文" in context

@@ -368,6 +368,10 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
             "ALTER TABLE chapter_summaries ADD COLUMN "
             "source_content_sha256 TEXT NOT NULL DEFAULT ''"
         ),
+        "source_content_revision": (
+            "ALTER TABLE chapter_summaries ADD COLUMN "
+            "source_content_revision INTEGER NOT NULL DEFAULT 0"
+        ),
         "pipeline_version": (
             "ALTER TABLE chapter_summaries ADD COLUMN "
             "pipeline_version TEXT NOT NULL DEFAULT ''"
@@ -402,6 +406,7 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
             vector_status TEXT NOT NULL DEFAULT 'not_started',
             memory_status TEXT NOT NULL DEFAULT 'not_required',
             memory_failure_reason TEXT NOT NULL DEFAULT '',
+            memory_attempt_count INTEGER NOT NULL DEFAULT 0,
             advance_status TEXT NOT NULL DEFAULT 'pending',
             advance_applied_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -432,6 +437,10 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
         "memory_failure_reason": (
             "ALTER TABLE chapter_narrative_commits ADD COLUMN "
             "memory_failure_reason TEXT NOT NULL DEFAULT ''"
+        ),
+        "memory_attempt_count": (
+            "ALTER TABLE chapter_narrative_commits ADD COLUMN "
+            "memory_attempt_count INTEGER NOT NULL DEFAULT 0"
         ),
         "advance_status": (
             "ALTER TABLE chapter_narrative_commits ADD COLUMN "

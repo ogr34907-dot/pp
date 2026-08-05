@@ -281,8 +281,8 @@ class SqliteKnowledgeRepository:
         summaries_sql = """
             SELECT chapter_number, summary, key_events, open_threads,
                    consistency_note, beat_sections, micro_beats, sync_status,
-                   source_content_sha256, pipeline_version, sync_error, sync_attempts,
-                   canonical_payload_sha256
+                   source_content_sha256, source_content_revision, pipeline_version,
+                   sync_error, sync_attempts, canonical_payload_sha256
             FROM chapter_summaries
             WHERE knowledge_id = ?
             ORDER BY chapter_number ASC
@@ -313,6 +313,7 @@ class SqliteKnowledgeRepository:
                 micro_beats=micro_beats,
                 sync_status=row["sync_status"] or "synced",
                 source_content_sha256=row["source_content_sha256"] or "",
+                source_content_revision=int(row["source_content_revision"] or 0),
                 pipeline_version=row["pipeline_version"] or "",
                 sync_error=row["sync_error"] or "",
                 sync_attempts=int(row["sync_attempts"] or 0),
@@ -792,9 +793,10 @@ class SqliteKnowledgeRepository:
                     INSERT INTO chapter_summaries
                     (id, knowledge_id, chapter_number, summary, key_events, open_threads,
                      consistency_note, beat_sections, micro_beats,
-                     source_content_sha256, pipeline_version, sync_status, sync_error,
-                     sync_attempts, canonical_payload_sha256, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source_content_sha256, source_content_revision, pipeline_version,
+                     sync_status, sync_error, sync_attempts, canonical_payload_sha256,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(knowledge_id, chapter_number) DO UPDATE SET
                         summary = excluded.summary,
                         key_events = excluded.key_events,
@@ -803,6 +805,7 @@ class SqliteKnowledgeRepository:
                         beat_sections = excluded.beat_sections,
                         micro_beats = excluded.micro_beats,
                         source_content_sha256 = excluded.source_content_sha256,
+                        source_content_revision = excluded.source_content_revision,
                         pipeline_version = excluded.pipeline_version,
                         sync_status = excluded.sync_status,
                         sync_error = excluded.sync_error,
@@ -819,6 +822,7 @@ class SqliteKnowledgeRepository:
                         beat_sections_json,
                         micro_beats_json,
                         getattr(chapter, "source_content_sha256", "") or "",
+                        int(getattr(chapter, "source_content_revision", 0) or 0),
                         getattr(chapter, "pipeline_version", "") or "",
                         getattr(chapter, "sync_status", "draft") or "draft",
                         getattr(chapter, "sync_error", "") or "",
@@ -881,9 +885,10 @@ class SqliteKnowledgeRepository:
                     INSERT INTO chapter_summaries 
                     (id, knowledge_id, chapter_number, summary, key_events, open_threads,
                      consistency_note, beat_sections, micro_beats,
-                     source_content_sha256, pipeline_version, sync_status, sync_error,
-                     sync_attempts, canonical_payload_sha256, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source_content_sha256, source_content_revision, pipeline_version,
+                     sync_status, sync_error, sync_attempts, canonical_payload_sha256,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(knowledge_id, chapter_number) DO UPDATE SET
                         summary = excluded.summary,
                         key_events = excluded.key_events,
@@ -892,6 +897,7 @@ class SqliteKnowledgeRepository:
                         beat_sections = excluded.beat_sections,
                         micro_beats = excluded.micro_beats,
                         source_content_sha256 = excluded.source_content_sha256,
+                        source_content_revision = excluded.source_content_revision,
                         pipeline_version = excluded.pipeline_version,
                         sync_status = excluded.sync_status,
                         sync_error = excluded.sync_error,
@@ -905,6 +911,7 @@ class SqliteKnowledgeRepository:
                         chapter.get("open_threads", ""), chapter.get("consistency_note", ""),
                         beat_sections_json, micro_beats_json,
                         chapter.get("source_content_sha256", ""),
+                        int(chapter.get("source_content_revision", 0) or 0),
                         chapter.get("pipeline_version", ""),
                         chapter.get("sync_status", "draft"),
                         chapter.get("sync_error", ""),

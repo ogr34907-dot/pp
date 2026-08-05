@@ -855,6 +855,97 @@ def test_canonical_commit_rejects_replaced_or_invalid_summary_row(tmp_path):
         )
 
 
+def test_prepare_summary_records_claimed_source_revision(tmp_path):
+    db, _chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    if not any(
+        row["name"] == "source_content_revision"
+        for row in db.fetch_all("PRAGMA table_info(chapter_summaries)")
+    ):
+        db.execute(
+            "ALTER TABLE chapter_summaries ADD COLUMN "
+            "source_content_revision INTEGER NOT NULL DEFAULT 0"
+        )
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    content_sha256 = hashlib.sha256(chapter.content.encode("utf-8")).hexdigest()
+    claim = repository.claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+    )
+    knowledge.upsert_chapter_summary(
+        novel_id="novel-1",
+        chapter_id=1,
+        summary="绑定正文修订号的摘要",
+        sync_status="in_progress",
+    )
+
+    repository.prepare_summary(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+        attempt_count=claim.attempt_count,
+    )
+
+    summary = db.fetch_one(
+        "SELECT source_content_sha256, source_content_revision "
+        "FROM chapter_summaries WHERE chapter_number = 1"
+    )
+    assert dict(summary) == {
+        "source_content_sha256": content_sha256,
+        "source_content_revision": claim.content_revision,
+    }
+
+
+def test_canonical_commit_rejects_summary_revision_changed_after_prepare(tmp_path):
+    db, _chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    if not any(
+        row["name"] == "source_content_revision"
+        for row in db.fetch_all("PRAGMA table_info(chapter_summaries)")
+    ):
+        db.execute(
+            "ALTER TABLE chapter_summaries ADD COLUMN "
+            "source_content_revision INTEGER NOT NULL DEFAULT 0"
+        )
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    content_sha256 = hashlib.sha256(chapter.content.encode("utf-8")).hexdigest()
+    claim = repository.claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+    )
+    knowledge.upsert_chapter_summary(
+        novel_id="novel-1",
+        chapter_id=1,
+        summary="准备提交的摘要",
+        sync_status="in_progress",
+    )
+    repository.prepare_summary(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+        attempt_count=claim.attempt_count,
+    )
+    db.execute(
+        "UPDATE chapter_summaries SET source_content_revision = 0 "
+        "WHERE chapter_number = 1"
+    )
+    db.commit()
+
+    with pytest.raises(RuntimeError, match="canonical_summary_write_missing"):
+        repository.commit(
+            novel_id="novel-1",
+            chapter_number=1,
+            content_sha256=content_sha256,
+            pipeline_version="chapter-narrative-sync:v1",
+            attempt_count=claim.attempt_count,
+            content_revision=claim.content_revision,
+        )
+
+
 def test_canonical_commit_rejects_nonempty_replaced_summary_payload(tmp_path):
     db, _chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
     repository = SqliteChapterNarrativeCommitRepository(db)

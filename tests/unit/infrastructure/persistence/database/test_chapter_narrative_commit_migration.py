@@ -2,6 +2,8 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from domain.novel.entities.chapter import Chapter
 from domain.novel.value_objects.novel_id import NovelId
 from infrastructure.persistence.database.connection import (
@@ -31,6 +33,10 @@ def _seed_current_committed_summary(
     content_sha256: str,
 ) -> None:
     knowledge_id = f"{novel_id}-knowledge"
+    source = db.fetch_one(
+        "SELECT content_revision FROM chapters WHERE novel_id = ? AND number = ?",
+        (novel_id, chapter_number),
+    )
     db.execute(
         "INSERT INTO knowledge (id, novel_id) VALUES (?, ?)",
         (knowledge_id, novel_id),
@@ -38,14 +44,15 @@ def _seed_current_committed_summary(
     db.execute(
         "INSERT INTO chapter_summaries "
         "(id, knowledge_id, chapter_number, summary, source_content_sha256, "
-        "pipeline_version, sync_status, sync_attempts) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "source_content_revision, pipeline_version, sync_status, sync_attempts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             f"{knowledge_id}-ch{chapter_number}",
             knowledge_id,
             chapter_number,
             "已提交的规范摘要",
             content_sha256,
+            int(source["content_revision"] or 0),
             "chapter-narrative-sync:v1",
             "committed",
             1,
@@ -58,6 +65,7 @@ def test_clean_install_has_content_versions_summary_provenance_and_claim_table(t
     assert {"content_sha256", "content_revision"} <= _columns(db, "chapters")
     assert {
         "source_content_sha256",
+        "source_content_revision",
         "pipeline_version",
         "sync_status",
         "sync_error",
@@ -78,6 +86,7 @@ def test_clean_install_has_content_versions_summary_provenance_and_claim_table(t
         "advance_applied_at",
         "memory_status",
         "memory_failure_reason",
+        "memory_attempt_count",
     } <= _columns(db, "chapter_narrative_commits")
     narrative_default = next(
         row["dflt_value"]
@@ -127,8 +136,8 @@ def test_existing_chapter_and_summary_receive_mechanical_legacy_backfill(tmp_pat
         "SELECT content_sha256, content_revision FROM chapters WHERE id = 'chapter-1'"
     )
     summary = db.fetch_one(
-        "SELECT source_content_sha256, pipeline_version, sync_status, sync_attempts, "
-        "canonical_payload_sha256 "
+        "SELECT source_content_sha256, source_content_revision, pipeline_version, "
+        "sync_status, sync_attempts, canonical_payload_sha256 "
         "FROM chapter_summaries WHERE id = 'summary-1'"
     )
 
@@ -138,6 +147,7 @@ def test_existing_chapter_and_summary_receive_mechanical_legacy_backfill(tmp_pat
     }
     assert dict(summary) == {
         "source_content_sha256": expected_hash,
+        "source_content_revision": 0,
         "pipeline_version": "legacy",
         "sync_status": "legacy",
         "sync_attempts": 0,
@@ -206,10 +216,11 @@ def test_memory_barrier_migration_preserves_pending_advance_on_existing_commit_t
         _apply_chapter_narrative_commit_migration(conn)
 
         row = conn.execute(
-            "SELECT advance_status, memory_status FROM chapter_narrative_commits"
+            "SELECT advance_status, memory_status, memory_attempt_count "
+            "FROM chapter_narrative_commits"
         ).fetchone()
 
-    assert row == ("pending", "not_required")
+    assert row == ("pending", "not_required", 0)
 
 
 def test_migration_skips_hash_backfill_for_legacy_chapters_without_content(tmp_path):
@@ -520,6 +531,52 @@ def test_memory_sync_pending_blocks_story_pipeline_advance_until_current_version
     assert [advance.disposition for advance in recovered] == ["applied"]
 
 
+def test_memory_sync_claim_is_exclusive_and_reuses_committed_version(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "memory-sync-claim.db"))
+    content = "规范正文等待独占记忆回写"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES (?, ?, ?)",
+        ("novel-1", "Novel", "novel-1"),
+    )
+    db.execute(
+        "INSERT INTO chapters (id, novel_id, number, title, content, status, "
+        "content_sha256, content_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "chapter-1",
+            "novel-1",
+            1,
+            "Chapter",
+            content,
+            "completed",
+            content_sha256,
+            1,
+        ),
+    )
+    _seed_current_committed_summary(db, "novel-1", 1, content_sha256)
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, "
+        "status, memory_status) VALUES (?, ?, ?, ?, ?, 'committed', 'pending')",
+        ("novel-1", 1, content_sha256, "chapter-narrative-sync:v1", 1),
+    )
+    db.get_connection().commit()
+
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    kwargs = {
+        "novel_id": "novel-1",
+        "chapter_number": 1,
+        "content_sha256": content_sha256,
+        "pipeline_version": "chapter-narrative-sync:v1",
+        "content_revision": 1,
+    }
+
+    assert repository.claim_memory_sync(**kwargs) == "claimed"
+    assert repository.claim_memory_sync(**kwargs) == "in_progress"
+    assert repository.finish_memory_sync(**kwargs) is True
+    assert repository.claim_memory_sync(**kwargs) == "reused"
+
+
 def test_readiness_and_advance_require_a_current_committed_summary(tmp_path):
     db = DatabaseConnection(str(tmp_path / "summary-readiness.db"))
     content = "正文已经替换，但旧摘要仍在"
@@ -591,6 +648,7 @@ def test_readiness_and_advance_require_a_current_committed_summary(tmp_path):
 
     assert advance.disposition == "source_version_mismatch"
     assert advance.failure_reason == "canonical_summary_not_current"
+
     assert dict(db.fetch_one(
         "SELECT current_auto_chapters, current_chapter_in_act FROM novels WHERE id = ?",
         ("novel-1",),
@@ -598,6 +656,112 @@ def test_readiness_and_advance_require_a_current_committed_summary(tmp_path):
         "current_auto_chapters": 0,
         "current_chapter_in_act": 0,
     }
+
+
+@pytest.mark.parametrize("summary_revision", [0, 1])
+def test_readiness_and_advance_reject_summary_from_older_same_hash_revision(
+    tmp_path,
+    summary_revision,
+):
+    db = DatabaseConnection(str(tmp_path / "summary-same-hash-older-revision.db"))
+    if "source_content_revision" not in _columns(db, "chapter_summaries"):
+        db.execute(
+            "ALTER TABLE chapter_summaries ADD COLUMN "
+            "source_content_revision INTEGER NOT NULL DEFAULT 0"
+        )
+    content = "正文改过后恢复成原文"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO novels (id, title, slug, current_auto_chapters, current_chapter_in_act) "
+        "VALUES ('novel-1', 'Novel', 'novel-1', 0, 0)"
+    )
+    db.execute(
+        "INSERT INTO chapters (id, novel_id, number, title, content, status, "
+        "content_sha256, content_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "chapter-1",
+            "novel-1",
+            1,
+            "Chapter",
+            content,
+            "completed",
+            content_sha256,
+            3,
+        ),
+    )
+    db.execute("INSERT INTO knowledge (id, novel_id) VALUES ('knowledge-1', 'novel-1')")
+    db.execute(
+        "INSERT INTO chapter_summaries "
+        "(id, knowledge_id, chapter_number, summary, source_content_sha256, "
+        "source_content_revision, pipeline_version, sync_status, sync_attempts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "summary-1",
+            "knowledge-1",
+            1,
+            "第一版正文的旧摘要",
+            content_sha256,
+            summary_revision,
+            "chapter-narrative-sync:v1",
+            "committed",
+            1,
+        ),
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status, advance_status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "novel-1",
+            1,
+            content_sha256,
+            "chapter-narrative-sync:v1",
+            3,
+            "committed",
+            "pending",
+        ),
+    )
+    db.get_connection().commit()
+
+    repository = SqliteChapterNarrativeCommitRepository(db)
+
+    assert repository.is_current_version_ready(
+        novel_id="novel-1",
+        chapter_number=1,
+        pipeline_version="chapter-narrative-sync:v1",
+    ) is False
+    assert repository.get_committed_summary(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+    ) is None
+    advance = repository.advance_story_pipeline_once(
+        novel_id="novel-1",
+        chapter_number=1,
+        pipeline_version="chapter-narrative-sync:v1",
+    )
+
+    assert advance.disposition == "source_version_mismatch"
+    assert advance.failure_reason == "canonical_summary_not_current"
+
+    db.execute(
+        "UPDATE chapter_narrative_commits SET content_revision = ? "
+        "WHERE novel_id = 'novel-1' AND chapter_number = 1",
+        (summary_revision,),
+    )
+    db.get_connection().commit()
+    assert db.fetch_one(
+        "SELECT content_revision FROM chapter_narrative_commits "
+        "WHERE novel_id = 'novel-1' AND chapter_number = 1"
+    )["content_revision"] == summary_revision
+
+    assert repository.get_committed_summary(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+    ) is None
 
 
 def test_chapter_repository_versions_only_changed_content(tmp_path):
@@ -719,8 +883,8 @@ def test_migration_runner_upgrades_existing_database_with_canonical_provenance(
             "SELECT content_sha256, content_revision FROM chapters WHERE id = 'chapter-1'"
         ).fetchone()
         summary = conn.execute(
-            "SELECT source_content_sha256, pipeline_version, sync_status, sync_attempts, "
-            "canonical_payload_sha256 "
+            "SELECT source_content_sha256, source_content_revision, pipeline_version, "
+            "sync_status, sync_attempts, canonical_payload_sha256 "
             "FROM chapter_summaries WHERE id = 'summary-1'"
         ).fetchone()
         commit_columns = {
@@ -734,13 +898,14 @@ def test_migration_runner_upgrades_existing_database_with_canonical_provenance(
     assert {"content_sha256", "content_revision"} <= chapter_columns
     assert {
         "source_content_sha256",
+        "source_content_revision",
         "pipeline_version",
         "sync_error",
         "sync_attempts",
         "canonical_payload_sha256",
     } <= summary_columns
     assert chapter == (hashlib.sha256(content.encode("utf-8")).hexdigest(), 1)
-    assert summary == (chapter[0], "legacy", "legacy", 0, "")
+    assert summary == (chapter[0], 0, "legacy", "legacy", 0, "")
     assert {"advance_status", "advance_applied_at"} <= commit_columns
     assert legacy_commit[0] == "applied"
     assert legacy_commit[1]

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from domain.ai.services.llm_service import LLMService
+from application.ai.structured_json_pipeline import _retry_delay_seconds
 
 if TYPE_CHECKING:
     from application.world.services.knowledge_service import KnowledgeService
@@ -375,66 +376,9 @@ class ChapterAftermathPipeline:
                     novel_id,
                     chapter_number,
                 )
-            else:
-                def _persist_memory_sync_status(
-                    memory_status: str,
-                    failure_reason: str = "",
-                ) -> bool:
-                    if not durable_memory_sync:
-                        return True
-                    if not memory_content_sha256 or not memory_content_revision:
-                        logger.error(
-                            "MemoryEngine 状态缺少当前正文版本 novel=%s ch=%s",
-                            novel_id,
-                            chapter_number,
-                        )
-                        return False
-                    try:
-                        from application.world.services.chapter_narrative_sync import (
-                            CHAPTER_NARRATIVE_PIPELINE_VERSION,
-                        )
-                        from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
-                            SqliteChapterNarrativeCommitRepository,
-                        )
+                return out
 
-                        persisted = SqliteChapterNarrativeCommitRepository(
-                            self._chapter_repository.db
-                        ).set_memory_sync_status(
-                            novel_id=novel_id,
-                            chapter_number=chapter_number,
-                            content_sha256=str(memory_content_sha256),
-                            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-                            content_revision=int(memory_content_revision),
-                            memory_status=memory_status,
-                            failure_reason=failure_reason,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "MemoryEngine 状态落库失败 novel=%s ch=%s status=%s: %s",
-                            novel_id,
-                            chapter_number,
-                            memory_status,
-                            exc,
-                        )
-                        return False
-                    if not persisted:
-                        logger.warning(
-                            "MemoryEngine 状态未写入当前正文版本 novel=%s ch=%s status=%s",
-                            novel_id,
-                            chapter_number,
-                            memory_status,
-                        )
-                    return bool(persisted)
-
-                if not _persist_memory_sync_status("pending"):
-                    out.update(
-                        {
-                            "memory_engine_ok": False,
-                            "narrative_sync_ok": False,
-                            "failure_reason": "memory_engine_sync_state_unavailable",
-                        }
-                    )
-                    return out
+            if not durable_memory_sync:
                 try:
                     memory_delta = await self._memory_engine.update_from_chapter(
                         novel_id,
@@ -449,11 +393,7 @@ class ChapterAftermathPipeline:
                     )
                     if memory_errors:
                         raise RuntimeError("; ".join(str(error) for error in memory_errors))
-                    if not _persist_memory_sync_status("committed"):
-                        raise RuntimeError("memory_engine_sync_state_commit_failed")
                     out["memory_engine_ok"] = True
-                    if durable_memory_sync:
-                        out["memory_status"] = "committed"
                     out["memory_engine_new_beats"] = int(
                         memory_delta.get("new_beats", 0)
                     )
@@ -461,7 +401,6 @@ class ChapterAftermathPipeline:
                         memory_delta.get("new_clues", 0)
                     )
                 except Exception as exc:
-                    persisted_failure = _persist_memory_sync_status("failed", str(exc))
                     out.update(
                         {
                             "memory_engine_ok": False,
@@ -470,14 +409,222 @@ class ChapterAftermathPipeline:
                             "memory_engine_error": str(exc),
                         }
                     )
-                    if durable_memory_sync:
-                        out["memory_status"] = "failed" if persisted_failure else "pending"
                     logger.warning(
                         "MemoryEngine 回写失败 novel=%s ch=%s: %s",
                         novel_id,
                         chapter_number,
                         exc,
                     )
+            elif not memory_content_sha256 or not memory_content_revision:
+                out.update(
+                    {
+                        "memory_engine_ok": False,
+                        "narrative_sync_ok": False,
+                        "failure_reason": "memory_engine_sync_state_unavailable",
+                    }
+                )
+                return out
+            else:
+                from application.world.services.chapter_narrative_sync import (
+                    CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                )
+                from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+                    MAX_MEMORY_SYNC_ATTEMPTS,
+                    SqliteChapterNarrativeCommitRepository,
+                )
+
+                memory_commit_repository = SqliteChapterNarrativeCommitRepository(
+                    self._chapter_repository.db
+                )
+                memory_kwargs = {
+                    "novel_id": novel_id,
+                    "chapter_number": chapter_number,
+                    "content_sha256": str(memory_content_sha256),
+                    "pipeline_version": CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                    "content_revision": int(memory_content_revision),
+                }
+                for retry_index in range(MAX_MEMORY_SYNC_ATTEMPTS):
+                    try:
+                        memory_claim = memory_commit_repository.claim_memory_sync(
+                            **memory_kwargs
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "MemoryEngine 声明状态失败 novel=%s ch=%s: %s",
+                            novel_id,
+                            chapter_number,
+                            exc,
+                        )
+                        out.update(
+                            {
+                                "memory_engine_ok": False,
+                                "narrative_sync_ok": False,
+                                "failure_reason": "memory_engine_sync_state_unavailable",
+                                "memory_engine_error": str(exc),
+                            }
+                        )
+                        return out
+
+                    if memory_claim == "reused":
+                        out["memory_engine_ok"] = True
+                        out["memory_status"] = "committed"
+                        break
+                    if memory_claim == "in_progress":
+                        out.update(
+                            {
+                                "memory_engine_ok": False,
+                                "memory_status": "in_progress",
+                                "narrative_sync_ok": False,
+                                "failure_reason": "memory_engine_sync_in_progress",
+                            }
+                        )
+                        return out
+                    if memory_claim == "exhausted":
+                        out.update(
+                            {
+                                "memory_engine_ok": False,
+                                "memory_status": "failed",
+                                "narrative_sync_ok": False,
+                                "failure_reason": "memory_engine_sync_exhausted",
+                            }
+                        )
+                        return out
+                    if memory_claim != "claimed":
+                        out.update(
+                            {
+                                "memory_engine_ok": False,
+                                "narrative_sync_ok": False,
+                                "discarded_stale": memory_claim == "source_version_mismatch",
+                                "failure_reason": (
+                                    "source_version_mismatch"
+                                    if memory_claim == "source_version_mismatch"
+                                    else "memory_engine_sync_state_unavailable"
+                                ),
+                            }
+                        )
+                        return out
+
+                    try:
+                        canonical_update = getattr(
+                            self._memory_engine,
+                            "update_canonical_version_from_chapter",
+                            None,
+                        )
+                        if callable(canonical_update):
+                            memory_delta = await canonical_update(
+                                novel_id,
+                                chapter_number,
+                                content,
+                                outline,
+                                content_sha256=str(memory_content_sha256),
+                                content_revision=int(memory_content_revision),
+                            )
+                        else:
+                            memory_delta = await self._memory_engine.update_from_chapter(
+                                novel_id,
+                                chapter_number,
+                                content,
+                                outline,
+                            )
+                        if isinstance(memory_delta, dict) and memory_delta.get(
+                            "discarded_stale"
+                        ):
+                            out.update(
+                                {
+                                    "memory_engine_ok": False,
+                                    "narrative_sync_ok": False,
+                                    "discarded_stale": True,
+                                    "failure_reason": "source_version_mismatch",
+                                }
+                            )
+                            return out
+                        memory_errors = (
+                            list(memory_delta.get("errors") or [])
+                            if isinstance(memory_delta, dict)
+                            else ["MemoryEngine returned an invalid update result"]
+                        )
+                        if memory_errors:
+                            raise RuntimeError("; ".join(str(error) for error in memory_errors))
+                        if not memory_commit_repository.finish_memory_sync(**memory_kwargs):
+                            if not self._is_current_content_version(
+                                novel_id,
+                                chapter_number,
+                                content,
+                                expected_content_sha256=str(memory_content_sha256),
+                                expected_content_revision=int(memory_content_revision),
+                            ):
+                                out.update(
+                                    {
+                                        "memory_engine_ok": False,
+                                        "narrative_sync_ok": False,
+                                        "discarded_stale": True,
+                                        "failure_reason": "source_version_mismatch",
+                                    }
+                                )
+                                return out
+                            raise RuntimeError("memory_engine_sync_state_commit_failed")
+                        out["memory_engine_ok"] = True
+                        out["memory_status"] = "committed"
+                        out["memory_engine_new_beats"] = int(
+                            memory_delta.get("new_beats", 0)
+                        )
+                        out["memory_engine_new_clues"] = int(
+                            memory_delta.get("new_clues", 0)
+                        )
+                        break
+                    except Exception as exc:
+                        persisted_failure = memory_commit_repository.fail_memory_sync(
+                            **memory_kwargs,
+                            failure_reason=str(exc),
+                        )
+                        if not persisted_failure and not self._is_current_content_version(
+                            novel_id,
+                            chapter_number,
+                            content,
+                            expected_content_sha256=str(memory_content_sha256),
+                            expected_content_revision=int(memory_content_revision),
+                        ):
+                            out.update(
+                                {
+                                    "memory_engine_ok": False,
+                                    "narrative_sync_ok": False,
+                                    "discarded_stale": True,
+                                    "failure_reason": "source_version_mismatch",
+                                }
+                            )
+                            return out
+                        if (
+                            persisted_failure
+                            and retry_index < MAX_MEMORY_SYNC_ATTEMPTS - 1
+                        ):
+                            delay = _retry_delay_seconds(retry_index)
+                            logger.info(
+                                "MemoryEngine 回写失败，%.1f 秒后重试 novel=%s ch=%s attempt=%s/%s",
+                                delay,
+                                novel_id,
+                                chapter_number,
+                                retry_index + 1,
+                                MAX_MEMORY_SYNC_ATTEMPTS,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        out.update(
+                            {
+                                "memory_engine_ok": False,
+                                "narrative_sync_ok": False,
+                                "failure_reason": "memory_engine_update_failed",
+                                "memory_engine_error": str(exc),
+                                "memory_status": (
+                                    "failed" if persisted_failure else "in_progress"
+                                ),
+                            }
+                        )
+                        logger.warning(
+                            "MemoryEngine 回写失败 novel=%s ch=%s: %s",
+                            novel_id,
+                            chapter_number,
+                            exc,
+                        )
 
         # 1b) 角色叙事内核对账：cast plan vs 正文，自动投影状态与风险。
         try:

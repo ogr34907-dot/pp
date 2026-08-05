@@ -33,6 +33,11 @@ def _chapter_summary_to_dto(ch: ChapterSummary) -> ChapterSummaryDTO:
         beat_sections=list(ch.beat_sections or []),
         micro_beats=list(ch.micro_beats or []),
         sync_status=ch.sync_status,
+        source_content_sha256=ch.source_content_sha256,
+        source_content_revision=ch.source_content_revision,
+        pipeline_version=ch.pipeline_version,
+        sync_error=ch.sync_error,
+        sync_attempts=ch.sync_attempts,
     )
 
 

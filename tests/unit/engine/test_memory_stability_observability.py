@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,9 @@ import pytest
 from application.ai_invocation.dtos import InvocationPolicy, InvocationSessionStatus
 from application.analyst.services.chapter_indexing_service import ChapterIndexingService
 from application.engine.services.chapter_aftermath_pipeline import ChapterAftermathPipeline
+from application.engine.services.context_budget_allocator import ContextBudgetAllocator
+from application.engine.services.memory_engine import MemoryEngine
+from application.engine.services.memory_engine_settings import MemoryEngineRuntimeSettings
 from application.world.services.chapter_narrative_sync import (
     sync_chapter_narrative_after_save,
 )
@@ -150,6 +154,35 @@ class _DeterministicLLM:
 
     async def generate(self, prompt: Prompt, config):
         body = prompt.user
+        memory_chapter = re.search(r"第\s*(\d+)\s*章", body)
+        if "【待分析的章节】" in body and memory_chapter:
+            chapter_number = int(memory_chapter.group(1))
+            return GenerationResult(
+                json.dumps(
+                    {
+                        "completed_beats": [
+                            {
+                                "beat_id": f"ch{chapter_number}-durable-beat",
+                                "summary": f"第{chapter_number}章完成的记忆节拍",
+                                "chapter": chapter_number,
+                                "characters_involved": ["沈青"],
+                            }
+                        ],
+                        "revealed_clues": [
+                            {
+                                "clue_id": f"ch{chapter_number}-durable-clue",
+                                "content": f"第{chapter_number}章揭露的记忆线索",
+                                "revealed_at_chapter": chapter_number,
+                                "category": "truth",
+                                "is_still_valid": True,
+                            }
+                        ],
+                        "fact_violations": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                TokenUsage(input_tokens=3, output_tokens=3),
+            )
         # Exhaust the canonical retry budget before the explicit recovery call.
         if "[EXTRACTION_FAIL]" in body and self.extraction_failures < 3:
             self.extraction_failures += 1
@@ -205,7 +238,13 @@ class _DeterministicComposer:
             17: "[EXTRACTION_FAIL]",
             20: "幕二转场",
         }.get(request.chapter_number, "常规推进")
-        return ProseCompositionResult(content=f"第{request.chapter_number}章正文：{scenario}")
+        return ProseCompositionResult(
+            content=(
+                f"第{request.chapter_number}章正文：{scenario}；"
+                f"记忆节拍-{request.chapter_number}；"
+                f"记忆线索-{request.chapter_number}"
+            )
+        )
 
 
 class _ChapterRepository:
@@ -264,12 +303,71 @@ class _CurrentStoryNodeRepository:
 
 
 class _ChapterWorkflow:
+    def __init__(self, allocator: ContextBudgetAllocator | None = None, captured_contexts=None):
+        self.context_builder = (
+            SimpleNamespace(budget_allocator=allocator) if allocator is not None else None
+        )
+        self._allocator = allocator
+        self._captured_contexts = captured_contexts
+
     def prepare_chapter_generation(self, novel_id, chapter_number, outline, scene_director=None):
+        if self._allocator is not None:
+            allocation = self._allocator.allocate(
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                outline=outline,
+                total_budget=12000,
+            )
+            context = allocation.get_final_context()
+            if self._captured_contexts is not None:
+                self._captured_contexts[chapter_number] = context
+            return {
+                "context": context,
+                "context_tokens": self._allocator.estimate_tokens(context),
+                "context_budget_tokens": 12000,
+                "voice_anchors": "",
+            }
         return {
             "context": f"T0 locked fact / T1 summary / T2 bridge / T3 evidence for {chapter_number}",
             "context_tokens": 16,
             "voice_anchors": "",
         }
+
+
+class _MemoryBibleRepository:
+    def __init__(self):
+        self._bible = SimpleNamespace(
+            characters=[
+                SimpleNamespace(
+                    name="林澈",
+                    description="林澈的父亲已经死亡。",
+                    status="",
+                    is_dead=False,
+                    relationships=[],
+                    public_profile="",
+                    hidden_profile="",
+                    reveal_chapter=None,
+                    mental_state="NORMAL",
+                ),
+                SimpleNamespace(
+                    name="沈青",
+                    description="",
+                    status="alive",
+                    is_dead=False,
+                    relationships=[],
+                    public_profile="",
+                    hidden_profile="",
+                    reveal_chapter=None,
+                    mental_state="NORMAL",
+                ),
+            ],
+            timeline_notes=[],
+            world_settings=[],
+            style_notes=[],
+        )
+
+    def get_by_novel_id(self, novel_id):
+        return self._bible
 
 
 class _SqliteKnowledgeService:
@@ -371,7 +469,7 @@ async def _run_memory_stability_regression(
     monkeypatch,
     *,
     chapter_count: int,
-) -> None:
+) -> dict[int, str]:
     """Exercise persisted extraction evidence across restart, failure, and rewrite boundaries."""
     database_path = tmp_path / "memory-stability-regression.sqlite"
     database = DatabaseConnection(str(database_path))
@@ -396,9 +494,26 @@ async def _run_memory_stability_regression(
     )
     connection.commit()
 
+    bible_repository = _MemoryBibleRepository()
+    captured_contexts: dict[int, str] = {}
+
     def _build_runtime(active_database, active_connection, active_chapter_repository):
         vector_store = _ControllableVectorStore(database_path, fail_chapters={12})
         llm = _DeterministicLLM()
+        memory_engine = MemoryEngine(
+            llm_service=llm,
+            bible_repository=bible_repository,
+            db_connection=active_database,
+            runtime_settings=MemoryEngineRuntimeSettings(
+                state_cache_ttl_seconds=0,
+                state_cache_max_size=0,
+            ),
+        )
+        allocator = ContextBudgetAllocator(
+            chapter_repository=active_chapter_repository,
+            bible_repository=bible_repository,
+            memory_engine=memory_engine,
+        )
         knowledge = KnowledgeService(SqliteKnowledgeRepository(active_database))
         aftermath = ChapterAftermathPipeline(
             knowledge_service=knowledge,
@@ -409,8 +524,9 @@ async def _run_memory_stability_regression(
             causal_edge_repository=_SqliteCausalEdgeRepository(active_connection),
             character_state_repository=_SqliteCharacterStateRepository(active_connection),
             chapter_repository=active_chapter_repository,
+            memory_engine=memory_engine,
         )
-        return vector_store, llm, aftermath, knowledge
+        return vector_store, llm, memory_engine, allocator, aftermath, knowledge
 
     async def _observed_bridge(self, novel_id, chapter_number, content):
         connection.execute("INSERT INTO aftermath_calls (stage, chapter_number) VALUES ('bridge', ?)", (chapter_number,))
@@ -424,7 +540,7 @@ async def _run_memory_stability_regression(
     monkeypatch.setattr(ChapterAftermathPipeline, "_run_auxiliary_stages", _observed_auxiliary)
 
     chapter_repository = _ChapterRepository(database)
-    vector_store, llm, aftermath, knowledge = _build_runtime(
+    vector_store, llm, memory_engine, allocator, aftermath, knowledge = _build_runtime(
         database,
         connection,
         chapter_repository,
@@ -440,7 +556,7 @@ async def _run_memory_stability_regression(
             chapter_repository = _ChapterRepository(database)
             story_node_repository = _CurrentStoryNodeRepository()
             novel_repository = _NovelRepository()
-            vector_store, llm, aftermath, knowledge = _build_runtime(
+            vector_store, llm, memory_engine, allocator, aftermath, knowledge = _build_runtime(
                 database,
                 connection,
                 chapter_repository,
@@ -459,7 +575,7 @@ async def _run_memory_stability_regression(
             novel_repository=novel_repository,
             chapter_repository=chapter_repository,
             story_node_repo=story_node_repository,
-            chapter_workflow=_ChapterWorkflow(),
+            chapter_workflow=_ChapterWorkflow(allocator, captured_contexts),
             prose_composer=_DeterministicComposer(),
             llm_service=llm,
             aftermath_pipeline=aftermath,
@@ -518,25 +634,71 @@ async def _run_memory_stability_regression(
     persisted_chapters = connection.execute("SELECT chapter_number, content FROM chapter_snapshots").fetchall()
     foreshadows = {row[0] for row in connection.execute("SELECT description FROM extracted_foreshadows")}
     aftermath_calls = connection.execute("SELECT stage, chapter_number FROM aftermath_calls").fetchall()
+    memory_state = connection.execute(
+        "SELECT state_json, last_updated_chapter FROM memory_engine_state WHERE novel_id = ?",
+        ("memory-stability",),
+    ).fetchone()
     database.close()
 
     assert database_path.exists()
     assert len(persisted_chapters) == chapter_count
     assert {row[0] for row in persisted_chapters} == set(range(1, chapter_count + 1))
-    assert dict(persisted_chapters)[10] == "第10章重写后的正文"
-    assert not any('"chapter_number": 17' in payload for payload in triple_payloads)
+    assert memory_state is not None
+    memory_payload = json.loads(memory_state[0])
+    assert memory_state[1] == chapter_count
+    assert {beat["beat_id"] for beat in memory_payload["completed_beats"]} >= {
+        "ch1-durable-beat",
+        f"ch{chapter_count}-durable-beat",
+    }
+    assert {clue["clue_id"] for clue in memory_payload["revealed_clues"]} >= {
+        "ch1-durable-clue",
+        f"ch{chapter_count}-durable-clue",
+    }
+    if chapter_count >= 17:
+        assert not any('"chapter_number": 17' in payload for payload in triple_payloads)
     persisted_text = "\n".join(triple_payloads)
-    for marker in ("林澈死亡", "赤铜钥匙", "钟楼", "内鬼秘密", "卷一结束", "卷二开始", "幕二转场"):
-        assert marker in persisted_text
-    assert "钟楼暗门伏笔" in foreshadows
+    expected_markers = {
+        3: "林澈死亡",
+        5: "赤铜钥匙",
+        7: "钟楼",
+        8: "内鬼秘密",
+        10: "卷一结束",
+        11: "卷二开始",
+        20: "幕二转场",
+    }
+    for chapter_number, marker in expected_markers.items():
+        if chapter_number <= chapter_count:
+            assert marker in persisted_text
+    if chapter_count >= 9:
+        assert "钟楼暗门伏笔" in foreshadows
     bridge_calls = [item for item in aftermath_calls if item[0] == "bridge"]
     auxiliary_calls = [item for item in aftermath_calls if item[0] == "auxiliary"]
-    assert len(bridge_calls) == chapter_count + 2
-    assert len(auxiliary_calls) == chapter_count + 1
-    assert len([item for item in bridge_calls if item[1] == 17]) == 2
-    assert len([item for item in auxiliary_calls if item[1] == 17]) == 1
-    assert vector_store.records["memory-stability_ch10_summary"]["text"] == "第10章重写后的正文已被重新抽取"
-    assert "memory-stability_ch12_summary" in vector_store.records
+    assert len(bridge_calls) == chapter_count + (chapter_count >= 17) + (chapter_count >= 20)
+    assert len(auxiliary_calls) == chapter_count + (chapter_count >= 17)
+    if chapter_count >= 17:
+        assert len([item for item in bridge_calls if item[1] == 17]) == 2
+        assert len([item for item in auxiliary_calls if item[1] == 17]) == 1
+    if chapter_count >= 20:
+        assert dict(persisted_chapters)[10] == "第10章重写后的正文"
+        assert vector_store.records["memory-stability_ch10_summary"]["text"] == "第10章重写后的正文已被重新抽取"
+    if chapter_count >= 12:
+        assert "memory-stability_ch12_summary" in vector_store.records
+
+    return captured_contexts
+
+
+@pytest.mark.asyncio
+async def test_default_story_pipeline_persists_memory_and_evolves_next_context(tmp_path: Path, monkeypatch):
+    """The default pipeline carries chapter-one memory into chapter two's real context."""
+    contexts = await _run_memory_stability_regression(
+        tmp_path,
+        monkeypatch,
+        chapter_count=2,
+    )
+
+    assert "第1章完成的记忆节拍" in contexts[2]
+    assert "第1章揭露的记忆线索" in contexts[2]
+    assert "禁止: 林澈(" not in contexts[2]
 
 
 @pytest.mark.asyncio
@@ -552,9 +714,13 @@ async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_pa
 @pytest.mark.asyncio
 @pytest.mark.slow
 async def test_hundred_chapter_memory_stability_regression(tmp_path: Path, monkeypatch):
-    """Run the real StoryPipeline and aftermath fixture across 100 persisted chapters."""
-    await _run_memory_stability_regression(
+    """Run 100 real pipeline iterations with durable memory and evolving context."""
+    contexts = await _run_memory_stability_regression(
         tmp_path,
         monkeypatch,
         chapter_count=100,
     )
+
+    assert "第99章完成的记忆节拍" in contexts[100]
+    assert "第99章揭露的记忆线索" in contexts[100]
+    assert "禁止: 林澈(" not in contexts[100]

@@ -14,6 +14,7 @@ class ChapterSummaryDTO(BaseModel):
     micro_beats: List[Dict[str, Any]] = Field(default_factory=list, description="微观节拍列表")
     sync_status: str = Field(default="draft", description="同步状态")
     source_content_sha256: str = Field(default="", description="来源正文 SHA-256")
+    source_content_revision: int = Field(default=0, description="来源正文修订号")
     pipeline_version: str = Field(default="", description="规范抽取管线版本")
     sync_error: str = Field(default="", description="同步失败原因")
     sync_attempts: int = Field(default=0, description="同步尝试次数")

@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import time
@@ -50,6 +51,7 @@ from application.engine.services.memory_engine_settings import (
 from infrastructure.ai.generation_profiles import generation_config_from_profile
 from infrastructure.ai.prompt_contracts.memory_extraction import MEMORY_EXTRACTION_CONTRACT
 from infrastructure.ai.prompt_gateway import PromptGatewayError, get_prompt_gateway
+from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +337,7 @@ class MemoryState:
     completed_beats: List[Dict[str, Any]] = field(default_factory=list)
     revealed_clues: List[Dict[str, Any]] = field(default_factory=list)
     fact_violations_history: List[Dict[str, Any]] = field(default_factory=list)
+    applied_aftermath_versions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class MemoryEngine:
@@ -511,6 +514,47 @@ class MemoryEngine:
         content: str,
         outline: str,
     ) -> Dict[str, Any]:
+        """Extract and persist memory without a canonical aftermath identity."""
+        return await self._update_from_chapter(
+            novel_id,
+            chapter_number,
+            content,
+            outline,
+        )
+
+    async def update_canonical_version_from_chapter(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        content: str,
+        outline: str,
+        *,
+        content_sha256: str,
+        content_revision: int,
+    ) -> Dict[str, Any]:
+        """Apply one canonical aftermath version at most once."""
+        return await self._update_from_chapter(
+            novel_id,
+            chapter_number,
+            content,
+            outline,
+            canonical_version={
+                "novel_id": novel_id,
+                "chapter_number": int(chapter_number),
+                "content_sha256": str(content_sha256),
+                "content_revision": int(content_revision),
+            },
+        )
+
+    async def _update_from_chapter(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        content: str,
+        outline: str,
+        *,
+        canonical_version: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         """章后状态回写：调用 LLM 提取增量 + 去重合并 + 持久化
         
         Args:
@@ -532,6 +576,12 @@ class MemoryEngine:
         try:
             # 1. 准备上下文
             state = deepcopy(self._get_or_load_state(novel_id))
+            if (
+                canonical_version is not None
+                and canonical_version in state.applied_aftermath_versions
+            ):
+                result["already_applied"] = True
+                return result
             fact_lock = self.build_fact_lock_section(novel_id, chapter_number)
             existing_beats = self._summarize_beats_for_prompt(state.completed_beats)
             existing_clues = self._summarize_clues_for_prompt(state.revealed_clues)
@@ -604,7 +654,18 @@ class MemoryEngine:
 
             # 6. 更新状态并持久化
             state.last_updated_chapter = max(state.last_updated_chapter, chapter_number)
-            self._persist_state(novel_id, state)
+            if canonical_version is not None:
+                state.applied_aftermath_versions.append(canonical_version)
+                if not self._persist_canonical_state(
+                    novel_id,
+                    state,
+                    canonical_version,
+                ):
+                    result["discarded_stale"] = True
+                    result["errors"].append("source_version_mismatch")
+                    return result
+            else:
+                self._persist_state(novel_id, state)
             self._remember_state(novel_id, state)
 
             logger.info(
@@ -700,6 +761,7 @@ class MemoryEngine:
                     completed_beats=data.get("completed_beats", []),
                     revealed_clues=data.get("revealed_clues", []),
                     fact_violations_history=data.get("fact_violations_history", []),
+                    applied_aftermath_versions=data.get("applied_aftermath_versions", []),
                 )
                 logger.debug(f"MemoryEngine 从 DB 加载状态: novel={novel_id}, ch={state.last_updated_chapter}")
                 return state
@@ -714,14 +776,95 @@ class MemoryEngine:
                 "completed_beats": state.completed_beats,
                 "revealed_clues": state.revealed_clues,
                 "fact_violations_history": state.fact_violations_history,
+                "applied_aftermath_versions": state.applied_aftermath_versions,
             },
             ensure_ascii=False,
         )
 
-    def _upsert_state_row(self, novel_id: str, state: MemoryState) -> None:
+    @staticmethod
+    def _source_matches_canonical_version(
+        source: Any,
+        canonical_version: Dict[str, Any],
+    ) -> bool:
+        if source is None:
+            return False
+        actual_sha256 = hashlib.sha256(
+            (source[0] or "").encode("utf-8")
+        ).hexdigest()
+        return (
+            actual_sha256 == str(canonical_version["content_sha256"])
+            and (source[1] or "") == str(canonical_version["content_sha256"])
+            and int(source[2] or 0) == int(canonical_version["content_revision"])
+        )
+
+    def _persist_canonical_state(
+        self,
+        novel_id: str,
+        state: MemoryState,
+        canonical_version: Dict[str, Any],
+        *,
+        _retry_after_table_create: bool = False,
+    ) -> bool:
+        """Persist one canonical version only while its source prose is current."""
+        if self.db_connection is None:
+            return False
+        try:
+            with sqlite_writes_bypass_queue():
+                if hasattr(self.db_connection, "transaction"):
+                    with self.db_connection.transaction() as conn:
+                        source = conn.execute(
+                            "SELECT content, content_sha256, content_revision FROM chapters "
+                            "WHERE novel_id = ? AND number = ?",
+                            (
+                                canonical_version["novel_id"],
+                                canonical_version["chapter_number"],
+                            ),
+                        ).fetchone()
+                        if not self._source_matches_canonical_version(
+                            source,
+                            canonical_version,
+                        ):
+                            return False
+                        self._upsert_state_row(novel_id, state, connection=conn)
+                    return True
+
+                source = self.db_connection.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (
+                        canonical_version["novel_id"],
+                        canonical_version["chapter_number"],
+                    ),
+                ).fetchone()
+                if not self._source_matches_canonical_version(source, canonical_version):
+                    return False
+                self._upsert_state_row(novel_id, state)
+                return True
+        except Exception as exc:
+            if (
+                not _retry_after_table_create
+                and "no such table" in str(exc).lower()
+            ):
+                self._ensure_table_exists()
+                return self._persist_canonical_state(
+                    novel_id,
+                    state,
+                    canonical_version,
+                    _retry_after_table_create=True,
+                )
+            raise RuntimeError(f"MemoryEngine state persistence failed: {exc}") from exc
+
+    def _upsert_state_row(
+        self,
+        novel_id: str,
+        state: MemoryState,
+        *,
+        connection: Any = None,
+    ) -> None:
         """将当前 MemoryState UPSERT 到 memory_engine_state（使用 DatabaseConnection / sqlite3 均支持的 execute API）"""
         state_json = self._memory_state_to_json(state)
-        self.db_connection.execute(
+        target = connection if connection is not None else self.db_connection
+        target.execute(
             """
             INSERT INTO memory_engine_state (novel_id, state_json, last_updated_chapter, updated_at)
             VALUES (?, ?, ?, datetime('now'))
@@ -732,7 +875,8 @@ class MemoryEngine:
             """,
             (novel_id, state_json, state.last_updated_chapter),
         )
-        self.db_connection.commit()
+        if connection is None:
+            self.db_connection.commit()
 
     def _persist_state(self, novel_id: str, state: MemoryState) -> None:
         """持久化状态到数据库"""
@@ -741,16 +885,17 @@ class MemoryEngine:
             return
 
         try:
-            self._upsert_state_row(novel_id, state)
+            with sqlite_writes_bypass_queue():
+                self._upsert_state_row(novel_id, state)
             logger.debug(f"MemoryEngine 状态已持久化: novel={novel_id}, ch={state.last_updated_chapter}")
 
         except Exception as e:
             # 表可能还不存在，尝试自动建表
             if "no such table" in str(e).lower() or "table" in str(e).lower():
-                self._ensure_table_exists()
-                # 重试一次
                 try:
-                    self._upsert_state_row(novel_id, state)
+                    with sqlite_writes_bypass_queue():
+                        self._ensure_table_exists()
+                        self._upsert_state_row(novel_id, state)
                 except Exception as retry_err:
                     logger.error(f"MemoryEngine 持久化重试失败: {retry_err}")
                     raise RuntimeError(
@@ -765,16 +910,17 @@ class MemoryEngine:
         if not self.db_connection:
             return
         try:
-            self.db_connection.execute("""
-                CREATE TABLE IF NOT EXISTS memory_engine_state (
-                    novel_id TEXT PRIMARY KEY,
-                    state_json TEXT NOT NULL DEFAULT '{}',
-                    last_updated_chapter INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-                )
-            """)
-            self.db_connection.commit()
+            with sqlite_writes_bypass_queue():
+                self.db_connection.execute("""
+                    CREATE TABLE IF NOT EXISTS memory_engine_state (
+                        novel_id TEXT PRIMARY KEY,
+                        state_json TEXT NOT NULL DEFAULT '{}',
+                        last_updated_chapter INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    )
+                """)
+                self.db_connection.commit()
             logger.info("memory_engine_state 表已自动创建")
         except Exception as e:
             logger.error(f"创建 memory_engine_state 表失败: {e}")

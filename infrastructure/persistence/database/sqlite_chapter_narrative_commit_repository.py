@@ -4,11 +4,17 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from domain.knowledge.chapter_summary import canonical_summary_payload_sha256
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
+
+
+MAX_MEMORY_SYNC_ATTEMPTS = 3
+# The daemon allows five minutes for the complete aftermath stage.  Keep the
+# lease longer so a live writer cannot be reclaimed by a concurrent process.
+MEMORY_SYNC_LEASE_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -400,6 +406,7 @@ class SqliteChapterNarrativeCommitRepository:
                       AND chapter_number = ?
                       AND summary IS NOT NULL AND TRIM(summary) != ''
                       AND source_content_sha256 = ?
+                      AND source_content_revision = ?
                       AND pipeline_version = ?
                       AND sync_status = 'in_progress'
                       AND sync_attempts = ?
@@ -408,6 +415,7 @@ class SqliteChapterNarrativeCommitRepository:
                         novel_id,
                         chapter_number,
                         content_sha256,
+                        content_revision,
                         pipeline_version,
                         attempt_count,
                     ),
@@ -431,7 +439,8 @@ class SqliteChapterNarrativeCommitRepository:
                 summary_cursor = conn.execute(
                     """
                     UPDATE chapter_summaries
-                    SET source_content_sha256 = ?, pipeline_version = ?,
+                    SET source_content_sha256 = ?, source_content_revision = ?,
+                        pipeline_version = ?,
                         sync_status = 'committed', sync_error = '', sync_attempts = ?,
                         updated_at = ?
                     WHERE id = ?
@@ -443,12 +452,14 @@ class SqliteChapterNarrativeCommitRepository:
                       AND micro_beats IS ?
                       AND canonical_payload_sha256 = ?
                       AND source_content_sha256 = ?
+                      AND source_content_revision = ?
                       AND pipeline_version = ?
                       AND sync_status = 'in_progress'
                       AND sync_attempts = ?
                     """,
                     (
                         content_sha256,
+                        content_revision,
                         pipeline_version,
                         attempt_count,
                         now,
@@ -461,6 +472,7 @@ class SqliteChapterNarrativeCommitRepository:
                         summary_row["micro_beats"],
                         expected_payload_sha256,
                         content_sha256,
+                        content_revision,
                         pipeline_version,
                         attempt_count,
                     ),
@@ -556,13 +568,15 @@ class SqliteChapterNarrativeCommitRepository:
                 cursor = conn.execute(
                     """
                     UPDATE chapter_summaries
-                    SET source_content_sha256 = ?, pipeline_version = ?,
+                    SET source_content_sha256 = ?, source_content_revision = ?,
+                        pipeline_version = ?,
                         sync_status = 'in_progress', sync_error = '', sync_attempts = ?,
                         canonical_payload_sha256 = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (
                         content_sha256,
+                        int(claim[0]),
                         pipeline_version,
                         attempt_count,
                         expected_payload_sha256,
@@ -613,6 +627,7 @@ class SqliteChapterNarrativeCommitRepository:
                     WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?)
                       AND chapter_number = ?
                       AND source_content_sha256 = ? AND pipeline_version = ?
+                      AND source_content_revision = ?
                       AND EXISTS (
                           SELECT 1
                           FROM chapter_narrative_commits
@@ -628,6 +643,7 @@ class SqliteChapterNarrativeCommitRepository:
                         chapter_number,
                         content_sha256,
                         pipeline_version,
+                        content_revision,
                         novel_id,
                         chapter_number,
                         content_sha256,
@@ -732,6 +748,7 @@ class SqliteChapterNarrativeCommitRepository:
                     WHERE knowledge.novel_id = ?
                       AND chapter_summaries.chapter_number = ?
                       AND chapter_summaries.source_content_sha256 = ?
+                      AND chapter_summaries.source_content_revision = ?
                       AND chapter_summaries.pipeline_version = ?
                       AND chapter_summaries.sync_status = 'committed'
                       AND chapter_summaries.summary IS NOT NULL
@@ -741,6 +758,7 @@ class SqliteChapterNarrativeCommitRepository:
                         novel_id,
                         chapter_number,
                         actual_sha256,
+                        content_revision,
                         pipeline_version,
                     ),
                 ).fetchone()
@@ -1006,6 +1024,7 @@ class SqliteChapterNarrativeCommitRepository:
             WHERE knowledge.novel_id = ?
               AND chapter_summaries.chapter_number = ?
               AND chapter_summaries.source_content_sha256 = ?
+              AND chapter_summaries.source_content_revision = ?
               AND chapter_summaries.pipeline_version = ?
               AND chapter_summaries.sync_status = 'committed'
               AND chapter_summaries.summary IS NOT NULL
@@ -1015,6 +1034,7 @@ class SqliteChapterNarrativeCommitRepository:
                 novel_id,
                 chapter_number,
                 content_sha256,
+                content_revision,
                 pipeline_version,
             ),
         )
@@ -1061,6 +1081,7 @@ class SqliteChapterNarrativeCommitRepository:
                     WHERE novel_id = ? AND chapter_number = ?
                       AND content_sha256 = ? AND pipeline_version = ?
                       AND content_revision = ? AND status = 'committed'
+                      AND (? = 'committed' OR memory_status != 'committed')
                     """,
                     (
                         memory_status,
@@ -1071,9 +1092,215 @@ class SqliteChapterNarrativeCommitRepository:
                         content_sha256,
                         pipeline_version,
                         int(content_revision),
+                        memory_status,
                     ),
                 )
                 return cursor.rowcount == 1
+
+    def claim_memory_sync(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+        content_revision: int,
+    ) -> str:
+        """Atomically reserve one committed narrative version for MemoryEngine."""
+        now = datetime.now(timezone.utc).isoformat()
+        lease_cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=MEMORY_SYNC_LEASE_SECONDS)
+        ).isoformat()
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                source = conn.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (novel_id, chapter_number),
+                ).fetchone()
+                actual_sha256 = hashlib.sha256(
+                    (source[0] or "").encode("utf-8")
+                ).hexdigest() if source is not None else ""
+                if (
+                    source is None
+                    or actual_sha256 != content_sha256
+                    or (source[1] or "") != content_sha256
+                    or int(source[2] or 0) != int(content_revision)
+                ):
+                    return "source_version_mismatch"
+
+                cursor = conn.execute(
+                    """
+                    UPDATE chapter_narrative_commits
+                    SET memory_status = 'in_progress', memory_failure_reason = '',
+                        memory_attempt_count = memory_attempt_count + 1, updated_at = ?
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ? AND status = 'committed'
+                      AND memory_attempt_count < ?
+                      AND (
+                          memory_status IN ('pending', 'failed')
+                          OR (
+                              memory_status = 'in_progress'
+                              AND datetime(updated_at) <= datetime(?)
+                          )
+                      )
+                    """,
+                    (
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                        MAX_MEMORY_SYNC_ATTEMPTS,
+                        lease_cutoff,
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    return "claimed"
+
+                row = conn.execute(
+                    """
+                    SELECT status, memory_status, memory_attempt_count
+                    FROM chapter_narrative_commits
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ?
+                    """,
+                    (
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                    ),
+                ).fetchone()
+                if row is None or (row[0] or "") != "committed":
+                    return "source_version_mismatch"
+                if (row[1] or "") == "committed":
+                    return "reused"
+                if int(row[2] or 0) >= MAX_MEMORY_SYNC_ATTEMPTS:
+                    return "exhausted"
+                if (row[1] or "") == "in_progress":
+                    return "in_progress"
+                return "source_version_mismatch"
+
+    def finish_memory_sync(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+        content_revision: int,
+    ) -> bool:
+        """Mark a claimed MemoryEngine update readable after its state is durable."""
+        return self.set_memory_sync_status(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=pipeline_version,
+            content_revision=content_revision,
+            memory_status="committed",
+        )
+
+    def fail_memory_sync(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+        content_revision: int,
+        failure_reason: str,
+    ) -> bool:
+        """Record a failed claimed MemoryEngine update without touching a newer version."""
+        now = datetime.now(timezone.utc).isoformat()
+        reason = str(failure_reason or "memory_engine_update_failed")[:1000]
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                source = conn.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (novel_id, chapter_number),
+                ).fetchone()
+                actual_sha256 = hashlib.sha256(
+                    (source[0] or "").encode("utf-8")
+                ).hexdigest() if source is not None else ""
+                if (
+                    source is None
+                    or actual_sha256 != content_sha256
+                    or (source[1] or "") != content_sha256
+                    or int(source[2] or 0) != int(content_revision)
+                ):
+                    return False
+                cursor = conn.execute(
+                    """
+                    UPDATE chapter_narrative_commits
+                    SET memory_status = 'failed', memory_failure_reason = ?, updated_at = ?
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ? AND status = 'committed'
+                      AND memory_status = 'in_progress'
+                    """,
+                    (
+                        reason,
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                    ),
+                )
+                return cursor.rowcount == 1
+
+    def get_memory_sync_status(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+        content_revision: int,
+    ) -> str | None:
+        """Return the barrier state only for the current canonical prose version."""
+        source = self._db.fetch_one(
+            "SELECT content, content_sha256, content_revision FROM chapters "
+            "WHERE novel_id = ? AND number = ?",
+            (novel_id, chapter_number),
+        )
+        if source is None:
+            return None
+        actual_sha256 = hashlib.sha256(
+            (source["content"] or "").encode("utf-8")
+        ).hexdigest()
+        if (
+            actual_sha256 != content_sha256
+            or (source["content_sha256"] or "") != content_sha256
+            or int(source["content_revision"] or 0) != int(content_revision)
+        ):
+            return None
+
+        row = self._db.fetch_one(
+            """
+            SELECT memory_status
+            FROM chapter_narrative_commits
+            WHERE novel_id = ? AND chapter_number = ?
+              AND content_sha256 = ? AND pipeline_version = ?
+              AND content_revision = ? AND status = 'committed'
+            """,
+            (
+                novel_id,
+                chapter_number,
+                content_sha256,
+                pipeline_version,
+                int(content_revision),
+            ),
+        )
+        return str(row["memory_status"] or "not_required") if row else None
 
     def get_committed_summary(
         self,
@@ -1089,6 +1316,11 @@ class SqliteChapterNarrativeCommitRepository:
                 """
                 SELECT summaries.summary
                 FROM chapter_narrative_commits AS commits
+                JOIN chapters AS source
+                  ON source.novel_id = commits.novel_id
+                 AND source.number = commits.chapter_number
+                 AND source.content_sha256 = commits.content_sha256
+                 AND source.content_revision = commits.content_revision
                 JOIN knowledge
                   ON knowledge.novel_id = commits.novel_id
                 JOIN chapter_summaries AS summaries
@@ -1098,6 +1330,7 @@ class SqliteChapterNarrativeCommitRepository:
                   AND commits.content_sha256 = ? AND commits.pipeline_version = ?
                   AND commits.status = 'committed'
                   AND summaries.source_content_sha256 = ?
+                  AND summaries.source_content_revision = commits.content_revision
                   AND summaries.pipeline_version = ?
                   AND summaries.sync_status = 'committed'
                   AND summaries.summary IS NOT NULL AND TRIM(summaries.summary) != ''
