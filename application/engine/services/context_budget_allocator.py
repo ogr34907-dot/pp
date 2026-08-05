@@ -1676,7 +1676,7 @@ class ContextBudgetAllocator:
         
         try:
             # ========== Step 1: 从大纲中提取实体名称 ==========
-            mentioned_entities = self._extract_entities_from_outline(outline)
+            mentioned_entities = self._extract_entities_from_outline(novel_id, outline)
             
             # ========== Step 2: 一度关系召回 ==========
             one_hop_triples = []
@@ -1723,7 +1723,7 @@ class ContextBudgetAllocator:
             logger.warning(f"获取图谱子网失败: {e}")
             return ""
     
-    def _extract_entities_from_outline(self, outline: str) -> List[str]:
+    def _extract_entities_from_outline(self, novel_id: str, outline: str) -> List[str]:
         """从大纲中提取实体名称
         
         简单实现：提取书名号《》中的内容作为作品名，
@@ -1750,7 +1750,7 @@ class ContextBudgetAllocator:
         if self.bible_repo:
             try:
                 from domain.novel.value_objects.novel_id import NovelId
-                bible = self.bible_repo.get_by_novel_id(NovelId(self._current_novel_id))
+                bible = self.bible_repo.get_by_novel_id(NovelId(novel_id))
                 if bible and hasattr(bible, 'characters'):
                     for char in bible.characters:
                         if char.name in outline:
@@ -1762,9 +1762,6 @@ class ContextBudgetAllocator:
                 pass
         
         return list(set(entities))
-    
-    # 临时存储当前 novel_id（用于 _extract_entities_from_outline）
-    _current_novel_id: str = ""
     
     def _get_trigger_based_triples(
         self,

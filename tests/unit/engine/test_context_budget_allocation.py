@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from application.engine.services.context_budget_allocator import (
@@ -113,3 +115,54 @@ def test_allocator_propagates_configured_memory_engine_fact_lock_failure(monkeyp
 
     with pytest.raises(RuntimeError, match="configured fact lock unavailable"):
         allocator.allocate("novel-1", 2, "outline", total_budget=1000)
+
+
+def test_graph_subnetwork_matches_bible_character_from_explicit_novel_id():
+    class BibleRepository:
+        def get_by_novel_id(self, novel_id):
+            if novel_id.value != "novel-graph":
+                return None
+            return SimpleNamespace(
+                characters=[
+                    SimpleNamespace(
+                        name="阿止",
+                        character_id=SimpleNamespace(value="character-azhi"),
+                    )
+                ]
+            )
+
+    class TripleRepository:
+        def get_by_entity_ids_sync(self, _novel_id, entity_ids):
+            if "character-azhi" not in entity_ids:
+                return []
+            return [
+                SimpleNamespace(
+                    id="azhi-clocktower",
+                    subject_id="阿止",
+                    predicate="守护",
+                    object_id="旧钟楼",
+                    subject_type="character",
+                    object_type="location",
+                    confidence=1.0,
+                    related_chapters=[3],
+                    first_appearance=3,
+                    description="阿止的当前守护地点",
+                )
+            ]
+
+        def get_recent_triples_sync(self, *_args, **_kwargs):
+            return []
+
+        def get_starred_triple_ids_sync(self, _novel_id):
+            return []
+
+    allocator = ContextBudgetAllocator(
+        bible_repository=BibleRepository(),
+        triple_repository=TripleRepository(),
+    )
+
+    context = allocator._get_graph_subnetwork(
+        "novel-graph", 5, "阿止正在前往旧钟楼"
+    )
+
+    assert "阿止 —守护→ 旧钟楼" in context
