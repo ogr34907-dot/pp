@@ -164,7 +164,7 @@ def update_embedding_config(body: EmbeddingConfigUpdate):
     """更新嵌入模型配置（持久化到数据库）。"""
     from application.ai.embedding_config_service import get_embedding_config_service
     svc = get_embedding_config_service()
-    updated = svc.update_config(
+    svc.update_config(
         mode=body.mode,
         api_key=body.api_key,
         base_url=body.base_url,
@@ -172,7 +172,7 @@ def update_embedding_config(body: EmbeddingConfigUpdate):
         use_gpu=body.use_gpu,
         model_path=body.model_path,
     )
-    return updated.to_api_dict()
+    return svc.to_api_dict()
 
 
 @embedding_router.post("/fetch-models")
