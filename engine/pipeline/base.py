@@ -1220,11 +1220,14 @@ class BaseStoryPipeline(ABC):
         if db is None:
             return False
         try:
-            return SqliteChapterNarrativeCommitRepository(db).is_current_version_ready(
+            kwargs = dict(
                 novel_id=ctx.novel_id,
                 chapter_number=chapter_number or ctx.chapter_number,
                 pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
             )
+            if ctx.metadata.get("requires_narrative_memory", False):
+                kwargs["require_memory_sync"] = True
+            return SqliteChapterNarrativeCommitRepository(db).is_current_version_ready(**kwargs)
         except Exception:
             return False
 

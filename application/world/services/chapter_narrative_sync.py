@@ -50,6 +50,7 @@ class AftermathCommitResult(Mapping[str, Any]):
     failure_reason: str = ""
     attempt_count: int = 0
     vector_status: str = "not_started"
+    memory_status: str = "not_required"
     content_revision: int = 0
     retryable: bool = False
     flags: Dict[str, Any] = field(default_factory=dict)
@@ -65,6 +66,7 @@ class AftermathCommitResult(Mapping[str, Any]):
                 "failure_reason": self.failure_reason,
                 "attempt_count": self.attempt_count,
                 "vector_status": self.vector_status,
+                "memory_status": self.memory_status,
                 "content_revision": self.content_revision,
                 "narrative_sync_ok": self.commit_status in {"committed", "reused"},
                 "vector_stored": self.vector_status == "stored",
@@ -2287,6 +2289,7 @@ async def _sync_chapter_narrative_after_save_once(
     chapter_micro_beats: Optional[List[Dict[str, Any]]] = None,
     expected_content_sha256: Optional[str] = None,
     expected_content_revision: Optional[int] = None,
+    require_memory_sync: bool = False,
 ) -> AftermathCommitResult:
     """异步：LLM bundle + 向量等落库。
 
@@ -2333,6 +2336,7 @@ async def _sync_chapter_narrative_after_save_once(
         content_sha256=content_sha256,
         pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
         expected_content_revision=expected_content_revision,
+        require_memory_sync=require_memory_sync,
     )
     if claim.disposition != "claimed":
         vector_status = claim.vector_status
@@ -2391,6 +2395,7 @@ async def _sync_chapter_narrative_after_save_once(
             failure_reason=claim.failure_reason,
             attempt_count=claim.attempt_count,
             vector_status=vector_status,
+            memory_status=claim.memory_status,
             content_revision=claim.content_revision,
             flags=flags,
         )
@@ -2412,6 +2417,7 @@ async def _sync_chapter_narrative_after_save_once(
             attempt_count=claim.attempt_count,
             content_revision=claim.content_revision,
             retryable=True,
+            memory_status=claim.memory_status,
             flags=flags,
         )
 
@@ -2779,6 +2785,7 @@ async def _sync_chapter_narrative_after_save_once(
             commit_status="failed",
             failure_reason=failure_reason,
             attempt_count=claim.attempt_count,
+            memory_status=claim.memory_status,
             content_revision=claim.content_revision,
             retryable=True,
             flags=flags,
@@ -2831,6 +2838,7 @@ async def _sync_chapter_narrative_after_save_once(
         commit_status="committed",
         attempt_count=claim.attempt_count,
         vector_status=vector_status,
+        memory_status="pending" if require_memory_sync else claim.memory_status,
         content_revision=claim.content_revision,
         flags=flags,
     )
@@ -2856,6 +2864,7 @@ async def sync_chapter_narrative_after_save(
     chapter_micro_beats: Optional[List[Dict[str, Any]]] = None,
     expected_content_sha256: Optional[str] = None,
     expected_content_revision: Optional[int] = None,
+    require_memory_sync: bool = False,
 ) -> AftermathCommitResult:
     """Run at most three durable canonical attempts with exponential backoff."""
     kwargs = dict(
@@ -2872,6 +2881,7 @@ async def sync_chapter_narrative_after_save(
         chapter_micro_beats=chapter_micro_beats,
         expected_content_sha256=expected_content_sha256,
         expected_content_revision=expected_content_revision,
+        require_memory_sync=require_memory_sync,
     )
     while True:
         result = await _sync_chapter_narrative_after_save_once(

@@ -112,6 +112,12 @@ async def test_run_story_pipeline_writing_success_updates_novel(monkeypatch):
     assert novel.beats_completed is False
     assert novel.last_chapter_tension == 72
     assert novel.current_stage == NovelStage.AUDITING
+    assert commit_repository.recover_pending_story_pipeline_advances.call_args.kwargs[
+        "require_memory_sync"
+    ] is True
+    assert commit_repository.advance_story_pipeline_once.call_args.kwargs[
+        "require_memory_sync"
+    ] is True
     daemon._flush_novel.assert_called_once_with(novel)
 
 

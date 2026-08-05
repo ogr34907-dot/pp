@@ -150,6 +150,7 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
         recovered_advances = commit_repository.recover_pending_story_pipeline_advances(
             novel_id=novel_id,
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            require_memory_sync=True,
         )
     except Exception as exc:
         _pause_for_story_pipeline_advance_failure(
@@ -306,6 +307,7 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
             novel_id=novel_id,
             chapter_number=chapter_num,
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            require_memory_sync=True,
         )
         if advance.disposition not in {"applied", "already_applied"}:
             _pause_for_story_pipeline_advance_failure(

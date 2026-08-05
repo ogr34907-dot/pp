@@ -232,6 +232,10 @@ class ChapterAftermathPipeline:
             "memory_engine_new_beats": 0,
             "memory_engine_new_clues": 0,
         }
+        durable_memory_sync = (
+            self._memory_engine is not None
+            and getattr(self._chapter_repository, "db", None) is not None
+        )
 
         if not self._is_current_content_version(
             novel_id,
@@ -284,6 +288,8 @@ class ChapterAftermathPipeline:
                     sync_kwargs["expected_content_sha256"] = expected_content_sha256
                 if expected_content_revision is not None:
                     sync_kwargs["expected_content_revision"] = expected_content_revision
+                if durable_memory_sync:
+                    sync_kwargs["require_memory_sync"] = True
                 return await sync_chapter_narrative_after_save(
                     novel_id,
                     chapter_number,
@@ -321,6 +327,8 @@ class ChapterAftermathPipeline:
                 "failure_reason",
                 "attempt_count",
                 "vector_status",
+                "memory_status",
+                "memory_failure_reason",
             ):
                 if key in sync_flags:
                     out[key] = sync_flags[key]
@@ -368,6 +376,65 @@ class ChapterAftermathPipeline:
                     chapter_number,
                 )
             else:
+                def _persist_memory_sync_status(
+                    memory_status: str,
+                    failure_reason: str = "",
+                ) -> bool:
+                    if not durable_memory_sync:
+                        return True
+                    if not memory_content_sha256 or not memory_content_revision:
+                        logger.error(
+                            "MemoryEngine 状态缺少当前正文版本 novel=%s ch=%s",
+                            novel_id,
+                            chapter_number,
+                        )
+                        return False
+                    try:
+                        from application.world.services.chapter_narrative_sync import (
+                            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                        )
+                        from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+                            SqliteChapterNarrativeCommitRepository,
+                        )
+
+                        persisted = SqliteChapterNarrativeCommitRepository(
+                            self._chapter_repository.db
+                        ).set_memory_sync_status(
+                            novel_id=novel_id,
+                            chapter_number=chapter_number,
+                            content_sha256=str(memory_content_sha256),
+                            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                            content_revision=int(memory_content_revision),
+                            memory_status=memory_status,
+                            failure_reason=failure_reason,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "MemoryEngine 状态落库失败 novel=%s ch=%s status=%s: %s",
+                            novel_id,
+                            chapter_number,
+                            memory_status,
+                            exc,
+                        )
+                        return False
+                    if not persisted:
+                        logger.warning(
+                            "MemoryEngine 状态未写入当前正文版本 novel=%s ch=%s status=%s",
+                            novel_id,
+                            chapter_number,
+                            memory_status,
+                        )
+                    return bool(persisted)
+
+                if not _persist_memory_sync_status("pending"):
+                    out.update(
+                        {
+                            "memory_engine_ok": False,
+                            "narrative_sync_ok": False,
+                            "failure_reason": "memory_engine_sync_state_unavailable",
+                        }
+                    )
+                    return out
                 try:
                     memory_delta = await self._memory_engine.update_from_chapter(
                         novel_id,
@@ -382,7 +449,11 @@ class ChapterAftermathPipeline:
                     )
                     if memory_errors:
                         raise RuntimeError("; ".join(str(error) for error in memory_errors))
+                    if not _persist_memory_sync_status("committed"):
+                        raise RuntimeError("memory_engine_sync_state_commit_failed")
                     out["memory_engine_ok"] = True
+                    if durable_memory_sync:
+                        out["memory_status"] = "committed"
                     out["memory_engine_new_beats"] = int(
                         memory_delta.get("new_beats", 0)
                     )
@@ -390,6 +461,7 @@ class ChapterAftermathPipeline:
                         memory_delta.get("new_clues", 0)
                     )
                 except Exception as exc:
+                    persisted_failure = _persist_memory_sync_status("failed", str(exc))
                     out.update(
                         {
                             "memory_engine_ok": False,
@@ -398,6 +470,8 @@ class ChapterAftermathPipeline:
                             "memory_engine_error": str(exc),
                         }
                     )
+                    if durable_memory_sync:
+                        out["memory_status"] = "failed" if persisted_failure else "pending"
                     logger.warning(
                         "MemoryEngine 回写失败 novel=%s ch=%s: %s",
                         novel_id,
@@ -544,11 +618,21 @@ class ChapterAftermathPipeline:
             return {"ready": True, "replayed_chapters": [], "anchor_chapter": 0}
 
         commit_repository = SqliteChapterNarrativeCommitRepository(db)
+        require_memory_sync = self._memory_engine is not None
+
+        def _history_is_current(chapter_number: int) -> bool:
+            kwargs: Dict[str, Any] = {
+                "novel_id": novel_id,
+                "chapter_number": chapter_number,
+                "pipeline_version": CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            }
+            if require_memory_sync:
+                kwargs["require_memory_sync"] = True
+            return commit_repository.is_current_version_ready(**kwargs)
+
         readiness = {
-            int(getattr(chapter, "number", 0) or 0): commit_repository.is_current_version_ready(
-                novel_id=novel_id,
-                chapter_number=int(getattr(chapter, "number", 0) or 0),
-                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            int(getattr(chapter, "number", 0) or 0): _history_is_current(
+                int(getattr(chapter, "number", 0) or 0)
             )
             for chapter in chapters
         }
@@ -612,11 +696,7 @@ class ChapterAftermathPipeline:
                     "failure_cause": failure_cause,
                     "chapter_number": chapter_number,
                 }
-            if not commit_repository.is_current_version_ready(
-                novel_id=novel_id,
-                chapter_number=chapter_number,
-                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-            ):
+            if not _history_is_current(chapter_number):
                 return {
                     "ready": False,
                     "failure_reason": "canonical_history_replay_uncommitted",

@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS chapter_narrative_commits (
     failure_reason TEXT NOT NULL DEFAULT '',
     attempt_count INTEGER NOT NULL DEFAULT 1,
     vector_status TEXT NOT NULL DEFAULT 'not_started',
+    memory_status TEXT NOT NULL DEFAULT 'not_required',
+    memory_failure_reason TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     committed_at TIMESTAMP,

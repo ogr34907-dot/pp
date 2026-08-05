@@ -400,6 +400,8 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
             failure_reason TEXT NOT NULL DEFAULT '',
             attempt_count INTEGER NOT NULL DEFAULT 1,
             vector_status TEXT NOT NULL DEFAULT 'not_started',
+            memory_status TEXT NOT NULL DEFAULT 'not_required',
+            memory_failure_reason TEXT NOT NULL DEFAULT '',
             advance_status TEXT NOT NULL DEFAULT 'pending',
             advance_applied_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -423,6 +425,14 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
     }
     advance_columns_added = False
     for column, sql in {
+        "memory_status": (
+            "ALTER TABLE chapter_narrative_commits ADD COLUMN "
+            "memory_status TEXT NOT NULL DEFAULT 'not_required'"
+        ),
+        "memory_failure_reason": (
+            "ALTER TABLE chapter_narrative_commits ADD COLUMN "
+            "memory_failure_reason TEXT NOT NULL DEFAULT ''"
+        ),
         "advance_status": (
             "ALTER TABLE chapter_narrative_commits ADD COLUMN "
             "advance_status TEXT NOT NULL DEFAULT 'pending'"
@@ -434,7 +444,8 @@ def _apply_chapter_narrative_commit_migration(conn: sqlite3.Connection) -> None:
     }.items():
         if column not in commit_cols:
             conn.execute(sql)
-            advance_columns_added = True
+            if column in {"advance_status", "advance_applied_at"}:
+                advance_columns_added = True
 
     # Only legacy databases that received the columns during this run need a
     # backfill. Fresh commits retain the pending default until their first

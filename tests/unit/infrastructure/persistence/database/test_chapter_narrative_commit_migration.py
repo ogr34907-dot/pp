@@ -48,6 +48,8 @@ def test_clean_install_has_content_versions_summary_provenance_and_claim_table(t
         "vector_status",
         "advance_status",
         "advance_applied_at",
+        "memory_status",
+        "memory_failure_reason",
     } <= _columns(db, "chapter_narrative_commits")
     narrative_default = next(
         row["dflt_value"]
@@ -114,6 +116,72 @@ def test_existing_chapter_and_summary_receive_mechanical_legacy_backfill(tmp_pat
         "canonical_payload_sha256": "",
     }
     assert db.fetch_all("SELECT * FROM chapter_narrative_commits") == []
+
+
+def test_memory_barrier_migration_preserves_pending_advance_on_existing_commit_table(
+    tmp_path,
+):
+    db_path = tmp_path / "legacy-advance-without-memory-columns.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE chapters (
+                id TEXT PRIMARY KEY,
+                novel_id TEXT NOT NULL,
+                number INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL DEFAULT '',
+                content_revision INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE knowledge (
+                id TEXT PRIMARY KEY,
+                novel_id TEXT NOT NULL
+            );
+            CREATE TABLE chapter_summaries (
+                id TEXT PRIMARY KEY,
+                knowledge_id TEXT NOT NULL,
+                chapter_number INTEGER NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                source_content_sha256 TEXT NOT NULL DEFAULT '',
+                pipeline_version TEXT NOT NULL DEFAULT '',
+                sync_status TEXT NOT NULL DEFAULT 'draft',
+                sync_error TEXT NOT NULL DEFAULT '',
+                sync_attempts INTEGER NOT NULL DEFAULT 0,
+                canonical_payload_sha256 TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE chapter_narrative_commits (
+                novel_id TEXT NOT NULL,
+                chapter_number INTEGER NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                pipeline_version TEXT NOT NULL,
+                content_revision INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'in_progress',
+                failure_reason TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                vector_status TEXT NOT NULL DEFAULT 'not_started',
+                advance_status TEXT NOT NULL DEFAULT 'pending',
+                advance_applied_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                committed_at TIMESTAMP,
+                PRIMARY KEY (novel_id, chapter_number, content_sha256, pipeline_version)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO chapter_narrative_commits "
+            "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, "
+            "status, advance_status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("novel-1", 1, "sha", "chapter-narrative-sync:v1", 1, "committed", "pending"),
+        )
+
+        _apply_chapter_narrative_commit_migration(conn)
+
+        row = conn.execute(
+            "SELECT advance_status, memory_status FROM chapter_narrative_commits"
+        ).fetchone()
+
+    assert row == ("pending", "not_required")
 
 
 def test_migration_skips_hash_backfill_for_legacy_chapters_without_content(tmp_path):
@@ -339,6 +407,86 @@ def test_story_pipeline_advance_rejects_a_canonical_record_for_a_stale_revision(
         "current_auto_chapters": 0,
         "current_chapter_in_act": 0,
     }
+
+
+def test_memory_sync_pending_blocks_story_pipeline_advance_until_current_version_is_ready(
+    tmp_path,
+):
+    db = DatabaseConnection(str(tmp_path / "memory-sync-barrier.db"))
+    content = "规范正文仍等待记忆回写"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO novels (id, title, slug, current_auto_chapters, current_chapter_in_act) "
+        "VALUES (?, ?, ?, 0, 0)",
+        ("novel-1", "Novel", "novel-1"),
+    )
+    db.execute(
+        "INSERT INTO chapters (id, novel_id, number, title, content, status, "
+        "content_sha256, content_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "chapter-1",
+            "novel-1",
+            1,
+            "Chapter",
+            content,
+            "completed",
+            content_sha256,
+            1,
+        ),
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, "
+        "status, advance_status, memory_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "novel-1",
+            1,
+            content_sha256,
+            "chapter-narrative-sync:v1",
+            1,
+            "committed",
+            "pending",
+            "pending",
+        ),
+    )
+    db.get_connection().commit()
+
+    repository = SqliteChapterNarrativeCommitRepository(db)
+
+    assert repository.is_current_version_ready(
+        novel_id="novel-1",
+        chapter_number=1,
+        pipeline_version="chapter-narrative-sync:v1",
+        require_memory_sync=True,
+    ) is False
+    assert repository.recover_pending_story_pipeline_advances(
+        novel_id="novel-1",
+        pipeline_version="chapter-narrative-sync:v1",
+        require_memory_sync=True,
+    ) == []
+
+    assert repository.set_memory_sync_status(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+        content_revision=1,
+        memory_status="committed",
+    ) is True
+    assert repository.is_current_version_ready(
+        novel_id="novel-1",
+        chapter_number=1,
+        pipeline_version="chapter-narrative-sync:v1",
+        require_memory_sync=True,
+    ) is True
+
+    recovered = repository.recover_pending_story_pipeline_advances(
+        novel_id="novel-1",
+        pipeline_version="chapter-narrative-sync:v1",
+        require_memory_sync=True,
+    )
+
+    assert [advance.disposition for advance in recovered] == ["applied"]
 
 
 def test_chapter_repository_versions_only_changed_content(tmp_path):

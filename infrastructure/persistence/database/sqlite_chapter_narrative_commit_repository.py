@@ -18,6 +18,7 @@ class NarrativeClaim:
     attempt_count: int = 1
     vector_status: str = "not_started"
     failure_reason: str = ""
+    memory_status: str = "not_required"
 
 
 @dataclass(frozen=True)
@@ -63,8 +64,10 @@ class SqliteChapterNarrativeCommitRepository:
         content_sha256: str,
         pipeline_version: str,
         expected_content_revision: int | None = None,
+        require_memory_sync: bool = False,
     ) -> NarrativeClaim:
         now = datetime.now(timezone.utc).isoformat()
+        memory_status = "pending" if require_memory_sync else "not_required"
         with sqlite_writes_bypass_queue():
             with self._db.transaction() as conn:
                 source = conn.execute(
@@ -107,8 +110,9 @@ class SqliteChapterNarrativeCommitRepository:
                     INSERT OR IGNORE INTO chapter_narrative_commits (
                         novel_id, chapter_number, content_sha256, pipeline_version,
                         content_revision, status, failure_reason, attempt_count,
-                        vector_status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'in_progress', '', 1, 'not_started', ?, ?)
+                        vector_status, memory_status, memory_failure_reason,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'in_progress', '', 1, 'not_started', ?, '', ?, ?)
                     """,
                     (
                         novel_id,
@@ -116,17 +120,22 @@ class SqliteChapterNarrativeCommitRepository:
                         content_sha256,
                         pipeline_version,
                         revision,
+                        memory_status,
                         now,
                         now,
                     ),
                 )
                 if cursor.rowcount == 1:
-                    return NarrativeClaim("claimed", revision)
+                    return NarrativeClaim(
+                        "claimed",
+                        revision,
+                        memory_status=memory_status,
+                    )
 
                 row = conn.execute(
                     """
                     SELECT status, content_revision, attempt_count, vector_status,
-                           failure_reason
+                           failure_reason, memory_status
                     FROM chapter_narrative_commits
                     WHERE novel_id = ? AND chapter_number = ?
                       AND content_sha256 = ? AND pipeline_version = ?
@@ -140,6 +149,7 @@ class SqliteChapterNarrativeCommitRepository:
                         SET content_revision = ?, status = 'in_progress',
                             failure_reason = '', attempt_count = 1,
                             vector_status = 'not_started', advance_status = 'pending',
+                            memory_status = ?, memory_failure_reason = '',
                             advance_applied_at = NULL, committed_at = NULL,
                             updated_at = ?
                         WHERE novel_id = ? AND chapter_number = ?
@@ -148,6 +158,7 @@ class SqliteChapterNarrativeCommitRepository:
                         """,
                         (
                             revision,
+                            memory_status,
                             now,
                             novel_id,
                             chapter_number,
@@ -157,11 +168,15 @@ class SqliteChapterNarrativeCommitRepository:
                         ),
                     )
                     if reclaim_cursor.rowcount == 1:
-                        return NarrativeClaim("claimed", revision)
+                        return NarrativeClaim(
+                            "claimed",
+                            revision,
+                            memory_status=memory_status,
+                        )
                     row = conn.execute(
                         """
                         SELECT status, content_revision, attempt_count, vector_status,
-                               failure_reason
+                               failure_reason, memory_status
                         FROM chapter_narrative_commits
                         WHERE novel_id = ? AND chapter_number = ?
                           AND content_sha256 = ? AND pipeline_version = ?
@@ -174,12 +189,14 @@ class SqliteChapterNarrativeCommitRepository:
                         UPDATE chapter_narrative_commits
                         SET status = 'in_progress', failure_reason = '', attempt_count = 1,
                             vector_status = 'not_started', advance_status = 'pending',
+                            memory_status = ?, memory_failure_reason = '',
                             advance_applied_at = NULL, committed_at = NULL, updated_at = ?
                         WHERE novel_id = ? AND chapter_number = ?
                           AND content_sha256 = ? AND pipeline_version = ?
                           AND status = 'stale'
                         """,
                         (
+                            memory_status,
                             now,
                             novel_id,
                             chapter_number,
@@ -188,11 +205,15 @@ class SqliteChapterNarrativeCommitRepository:
                         ),
                     )
                     if reclaim_cursor.rowcount == 1:
-                        return NarrativeClaim("claimed", int(row[1]))
+                        return NarrativeClaim(
+                            "claimed",
+                            int(row[1]),
+                            memory_status=memory_status,
+                        )
                     row = conn.execute(
                         """
                         SELECT status, content_revision, attempt_count, vector_status,
-                               failure_reason
+                               failure_reason, memory_status
                         FROM chapter_narrative_commits
                         WHERE novel_id = ? AND chapter_number = ?
                           AND content_sha256 = ? AND pipeline_version = ?
@@ -205,13 +226,15 @@ class SqliteChapterNarrativeCommitRepository:
                         """
                         UPDATE chapter_narrative_commits
                         SET status = 'in_progress', failure_reason = '',
-                            attempt_count = ?, updated_at = ?
+                            attempt_count = ?, memory_status = ?,
+                            memory_failure_reason = '', updated_at = ?
                         WHERE novel_id = ? AND chapter_number = ?
                           AND content_sha256 = ? AND pipeline_version = ?
                           AND status = 'failed' AND attempt_count = ?
                         """,
                         (
                             next_attempt,
+                            memory_status,
                             now,
                             novel_id,
                             chapter_number,
@@ -226,17 +249,55 @@ class SqliteChapterNarrativeCommitRepository:
                             int(row[1]),
                             next_attempt,
                             row[3] or "not_started",
+                            "",
+                            memory_status,
                         )
                     row = conn.execute(
                         """
                         SELECT status, content_revision, attempt_count, vector_status,
-                               failure_reason
+                               failure_reason, memory_status
                         FROM chapter_narrative_commits
                         WHERE novel_id = ? AND chapter_number = ?
                           AND content_sha256 = ? AND pipeline_version = ?
                         """,
                         (novel_id, chapter_number, content_sha256, pipeline_version),
                     ).fetchone()
+
+                if (
+                    require_memory_sync
+                    and row[0] == "committed"
+                    and (row[5] or "not_required") == "not_required"
+                ):
+                    promote_cursor = conn.execute(
+                        """
+                        UPDATE chapter_narrative_commits
+                        SET memory_status = 'pending', memory_failure_reason = '',
+                            updated_at = ?
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND pipeline_version = ?
+                          AND content_revision = ? AND status = 'committed'
+                          AND memory_status = 'not_required'
+                        """,
+                        (
+                            now,
+                            novel_id,
+                            chapter_number,
+                            content_sha256,
+                            pipeline_version,
+                            revision,
+                        ),
+                    )
+                    if promote_cursor.rowcount == 1:
+                        row = conn.execute(
+                            """
+                            SELECT status, content_revision, attempt_count, vector_status,
+                                   failure_reason, memory_status
+                            FROM chapter_narrative_commits
+                            WHERE novel_id = ? AND chapter_number = ?
+                              AND content_sha256 = ? AND pipeline_version = ?
+                            """,
+                            (novel_id, chapter_number, content_sha256, pipeline_version),
+                        ).fetchone()
 
                 disposition = "reused" if row[0] == "committed" else row[0]
                 return NarrativeClaim(
@@ -245,6 +306,7 @@ class SqliteChapterNarrativeCommitRepository:
                     int(row[2]),
                     row[3] or "not_started",
                     row[4] or "",
+                    row[5] or "not_required",
                 )
 
     def commit(
@@ -496,6 +558,7 @@ class SqliteChapterNarrativeCommitRepository:
         novel_id: str,
         chapter_number: int,
         pipeline_version: str,
+        require_memory_sync: bool = False,
     ) -> StoryPipelineAdvance:
         """Advance the durable novel cursor once for the current canonical chapter."""
         now = datetime.now(timezone.utc).isoformat()
@@ -552,7 +615,7 @@ class SqliteChapterNarrativeCommitRepository:
 
                 claim = conn.execute(
                     """
-                    SELECT advance_status
+                    SELECT advance_status, memory_status
                     FROM chapter_narrative_commits
                     WHERE novel_id = ? AND chapter_number = ?
                       AND content_sha256 = ? AND pipeline_version = ?
@@ -575,6 +638,16 @@ class SqliteChapterNarrativeCommitRepository:
                         current_chapter_in_act,
                         current_stage,
                         "canonical_commit_not_current",
+                    )
+                if require_memory_sync and (claim[1] or "not_required") != "committed":
+                    return StoryPipelineAdvance(
+                        "memory_sync_pending",
+                        chapter_number,
+                        content_revision,
+                        current_auto_chapters,
+                        current_chapter_in_act,
+                        current_stage,
+                        f"memory_status={claim[1] or 'not_required'}",
                     )
                 if claim[0] == "applied":
                     return StoryPipelineAdvance(
@@ -697,6 +770,7 @@ class SqliteChapterNarrativeCommitRepository:
         *,
         novel_id: str,
         pipeline_version: str,
+        require_memory_sync: bool = False,
     ) -> list[StoryPipelineAdvance]:
         """Replay consecutive pending advances without regenerating canonical prose."""
         novel = self._db.fetch_one(
@@ -706,12 +780,16 @@ class SqliteChapterNarrativeCommitRepository:
         if novel is None:
             return []
         current_auto_chapters = int(novel["current_auto_chapters"] or 0)
+        memory_clause = (
+            " AND memory_status = 'committed'" if require_memory_sync else ""
+        )
         rows = self._db.fetch_all(
-            """
+            f"""
             SELECT chapter_number
             FROM chapter_narrative_commits
             WHERE novel_id = ? AND pipeline_version = ?
               AND status = 'committed' AND advance_status = 'pending'
+              {memory_clause}
               AND chapter_number > ?
             ORDER BY chapter_number ASC
             """,
@@ -723,6 +801,7 @@ class SqliteChapterNarrativeCommitRepository:
                 novel_id=novel_id,
                 chapter_number=int(row["chapter_number"]),
                 pipeline_version=pipeline_version,
+                require_memory_sync=require_memory_sync,
             )
             recovered.append(advance)
             if advance.disposition not in {"applied", "already_applied"}:
@@ -763,6 +842,7 @@ class SqliteChapterNarrativeCommitRepository:
         novel_id: str,
         chapter_number: int,
         pipeline_version: str,
+        require_memory_sync: bool = False,
     ) -> bool:
         source = self._db.fetch_one(
             "SELECT content, content_sha256, content_revision FROM chapters "
@@ -779,13 +859,17 @@ class SqliteChapterNarrativeCommitRepository:
         if source["content_sha256"] != content_sha256 or content_revision < 1:
             return False
 
+        memory_clause = (
+            " AND memory_status = 'committed'" if require_memory_sync else ""
+        )
         claim = self._db.fetch_one(
-            """
+            f"""
             SELECT 1
             FROM chapter_narrative_commits
             WHERE novel_id = ? AND chapter_number = ?
               AND content_sha256 = ? AND pipeline_version = ?
               AND content_revision = ? AND status = 'committed'
+              {memory_clause}
             """,
             (
                 novel_id,
@@ -796,6 +880,61 @@ class SqliteChapterNarrativeCommitRepository:
             ),
         )
         return claim is not None
+
+    def set_memory_sync_status(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+        content_revision: int,
+        memory_status: str,
+        failure_reason: str = "",
+    ) -> bool:
+        """Persist the MemoryEngine barrier for one current canonical version."""
+        if memory_status not in {"pending", "committed", "failed"}:
+            raise ValueError(f"unsupported memory sync status: {memory_status}")
+
+        now = datetime.now(timezone.utc).isoformat()
+        reason = "" if memory_status == "committed" else str(failure_reason or "")[:1000]
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                source = conn.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (novel_id, chapter_number),
+                ).fetchone()
+                if source is None:
+                    return False
+                actual_sha256 = hashlib.sha256((source[0] or "").encode("utf-8")).hexdigest()
+                if (
+                    actual_sha256 != content_sha256
+                    or (source[1] or "") != content_sha256
+                    or int(source[2] or 0) != int(content_revision)
+                ):
+                    return False
+
+                cursor = conn.execute(
+                    """
+                    UPDATE chapter_narrative_commits
+                    SET memory_status = ?, memory_failure_reason = ?, updated_at = ?
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ? AND status = 'committed'
+                    """,
+                    (
+                        memory_status,
+                        reason,
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                    ),
+                )
+                return cursor.rowcount == 1
 
     def get_committed_summary(
         self,
