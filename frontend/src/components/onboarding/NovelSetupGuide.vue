@@ -624,6 +624,7 @@
                         <n-input-number
                           :value="stage.chapter_start ?? null"
                           :min="1"
+                          :max="plotOutlineTotalChapters"
                           :precision="0"
                           placeholder="起始章"
                           @update:value="updateStageChapterNumber(index, 'chapter_start', $event)"
@@ -632,6 +633,7 @@
                         <n-input-number
                           :value="stage.chapter_end ?? null"
                           :min="1"
+                          :max="plotOutlineTotalChapters"
                           :precision="0"
                           placeholder="结束章"
                           @update:value="updateStageChapterNumber(index, 'chapter_end', $event)"
@@ -1078,13 +1080,7 @@ const plotOutlineTopFieldKeys = computed(() => {
   return getPlotOutlineTopFieldKeys(editablePlotOutline.value)
 })
 const plotOutlineTotalChapters = computed(() => {
-  const maxStageEnd = Math.max(
-    0,
-    ...editablePlotOutline.value.stage_plan.map(stage =>
-      typeof stage.chapter_end === 'number' ? stage.chapter_end : 0
-    ),
-  )
-  return Math.max(1, props.targetChapters || 0, maxStageEnd)
+  return Math.max(1, props.targetChapters || 0)
 })
 const plotOutlineBusy = computed(() =>
   plotOutlineGenerating.value ||
@@ -1261,7 +1257,7 @@ function applyPlotOutlineFromResult(
   if (!outline) return false
   plotOutline.value = outline
   syncEditablePlotOutline(outline)
-  plotOutlineCommitted.value = true
+  plotOutlineCommitted.value = false
   writeWizardUiCache(props.novelId, { plotOutline: outline })
   message.success('AI 审阅已完成，剧情总纲已回填')
   finishPlotOutlineInvocation()
@@ -2033,7 +2029,7 @@ async function saveLocationsEdits(): Promise<boolean> {
 async function savePlotOutlineEdits(): Promise<boolean> {
   try {
     const payload = buildEditablePlotOutlinePayload()
-    const validationError = validateEditablePlotOutline(payload)
+    const validationError = validateEditablePlotOutline(payload, plotOutlineTotalChapters.value)
     if (validationError) {
       message.error(validationError)
       return false

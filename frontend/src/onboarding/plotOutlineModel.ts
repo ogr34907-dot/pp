@@ -107,7 +107,17 @@ function canonicalPhase(value: unknown): string {
 }
 
 export function buildStageChapterRanges(totalChapters: number): Array<{ chapter_start: number; chapter_end: number }> {
-  const total = Math.max(STAGE_RANGE_RATIOS.length, Math.floor(Number(totalChapters) || 0) || 100)
+  const total = Math.max(1, Math.floor(Number(totalChapters) || 0) || 100)
+  if (total < STAGE_RANGE_RATIOS.length) {
+    let previousEnd = 0
+    return STAGE_RANGE_RATIOS.map((ratio) => {
+      const chapterEnd = Math.min(total, Math.max(1, Math.ceil(total * ratio)))
+      const chapterStart = previousEnd === 0 ? 1 : Math.min(chapterEnd, previousEnd + 1)
+      previousEnd = chapterEnd
+      return { chapter_start: chapterStart, chapter_end: chapterEnd }
+    })
+  }
+
   const ends: number[] = []
   let previous = 0
   STAGE_RANGE_RATIOS.forEach((ratio, index) => {
@@ -132,7 +142,8 @@ function normalizeStagePlanRanges(
   stagePlan: PlotOutlineDTO['stage_plan'],
   totalChapters: number,
 ): PlotOutlineDTO['stage_plan'] {
-  const ranges = buildStageChapterRanges(totalChapters)
+  const total = Math.max(1, Math.floor(Number(totalChapters) || 0) || 100)
+  const ranges = buildStageChapterRanges(total)
   return stagePlan.map((stage, index) => {
     const meta = STAGE_PHASE_META[index]
     const fallback = ranges[index] || {
@@ -141,7 +152,7 @@ function normalizeStagePlanRanges(
     }
     const rawStart = coerceChapterNumber(stage.chapter_start)
     const rawEnd = coerceChapterNumber(stage.chapter_end)
-    const keepManualRange = rawStart !== undefined && rawEnd !== undefined && rawStart <= rawEnd
+    const keepManualRange = rawStart !== undefined && rawEnd !== undefined && rawStart <= rawEnd && rawStart <= total && rawEnd <= total
     const next = {
       ...stage,
       phase: meta?.phase || stage.phase,
@@ -153,7 +164,7 @@ function normalizeStagePlanRanges(
     return {
       ...next,
       ...(sourcePhase && meta && sourcePhase !== meta.phase ? { source_phase: stage.phase || stage.label } : {}),
-      range_percent: buildStageRangePercentLabel(next, Math.max(totalChapters, next.chapter_end || 0)) || stage.range_percent,
+      range_percent: buildStageRangePercentLabel(next, total) || stage.range_percent,
     }
   })
 }
@@ -270,17 +281,18 @@ export function buildEditablePlotOutlinePayload(
   }
 }
 
-export function validateEditablePlotOutline(outline: PlotOutlineDTO): string {
+export function validateEditablePlotOutline(outline: PlotOutlineDTO, totalChapters = 100): string {
   const topRecord = outline as unknown as Record<string, unknown>
   const hasTopContent = Object.entries(topRecord).some(([key, value]) =>
     !PLOT_OUTLINE_META_KEYS.has(key) && String(value ?? '').trim().length > 0,
   )
   if (!hasTopContent) return '请至少保留一项总纲内容'
   if (!outline.stage_plan.length) return '请保留并填写阶段规划'
+  const total = Math.max(1, Math.floor(Number(totalChapters) || 0) || 100)
   const invalidStageRange = outline.stage_plan.find((stage) => {
     const start = stage.chapter_start
     const end = stage.chapter_end
-    return typeof start !== 'number' || typeof end !== 'number' || start < 1 || end < 1 || start > end
+    return typeof start !== 'number' || typeof end !== 'number' || start < 1 || end < 1 || start > end || start > total || end > total
   })
   if (invalidStageRange) return `请检查${invalidStageRange.label || '阶段'}的起止章节`
   const emptyStage = outline.stage_plan.find(stage => stageContentFieldKeys(stage).every(key => !plotFieldText(stage, key).trim()))

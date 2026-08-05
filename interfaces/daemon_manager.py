@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -18,6 +19,10 @@ from interfaces.api.settings import BackendSettings, get_backend_settings
 logger = logging.getLogger(__name__)
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
+def _is_orphan_cleanup_disabled() -> bool:
+    return os.getenv("DISABLE_ORPHAN_CLEANUP", "").strip().lower() in {"1", "true", "yes"}
 
 
 @dataclass(frozen=True)
@@ -227,8 +232,12 @@ def run_autopilot_daemon_process(
 def cleanup_orphan_python_processes(logger_: logging.Logger | None = None) -> None:
     """Windows cleanup for leftover PlotPilot/uvicorn Python processes."""
     log = logger_ or logger
+    if _is_orphan_cleanup_disabled():
+        log.debug("残留后端进程清理已禁用")
+        return
     lifecycle_settings = get_daemon_lifecycle_settings()
     current_pid = os.getpid()
+    current_executable = os.path.normcase(os.path.abspath(sys.executable))
     log.info("检查残留进程（当前 PID=%s）...", current_pid)
 
     ps_script = r"""$ErrorActionPreference = 'SilentlyContinue'
@@ -322,6 +331,11 @@ Get-CimInstance Win32_Process | ForEach-Object {
         for pid, cmdline in candidates:
             low = cmdline.lower()
             if not any(k in low for k in keywords) or pid == current_pid:
+                continue
+            # A second PlotPilot checkout or installed copy must never be
+            # considered an orphan of this backend instance.
+            if current_executable not in os.path.normcase(cmdline):
+                log.debug("跳过其他后端实例 PID=%s", pid)
                 continue
             try:
                 log.info("清理残留进程 PID=%s: %s...", pid, cmdline[:80])
@@ -501,7 +515,7 @@ class AutopilotDaemonManager:
         self.process = None
         self.stop_event = None
 
-        if os.name == "nt":
+        if os.name == "nt" and not _is_orphan_cleanup_disabled():
             self.cleanup_orphans()
 
     def restart(self) -> None:

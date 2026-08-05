@@ -187,6 +187,8 @@ def test_autopilot_macro_plan_contract_uses_novel_scope_for_story_level_bindings
             "target_chapters",
             "worldview",
             "characters",
+            "worldbuilding.content",
+            "locations.list",
             "genre_opening_profile",
         ],
     )
@@ -218,6 +220,16 @@ def test_autopilot_macro_plan_contract_uses_novel_scope_for_story_level_bindings
     assert input_bindings["premise"].stage == "setup"
     assert input_bindings["target_chapters"].scope == "novel"
     assert input_bindings["characters"].scope == "novel"
+    assert input_bindings["worldbuilding.content"].variable_key == "worldbuilding.content"
+    assert input_bindings["worldbuilding.content"].value_type == "object"
+    assert input_bindings["worldbuilding.content"].scope == "novel"
+    assert input_bindings["worldbuilding.content"].source == "variable_hub"
+    assert input_bindings["worldbuilding.content"].required is False
+    assert input_bindings["locations.list"].variable_key == "locations.list"
+    assert input_bindings["locations.list"].value_type == "list"
+    assert input_bindings["locations.list"].scope == "novel"
+    assert input_bindings["locations.list"].source == "variable_hub"
+    assert input_bindings["locations.list"].required is False
     assert input_bindings["genre_opening_profile"].scope == "novel"
     assert input_bindings["worldview"].scope == "novel"
     assert input_bindings["worldview"].stage == "planning"

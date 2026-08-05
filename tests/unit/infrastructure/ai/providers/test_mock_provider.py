@@ -4,6 +4,9 @@ import pytest
 
 from domain.ai.services.llm_service import GenerationConfig
 from domain.ai.value_objects.prompt import Prompt
+from application.blueprint.services.chapter_planning_policy import has_rendered_chapter_execution_plan
+from application.blueprint.services.chapter_plan_renderer import render_chapter_execution_plan
+from application.engine.services.memory_engine import MemoryDeltaPayload
 from infrastructure.ai.providers.mock_provider import MockProvider
 
 
@@ -45,6 +48,112 @@ async def test_mock_provider_characters_and_locations_return_expected_arrays():
     assert {"name", "role", "description", "voice_profile", "relationships"} <= set(characters[0])
     assert len(locations) >= 3
     assert {"id", "name", "type", "description", "connections"} <= set(locations[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage_schema", "result_key"),
+    [
+        ('"characters": [{"name": "...", "role": "..."}]', "characters"),
+        ('"locations": [{"id": "...", "name": "..."}]', "locations"),
+    ],
+)
+async def test_mock_provider_stage_schema_wins_over_shared_worldbuilding_context(
+    stage_schema: str,
+    result_key: str,
+):
+    data = _loads(
+        await _generate(
+            "已有世界观 worldbuilding 与核心法则作为上下文。"
+            f"请严格输出 {stage_schema}。"
+        )
+    )
+
+    assert result_key in data
+    assert len(data[result_key]) >= 3
+
+
+@pytest.mark.asyncio
+async def test_mock_provider_act_plan_schema_wins_over_character_context():
+    data = _loads(
+        await _generate(
+            "可用人物：核心人物甲。"
+            '请为这一幕规划 3 个章节，并严格输出 {"chapters": ['
+            '{"number": 1, "title": "章节标题", "characters": ["人物ID"]}]}。'
+        )
+    )
+
+    chapters = data["chapters"]
+    assert len(chapters) == 3
+    assert [chapter["number"] for chapter in chapters] == [1, 2, 3]
+    for chapter in chapters:
+        assert {"title", "main_event", "handoff_from_previous", "handoff_to_next"} <= set(chapter)
+
+
+@pytest.mark.asyncio
+async def test_mock_provider_chapter_preplan_returns_renderable_execution_script():
+    data = _loads(
+        await _generate(
+            '请输出 JSON，包含 "detail_title"、"key_plot_points"、'
+            '"chapter_characters" 与 "chapter_plan"。'
+            "chapter_plan 必须覆盖七段执行剧本，并包含 characters 作为上下文。"
+        )
+    )
+
+    plan = data["chapter_plan"]
+    assert data["detail_title"]
+    assert data["key_plot_points"]
+    assert data["chapter_characters"]
+    assert has_rendered_chapter_execution_plan(render_chapter_execution_plan(plan))
+
+
+@pytest.mark.asyncio
+async def test_mock_provider_chapter_prose_wins_over_character_context():
+    content = await _generate(
+        "文章字数：2000\n"
+        "【连续性上下文】人物 characters：核心人物甲。\n"
+        "【正文细纲】当前冲突地点发生必须回应的压力。\n"
+        "请生成正文内容。"
+    )
+
+    assert not content.lstrip().startswith("{")
+    assert "当前冲突地点" in content
+    assert len(content) >= 2000
+
+
+@pytest.mark.asyncio
+async def test_mock_provider_narrative_sync_returns_non_empty_canonical_summary():
+    data = _loads(
+        await _generate(
+            '你是叙事编辑，请输出 JSON，包含 "summary"、"key_events"、'
+            '"open_threads"、"relation_triples" 与 "character_states"。'
+            "第 1 章正文如下：核心人物甲做出选择，角色状态发生变化。"
+        )
+    )
+
+    assert data["summary"]
+    assert data["key_events"]
+    assert data["open_threads"]
+    assert isinstance(data["relation_triples"], list)
+    assert isinstance(data["character_states"], list)
+
+
+@pytest.mark.asyncio
+async def test_mock_provider_memory_extraction_matches_canonical_memory_contract():
+    data = _loads(
+        await _generate(
+            "你是叙事状态追踪引擎，只返回 JSON。"
+            "字段必须为 completed_beats、revealed_clues、fact_violations。"
+            'completed_beats 项必须含 beat_id、summary、chapter、characters_involved。'
+            "请从第 1 章正文提取记忆增量。"
+        )
+    )
+
+    payload = MemoryDeltaPayload.model_validate(data)
+
+    assert payload.completed_beats
+    assert payload.revealed_clues
+    assert payload.fact_violations == []
 
 
 @pytest.mark.asyncio

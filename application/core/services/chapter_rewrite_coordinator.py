@@ -253,7 +253,9 @@ class ChapterRewriteCoordinator:
 
     def _chapter_head(self, novel_id: str) -> int:
         row = self._db.fetch_one(
-            "SELECT MAX(number) AS head FROM chapters WHERE novel_id = ?", (novel_id,)
+            "SELECT MAX(number) AS head FROM chapters "
+            "WHERE novel_id = ? AND TRIM(COALESCE(content, '')) <> ''",
+            (novel_id,),
         )
         return int(row["head"] or 0) if row else 0
 

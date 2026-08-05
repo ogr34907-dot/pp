@@ -166,3 +166,54 @@ def test_graph_subnetwork_matches_bible_character_from_explicit_novel_id():
     )
 
     assert "阿止 —守护→ 旧钟楼" in context
+
+
+def test_context_slots_include_saved_locations_without_outline_mentions(monkeypatch):
+    """SETTING-004: first-chapter prose must know the saved location catalog."""
+    locations = [
+        SimpleNamespace(
+            name="雾港",
+            description="终年被白雾遮住的盐商港口。",
+            location_type="city",
+        ),
+        SimpleNamespace(
+            name="赤岩塔",
+            description="海崖上的旧烽火塔，夜间仍会发出红光。",
+            location_type="landmark",
+        ),
+        SimpleNamespace(
+            name="潮汐议会",
+            description="控制航道税与港口执法的地方势力。",
+            location_type="faction",
+        ),
+    ]
+    bible = SimpleNamespace(
+        characters=[],
+        locations=locations,
+        world_settings=[],
+        style_notes=[],
+    )
+    bible_repository = SimpleNamespace(get_by_novel_id=lambda _novel_id: bible)
+    allocator = ContextBudgetAllocator(bible_repository=bible_repository)
+    monkeypatch.setattr(
+        allocator,
+        "_build_lifecycle_directive",
+        lambda _novel_id, _chapter_number: "",
+    )
+    monkeypatch.setattr(
+        allocator,
+        "_build_anti_ai_protocol_block",
+        lambda _novel_id, _chapter_number: "",
+    )
+
+    slots = allocator._collect_all_slots(
+        "novel-location-catalog",
+        1,
+        "主角在雨棚下醒来，尚未决定前往何处。",
+    )
+
+    catalog = slots["location_catalog"]
+    assert catalog.content.startswith("=== 可用地点与势力 ===")
+    assert "雾港" in catalog.content
+    assert "赤岩塔" in catalog.content
+    assert "潮汐议会" in catalog.content

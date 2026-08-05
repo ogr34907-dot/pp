@@ -65,6 +65,7 @@ from application.engine.services.recent_chapter_context import (
 from application.engine.services.context_slot_providers import (
     build_immersion_details_slot_content,
     build_key_props_slot_content,
+    build_location_catalog_slot_content,
     build_narrative_promise_slot_content,
     build_storyline_slot_content,
     build_worldbuilding_core_slot_content,
@@ -1009,6 +1010,25 @@ class ContextBudgetAllocator:
                 tokens=self.estimate_tokens(immersion_details),
                 max_tokens=400,
                 priority=66,
+            )
+
+        # ── T1: 已保存地点与势力目录 ──
+        # 当前章已经点名的地点由角色锚点中的场景提示提供，目录只保留其余
+        # canonical choices，避免在正文主上下文中重复同一地点。
+        location_catalog = build_location_catalog_slot_content(
+            self.bible_repo,
+            novel_id,
+            outline=outline,
+            scene_director=scene_director,
+        )
+        if location_catalog:
+            slots["location_catalog"] = ContextSlot(
+                name="可用地点与势力(LOCATION_CATALOG)",
+                tier=PriorityTier.T1_COMPRESSIBLE,
+                content=location_catalog,
+                tokens=self.estimate_tokens(location_catalog),
+                max_tokens=600,
+                priority=67,
             )
 
         # ── T1: 本章关键道具（用户标记 is_key）── priority=64 ──

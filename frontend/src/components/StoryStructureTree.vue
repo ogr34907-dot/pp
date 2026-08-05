@@ -78,6 +78,14 @@
         <template #extra>
           <n-space vertical :size="8" align="center">
             <n-spin v-if="loading" size="small" />
+            <n-button
+              v-if="!loading && !autopilotEmptyMode"
+              type="primary"
+              size="small"
+              @click="emit('openPlanModal')"
+            >
+              生成叙事骨架
+            </n-button>
             <n-alert v-if="!autopilotEmptyMode" type="info" :show-icon="false" style="font-size: 12px; max-width: 240px; text-align: center;">
               <strong>提示</strong>：可在正文区直接生成正文
             </n-alert>
@@ -126,7 +134,7 @@
 
 <script setup lang="ts">
 import { ref, computed, h, onMounted, onUnmounted, watch } from 'vue'
-import { NTree, NEmpty, NSpin, NTag, NSpace, NDropdown, NModal, NInput, useMessage, useDialog } from 'naive-ui'
+import { NTree, NEmpty, NSpin, NTag, NSpace, NButton, NDropdown, NModal, NInput, useMessage, useDialog } from 'naive-ui'
 import { structureApi, type StoryNode } from '@/api/structure'
 import { chapterApi } from '@/api/chapter'
 import { autopilotApi, isAutopilotHttpError } from '@/api/autopilot'

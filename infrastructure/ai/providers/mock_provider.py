@@ -9,6 +9,7 @@ hidden fallback narratives.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, AsyncIterator, Callable, Dict
 
 from domain.ai.services.llm_service import GenerationConfig, GenerationResult, LLMService
@@ -28,6 +29,16 @@ class MockResponseFactory:
 
     def build(self, prompt: Prompt) -> str:
         intent = self._detect_intent(prompt)
+        if intent == "act_plan":
+            return self._act_plan(prompt)
+        if intent == "chapter_preplan":
+            return self._chapter_preplan()
+        if intent == "prose":
+            return self._prose(prompt)
+        if intent == "narrative_sync":
+            return self._narrative_sync()
+        if intent == "memory_extraction":
+            return self._memory_extraction(prompt)
         builders: Dict[str, Callable[[], str]] = {
             "macro_refactor": self._macro_refactor,
             "macro_plan": self._macro_plan,
@@ -57,6 +68,34 @@ class MockResponseFactory:
             return "plot_outline"
         if "宏观结构" in text or "结构框架" in text or "部-卷-幕" in text or '"parts"' in text:
             return "macro_plan"
+        if (
+            '"detail_title"' in text
+            and '"key_plot_points"' in text
+            and '"chapter_plan"' in text
+        ):
+            return "chapter_preplan"
+        if "文章字数" in text and "请生成正文内容" in text:
+            return "prose"
+        if (
+            '"summary"' in text
+            and '"key_events"' in text
+            and '"open_threads"' in text
+            and '"relation_triples"' in text
+        ):
+            return "narrative_sync"
+        if all(
+            key in text
+            for key in ("completed_beats", "revealed_clues", "fact_violations")
+        ):
+            return "memory_extraction"
+        if "请为这一幕规划" in text and '"chapters"' in text:
+            return "act_plan"
+        # Stage prompts include worldbuilding as context. Their explicit output
+        # schema must win over that shared context when no provider is configured.
+        if '"characters"' in text:
+            return "characters"
+        if '"locations"' in text:
+            return "locations"
         if "worldbuilding" in text or "世界观" in text or "核心法则" in text:
             return "worldbuilding"
         if "characters" in text or "人物" in text or "角色" in text:
@@ -426,6 +465,247 @@ class MockResponseFactory:
                     }
                 ],
                 "suggestions": ["配置真实模型后重新执行 AI 审阅。"],
+            }
+        )
+
+    def _act_plan(self, prompt: Prompt) -> str:
+        match = re.search(r"请为这一幕规划\s*(\d+)\s*个章节", prompt.user)
+        chapter_count = max(int(match.group(1)), 1) if match else 1
+        chapters = []
+        for number in range(1, chapter_count + 1):
+            is_first = number == 1
+            is_last = number == chapter_count
+            chapters.append(
+                {
+                    "number": number,
+                    "title": f"第{number}章：压力推进",
+                    "main_event": "围绕当前核心压力做出行动选择，并产生可见后果。",
+                    "handoff_from_previous": (
+                        "从本幕入口落下当前核心压力。"
+                        if is_first
+                        else "承接上一章行动留下的后果和未解问题。"
+                    ),
+                    "handoff_to_next": (
+                        "将本幕的阶段性后果交给下一幕。"
+                        if is_last
+                        else "留下必须由下一章回应的明确压力。"
+                    ),
+                    "required_threads": ["当前幕核心问题"],
+                    "location_hint": "当前冲突地点",
+                    "cast_hint": ["核心人物甲"],
+                    "thrill_type": "hook" if is_first else "action",
+                    "thrill_description": "通过选择和即时后果提供结构化正反馈。",
+                    "foreshadow_action": "resolve" if is_last else "plant",
+                    "foreshadow_detail": "当前行动留下的线索将在后续章节回应。",
+                }
+            )
+        return self._json({"chapters": chapters})
+
+    def _chapter_preplan(self) -> str:
+        return self._json(
+            {
+                "detail_title": "压力落地与主动选择",
+                "key_plot_points": [
+                    "当前压力在具体场景中落地。",
+                    "核心人物甲确认无法回避的代价。",
+                    "关键关系乙提出风险判断。",
+                    "核心人物甲做出可验证的主动选择。",
+                    "选择产生下一章必须回应的新问题。",
+                ],
+                "chapter_characters": ["核心人物甲", "关键关系乙"],
+                "chapter_plan": {
+                    "opening_entry": "核心人物甲在当前冲突地点核对一条会改变处境的信息。",
+                    "scene_transitions": [
+                        {
+                            "scene": "压力落场",
+                            "location": "当前冲突地点",
+                            "cast": ["核心人物甲"],
+                            "purpose": "让当前主事件变成必须回应的即时压力。",
+                        },
+                        {
+                            "scene": "风险对照",
+                            "location": "当前冲突地点",
+                            "cast": ["核心人物甲", "关键关系乙"],
+                            "purpose": "明确选择代价与可用筹码。",
+                        },
+                    ],
+                    "key_dialogues": [
+                        {
+                            "speaker": "核心人物甲",
+                            "line": "先确认这条信息会让谁失去选择。",
+                            "reply": "关键关系乙要求先核对风险。",
+                            "purpose": "建立行动目标与风险分歧。",
+                        },
+                        {
+                            "speaker": "关键关系乙",
+                            "line": "一旦行动，代价不会只落在你身上。",
+                            "reply": "核心人物甲要求给出可验证的退路。",
+                            "purpose": "压实选择代价。",
+                        },
+                        {
+                            "speaker": "核心人物甲",
+                            "line": "我不接受把无关者当作代价。",
+                            "reply": "关键关系乙指出时间窗口正在关闭。",
+                            "purpose": "落实人物底线和外部压力。",
+                        },
+                        {
+                            "speaker": "核心人物甲",
+                            "line": "那就用现有筹码先打开一个缺口。",
+                            "reply": "关键关系乙同意协助验证。",
+                            "purpose": "把讨论转化为共同动作。",
+                        },
+                    ],
+                    "event_chain": [
+                        {"phase": "触发", "content": "核心人物甲发现当前压力已经影响到可争夺资源。"},
+                        {"phase": "升级", "content": "关键关系乙补充风险信息，证明拖延会扩大后果。"},
+                        {"phase": "升级", "content": "两人比对现有筹码，排除一条会伤及无关者的方案。"},
+                        {"phase": "爆发", "content": "核心人物甲选择先验证关键入口，而不是继续等待。"},
+                        {"phase": "爆发", "content": "行动获得局部信息回报，同时暴露新的阻力。"},
+                        {"phase": "收束", "content": "核心人物甲确认下一章必须回应新阻力并保护当前筹码。"},
+                    ],
+                    "character_decisions": [
+                        {
+                            "actor": "核心人物甲",
+                            "decision": "在时间窗口关闭前验证关键入口。",
+                            "purpose": "用可控风险换取下一步行动所需的信息。",
+                        }
+                    ],
+                    "payoff_reversals": [
+                        "预期只能被动承压，反转为核心人物甲主动拿到可验证线索，形成即时正反馈。"
+                    ],
+                    "protagonist_state_change": {
+                        "位置": "当前冲突地点",
+                        "实力": "无直接变化，但获得可执行的信息优势。",
+                        "新获得": "关键入口的验证线索。",
+                        "身体状况": "承压但可行动。",
+                        "重大变化": "从等待风险落地转为主动验证下一步。",
+                    },
+                },
+            }
+        )
+
+    def _prose(self, prompt: Prompt) -> str:
+        match = re.search(r"文章字数\s*[：:]\s*(\d+)", prompt.user)
+        target_length = int(match.group(1)) if match else 2000
+        target_length = min(max(target_length, 800), 5000)
+        paragraphs = [
+            "当前冲突地点的光线被临时警报切成几段，核心人物甲没有立刻行动。"
+            "他先核对手里的线索，又确认身边的人是否仍有选择，这让眼前的压力不再只是一个抽象的威胁。",
+            "关键关系乙指出时间窗口正在收紧，任何看似省事的方案都会把代价转给无关的人。"
+            "核心人物甲因此放弃了最快的路径，转而把现有筹码拆成可以逐项验证的步骤。",
+            "第一次验证带来了局部回报：关键入口确实存在，但入口另一端也留下了新的阻力。"
+            "两人没有把这当成胜利，而是把得到的信息同下一步要承担的风险一并记下。",
+            "核心人物甲选择先守住能够改变局面的证据，再用一次明确行动回应压力。"
+            "当场的选择没有替他解决全部问题，却让后续行动终于有了可追溯的方向和必须兑现的代价。",
+        ]
+        blocks: list[str] = []
+        while len("\n\n".join(blocks)) < target_length:
+            blocks.extend(paragraphs)
+        return "\n\n".join(blocks)
+
+    def _narrative_sync(self) -> str:
+        return self._json(
+            {
+                "summary": (
+                    "核心人物甲在当前冲突地点核对关键信息，拒绝把无关者当作代价，"
+                    "并与关键关系乙共同验证了一个可用入口。行动带来局部线索，也暴露出"
+                    "必须在下一章回应的新阻力。"
+                ),
+                "key_events": "核对压力来源；确认风险；验证关键入口；获得局部线索；暴露新阻力。",
+                "open_threads": "关键入口另一端的阻力来源尚未确认，现有筹码需要在下一章得到保护。",
+                "relation_triples": [
+                    {
+                        "subject": "核心人物甲",
+                        "predicate": "协作",
+                        "object": "关键关系乙",
+                    }
+                ],
+                "foreshadow_hints": [
+                    {
+                        "description": "关键入口另一端的阻力来源",
+                        "suggested_resolve_offset": 3,
+                        "importance": "medium",
+                        "resolve_hint": "下一幕前确认阻力的具体目的",
+                    }
+                ],
+                "consumed_foreshadows": [],
+                "storyline_progress": [
+                    {
+                        "type": "主线",
+                        "arc_label": "入口阻力",
+                        "description": "主角从被动承压转为主动验证，并获得下一步线索。",
+                    }
+                ],
+                "dialogues": [
+                    {
+                        "speaker": "核心人物甲",
+                        "content": "先确认这条信息会让谁失去选择。",
+                        "context": "风险对照",
+                    }
+                ],
+                "timeline_events": [
+                    {
+                        "time_point": "本章",
+                        "event": "验证关键入口",
+                        "description": "核心人物甲与关键关系乙完成首次可控验证。",
+                    }
+                ],
+                "causal_edges": [
+                    {
+                        "source_event": "关键入口被验证",
+                        "causal_type": "triggers",
+                        "target_event": "新阻力需要被回应",
+                        "state_change": "核心人物甲从等待风险转为主动行动。",
+                        "involved_characters": ["核心人物甲", "关键关系乙"],
+                        "strength": 0.8,
+                    }
+                ],
+                "character_mutations": [
+                    {
+                        "character_name": "核心人物甲",
+                        "mutation_type": "motivation",
+                        "source_event": "关键入口验证后暴露新阻力",
+                        "impact_or_description": "决定保护筹码并查明阻力来源。",
+                        "sensitivity_tags_or_priority": 7,
+                        "intensity": 7,
+                    }
+                ],
+                "character_states": [
+                    {
+                        "character_name": "核心人物甲",
+                        "mental_state": "确认风险后保持克制，决心主动验证下一步。",
+                    },
+                    {
+                        "character_name": "关键关系乙",
+                        "mental_state": "认可合作的必要性，同时持续警惕代价扩散。",
+                    },
+                ],
+            }
+        )
+
+    def _memory_extraction(self, prompt: Prompt) -> str:
+        match = re.search(r"第\s*(\d+)\s*章", prompt.user)
+        chapter_number = int(match.group(1)) if match else 1
+        return self._json(
+            {
+                "completed_beats": [
+                    {
+                        "beat_id": f"mock-ch{chapter_number}-choice",
+                        "summary": "核心人物甲在压力下做出可追溯的选择，并留下下一步需要回应的阻力。",
+                        "chapter": chapter_number,
+                        "characters_involved": ["核心人物甲", "关键关系乙"],
+                    }
+                ],
+                "revealed_clues": [
+                    {
+                        "clue_id": f"mock-clue-ch{chapter_number}-entry",
+                        "content": "关键入口存在，但其另一端的阻力仍需查明。",
+                        "revealed_at_chapter": chapter_number,
+                        "category": "truth",
+                        "is_still_valid": True,
+                    }
+                ],
+                "fact_violations": [],
             }
         )
 

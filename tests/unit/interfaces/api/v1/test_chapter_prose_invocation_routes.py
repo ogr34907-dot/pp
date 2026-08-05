@@ -28,6 +28,16 @@ class _StreamingLLM:
         yield "正文"
 
 
+class _PromptCapturingStreamingLLM(_StreamingLLM):
+    def __init__(self) -> None:
+        self.prompts: list[Prompt] = []
+
+    async def stream_generate(self, prompt: Prompt, config: GenerationConfig):
+        self.prompts.append(prompt)
+        async for chunk in super().stream_generate(prompt, config):
+            yield chunk
+
+
 def _wait_for_status(client: TestClient, session_id: str, expected: str, timeout: float = 5.0) -> dict:
     deadline = time.monotonic() + timeout
     latest = {}
@@ -581,5 +591,81 @@ def test_chapter_prose_get_refresh_keeps_setup_snapshot_without_prompt_injection
     prompt_user = refreshed.json()["session"]["prompt_snapshot"]["prompt"]["user"]
     assert "变量角色" not in prompt_user
     assert "变量武道" not in prompt_user
+
+    db.close_all(skip_checkpoint=True)
+
+
+def test_chapter_prose_review_refresh_and_resume_keep_explicit_context_snapshot(tmp_path, monkeypatch):
+    """A review refresh must not replace StoryPipeline's prepared context with Hub state."""
+    db = DatabaseConnection(str(tmp_path / "plotpilot-test-prose-explicit-context.db"))
+    llm = _PromptCapturingStreamingLLM()
+
+    monkeypatch.setattr(ai_invocation_routes, "get_database", lambda db_path=None: db)
+    monkeypatch.setattr("infrastructure.persistence.database.connection.get_database", lambda db_path=None: db)
+    monkeypatch.setattr(ai_invocation_routes, "get_llm_service", lambda: llm)
+
+    import infrastructure.ai.prompt_manager as prompt_manager_module
+    import infrastructure.ai.prompt_registry as prompt_registry_module
+
+    prompt_manager_module._manager_instance = prompt_manager_module.PromptManager(db)
+    prompt_registry_module._registry_instance = prompt_registry_module.PromptRegistry(
+        prompt_manager=prompt_manager_module._manager_instance
+    )
+    with sqlite_writes_bypass_queue():
+        with db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+                ("novel-explicit-context", "上下文快照小说", "novel-explicit-context", 12),
+            )
+
+    app = FastAPI()
+    app.include_router(ai_invocation_routes.router)
+    client = TestClient(app)
+    full_context_marker = "TRACE_FULL_PIPELINE_CONTEXT_A31F"
+    stale_hub_marker = "TRACE_STALE_HUB_CONTEXT_B92D"
+
+    created = client.post(
+        "/ai-invocations",
+        json={
+            "operation": "chapter.generate.prose",
+            "node_key": "chapter-prose-generation",
+            "policy": "FULL_INTERACTIVE",
+            "context": {"novel_id": "novel-explicit-context", "chapter_number": 1},
+            "variables": {
+                "novel_title": "上下文快照小说",
+                "chapter_number": 1,
+                "chapter_outline": "正文需承接完整上下文快照",
+                "continuity_context": full_context_marker,
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    session_id = created.json()["session"]["id"]
+
+    variable_repo = SqliteVariableHubRepository(db)
+    variable_repo.set_value(
+        VariableWrite(
+            key="chapter.continuity_context",
+            value=stale_hub_marker,
+            context_key="novel_id:novel-explicit-context|chapter_number:1",
+            source_node_key="test",
+            value_type="string",
+            scope="chapter",
+            stage="writing",
+        )
+    )
+
+    refreshed = client.get(f"/ai-invocations/{session_id}")
+    assert refreshed.status_code == 200, refreshed.text
+    review_prompt = refreshed.json()["session"]["prompt_snapshot"]["prompt"]["user"]
+    assert full_context_marker in review_prompt
+    assert stale_hub_marker not in review_prompt
+
+    resumed = client.post(f"/ai-invocations/{session_id}/resume", json={"resumed_by": "test"})
+    assert resumed.status_code == 200, resumed.text
+    _wait_for_status(client, session_id, "awaiting_acceptance")
+    assert len(llm.prompts) == 1
+    assert full_context_marker in llm.prompts[0].user
+    assert stale_hub_marker not in llm.prompts[0].user
 
     db.close_all(skip_checkpoint=True)

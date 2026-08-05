@@ -13,6 +13,8 @@ from domain.novel.value_objects.novel_id import NovelId
 from infrastructure.persistence.database.connection import get_database
 from infrastructure.persistence.database.manuscript_entity_repository import ManuscriptEntityRepository
 from infrastructure.persistence.database.sqlite_bible_repository import SqliteBibleRepository
+from infrastructure.persistence.database.unified_character_repository import SqliteUnifiedCharacterRepository
+from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
 
 from application.core.services.chapter_service import ChapterService
 from interfaces.api.dependencies import get_chapter_service
@@ -96,15 +98,19 @@ def list_props(novel_id: str):
 
 
 def _validate_holder(novel_id: str, holder_character_id: Optional[str]) -> None:
-    """校验 holder_character_id 确实存在于 bible_characters 表。"""
+    """校验 holder_character_id 确实存在于统一角色真源。"""
     if not holder_character_id:
         return
     db = get_database()
-    row = db.fetch_one(
-        "SELECT id FROM bible_characters WHERE id = ? AND novel_id = ?",
-        (holder_character_id, novel_id),
-    )
-    if not row:
+    from domain.character.value_objects.character_id import CharacterId
+
+    try:
+        character_id = CharacterId(holder_character_id)
+    except ValueError:
+        character = None
+    else:
+        character = SqliteUnifiedCharacterRepository(db).get(character_id)
+    if character is None or character.novel_id != novel_id:
         raise HTTPException(
             status_code=422,
             detail=f"持有者角色 ID '{holder_character_id}' 不存在于本作 Bible，请先在世界观中创建该角色",
@@ -115,14 +121,15 @@ def _validate_holder(novel_id: str, holder_character_id: Optional[str]) -> None:
 def create_prop(novel_id: str, body: PropCreateBody):
     _validate_holder(novel_id, body.holder_character_id)
     repo = ManuscriptEntityRepository(get_database())
-    row = repo.create_prop(
-        novel_id,
-        name=body.name,
-        description=body.description,
-        aliases=body.aliases,
-        holder_character_id=body.holder_character_id,
-        first_chapter=body.first_chapter,
-    )
+    with sqlite_writes_bypass_queue():
+        row = repo.create_prop(
+            novel_id,
+            name=body.name,
+            description=body.description,
+            aliases=body.aliases,
+            holder_character_id=body.holder_character_id,
+            first_chapter=body.first_chapter,
+        )
     return row
 
 
@@ -133,17 +140,18 @@ def patch_prop(novel_id: str, prop_id: str, body: PropPatchBody):
     repo = ManuscriptEntityRepository(get_database())
     if not repo.get_prop(novel_id, prop_id):
         raise HTTPException(status_code=404, detail="道具不存在")
-    repo.update_prop(
-        novel_id,
-        prop_id,
-        name=body.name,
-        description=body.description,
-        aliases=body.aliases,
-        holder_character_id=body.holder_character_id,
-        first_chapter=body.first_chapter,
-        is_key=body.is_key,
-    )
-    return repo.get_prop(novel_id, prop_id)
+    with sqlite_writes_bypass_queue():
+        repo.update_prop(
+            novel_id,
+            prop_id,
+            name=body.name,
+            description=body.description,
+            aliases=body.aliases,
+            holder_character_id=body.holder_character_id,
+            first_chapter=body.first_chapter,
+            is_key=body.is_key,
+        )
+        return repo.get_prop(novel_id, prop_id)
 
 
 @router.delete("/{novel_id}/manuscript/props/{prop_id}", status_code=204)
@@ -151,5 +159,6 @@ def delete_prop(novel_id: str, prop_id: str):
     repo = ManuscriptEntityRepository(get_database())
     if not repo.get_prop(novel_id, prop_id):
         raise HTTPException(status_code=404, detail="道具不存在")
-    repo.delete_prop(novel_id, prop_id)
+    with sqlite_writes_bypass_queue():
+        repo.delete_prop(novel_id, prop_id)
     return Response(status_code=204)

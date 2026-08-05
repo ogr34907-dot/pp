@@ -216,6 +216,65 @@ def build_immersion_details_slot_content(
         return ""
 
 
+def build_location_catalog_slot_content(
+    bible_repository: Any,
+    novel_id: str,
+    *,
+    outline: str = "",
+    scene_director: Any = None,
+    max_items: int = 8,
+    max_description_chars: int = 160,
+) -> str:
+    """Render saved locations not already selected by the current scene.
+
+    Explicit outline or scene-director locations remain in the existing scene
+    hint block. The catalog supplies the remaining canonical choices so an
+    early chapter can select a saved location before its outline names one.
+    """
+    if not bible_repository:
+        return ""
+
+    try:
+        bible = bible_repository.get_by_novel_id(NovelId(novel_id))
+    except Exception as exc:
+        logger.warning("地点目录构建失败 novel=%s: %s", novel_id, exc)
+        return ""
+    if bible is None:
+        return ""
+
+    scene_locations = set()
+    if isinstance(scene_director, dict):
+        scene_locations = {
+            str(value).strip()
+            for value in scene_director.get("locations", [])
+            if str(value).strip()
+        }
+    outline_text = str(outline or "")
+    seen_names: set[str] = set()
+    lines = ["=== 可用地点与势力 ==="]
+    for location in list(getattr(bible, "locations", None) or []):
+        name = str(getattr(location, "name", "") or "").strip()
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        if name in outline_text or name in scene_locations:
+            continue
+
+        location_type = str(getattr(location, "location_type", "") or "other").lower()
+        label = "势力" if location_type == "faction" else "地点"
+        description = " ".join(
+            str(getattr(location, "description", "") or "").split()
+        )[:max_description_chars]
+        line = f"- [{label}] {name}"
+        if description:
+            line += f": {description}"
+        lines.append(line)
+        if len(lines) - 1 >= max_items:
+            break
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def build_key_props_slot_content(novel_id: str, db_path_provider: Any = None) -> str:
     """Render user-marked key props from unified props."""
     try:

@@ -122,6 +122,8 @@ def ensure_autopilot_macro_plan_contract(db=None) -> None:
         "premise": "novel.setup.premise",
         "target_chapters": "novel.setup.target_chapters",
         "characters": "novel.characters.list",
+        "worldbuilding.content": "worldbuilding.content",
+        "locations.list": "locations.list",
         "planning_depth": "novel.planning.macro.depth",
         "rec_parts": "novel.planning.macro.rec_parts",
         "rec_volumes_per_part": "novel.planning.macro.rec_volumes_per_part",
@@ -141,9 +143,11 @@ def ensure_autopilot_macro_plan_contract(db=None) -> None:
         "genre_opening_profile",
         "genre_reader_contract",
         "genre_rhythm_constraints",
+        "worldbuilding.content",
     }
-    list_aliases = {"characters"}
+    list_aliases = {"characters", "locations.list"}
     setup_aliases = {"premise", "target_chapters"}
+    optional_variable_aliases = {"worldbuilding.content", "locations.list"}
     runtime_only_aliases = {"worldview"}
     derived_config_aliases = {
         "genre_opening_profile",
@@ -156,7 +160,7 @@ def ensure_autopilot_macro_plan_contract(db=None) -> None:
         VariableBinding(
             alias=alias,
             variable_key=variable_keys.get(alias, ""),
-            required=alias in variable_keys,
+            required=alias in variable_keys and alias not in optional_variable_aliases,
             default=None if alias in variable_keys else "",
             source=(
                 "variable_hub" if alias in variable_keys else

@@ -237,6 +237,51 @@ def test_retain_prose_replays_in_order_and_reindexes_current_versions(
     }
 
 
+def test_retain_prose_ignores_empty_planned_tail_chapters(monkeypatch, tmp_path):
+    db = DatabaseConnection(str(tmp_path / "retain-planned-tail.db"))
+    novel_id = "novel-replay-planned-tail"
+    db.execute(
+        "INSERT INTO novels (id, title, slug, autopilot_status, current_stage) "
+        "VALUES (?, ?, ?, 'running', 'writing')",
+        (novel_id, "Replay", novel_id),
+    )
+    repo = SqliteChapterRepository(db)
+    _seed_completed_chapter(repo, novel_id, 1, "第一章正文")
+    _seed_completed_chapter(repo, novel_id, 2, "第二章旧正文")
+    _seed_completed_chapter(repo, novel_id, 3, "第三章正文")
+    repo.save(
+        Chapter(
+            id="chapter-4",
+            novel_id=NovelId(novel_id),
+            number=4,
+            title="第4章（已规划）",
+            content="",
+            status=ChapterStatus.DRAFT,
+        )
+    )
+    aftermath = _ReplayAftermath()
+
+    monkeypatch.setattr(
+        "application.core.services.chapter_rewrite_coordinator.reindex_chapter_entity_mentions",
+        lambda *_args, **_kwargs: None,
+        raising=False,
+    )
+    coordinator = ChapterRewriteCoordinator(
+        db=db,
+        chapter_repository=repo,
+        aftermath_pipeline=aftermath,
+    )
+
+    result = coordinator.rewrite(
+        repo.get_by_novel_and_number(NovelId(novel_id), 2),
+        "第二章重写正文",
+        rewrite_mode="retain_prose",
+    )
+
+    assert result.replay_completed is True
+    assert [call[1] for call in aftermath.calls] == [2, 3]
+
+
 def test_retain_prose_keeps_mainline_paused_when_a_replay_commit_fails(tmp_path):
     db = DatabaseConnection(str(tmp_path / "retain-failure.db"))
     novel_id = "novel-replay-failure"

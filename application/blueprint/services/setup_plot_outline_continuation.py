@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from math import ceil
 from typing import Any, Mapping
 
 from application.ai.llm_json_extract import parse_llm_json_to_dict
@@ -256,6 +257,21 @@ def _target_chapters(context: ContinuationContext) -> int:
 
 def _chapter_ranges(target_chapters: int) -> list[tuple[int, int]]:
     ratios = [0.15, 0.40, 0.70, 0.90, 1.0]
+    target_chapters = max(1, int(target_chapters))
+
+    # The plot-outline contract has five semantic phases. For a deliberately
+    # short book, multiple phases must share a chapter rather than inventing
+    # chapters beyond the configured capacity.
+    if target_chapters < len(ratios):
+        ranges: list[tuple[int, int]] = []
+        previous_end = 0
+        for ratio in ratios:
+            end = min(target_chapters, max(1, ceil(target_chapters * ratio)))
+            start = 1 if previous_end == 0 else min(end, previous_end + 1)
+            ranges.append((start, end))
+            previous_end = end
+        return ranges
+
     ends = []
     previous = 0
     for index, ratio in enumerate(ratios):
@@ -299,15 +315,8 @@ def _normalize_stage_plan(raw_items: Any, *, target_chapters: int) -> list[dict[
     if len(raw_items) != 5:
         raise ValueError("plot_outline.stage_plan 必须包含 5 个阶段")
 
+    target_chapters = max(1, int(target_chapters))
     ranges = _chapter_ranges(target_chapters)
-    total_chapters = max(
-        target_chapters,
-        *(
-            _coerce_chapter_number(item.get("chapter_end")) or 0
-            for item in raw_items
-            if isinstance(item, Mapping)
-        ),
-    )
     normalized: list[dict[str, Any]] = []
     for index, schema in enumerate(_PHASE_SCHEMA):
         raw = raw_items[index] if index < len(raw_items) else None
@@ -328,9 +337,19 @@ def _normalize_stage_plan(raw_items: Any, *, target_chapters: int) -> list[dict[
         key_goals = []
         if isinstance(key_goals_raw, list):
             key_goals = [str(item).strip() for item in key_goals_raw if str(item).strip()]
+        raw_start = _coerce_chapter_number(raw.get("chapter_start"))
+        raw_end = _coerce_chapter_number(raw.get("chapter_end"))
+        if raw_start is not None and raw_start > target_chapters:
+            raise ValueError(
+                f"plot_outline.stage_plan[{index}] 起始章不能超过目标章节数 {target_chapters}"
+            )
+        if raw_end is not None and raw_end > target_chapters:
+            raise ValueError(
+                f"plot_outline.stage_plan[{index}] 结束章不能超过目标章节数 {target_chapters}"
+            )
         default_start, default_end = ranges[index]
-        chapter_start = _coerce_chapter_number(raw.get("chapter_start")) or default_start
-        chapter_end = _coerce_chapter_number(raw.get("chapter_end")) or default_end
+        chapter_start = raw_start or default_start
+        chapter_end = raw_end or default_end
         if chapter_start > chapter_end:
             raise ValueError(f"plot_outline.stage_plan[{index}] 章节范围不合法")
         extra_fields = {
@@ -359,7 +378,7 @@ def _normalize_stage_plan(raw_items: Any, *, target_chapters: int) -> list[dict[
                 "range_percent": _range_percent_label(
                     chapter_start,
                     chapter_end,
-                    total_chapters=total_chapters,
+                    total_chapters=target_chapters,
                 ),
                 "chapter_start": chapter_start,
                 "chapter_end": chapter_end,

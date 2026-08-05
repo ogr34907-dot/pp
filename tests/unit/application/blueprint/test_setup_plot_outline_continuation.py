@@ -1,3 +1,5 @@
+import pytest
+
 from application.ai_invocation.continuation import ContinuationContext
 from application.ai_invocation.dtos import (
     AdoptionDecision,
@@ -264,7 +266,7 @@ def test_normalize_plot_outline_preserves_manual_chapter_ranges():
         "core_conflict": "主角试图守住重要关系与核心目标，但结构性压力不断逼他支付超出预期的代价。",
     }
 
-    normalized = normalize_setup_plot_outline_payload(outline, target_chapters=100)
+    normalized = normalize_setup_plot_outline_payload(outline, target_chapters=500)
 
     assert normalized["stage_plan"][0]["chapter_end"] == 20
     assert normalized["stage_plan"][0]["range_percent"] == "1-4%"
@@ -272,6 +274,46 @@ def test_normalize_plot_outline_preserves_manual_chapter_ranges():
     assert normalized["stage_plan"][-1]["chapter_start"] == 421
     assert normalized["stage_plan"][-1]["chapter_end"] == 500
     assert normalized["stage_plan"][-1]["range_percent"] == "84-100%"
+
+
+def test_normalize_plot_outline_compresses_five_phases_inside_two_chapter_target():
+    outline = {
+        "main_story_overview": "主角必须在两章内完成一次明确选择并承担后果。",
+        "stage_plan": [
+            {"phase": "opening", "label": "开篇阶段", "summary": "建立初始压力。"},
+            {"phase": "development", "label": "发展阶段", "summary": "扩大局部危机。"},
+            {"phase": "deepening", "label": "深化阶段", "summary": "揭示关键限制。"},
+            {"phase": "climax", "label": "高潮阶段", "summary": "迫使主角决断。"},
+            {"phase": "ending", "label": "收尾阶段", "summary": "收束本次选择的后果。"},
+        ],
+        "expected_ending": "主角完成阶段目标。",
+        "core_conflict": "时间不足与责任之间的冲突。",
+    }
+
+    normalized = normalize_setup_plot_outline_payload(outline, target_chapters=2)
+
+    assert [
+        (stage["chapter_start"], stage["chapter_end"])
+        for stage in normalized["stage_plan"]
+    ] == [(1, 1), (1, 1), (2, 2), (2, 2), (2, 2)]
+
+
+def test_normalize_plot_outline_rejects_manual_range_beyond_target_chapters():
+    outline = {
+        "main_story_overview": "主角需要在既定篇幅内完成清晰的阶段推进。",
+        "stage_plan": [
+            {"phase": "opening", "label": "开篇阶段", "chapter_start": 1, "chapter_end": 1, "summary": "建立初始压力。"},
+            {"phase": "development", "label": "发展阶段", "chapter_start": 1, "chapter_end": 1, "summary": "扩大局部危机。"},
+            {"phase": "deepening", "label": "深化阶段", "chapter_start": 2, "chapter_end": 2, "summary": "揭示关键限制。"},
+            {"phase": "climax", "label": "高潮阶段", "chapter_start": 2, "chapter_end": 2, "summary": "迫使主角决断。"},
+            {"phase": "ending", "label": "收尾阶段", "chapter_start": 3, "chapter_end": 3, "summary": "错误地超出目标章节数。"},
+        ],
+        "expected_ending": "主角完成阶段目标。",
+        "core_conflict": "目标篇幅与错误人工范围之间的冲突。",
+    }
+
+    with pytest.raises(ValueError, match="目标章节数"):
+        normalize_setup_plot_outline_payload(outline, target_chapters=2)
 
 
 def test_normalize_plot_outline_accepts_chinese_alias_keys():

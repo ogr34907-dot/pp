@@ -528,10 +528,27 @@ def _session_variable_resolver(repos, session, spec) -> VariableResolver:
     )
 
 
-def _runtime_only_explicit_variables(session, bindings: list[VariableBinding]) -> dict[str, Any]:
-    aliases = dict(getattr(getattr(session, "variable_plan", None), "aliases", {}) or {})
-    if not aliases:
+def _preserved_session_explicit_variables(
+    session,
+    bindings: list[VariableBinding],
+    *,
+    overridden_aliases: set[str] | None = None,
+) -> dict[str, Any]:
+    """Keep values supplied when the invocation was prepared across review refreshes.
+
+    A StoryPipeline prose invocation supplies its fully budgeted context as an
+    explicit variable. Re-resolving a waiting session from Variable Hub must
+    not replace that frozen request input with an older chapter-scoped value.
+    Hub-backed values still refresh normally, and an explicit user edit wins
+    for the aliases it changes.
+    """
+    variable_plan = getattr(session, "variable_plan", None)
+    aliases = dict(getattr(variable_plan, "aliases", {}) or {})
+    raw_aliases = dict(getattr(variable_plan, "raw_aliases", {}) or {})
+    lineage = dict(getattr(variable_plan, "lineage", {}) or {})
+    if not aliases and not raw_aliases:
         return {}
+    overridden_aliases = overridden_aliases or set()
     runtime_aliases = {
         binding.alias
         for binding in bindings
@@ -539,17 +556,37 @@ def _runtime_only_explicit_variables(session, bindings: list[VariableBinding]) -
         or (binding.variable_key and str(binding.variable_key).startswith("system."))
     }
     runtime_aliases.update(alias for alias in aliases if str(alias).startswith("genre_"))
-    return {alias: aliases[alias] for alias in runtime_aliases if alias in aliases}
+    explicit_aliases = {
+        str(alias)
+        for alias, source in lineage.items()
+        if source == "explicit" and str(alias) not in overridden_aliases
+    }
+    preserved_aliases = runtime_aliases | explicit_aliases
+    return {
+        alias: raw_aliases.get(alias, aliases[alias])
+        for alias in preserved_aliases
+        if alias in raw_aliases or alias in aliases
+    }
 
 
-def _resolve_current_variable_plan(repos, session, spec=None):
+def _resolve_current_variable_plan(
+    repos,
+    session,
+    spec=None,
+    *,
+    overridden_aliases: set[str] | None = None,
+):
     spec = spec or repos["spec"].get(session.operation, session.node_key)
     if spec is None:
         return session.variable_plan
     input_bindings = _session_input_bindings(repos, session, spec)
     return _session_variable_resolver(repos, session, spec).resolve(
         spec=spec,
-        explicit_variables=_runtime_only_explicit_variables(session, input_bindings),
+        explicit_variables=_preserved_session_explicit_variables(
+            session,
+            input_bindings,
+            overridden_aliases=overridden_aliases,
+        ),
         context=session.context,
     )
 
@@ -888,7 +925,7 @@ async def preview_prompt_draft(session_id: str, request: PromptDraftRequest) -> 
                 else ""
             ),
         )
-        variable_plan = _session_variable_resolver(repos, session, spec).resolve(spec=spec, explicit_variables={}, context=session.context)
+        variable_plan = _resolve_current_variable_plan(repos, session, spec)
         session.variable_plan = variable_plan
     try:
         snapshot = _render_prompt_draft(session, request.system_template, request.user_template)
@@ -923,7 +960,7 @@ async def save_prompt_draft(session_id: str, request: PromptDraftRequest) -> dic
                 else ""
             ),
         )
-        variable_plan = _session_variable_resolver(repos, session, spec).resolve(spec=spec, explicit_variables={}, context=session.context)
+        variable_plan = _resolve_current_variable_plan(repos, session, spec)
         session.variable_plan = variable_plan
     try:
         session.prompt_snapshot = _render_prompt_draft(session, request.system_template, request.user_template)
@@ -968,6 +1005,7 @@ async def update_invocation_variables(session_id: str, request: VariableUpdateRe
         raise HTTPException(status_code=400, detail="variable_values_required")
 
     written: list[dict[str, Any]] = []
+    overridden_aliases: set[str] = set()
     for alias, value in request.values.items():
         value = parse_variable_literal(value)
         binding = bindings.get(alias)
@@ -1010,9 +1048,14 @@ async def update_invocation_variables(session_id: str, request: VariableUpdateRe
                 "version_number": getattr(stored, "version_number", 1),
             }
         )
+        overridden_aliases.add(binding.alias)
 
-    resolver = _session_variable_resolver(repos, session, spec)
-    variable_plan = resolver.resolve(spec=spec, explicit_variables={}, context=session.context)
+    variable_plan = _resolve_current_variable_plan(
+        repos,
+        session,
+        spec,
+        overridden_aliases=overridden_aliases,
+    )
     session.variable_plan = variable_plan
     draft_prompt = session.prompt_snapshot.draft_prompt if session.prompt_snapshot is not None else None
     if draft_prompt is not None:

@@ -1,8 +1,12 @@
+import subprocess
+import sys
+
 from interfaces.api.settings import BackendSettings
 from interfaces.daemon_manager import (
     AutopilotDaemonManager,
     DaemonLifecycleSettings,
     DaemonStatus,
+    cleanup_orphan_python_processes,
     is_expected_daemon_shutdown_exception,
 )
 
@@ -96,3 +100,48 @@ def test_daemon_manager_stop_signals_and_terminates_stuck_process(monkeypatch):
     assert process.join_calls == [0.25, 0.5]
     assert manager.process is None
     assert manager.stop_event is None
+
+
+def test_orphan_cleanup_does_not_kill_other_workspace_backend(monkeypatch):
+    local_executable = sys.executable
+    foreign_executable = r"W:\novel\PlotPilot\.venv\Scripts\python.exe"
+    listed_processes = "\n".join(
+        [
+            f'101\t"{local_executable}" -m uvicorn interfaces.main:app --port 8015',
+            f'202\t"{local_executable}" -m uvicorn interfaces.main:app --port 8015',
+            f'303\t"{foreign_executable}" -m uvicorn interfaces.main:app --port 8005',
+        ]
+    )
+    killed_pids = []
+
+    def fake_run(args, **_kwargs):
+        if args[0] == "powershell":
+            return subprocess.CompletedProcess(args, 0, stdout=listed_processes, stderr="")
+        if args[0] == "taskkill":
+            killed_pids.append(int(args[-1]))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess: {args}")
+
+    monkeypatch.setattr("interfaces.daemon_manager.os.getpid", lambda: 101)
+    monkeypatch.setattr("interfaces.daemon_manager.get_daemon_lifecycle_settings", DaemonLifecycleSettings)
+    monkeypatch.setattr("interfaces.daemon_manager.subprocess.run", fake_run)
+
+    cleanup_orphan_python_processes()
+
+    assert killed_pids == [202]
+
+
+def test_daemon_manager_stop_respects_disabled_orphan_cleanup(monkeypatch):
+    cleanup_calls = []
+    manager = AutopilotDaemonManager(
+        log_level=20,
+        log_file="logs/test.log",
+        shared_state_provider=lambda: {},
+    )
+    monkeypatch.setattr("interfaces.daemon_manager.os.name", "nt")
+    monkeypatch.setenv("DISABLE_ORPHAN_CLEANUP", "1")
+    monkeypatch.setattr(manager, "cleanup_orphans", lambda: cleanup_calls.append(True))
+
+    manager.stop()
+
+    assert cleanup_calls == []
