@@ -29,5 +29,11 @@ variables:
 - name: special_requirements
   desc: 特殊要求
   type: string
+- name: fields_desc
+  desc: 本次世界观维度及字段模板
+  type: string
+- name: genre_opening_profile
+  desc: 本次生成范围与已完成维度画像
+  type: object
 id: bible-worldbuilding
 sort_order: 27

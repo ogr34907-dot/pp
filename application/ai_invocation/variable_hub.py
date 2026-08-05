@@ -532,8 +532,11 @@ class VariableResolver:
                         snapshot_values.get(alias, raw_aliases.get(alias, aliases[alias])),
                     )
 
-        for alias, value in aliases.items():
-            binding = binding_by_alias.get(alias)
+        for binding in bindings:
+            alias = self._snapshot_alias(binding, aliases)
+            if not alias:
+                continue
+            value = aliases[alias]
             if self._is_runtime_only_binding(binding):
                 continue
             if alias not in resolved_from_hub:
@@ -575,6 +578,15 @@ class VariableResolver:
         )
 
     @staticmethod
+    def _snapshot_alias(binding: VariableBinding, aliases: Mapping[str, Any]) -> str:
+        variable_key = str(binding.variable_key or "")
+        if binding.alias == variable_key and variable_key.startswith("novel."):
+            public_alias = variable_key.removeprefix("novel.")
+            if public_alias in aliases:
+                return public_alias
+        return binding.alias if binding.alias in aliases else ""
+
+    @staticmethod
     def _context_key(context: Mapping[str, Any]) -> str:
         parts = []
         for key in ("novel_id", "act_id", "chapter_id", "chapter_number", "scene_id", "beat_index"):
@@ -604,13 +616,15 @@ class VariableResolver:
         display_name: str,
     ) -> dict[str, Any]:
         variable_key = binding.variable_key if binding else alias
+        scope = binding.scope if binding and binding.scope != "runtime" else VariableResolver._infer_scope(variable_key)
+        stage = binding.stage if binding and binding.stage != "runtime" else VariableResolver._infer_stage(variable_key)
         return {
             "key": alias,
             "display_name": display_name,
             "value": value,
             "type": VariableResolver._infer_type(value),
-            "scope": binding.scope if binding and binding.scope else VariableResolver._infer_scope(variable_key),
-            "stage": binding.stage if binding and binding.stage else VariableResolver._infer_stage(variable_key),
+            "scope": scope,
+            "stage": stage,
             "source": "variable_hub" if lineage == "variable_hub" else (binding.source if binding and binding.source else lineage),
             "variable_key": variable_key,
             "required": bool(binding.required) if binding else False,
