@@ -311,7 +311,7 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { NModal, NTag, NButton, NSwitch, NForm, NFormItem, NInput, NSelect, NSpin, NAlert, NProgress } from 'naive-ui'
+import { NModal, NTag, NButton, NSwitch, NForm, NFormItem, NInput, NSelect, NSpin, NAlert, NProgress, useMessage } from 'naive-ui'
 import {
   llmControlApi,
   type LLMControlPanelData,
@@ -332,6 +332,7 @@ const props = withDefaults(defineProps<{
 })
 
 const showPanel = ref(false)
+const message = useMessage()
 const llmPanelInitialized = ref(false) // 缓存 LLM 面板是否已初始化
 const drawerTab = ref<DrawerTab>('llm')
 const runtimeLoading = ref(false)
@@ -468,6 +469,7 @@ async function handleSaveEmbedding() {
   try {
     const result = await settingsApi.updateEmbeddingConfig({ ...embeddingForm.value })
     embeddingForm.value = result
+    message.success('嵌入配置已保存')
   } catch {
     // 由 naive-ui form 处理错误提示
   } finally {
