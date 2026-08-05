@@ -20,6 +20,7 @@ CONTINUATION_HANDLER_KEY = "chapter_generate_prose_commit"
 
 def chapter_prose_input_bindings() -> list[VariableBinding]:
     return [
+        VariableBinding("novel_title", "novel.setup.title", False, "", scope="novel", stage="setup", display_name="小说标题"),
         VariableBinding("target_words", "chapter.target_words", False, 2500, scope="chapter", stage="writing", value_type="integer", display_name="文章目标字数"),
         VariableBinding("chapter_outline", "chapter.outline", False, "", scope="chapter", stage="writing", display_name="正文细纲"),
         VariableBinding("continuity_context", "chapter.continuity_context", False, "", scope="chapter", stage="writing", display_name="连续性上下文"),
