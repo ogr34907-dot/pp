@@ -6,6 +6,7 @@ export type AutopilotStatus = Record<string, any> & {
   active_pipeline_run_id?: string
   last_stable_stage?: string
   autopilot_run_epoch?: number
+  autopilot_pause_reason?: string
   autopilot_recovery_reason?: string
 }
 
@@ -49,6 +50,20 @@ export const autopilotApi = {
 
   stop(novelId: string, timeoutMs?: number): Promise<Response> {
     return fetchOk(apiRoutes.autopilot.stop(novelId), {
+      method: 'POST',
+      timeoutMs,
+    })
+  },
+
+  pause(novelId: string, timeoutMs?: number): Promise<Response> {
+    return fetchOk(apiRoutes.autopilot.pause(novelId), {
+      method: 'POST',
+      timeoutMs,
+    })
+  },
+
+  terminate(novelId: string, timeoutMs?: number): Promise<Response> {
+    return fetchOk(apiRoutes.autopilot.terminate(novelId), {
       method: 'POST',
       timeoutMs,
     })

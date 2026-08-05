@@ -152,7 +152,8 @@ class StateBootstrap:
                 """SELECT id, title, autopilot_status, current_stage,
                           current_act, current_chapter_in_act, current_beat_index,
                           current_auto_chapters, target_chapters, target_words_per_chapter,
-                          consecutive_error_count, last_chapter_tension, auto_approve_mode
+                          consecutive_error_count, last_chapter_tension, auto_approve_mode,
+                          autopilot_recovery_reason
                    FROM novels"""
             )
 
@@ -180,7 +181,8 @@ class StateBootstrap:
                 """SELECT id, title, autopilot_status, current_stage,
                           current_act, current_chapter_in_act, current_beat_index,
                           current_auto_chapters, target_chapters, target_words_per_chapter,
-                          consecutive_error_count, last_chapter_tension, auto_approve_mode
+                          consecutive_error_count, last_chapter_tension, auto_approve_mode,
+                          autopilot_recovery_reason
                    FROM novels WHERE id = ?""",
                 (novel_id,),
             )
@@ -215,6 +217,7 @@ class StateBootstrap:
             last_chapter_tension=novel.get("last_chapter_tension", 0),
             auto_approve_mode=novel.get("auto_approve_mode", False),
             needs_review=novel.get("needs_review", False),
+            autopilot_recovery_reason=novel.get("autopilot_recovery_reason", ""),
         )
 
         self._shared.set_novel_state(novel["id"], state)

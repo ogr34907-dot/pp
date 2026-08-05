@@ -84,10 +84,37 @@ class AutopilotRecoveryPolicy:
         novel_id = str(row["id"])
         stage = str(row.get("current_stage") or NovelStage.MACRO_PLANNING.value)
         autopilot_stopped = str(row.get("autopilot_status") or "").strip().lower() == "stopped"
+        recovery_reason = str(row.get("autopilot_recovery_reason") or "").strip().lower()
         if stage == NovelStage.PLANNING.value:
             stage = NovelStage.MACRO_PLANNING.value
 
         pending = self._find_pending_invocation(novel_id)
+
+        # A manual pause is an explicit user decision to preserve the in-flight
+        # work. It must not reuse the interrupted-run cleanup path below.
+        if (
+            autopilot_stopped
+            and recovery_reason == "manual_pause"
+            and stage in RETRYABLE_STAGES
+        ):
+            if stage == NovelStage.WRITING.value:
+                chapter_number = self._current_uncompleted_chapter_number(novel_id)
+            elif stage == NovelStage.AUDITING.value:
+                chapter_number = self._latest_completed_chapter_number(novel_id)
+            else:
+                chapter_number = self._current_chapter_number(novel_id)
+            return AutopilotRecoveryDecision(
+                novel_id=novel_id,
+                next_stage=stage,
+                chapter_number=chapter_number,
+                discard_transient_generation=False,
+                discard_transient_invocations=False,
+                clear_stop_signal=True,
+                clear_pending_invocation=False,
+                story_pipeline_mode=self._is_story_pipeline_writing_enabled(),
+                reason="resume_manual_pause",
+            )
+
         if stage == NovelStage.PAUSED_FOR_REVIEW.value:
             completed_chapter = self._latest_completed_chapter_number(novel_id)
             if (

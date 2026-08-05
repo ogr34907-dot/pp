@@ -357,6 +357,98 @@ def _persist_autopilot_resume_sync(
     return result
 
 
+def _persist_autopilot_stop_intent_sync(
+    novel_id: str,
+    *,
+    recovery_reason: str,
+    cleanup_transient: bool,
+) -> None:
+    """Persist an explicit manual stop intent before recovery can inspect it."""
+    from application.paths import get_db_path
+    from infrastructure.persistence.database.connection import get_database
+
+    db = get_database(get_db_path())
+    db.execute(
+        """
+        UPDATE novels
+        SET autopilot_status = 'stopped',
+            autopilot_recovery_reason = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (recovery_reason, novel_id),
+    )
+    db.commit()
+
+    if not cleanup_transient:
+        return
+
+    from application.engine.services.autopilot_recovery_policy import AutopilotRecoveryPolicy
+    from application.engine.services.chapter_generation_workspace import ChapterGenerationWorkspace
+
+    policy = AutopilotRecoveryPolicy(db, workspace=ChapterGenerationWorkspace())
+    policy.apply_transient_cleanup(policy.decide_on_start(novel_id))
+
+
+async def _request_manual_stop(
+    novel_id: str,
+    *,
+    recovery_reason: str,
+    cleanup_transient: bool,
+    message: str,
+) -> Dict[str, Any]:
+    """Publish a manual intent through IPC, shared state, and durable storage."""
+    shared = _get_shared_state_for_novel(novel_id)
+    current_status = str((shared or {}).get("autopilot_status") or "").strip().lower()
+    current_reason = str((shared or {}).get("autopilot_recovery_reason") or "").strip().lower()
+    if current_status == "stopped" and (
+        not cleanup_transient or current_reason == recovery_reason
+    ):
+        return {"success": True, "message": f"{message}（幂等跳过）"}
+
+    try:
+        from application.engine.services.novel_stop_signal import publish_stop_signal
+
+        publish_stop_signal(novel_id)
+    except Exception as exc:
+        logger.debug("发布手动停止信号失败（将依赖持久化兜底）: %s", exc)
+
+    try:
+        from interfaces.runtime_state import update_shared_novel_state
+
+        update_shared_novel_state(
+            novel_id,
+            autopilot_status="stopped",
+            autopilot_pause_reason=recovery_reason,
+            autopilot_recovery_reason=recovery_reason,
+        )
+    except Exception as exc:
+        logger.debug("更新手动停止共享状态失败（可忽略）: %s", exc)
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            _SSE_THREAD_POOL,
+            lambda: _persist_autopilot_stop_intent_sync(
+                novel_id,
+                recovery_reason=recovery_reason,
+                cleanup_transient=cleanup_transient,
+            ),
+        )
+    except Exception as exc:
+        logger.warning("手动停止意图持久化失败 novel=%s: %s", novel_id, exc)
+        return {
+            "success": True,
+            "message": f"{message}（停止信号已送达，持久化待恢复）",
+        }
+
+    return {
+        "success": True,
+        "message": message,
+        "autopilot_status": "stopped",
+        "autopilot_recovery_reason": recovery_reason,
+    }
+
+
 def _canonical_resume_block_reason(
     novel_id: str,
     *,
@@ -1705,6 +1797,28 @@ async def start_autopilot(novel_id: str, body: StartRequest = StartRequest()):
     }
 
 
+@router.post("/{novel_id}/pause")
+async def pause_autopilot(novel_id: str):
+    """Pause work without discarding the recoverable generation workspace."""
+    return await _request_manual_stop(
+        novel_id,
+        recovery_reason="manual_pause",
+        cleanup_transient=False,
+        message="自动驾驶已暂停",
+    )
+
+
+@router.post("/{novel_id}/terminate")
+async def terminate_autopilot(novel_id: str):
+    """Terminate work and retain the historical destructive cleanup semantics."""
+    return await _request_manual_stop(
+        novel_id,
+        recovery_reason="manual_terminate",
+        cleanup_transient=True,
+        message="自动驾驶已终止",
+    )
+
+
 @router.post("/{novel_id}/stop")
 async def stop_autopilot(novel_id: str):
     """停止自动驾驶（IPC 零延迟版）
@@ -1812,7 +1926,7 @@ async def stop_autopilot(novel_id: str):
 
 @router.post("/{novel_id}/resume")
 async def resume_from_review(novel_id: str):
-    """从人工审阅点恢复（PAUSED_FOR_REVIEW → RUNNING）（非阻塞版）
+    """从人工审阅点或人工暂停恢复（非阻塞版）
 
     架构优化：与 start_autopilot 一致
     1. 先从共享内存校验 + 计算下一阶段
@@ -1826,38 +1940,45 @@ async def resume_from_review(novel_id: str):
     # ── 第一步：从共享内存校验当前状态 ──
     current_act = 0
     current_stage_str = ""
+    manual_pause = False
 
     shared = _get_shared_state_for_novel(novel_id)
     if shared and shared.get("_updated_at"):
         current_stage_str = shared.get("current_stage", "")
         current_act = shared.get("current_act", 0) or 0
+        manual_pause = (
+            str(shared.get("autopilot_status") or "").strip().lower() == "stopped"
+            and str(shared.get("autopilot_recovery_reason") or "").strip().lower()
+            == "manual_pause"
+        )
 
-        if not stage_needs_human_review(current_stage_str):
+        if not manual_pause and not stage_needs_human_review(current_stage_str):
             raise HTTPException(400, f"当前不在审阅等待状态（当前：{current_stage_str}）")
 
-        shared_status = with_review_gate(
-            {
-                "current_stage": current_stage_str,
-                "needs_review": stage_needs_human_review(current_stage_str),
-                "current_act": current_act,
-                "current_auto_chapters": shared.get("current_auto_chapters", 0),
-                "current_chapter_number": shared.get("current_chapter_number") or shared.get("_cached_current_chapter_number"),
-                "autopilot_pending_macro_plan": shared.get("autopilot_pending_macro_plan"),
-                "macro_structure_ready": shared.get("macro_structure_ready"),
-                "active_invocation_session_id": shared.get("active_invocation_session_id", ""),
-                "active_invocation_operation": shared.get("active_invocation_operation", ""),
-                "active_invocation_node_key": shared.get("active_invocation_node_key", ""),
-                "active_invocation_status": shared.get("active_invocation_status", ""),
-                "active_invocation_policy": shared.get("active_invocation_policy", ""),
-                "has_active_invocation": bool(shared.get("has_active_invocation", False)),
-                "requires_ai_review": bool(shared.get("requires_ai_review", False)),
-                "autopilot_pause_reason": shared.get("autopilot_pause_reason", ""),
-                "writing_substep": shared.get("writing_substep", ""),
-            }
-        )
-        block_reason = resume_block_reason_from_status(shared_status)
-        if block_reason:
-            raise HTTPException(409, block_reason)
+        if not manual_pause:
+            shared_status = with_review_gate(
+                {
+                    "current_stage": current_stage_str,
+                    "needs_review": stage_needs_human_review(current_stage_str),
+                    "current_act": current_act,
+                    "current_auto_chapters": shared.get("current_auto_chapters", 0),
+                    "current_chapter_number": shared.get("current_chapter_number") or shared.get("_cached_current_chapter_number"),
+                    "autopilot_pending_macro_plan": shared.get("autopilot_pending_macro_plan"),
+                    "macro_structure_ready": shared.get("macro_structure_ready"),
+                    "active_invocation_session_id": shared.get("active_invocation_session_id", ""),
+                    "active_invocation_operation": shared.get("active_invocation_operation", ""),
+                    "active_invocation_node_key": shared.get("active_invocation_node_key", ""),
+                    "active_invocation_status": shared.get("active_invocation_status", ""),
+                    "active_invocation_policy": shared.get("active_invocation_policy", ""),
+                    "has_active_invocation": bool(shared.get("has_active_invocation", False)),
+                    "requires_ai_review": bool(shared.get("requires_ai_review", False)),
+                    "autopilot_pause_reason": shared.get("autopilot_pause_reason", ""),
+                    "writing_substep": shared.get("writing_substep", ""),
+                }
+            )
+            block_reason = resume_block_reason_from_status(shared_status)
+            if block_reason:
+                raise HTTPException(409, block_reason)
     else:
         # 降级路径：共享内存无数据，读 DB（在线程池中）
         def _resume_read_sync():
@@ -1868,6 +1989,8 @@ async def resume_from_review(novel_id: str):
             return {
                 "current_stage": n.current_stage.value if hasattr(n.current_stage, 'value') else str(n.current_stage),
                 "current_act": n.current_act or 0,
+                "autopilot_status": n.autopilot_status.value if hasattr(n.autopilot_status, "value") else str(n.autopilot_status),
+                "autopilot_recovery_reason": getattr(n, "autopilot_recovery_reason", "") or "",
             }
 
         try:
@@ -1883,8 +2006,13 @@ async def resume_from_review(novel_id: str):
 
         current_stage_str = novel_data["current_stage"]
         current_act = novel_data["current_act"]
+        manual_pause = (
+            str(novel_data.get("autopilot_status") or "").strip().lower() == "stopped"
+            and str(novel_data.get("autopilot_recovery_reason") or "").strip().lower()
+            == "manual_pause"
+        )
 
-        if not stage_needs_human_review(current_stage_str):
+        if not manual_pause and not stage_needs_human_review(current_stage_str):
             raise HTTPException(400, f"当前不在审阅等待状态（当前：{current_stage_str}）")
 
     try:
@@ -1901,8 +2029,20 @@ async def resume_from_review(novel_id: str):
     if canonical_block_reason:
         raise HTTPException(409, canonical_block_reason)
 
-    # 计算下一阶段
-    if _has_chapter_nodes_under_current_act(novel_id, current_act):
+    # A manual pause resumes its durable stable stage. Review resumes retain
+    # their existing structure-aware transition rules.
+    if manual_pause:
+        resumable_stages = {
+            NovelStage.MACRO_PLANNING.value,
+            NovelStage.ACT_PLANNING.value,
+            NovelStage.WRITING.value,
+            NovelStage.AUDITING.value,
+        }
+        if current_stage_str not in resumable_stages:
+            raise HTTPException(409, f"人工暂停的阶段不可恢复（当前：{current_stage_str}）")
+        next_stage = current_stage_str
+        msg = "已恢复：继续人工暂停前的自动驾驶阶段"
+    elif _has_chapter_nodes_under_current_act(novel_id, current_act):
         next_stage = NovelStage.WRITING.value
         msg = "已恢复：当前幕已有章节规划，进入正文撰写"
     else:
@@ -1914,11 +2054,22 @@ async def resume_from_review(novel_id: str):
     # ── 第二步：立即写入共享内存（前端立即可见）──
     try:
         from interfaces.runtime_state import update_shared_novel_state
-        update_shared_novel_state(novel_id,
-            autopilot_status="running",
-            current_stage=next_stage,
-            current_act=current_act,
-        )
+        if manual_pause:
+            update_shared_novel_state(
+                novel_id,
+                autopilot_status="running",
+                current_stage=next_stage,
+                current_act=current_act,
+                autopilot_pause_reason="",
+                autopilot_recovery_reason="",
+            )
+        else:
+            update_shared_novel_state(
+                novel_id,
+                autopilot_status="running",
+                current_stage=next_stage,
+                current_act=current_act,
+            )
     except Exception as e:
         logger.debug("刷新共享内存失败（可忽略）: %s", e)
 

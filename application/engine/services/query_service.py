@@ -65,6 +65,7 @@ _RUNTIME_STATUS_KEYS: tuple[str, ...] = (
     "has_active_invocation",
     "requires_ai_review",
     "autopilot_pause_reason",
+    "autopilot_recovery_reason",
     "autopilot_pending_chapter_number",
     "autopilot_pending_chapter_plan",
     "autopilot_pending_macro_plan",
@@ -233,6 +234,7 @@ class NovelStatusResponse:
     manuscript_chapters: int
     progress_pct_manuscript: float
     current_chapter_number: Optional[int]
+    autopilot_recovery_reason: str
     needs_review: bool
     auto_approve_mode: bool
     last_chapter_audit: Optional[Dict[str, Any]]
@@ -263,6 +265,7 @@ class NovelStatusResponse:
             "manuscript_chapters": self.manuscript_chapters,
             "progress_pct_manuscript": self.progress_pct_manuscript,
             "current_chapter_number": self.current_chapter_number,
+            "autopilot_recovery_reason": self.autopilot_recovery_reason,
             "needs_review": self.needs_review,
             "auto_approve_mode": self.auto_approve_mode,
             "last_chapter_audit": self.last_chapter_audit,
@@ -345,10 +348,9 @@ class QueryService:
         if state.target_chapters > 0:
             progress_pct = (completed_chapters / state.target_chapters) * 100
 
-        # 计算当前章节号
+        # Only a persisted or cached global chapter number is authoritative.
+        # An act-local position cannot be converted without the real act size.
         current_chapter_number = None
-        if state.current_act and state.current_chapter_in_act:
-            current_chapter_number = (state.current_act - 1) * 5 + state.current_chapter_in_act
 
         return NovelStatusResponse(
             novel_id=state.novel_id,
@@ -371,6 +373,7 @@ class QueryService:
             manuscript_chapters=completed_chapters,
             progress_pct_manuscript=round(progress_pct, 1),
             current_chapter_number=current_chapter_number,
+            autopilot_recovery_reason=state.autopilot_recovery_reason,
             needs_review=stage_needs_human_review(state.current_stage),
             auto_approve_mode=state.auto_approve_mode,
             last_chapter_audit=None,  # 需要单独存储
@@ -392,9 +395,9 @@ class QueryService:
 
         current_act = raw_data.get("current_act")
         current_chapter_in_act = raw_data.get("current_chapter_in_act")
-        current_chapter_number = raw_data.get("_cached_current_chapter_number")
-        if current_chapter_number is None and current_act and current_chapter_in_act:
-            current_chapter_number = (current_act - 1) * 5 + current_chapter_in_act
+        current_chapter_number = raw_data.get("current_chapter_number")
+        if current_chapter_number is None:
+            current_chapter_number = raw_data.get("_cached_current_chapter_number")
 
         return NovelStatusResponse(
             novel_id=novel_id,
@@ -417,6 +420,7 @@ class QueryService:
             manuscript_chapters=completed_chapters,
             progress_pct_manuscript=round(progress_pct, 1),
             current_chapter_number=current_chapter_number,
+            autopilot_recovery_reason=raw_data.get("autopilot_recovery_reason", ""),
             needs_review=stage_needs_human_review(raw_data.get("current_stage", "writing")),
             auto_approve_mode=raw_data.get("auto_approve_mode", False),
             last_chapter_audit=None,
@@ -443,7 +447,8 @@ class QueryService:
                 """SELECT id, title, autopilot_status, current_stage,
                           current_act, current_chapter_in_act, current_beat_index,
                           current_auto_chapters, target_chapters, target_words_per_chapter,
-                          consecutive_error_count, last_chapter_tension, auto_approve_mode
+                          consecutive_error_count, last_chapter_tension, auto_approve_mode,
+                          autopilot_recovery_reason
                    FROM novels WHERE id = ?""",
                 (novel_id,),
             )
@@ -520,6 +525,7 @@ class QueryService:
                 manuscript_chapters=manuscript_chapters,
                 progress_pct_manuscript=round(manuscript_chapters / target_chapters * 100, 1) if target_chapters else 0,
                 current_chapter_number=current_chapter_number,
+                autopilot_recovery_reason=novel_row["autopilot_recovery_reason"] or "",
                 needs_review=(
                     str(novel_row["current_stage"] or "").strip().lower()
                     in ("paused_for_review", "reviewing")

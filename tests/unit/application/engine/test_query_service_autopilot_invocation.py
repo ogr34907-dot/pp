@@ -234,3 +234,81 @@ def test_query_service_does_not_hydrate_pending_invocation_by_partial_novel_id(m
     assert status is not None
     assert status["active_invocation_session_id"] == ""
     assert "review_gate" not in status
+
+
+def test_query_service_does_not_invent_global_chapter_number_from_act_position():
+    """STATUS-001: act capacity is structural, not a fixed five-chapter constant."""
+    repo = SharedStateRepository(shared_dict={})
+    repo.set_novel_state(
+        "novel-1",
+        NovelState(
+            novel_id="novel-1",
+            title="Demo",
+            autopilot_status="running",
+            current_stage="writing",
+            current_act=1,
+            current_chapter_in_act=2,
+            current_beat_index=0,
+            current_auto_chapters=0,
+            target_chapters=20,
+            target_words_per_chapter=2500,
+            consecutive_error_count=0,
+            last_chapter_tension=0,
+            auto_approve_mode=False,
+            needs_review=False,
+        ),
+    )
+
+    status = QueryService(repo).get_novel_status_dict("novel-1")
+
+    assert status is not None
+    assert status["current_chapter_number"] is None
+
+
+def test_query_service_raw_status_does_not_invent_global_chapter_number():
+    """STATUS-001 applies equally to the legacy raw-state fallback."""
+    repo = SharedStateRepository(shared_dict={})
+    response = QueryService(repo)._build_status_from_raw(
+        "novel-1",
+        {
+            "title": "Demo",
+            "autopilot_status": "running",
+            "current_stage": "writing",
+            "current_act": 1,
+            "current_chapter_in_act": 2,
+            "target_chapters": 20,
+            "target_words_per_chapter": 2500,
+        },
+    )
+
+    assert response.current_chapter_number is None
+
+
+def test_query_service_exposes_the_durable_manual_pause_reason():
+    """AUTOPILOT-002: the cockpit can render an explicit resume control."""
+    repo = SharedStateRepository(shared_dict={})
+    repo.set_novel_state(
+        "novel-1",
+        NovelState(
+            novel_id="novel-1",
+            title="Demo",
+            autopilot_status="stopped",
+            current_stage="writing",
+            current_act=1,
+            current_chapter_in_act=2,
+            current_beat_index=0,
+            current_auto_chapters=0,
+            target_chapters=20,
+            target_words_per_chapter=2500,
+            consecutive_error_count=0,
+            last_chapter_tension=0,
+            auto_approve_mode=False,
+            needs_review=False,
+        ),
+    )
+    repo.merge_raw_state("novel-1", autopilot_recovery_reason="manual_pause")
+
+    status = QueryService(repo).get_novel_status_dict("novel-1")
+
+    assert status is not None
+    assert status["autopilot_recovery_reason"] == "manual_pause"

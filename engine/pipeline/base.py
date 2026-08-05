@@ -192,6 +192,16 @@ class BaseStoryPipeline(ABC):
                 # 验证失败不阻断管线，记录违规但继续
 
             # 6. 保存章节（独立短连接写库）
+            if self._novel_stream_should_stop(ctx.novel_id):
+                ctx.generation_interrupted = True
+                self._discard_generation_workspace(ctx)
+                step_status["save_chapter"] = "interrupted"
+                return self._make_result(
+                    ctx,
+                    success=False,
+                    error="interrupted",
+                    step_status=step_status,
+                )
             self._mark_pipeline_step(ctx, "save_chapter")
             r = await self._step_save_chapter(ctx)
             step_status["save_chapter"] = "ok" if r.passed else "failed"

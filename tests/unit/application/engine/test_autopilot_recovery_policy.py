@@ -14,7 +14,8 @@ class _Db:
             CREATE TABLE novels (
                 id TEXT PRIMARY KEY,
                 current_stage TEXT DEFAULT 'writing',
-                autopilot_status TEXT DEFAULT 'running'
+                autopilot_status TEXT DEFAULT 'running',
+                autopilot_recovery_reason TEXT DEFAULT ''
             );
             CREATE TABLE chapters (
                 id TEXT PRIMARY KEY,
@@ -109,6 +110,33 @@ def test_recovery_policy_retries_writing_and_discards_transient_generation():
     assert decision.chapter_number == 1
     assert decision.discard_transient_generation is True
     assert decision.reason == "retry_writing_step"
+
+
+def test_recovery_policy_preserves_manual_pause_without_discarding_working_draft():
+    """AUTOPILOT-002: a user pause is resumable, unlike an interrupted retry."""
+    db = _Db()
+    db.execute(
+        "INSERT INTO novels (id, current_stage, autopilot_status, autopilot_recovery_reason) "
+        "VALUES ('novel-1', 'writing', 'stopped', 'manual_pause')"
+    )
+    db.execute(
+        "INSERT INTO chapters (id, novel_id, number, status, content) "
+        "VALUES ('c1', 'novel-1', 1, 'draft', '可恢复的半章')"
+    )
+
+    policy = AutopilotRecoveryPolicy(db)
+    decision = policy.decide_on_start("novel-1")
+
+    assert decision.next_stage == "writing"
+    assert decision.chapter_number == 1
+    assert decision.discard_transient_generation is False
+    assert decision.discard_transient_invocations is False
+    assert decision.clear_pending_invocation is False
+    assert decision.reason == "resume_manual_pause"
+
+    policy.apply_transient_cleanup(decision)
+
+    assert db.fetch_one("SELECT content FROM chapters WHERE id = 'c1'")["content"] == "可恢复的半章"
 
 
 def test_recovery_policy_preserves_completed_chapter_for_auditing():

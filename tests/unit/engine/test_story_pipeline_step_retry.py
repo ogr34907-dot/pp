@@ -7,6 +7,7 @@ import pytest
 from engine.pipeline.base import BaseStoryPipeline
 from engine.pipeline.context import PipelineContext
 from engine.pipeline.prose_composer import ProseCompositionResult
+from engine.pipeline.steps import StepResult
 
 
 class _Pipeline(BaseStoryPipeline):
@@ -127,6 +128,63 @@ class _DetachedCompletedHistoryChapterRepo:
         return [SimpleNamespace(number=1, status="completed", content="第一章正文")]
 
 
+class _StopBeforeSavePipeline(BaseStoryPipeline):
+    """Small real pipeline harness that receives a stop after generation."""
+
+    def __init__(self):
+        super().__init__()
+        self.stop_requested = False
+        self.save_attempted = False
+
+    def _check_required_narrative_memory(self, ctx):
+        return StepResult.ok()
+
+    async def _step_find_next_chapter(self, ctx):
+        ctx.chapter_number = 1
+        return StepResult.ok()
+
+    async def _ensure_auxiliary_stages_drained(self, ctx):
+        return StepResult.ok()
+
+    async def _step_prepare_governance(self, ctx):
+        return StepResult.ok()
+
+    async def _step_prepare_chapter_plan(self, ctx):
+        return StepResult.ok()
+
+    async def _step_build_context(self, ctx):
+        return StepResult.ok()
+
+    async def _step_generate(self, ctx):
+        ctx.chapter_content = "不应在停止后落库的正文"
+        ctx.word_count = len(ctx.chapter_content)
+        return StepResult.ok()
+
+    async def _step_validate_content(self, ctx):
+        self.stop_requested = True
+        return StepResult.ok()
+
+    async def _step_save_chapter(self, ctx):
+        self.save_attempted = True
+        return StepResult.ok()
+
+    async def _step_validate_voice(self, ctx):
+        return StepResult.ok()
+
+    async def _step_run_post_commit(self, ctx):
+        ctx.narrative_sync_ok = True
+        return StepResult.ok()
+
+    async def _step_score_tension(self, ctx):
+        return StepResult.ok()
+
+    async def _step_finalize(self, ctx):
+        return StepResult.ok()
+
+    def _novel_stream_should_stop(self, novel_id):
+        return self.stop_requested
+
+
 @pytest.mark.asyncio
 async def test_story_pipeline_interrupted_generate_discards_workspace_and_does_not_commit_content():
     workspace = _Workspace()
@@ -150,6 +208,18 @@ async def test_story_pipeline_interrupted_generate_discards_workspace_and_does_n
     assert ctx.chapter_content == ""
     assert workspace.previews == {}
     assert any(run_id for _, _, run_id in workspace.discards)
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_does_not_save_when_stop_arrives_after_generate():
+    """AUTOPILOT-002: stopping between generation and persistence is fail-closed."""
+    pipeline = _StopBeforeSavePipeline()
+
+    result = await pipeline.run_chapter(PipelineContext(novel_id="novel-stop"))
+
+    assert result.success is False
+    assert result.error == "interrupted"
+    assert pipeline.save_attempted is False
 
 
 @pytest.mark.asyncio

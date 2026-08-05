@@ -59,6 +59,8 @@ export const apiRoutes = {
     status: (novelId: string) => apiRootPath('autopilot', novelId, 'status'),
     start: (novelId: string) => apiRootPath('autopilot', novelId, 'start'),
     stop: (novelId: string) => apiRootPath('autopilot', novelId, 'stop'),
+    pause: (novelId: string) => apiRootPath('autopilot', novelId, 'pause'),
+    terminate: (novelId: string) => apiRootPath('autopilot', novelId, 'terminate'),
     resume: (novelId: string) => apiRootPath('autopilot', novelId, 'resume'),
     stream: (novelId: string, params?: QueryParams) =>
       withQuery(apiRootPath('autopilot', novelId, 'stream'), params),

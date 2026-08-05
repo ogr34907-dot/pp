@@ -238,11 +238,30 @@
       <n-button v-if="canResumeReview" type="warning" ghost size="small" :loading="toggling" @click="resume">
         再次确认 · 继续
       </n-button>
-      <n-button v-if="!isRunning && !needsReview && !needsRecovery" type="primary" size="small" :loading="toggling" @click="openStartModal">
+      <n-button v-else-if="isManualPause" type="primary" size="small" :loading="toggling" @click="resume">
+        恢复
+      </n-button>
+      <n-button v-if="!isRunning && !needsReview && !needsRecovery && !isManualPause" type="primary" size="small" :loading="toggling" @click="openStartModal">
         🚀 启动全托管
       </n-button>
-      <n-button v-if="isRunning" type="error" ghost size="small" :loading="toggling" @click="stop">
-        ⏹ 停止
+      <n-button v-if="isRunning && !needsReview" type="warning" ghost size="small" :loading="toggling" @click="pause">
+        暂停
+      </n-button>
+      <n-popconfirm
+        v-if="canTerminate"
+        positive-text="终止"
+        negative-text="取消"
+        @positive-click="terminate"
+      >
+        <template #trigger>
+          <n-button type="error" ghost size="small" :loading="toggling">
+            终止
+          </n-button>
+        </template>
+        终止会清理当前未提交的临时生成内容，且不能恢复。
+      </n-popconfirm>
+      <n-button v-if="needsRecovery && !isRunning" type="primary" size="small" :loading="toggling" @click="retry">
+        重试
       </n-button>
       <!-- 🔥 error 状态下显示强制停止按钮（解除挂起 + 停止） -->
       <n-button v-if="needsRecovery && !isRunning" type="error" size="small" :loading="toggling" @click="forceStopFromError">
@@ -561,6 +580,13 @@ const needsRecovery = computed(
     status.value?.autopilot_status === 'error' ||
     (status.value?.consecutive_error_count || 0) >= 3
 )
+const isManualPause = computed(() => (
+  status.value?.autopilot_status === 'stopped' &&
+  status.value?.autopilot_recovery_reason === 'manual_pause'
+))
+const canTerminate = computed(() => (
+  (isRunning.value && !needsReview.value) || isManualPause.value
+))
 // 🔥 守护进程存活状态判断
 // 核心原则：如果 /status 接口成功返回了共享内存数据（_from_shared_memory），
 // 说明守护进程在运行（否则共享内存不会有数据），不应该仅靠心跳误判。
@@ -1286,32 +1312,30 @@ async function start() {
   }
 }
 
-async function stop() {
+async function pause() {
   if (isToggleThrottled()) return
-  // 🔥 乐观更新：立即更新本地状态，用户无需等待后端响应
   const prevStatus = status.value
   status.value = {
     ...status.value,
     autopilot_status: 'stopped',
+    autopilot_pause_reason: 'manual_pause',
+    autopilot_recovery_reason: 'manual_pause',
     needs_review: false,
     requires_ai_review: false,
     review_gate: null,
   }
   emit('status-change', status.value)
-  message.info('已停止')
+  message.info('已暂停')
   toggling.value = true
 
   try {
-    // 先关闭 SSE 连接，避免阻塞
     stopChapterStream()
-    // 发送停止请求（带超时）
     try {
-      await autopilotApi.stop(props.novelId, panelPerformance.stopRequestTimeoutMs)
+      await autopilotApi.pause(props.novelId, panelPerformance.stopRequestTimeoutMs)
     } catch (e) {
       if (e instanceof Error && e.name === 'AbortError') {
-        message.warning('停止请求超时，但后台可能已处理')
+        message.warning('暂停请求超时，但后台可能已处理')
       } else {
-        // 🔥 网络错误时回滚乐观更新
         status.value = prevStatus
         emit('status-change', prevStatus)
         throw e
@@ -1323,9 +1347,39 @@ async function stop() {
   }
 }
 
+async function terminate() {
+  if (isToggleThrottled()) return
+  const prevStatus = status.value
+  status.value = {
+    ...status.value,
+    autopilot_status: 'stopped',
+    autopilot_pause_reason: 'manual_terminate',
+    autopilot_recovery_reason: 'manual_terminate',
+    needs_review: false,
+    requires_ai_review: false,
+    review_gate: null,
+  }
+  emit('status-change', status.value)
+  toggling.value = true
+
+  try {
+    stopChapterStream()
+    await autopilotApi.terminate(props.novelId, panelPerformance.stopRequestTimeoutMs)
+    message.success('自动驾驶已终止')
+    void fetchStatus()
+  } catch (err) {
+    status.value = prevStatus
+    emit('status-change', prevStatus)
+    message.error('终止请求失败，请重试')
+  } finally {
+    toggling.value = false
+  }
+}
+
 async function resume() {
   if (isToggleThrottled()) return
-  if (!canResumeReview.value) {
+  const resumeManualPause = isManualPause.value
+  if (!canResumeReview.value && !resumeManualPause) {
     message.warning(reviewGateMessage.value || '当前还没有可确认的产物')
     return
   }
@@ -1339,10 +1393,14 @@ async function resume() {
       ...status.value,
       autopilot_status: 'running',
       current_stage: body.current_stage || 'writing',
+      autopilot_pause_reason: '',
+      autopilot_recovery_reason: '',
       needs_review: false,
     }
     emit('status-change', status.value)
-    message.success(body.message || reviewGateActionLabel.value || '已确认，继续自动驾驶')
+    message.success(
+      body.message || (resumeManualPause ? '已恢复自动驾驶' : reviewGateActionLabel.value || '已确认，继续自动驾驶')
+    )
     void fetchStatus()
   } catch (err) {
     if (isAutopilotHttpError(err)) {
@@ -1353,6 +1411,43 @@ async function resume() {
     status.value = prevStatus
     emit('status-change', prevStatus)
     message.error('恢复请求失败，请重试')
+  } finally {
+    toggling.value = false
+  }
+}
+
+async function retry() {
+  if (isToggleThrottled() || !needsRecovery.value) return
+  const prevStatus = status.value
+  const targetChapters = Number(status.value?.target_chapters || startConfig.value.target_chapters || 1)
+  const targetWords = Number(status.value?.target_words_per_chapter || startConfig.value.target_words_per_chapter || 2500)
+  const maxAutoChapters = Math.max(
+    Number(startConfig.value.max_auto_chapters || 1),
+    targetChapters + 20,
+  )
+  toggling.value = true
+
+  try {
+    await autopilotApi.start(props.novelId, {
+      max_auto_chapters: maxAutoChapters,
+      target_chapters: targetChapters,
+      target_words_per_chapter: targetWords,
+    })
+    status.value = {
+      ...status.value,
+      autopilot_status: 'running',
+      consecutive_error_count: 0,
+      autopilot_pause_reason: '',
+      autopilot_recovery_reason: '',
+    }
+    emit('status-change', status.value)
+    message.success('已提交重试')
+    reconnectAttempts = 0
+    void fetchStatus()
+  } catch (err) {
+    status.value = prevStatus
+    emit('status-change', prevStatus)
+    message.error('重试请求失败，请检查当前错误后再试')
   } finally {
     toggling.value = false
   }
@@ -1398,14 +1493,14 @@ async function forceStopFromError() {
   try {
     // 先关闭 SSE 连接
     stopChapterStream()
-    // 并行发送：stop 请求 + circuit-breaker/reset 请求
-    const stopPromise = autopilotApi.stop(props.novelId).catch(err => {
-      console.warn('[AutopilotPanel] 强制停止请求失败:', err)
+    // 并行发送：terminate 请求 + circuit-breaker/reset 请求
+    const terminatePromise = autopilotApi.terminate(props.novelId).catch(err => {
+      console.warn('[AutopilotPanel] 强制终止请求失败:', err)
     })
     const resetPromise = autopilotApi.resetCircuitBreaker(props.novelId).catch(err => {
       console.warn('[AutopilotPanel] 重置熔断器失败:', err)
     })
-    await Promise.allSettled([stopPromise, resetPromise])
+    await Promise.allSettled([terminatePromise, resetPromise])
     void fetchStatus()
   } catch (err) {
     // 即使失败也保持 stopped 状态（强制停止的含义）

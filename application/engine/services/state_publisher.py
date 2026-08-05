@@ -88,6 +88,7 @@ class StatePublisher:
                 has_active_invocation=bool(fields.get("has_active_invocation", False)),
                 requires_ai_review=fields.get("requires_ai_review", False),
                 autopilot_pause_reason=fields.get("autopilot_pause_reason", ""),
+                autopilot_recovery_reason=fields.get("autopilot_recovery_reason", ""),
             )
         else:
             # 更新字段
