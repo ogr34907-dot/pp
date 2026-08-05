@@ -29,6 +29,7 @@ class MockResponseFactory:
     def build(self, prompt: Prompt) -> str:
         intent = self._detect_intent(prompt)
         builders: Dict[str, Callable[[], str]] = {
+            "macro_refactor": self._macro_refactor,
             "macro_plan": self._macro_plan,
             "worldbuilding": self._worldbuilding,
             "characters": self._characters,
@@ -43,6 +44,13 @@ class MockResponseFactory:
     def _detect_intent(self, prompt: Prompt) -> str:
         text = f"{prompt.system}\n{prompt.user}".lower()
 
+        if (
+            "natural_language_suggestion" in text
+            and "suggested_mutations" in text
+            and "suggested_tags" in text
+            and "reasoning" in text
+        ):
+            return "macro_refactor"
         if "setup_main_plot_options_v1" in text or "plot_options" in text or "主线候选" in text:
             return "main_plot_options"
         if '"plot_outline"' in text or "剧情总纲" in text or "setup.plot_outline" in text:
@@ -418,6 +426,20 @@ class MockResponseFactory:
                     }
                 ],
                 "suggestions": ["配置真实模型后重新执行 AI 审阅。"],
+            }
+        )
+
+    def _macro_refactor(self) -> str:
+        return self._json(
+            {
+                "natural_language_suggestion": (
+                    "本地模拟仅确认提案契约；请在配置真实模型后生成针对当前事件的具体改写建议。"
+                ),
+                "suggested_mutations": [],
+                "suggested_tags": [],
+                "reasoning": (
+                    "无密钥模式不虚构人物、动机或标签变更，以免模拟结果被误用为真实叙事修改。"
+                ),
             }
         )
 

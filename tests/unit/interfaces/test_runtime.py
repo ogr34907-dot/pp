@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -102,6 +103,57 @@ def test_backend_lifecycle_skips_orphan_cleanup_when_disabled_by_environment(mon
         "start_daemon",
         "dag_registry",
     ]
+
+
+def test_startup_reset_persists_restart_interruption_reason(tmp_path, monkeypatch):
+    """AUTOPILOT-001: restart-stop is distinguishable from a user stop."""
+    database_path = tmp_path / "runtime-reset.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE novels (
+            id TEXT PRIMARY KEY,
+            autopilot_status TEXT NOT NULL,
+            autopilot_recovery_reason TEXT NOT NULL DEFAULT '',
+            updated_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO novels (id, autopilot_status) VALUES ('novel-1', 'running')"
+    )
+    connection.commit()
+
+    class _SqliteDatabase:
+        def fetch_one(self, sql, params=()):
+            row = connection.execute(sql, params).fetchone()
+            if row is None:
+                return None
+            names = [column[0] for column in connection.execute(sql, params).description]
+            return dict(zip(names, row))
+
+        def execute(self, sql, params=()):
+            return connection.execute(sql, params)
+
+        def commit(self):
+            connection.commit()
+
+        def get_connection(self):
+            return connection
+
+    database = _SqliteDatabase()
+    monkeypatch.setattr("application.paths.get_db_path", lambda: database_path)
+    monkeypatch.setattr("infrastructure.persistence.database.connection.get_database", lambda *_args: database)
+    lifecycle = BackendLifecycle(start_daemon=lambda: None, stop_daemon=lambda: None)
+
+    lifecycle.stop_all_running_novels()
+
+    row = connection.execute(
+        "SELECT autopilot_status, autopilot_recovery_reason FROM novels WHERE id = 'novel-1'"
+    ).fetchone()
+    connection.close()
+
+    assert row == ("stopped", "service_restart_interrupted")
 
 
 def test_backend_lifecycle_shutdown_orchestrates_cleanup(monkeypatch):

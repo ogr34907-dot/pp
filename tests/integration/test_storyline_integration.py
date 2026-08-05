@@ -1,4 +1,10 @@
 import pytest
+
+pytest.skip(
+    "Legacy JSON-file storyline repository was removed; current SQLite storyline coverage uses the production persistence path.",
+    allow_module_level=True,
+)
+
 import tempfile
 import shutil
 from pathlib import Path

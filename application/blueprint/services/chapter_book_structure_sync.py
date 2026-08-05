@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Set
+from typing import TYPE_CHECKING, Iterable, Optional, Set
 
 from domain.novel.value_objects.chapter_id import ChapterId
 from domain.novel.value_objects.novel_id import NovelId
@@ -16,6 +16,27 @@ if TYPE_CHECKING:
     from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 
 logger = logging.getLogger(__name__)
+
+
+def assert_chapter_rows_safe_to_delete(
+    chapters: Iterable[object],
+    *,
+    novel_id: str,
+    operation: str,
+) -> None:
+    """Reject a structural mutation before it removes authored chapter prose."""
+    authored = []
+    for chapter in chapters:
+        content = str(getattr(chapter, "content", "") or "").strip()
+        if content:
+            authored.append(int(getattr(chapter, "number", 0) or 0))
+
+    if authored:
+        numbers = ", ".join(str(number) for number in sorted(set(authored)))
+        raise ValueError(
+            f"拒绝{operation}：小说 {novel_id} 的第 {numbers} 章已有正文。"
+            "请先通过可恢复的重写流程处理正文。"
+        )
 
 
 def collect_structure_chapter_numbers(
@@ -48,7 +69,7 @@ def purge_chapter_book_rows_not_matching_structure(
         return 0
     structure_nums = collect_structure_chapter_numbers(story_node_repo, novel_id)
     novel_vo = NovelId(novel_id)
-    removed = 0
+    orphaned = []
     for ch in list(chapter_repository.list_by_novel(novel_vo)):
         try:
             cn = int(ch.number)
@@ -56,16 +77,18 @@ def purge_chapter_book_rows_not_matching_structure(
             continue
         if cn in structure_nums:
             continue
+        orphaned.append(ch)
+
+    assert_chapter_rows_safe_to_delete(
+        orphaned,
+        novel_id=novel_id,
+        operation="结构同步删除章节",
+    )
+
+    removed = 0
+    for ch in orphaned:
+        cn = int(ch.number)
         cid = getattr(ch.id, "value", ch.id)
-        text_preview = len((ch.content or "").strip())
-        if text_preview:
-            logger.warning(
-                "[chapter↔structure] novel=%s 删正文行 #%s (%s)：树无章节点，按要求同步删除（正文约 %s 字）",
-                novel_id,
-                cn,
-                cid,
-                text_preview,
-            )
         chapter_repository.delete(ChapterId(cid))
         removed += 1
     if removed:

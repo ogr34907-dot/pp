@@ -30,6 +30,10 @@ export const useDAGRunStore = defineStore('dagRun', () => {
   let _eventSource: EventSource | null = null
   let _reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let _reconnectAttempts = 0
+  let _sseNovelId: string | null = null
+  let _lastEventId: string | null = null
+  const _seenEventIds = new Set<string>()
+  const maxSeenEventIds = Math.max(100, runtimePerformance.dagSse.maxQueueSize * 4)
 
   // ─── 计算属性 ───
   const isRunning = computed(() => runStatus.value === 'running')
@@ -88,10 +92,14 @@ export const useDAGRunStore = defineStore('dagRun', () => {
   // ─── SSE 事件连接 ───
 
   function connectSSE(novelId: string, options: { resetReconnect?: boolean } = {}) {
+    if (_sseNovelId !== novelId) {
+      resetSSEEventTracking()
+      _sseNovelId = novelId
+    }
     disconnectSSE({ resetReconnect: options.resetReconnect ?? true })
 
     // 构建 SSE URL（由 dagApi 兼容 Tauri 桌面模式）
-    const url = dagApi.eventsUrl(novelId)
+    const url = dagApi.eventsUrl(novelId, _lastEventId ?? undefined)
 
     try {
       const source = new EventSource(url)
@@ -104,49 +112,49 @@ export const useDAGRunStore = defineStore('dagRun', () => {
         sseConnected.value = true
         sseError.value = null
         _reconnectAttempts = 0
+        // Process restart or replay-cache eviction is reconciled from the authoritative snapshot.
+        void fetchStatus(novelId)
       }
 
       source.onmessage = (event) => {
         if (_eventSource !== source) return
-        try {
-          const data = JSON.parse(event.data) as NodeEvent
+        const data = parseSSEPayload<NodeEvent>(event)
+        if (data) {
           handleSSEMessage(data)
-        } catch {
-          // 忽略解析错误
         }
       }
 
       // 监听特定事件类型
       source.addEventListener('node_status_change', (event) => {
         if (_eventSource !== source) return
-        try {
-          const data = JSON.parse((event as MessageEvent).data) as NodeEvent
+        const data = parseSSEPayload<NodeEvent>(event as MessageEvent)
+        if (data) {
           handleNodeStatusChange(data)
-        } catch { /* ignore */ }
+        }
       })
 
       source.addEventListener('node_output', (event) => {
         if (_eventSource !== source) return
-        try {
-          const data = JSON.parse((event as MessageEvent).data) as NodeEvent
+        const data = parseSSEPayload<NodeEvent>(event as MessageEvent)
+        if (data) {
           handleNodeOutput(data)
-        } catch { /* ignore */ }
+        }
       })
 
       source.addEventListener('edge_data_flow', (event) => {
         if (_eventSource !== source) return
-        try {
-          const data = JSON.parse((event as MessageEvent).data) as NodeEvent
+        const data = parseSSEPayload<NodeEvent>(event as MessageEvent)
+        if (data) {
           handleEdgeFlow(data)
-        } catch { /* ignore */ }
+        }
       })
 
       source.addEventListener('dag_run_complete', (event) => {
         if (_eventSource !== source) return
-        try {
-          const data = JSON.parse((event as MessageEvent).data) as DAGRunResult
+        const data = parseSSEPayload<DAGRunResult>(event as MessageEvent)
+        if (data) {
           handleDAGRunComplete(data)
-        } catch { /* ignore */ }
+        }
       })
 
       source.onerror = () => {
@@ -192,6 +200,40 @@ export const useDAGRunStore = defineStore('dagRun', () => {
         connectSSE(novelId, { resetReconnect: false })
       }
     }, delayMs)
+  }
+
+  function resetSSEEventTracking() {
+    _lastEventId = null
+    _seenEventIds.clear()
+  }
+
+  function parseSSEPayload<T>(event: MessageEvent): T | null {
+    try {
+      const data = JSON.parse(event.data) as T
+      const payloadEventId = (data as { event_id?: unknown }).event_id
+      const eventId = event.lastEventId || (typeof payloadEventId === 'string' ? payloadEventId : '')
+      if (eventId && !rememberSSEEventId(eventId)) {
+        return null
+      }
+      return data
+    } catch {
+      return null
+    }
+  }
+
+  function rememberSSEEventId(eventId: string): boolean {
+    if (_seenEventIds.has(eventId)) {
+      return false
+    }
+    _seenEventIds.add(eventId)
+    _lastEventId = eventId
+    if (_seenEventIds.size > maxSeenEventIds) {
+      const oldest = _seenEventIds.values().next().value
+      if (oldest) {
+        _seenEventIds.delete(oldest)
+      }
+    }
+    return true
   }
 
   // ─── SSE 事件处理回调 ───
@@ -337,6 +379,8 @@ export const useDAGRunStore = defineStore('dagRun', () => {
     nodeStates.value = {}
     sseError.value = null
     disconnectSSE()
+    resetSSEEventTracking()
+    _sseNovelId = null
     disconnectAutopilotLog()
   }
 

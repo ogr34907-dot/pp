@@ -240,12 +240,16 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
             **merged,
         )
 
+    generation_prefs = getattr(novel, "generation_prefs", None)
+    locked_genre = str(
+        getattr(generation_prefs, "locked_genre", getattr(novel, "genre", "")) or ""
+    ).strip()
     ctx = runner._make_context(
         novel_id=novel_id,
         target_word_count=target_words,
         phase=runner._get_novel_phase(novel),
         auto_approve_mode=getattr(novel, "auto_approve_mode", False),
-        genre=getattr(novel, "genre", ""),
+        genre=locked_genre,
         era=getattr(novel, "era", "ancient"),
     )
     ctx.writing_progress_sink = _writing_sink

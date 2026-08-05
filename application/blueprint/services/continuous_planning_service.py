@@ -52,6 +52,7 @@ from application.blueprint.services.chapter_continuity_ledger import ChapterCont
 from application.blueprint.services.chapter_planning_policy import validate_lightweight_act_plan
 from application.audit.services.macro_merge_engine import MacroMergeEngine, MergePlan, MergeConflictException
 from application.blueprint.services.chapter_book_structure_sync import (
+    assert_chapter_rows_safe_to_delete,
     collect_structure_chapter_numbers,
     purge_chapter_book_rows_not_matching_structure,
 )
@@ -1330,7 +1331,7 @@ class ContinuousPlanningService:
         novel_id: str,
         structure: List[Dict],
     ) -> Dict:
-        """先安全合并，失败则回退为一次性写入（与全托管守护进程行为一致）。"""
+        """Persist through the safe merge path and preserve its failure semantics."""
         try:
             await self.confirm_macro_plan_safe(novel_id=novel_id, structure=structure)
             count = await self._count_macro_structure_nodes(novel_id)
@@ -1340,10 +1341,12 @@ class ContinuousPlanningService:
                 "message": f"已同步 {count} 个结构节点",
             }
         except Exception as e:
-            logger.warning(
-                f"[{novel_id}] confirm_macro_plan_safe 失败，回退 confirm_macro_plan：{e}"
+            logger.error(
+                "[%s] confirm_macro_plan_safe failed; preserving existing structure: %s",
+                novel_id,
+                e,
             )
-            return await self.confirm_macro_plan(novel_id=novel_id, structure=structure)
+            raise
 
     def build_minimal_macro_structure(
         self,
@@ -1563,6 +1566,22 @@ class ContinuousPlanningService:
         """同一幕再次确认规划时，先删掉本幕下已有章节节点及对应正文行、元素关联，避免重复堆积。"""
         children = self.story_node_repo.get_children_sync(act_id)
         chapter_nodes = [n for n in children if n.node_type == NodeType.CHAPTER]
+        if self.chapter_repository and chapter_nodes:
+            novel_id = str(chapter_nodes[0].novel_id)
+            node_ids = {str(node.id) for node in chapter_nodes}
+            node_numbers = {int(node.number) for node in chapter_nodes}
+            chapter_rows = list(self.chapter_repository.list_by_novel(NovelId(novel_id)))
+            candidates = [
+                chapter
+                for chapter in chapter_rows
+                if str(getattr(getattr(chapter, "id", None), "value", getattr(chapter, "id", ""))) in node_ids
+                or int(getattr(chapter, "number", 0) or 0) in node_numbers
+            ]
+            assert_chapter_rows_safe_to_delete(
+                candidates,
+                novel_id=novel_id,
+                operation="幕级重规划删除章节",
+            )
         for n in chapter_nodes:
             await self.chapter_element_repo.delete_by_chapter(n.id)
             if self.chapter_repository:
@@ -1665,6 +1684,11 @@ class ContinuousPlanningService:
             for n in range(next_global_number, next_global_number + len(chapters)):
                 existing = self.chapter_repository.get_by_novel_and_number(novel_id_vo, n)
                 if existing is not None:
+                    assert_chapter_rows_safe_to_delete(
+                        [existing],
+                        novel_id=novel_id_str,
+                        operation="幕级重规划清理章节",
+                    )
                     cid = getattr(existing.id, "value", existing.id)
                     self.chapter_repository.delete(ChapterId(cid))
                     logger.warning(
@@ -1796,6 +1820,66 @@ class ContinuousPlanningService:
                 "message": f"继续第 {current_act.number} 幕"
             }
 
+    async def _preflight_next_act_creation(
+        self,
+        novel_id: str,
+        current_act: StoryNode,
+        parent_volume_id: Optional[str],
+    ) -> str:
+        """Validate the same structural boundaries used before daemon act planning."""
+        if current_act.node_type != NodeType.ACT or current_act.novel_id != novel_id:
+            raise ValueError(f"当前幕不属于小说: {current_act.id}")
+
+        nodes = list(await self.story_node_repo.get_by_novel(novel_id))
+        parent_id = parent_volume_id or current_act.parent_id
+        if not parent_id:
+            raise ValueError(f"当前幕缺少父卷: {current_act.id}")
+
+        parent_volume = next((node for node in nodes if node.id == parent_id), None)
+        if parent_volume is None:
+            parent_volume = await self.story_node_repo.get_by_id(parent_id)
+        if (
+            parent_volume is None
+            or parent_volume.node_type != NodeType.VOLUME
+            or parent_volume.novel_id != novel_id
+        ):
+            raise ValueError(f"下一幕父卷不存在或类型错误: {parent_id}")
+
+        target_limit = self._target_chapter_limit(novel_id)
+        if target_limit is not None:
+            highest_planned_chapter = max(
+                (
+                    int(node.number)
+                    for node in nodes
+                    if node.node_type == NodeType.CHAPTER
+                ),
+                default=0,
+            )
+            if highest_planned_chapter >= target_limit:
+                raise ValueError(
+                    f"已规划至目标章节数 {target_limit}，不能继续创建新幕"
+                )
+
+            acts_per_volume = calculate_structure_params(target_limit)["acts_per_volume"]
+            act_count = sum(
+                1
+                for node in nodes
+                if node.node_type == NodeType.ACT and node.parent_id == parent_volume.id
+            )
+            if act_count >= acts_per_volume:
+                raise ValueError(
+                    f"父卷已达到幕容量 {acts_per_volume}，请先创建或选择下一卷"
+                )
+
+        next_act_number = int(current_act.number) + 1
+        if any(
+            node.node_type == NodeType.ACT and int(node.number) == next_act_number
+            for node in nodes
+        ):
+            raise ValueError(f"第 {next_act_number} 幕已存在，不能重复创建")
+
+        return parent_volume.id
+
     async def create_next_act_auto(
         self,
         novel_id: str,
@@ -1809,12 +1893,11 @@ class ContinuousPlanningService:
         if not current_act:
             raise ValueError(f"当前幕不存在: {current_act_id}")
 
-        parent_id = current_act.parent_id
-        if parent_volume_id is not None:
-            parent_volume = await self.story_node_repo.get_by_id(parent_volume_id)
-            if not parent_volume or parent_volume.node_type != NodeType.VOLUME:
-                raise ValueError(f"下一幕父卷不存在或类型错误: {parent_volume_id}")
-            parent_id = parent_volume.id
+        parent_id = await self._preflight_next_act_creation(
+            novel_id=novel_id,
+            current_act=current_act,
+            parent_volume_id=parent_volume_id,
+        )
 
         bible_context = self._get_bible_context(novel_id)
         next_act_info = await self._generate_next_act_info(novel_id, current_act, bible_context)
@@ -2194,10 +2277,17 @@ class ContinuousPlanningService:
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as e:
-            logger.error("Failed to parse planning JSON: %s", e)
-            logger.error("Planning content length: %d", len(cleaned))
-            logger.error("Planning raw content (first 1000 chars): %s", cleaned[:1000])
-            logger.error("Planning raw content (last 500 chars): %s", cleaned[-500:])
+            content_digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+            logger.error(
+                "Failed to parse planning JSON: error_type=%s line=%s column=%s "
+                "position=%s content_length=%s content_sha256=%s",
+                type(e).__name__,
+                e.lineno,
+                e.colno,
+                e.pos,
+                len(cleaned),
+                content_digest,
+            )
             raise
 
     def _calculate_chapter_distribution(self, total_chapters: int, parts: int) -> Dict[str, List[int]]:

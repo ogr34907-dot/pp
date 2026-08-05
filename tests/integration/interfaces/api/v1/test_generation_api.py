@@ -106,7 +106,13 @@ def mock_hosted_service():
 
 
 @pytest.fixture
-def app(mock_workflow, mock_storyline_manager, mock_plot_arc_repository, mock_hosted_service):
+def app(
+    mock_workflow,
+    mock_storyline_manager,
+    mock_plot_arc_repository,
+    mock_hosted_service,
+    monkeypatch,
+):
     """创建测试应用"""
     test_app = FastAPI()
     test_app.include_router(router, prefix="/api/v1")
@@ -154,7 +160,7 @@ def app(mock_workflow, mock_storyline_manager, mock_plot_arc_repository, mock_ho
 
     from application.engine.services import query_service
 
-    query_service.get_query_service = lambda: _FakeQueryService()
+    monkeypatch.setattr(query_service, "get_query_service", lambda: _FakeQueryService())
 
     return test_app
 

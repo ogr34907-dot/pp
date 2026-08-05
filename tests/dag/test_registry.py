@@ -1,7 +1,20 @@
 """节点注册表测试"""
 import pytest
-from application.engine.dag.models import NodeCategory, NodeConfig, NodeMeta, NodePort, PortDataType
+from application.engine.dag.models import (
+    NodeCategory,
+    NodeConfig,
+    NodeMeta,
+    NodePort,
+    PortDataType,
+    get_default_dag,
+)
 from application.engine.dag.registry import BaseNode, NodeRegistry
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _load_builtin_dag_nodes():
+    """Preload the production registry so test isolation covers cached imports."""
+    NodeRegistry.ensure_builtins_loaded()
 
 
 class TestNodeRegistry:
@@ -9,8 +22,17 @@ class TestNodeRegistry:
 
     def setup_method(self):
         """每个测试前清理注册表"""
+        self._registry_snapshot = NodeRegistry._registry.copy()
+        self._meta_registry_snapshot = NodeRegistry._meta_registry.copy()
         NodeRegistry._registry.clear()
         NodeRegistry._meta_registry.clear()
+
+    def teardown_method(self):
+        """恢复被测试隔离的生产节点定义。"""
+        NodeRegistry._registry.clear()
+        NodeRegistry._registry.update(self._registry_snapshot)
+        NodeRegistry._meta_registry.clear()
+        NodeRegistry._meta_registry.update(self._meta_registry_snapshot)
 
     def test_register_node(self):
         @NodeRegistry.register("test_node_a")
@@ -102,3 +124,10 @@ class TestNodeRegistry:
 
         all_meta = NodeRegistry.all_meta()
         assert "test_node_e" in all_meta
+
+
+def test_registry_examples_leave_default_dag_constructible():
+    """Custom registry examples must not unload production DAG node definitions."""
+    dag = get_default_dag()
+
+    assert {node.type for node in dag.nodes} >= {"ctx_blueprint", "exec_writer", "val_style"}

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from application.core.v1_length_tiers import build_v1_structure_black_box_hint
 from application.ai_invocation.variable_backfill import VariableHubBackfillService
 from application.ai_invocation.variable_hub import InMemoryVariableHubRepository, VariableWrite
+from domain.novel.value_objects.generation_preferences import GenerationPreferences
 from domain.novel.value_objects.novel_id import NovelId
 
 
@@ -114,3 +115,36 @@ def test_variable_hub_backfill_does_not_overwrite_existing_values():
 
     assert result.skipped_existing == 1
     assert repo.get_value("novel.setup.title", "novel_id:novel-1").value == "新标题"
+
+
+def test_variable_hub_backfill_reads_locked_settings_from_generation_preferences():
+    """SETTING-001: the modern aggregate source must populate setup variables."""
+    repo = InMemoryVariableHubRepository()
+    novel = SimpleNamespace(
+        novel_id=NovelId("novel-1"),
+        title="设定链路测试",
+        premise="主角在旧城破解王朝债务谜团。",
+        target_chapters=30,
+        target_words_per_chapter=2500,
+        generation_prefs=GenerationPreferences(
+            locked_genre="TRACE_GENRE",
+            locked_world_preset="TRACE_WORLD",
+            locked_story_structure="TRACE_STRUCTURE",
+            locked_pacing_control="TRACE_PACING",
+            locked_writing_style="TRACE_STYLE",
+            locked_special_requirements="TRACE_TABOO",
+        ),
+    )
+
+    VariableHubBackfillService(
+        variable_hub_repository=repo,
+        novel_repository=_NovelRepo([novel]),
+    ).backfill_novel("novel-1")
+
+    context_key = "novel_id:novel-1"
+    assert repo.get_value("novel.setup.genre_label", context_key).value == "TRACE_GENRE"
+    assert repo.get_value("novel.setup.world_preset", context_key).value == "TRACE_WORLD"
+    assert repo.get_value("novel.setup.story_structure", context_key).value == "TRACE_STRUCTURE"
+    assert repo.get_value("novel.setup.pacing_control", context_key).value == "TRACE_PACING"
+    assert repo.get_value("novel.setup.writing_style", context_key).value == "TRACE_STYLE"
+    assert repo.get_value("novel.setup.special_requirements", context_key).value == "TRACE_TABOO"

@@ -37,7 +37,9 @@ class SqliteNovelRepository(NovelRepository):
                 id, title, slug, author, target_chapters, premise,
                 autopilot_status, auto_approve_mode, current_stage, current_act, current_chapter_in_act,
                 max_auto_chapters, current_auto_chapters, last_chapter_tension,
-                consecutive_error_count, current_beat_index, beats_completed,
+                consecutive_error_count, current_beat_index,
+                autopilot_run_epoch, active_pipeline_step, active_pipeline_run_id,
+                last_stable_stage, autopilot_recovery_reason, beats_completed,
                 last_audit_chapter_number, last_audit_similarity, last_audit_drift_alert,
                 last_audit_narrative_ok, last_audit_at,
                 last_audit_vector_stored, last_audit_foreshadow_stored,
@@ -45,7 +47,11 @@ class SqliteNovelRepository(NovelRepository):
                 target_words_per_chapter, audit_progress, generation_prefs_json,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 slug = excluded.slug,
@@ -62,6 +68,11 @@ class SqliteNovelRepository(NovelRepository):
                 last_chapter_tension = excluded.last_chapter_tension,
                 consecutive_error_count = excluded.consecutive_error_count,
                 current_beat_index = excluded.current_beat_index,
+                autopilot_run_epoch = excluded.autopilot_run_epoch,
+                active_pipeline_step = excluded.active_pipeline_step,
+                active_pipeline_run_id = excluded.active_pipeline_run_id,
+                last_stable_stage = excluded.last_stable_stage,
+                autopilot_recovery_reason = excluded.autopilot_recovery_reason,
                 beats_completed = excluded.beats_completed,
                 last_audit_chapter_number = excluded.last_audit_chapter_number,
                 last_audit_similarity = excluded.last_audit_similarity,
@@ -95,6 +106,13 @@ class SqliteNovelRepository(NovelRepository):
         last_chapter_tension = getattr(novel, 'last_chapter_tension', 0)
         consecutive_error_count = getattr(novel, 'consecutive_error_count', 0)
         current_beat_index = getattr(novel, 'current_beat_index', 0)
+        autopilot_run_epoch = int(getattr(novel, "autopilot_run_epoch", 0) or 0)
+        active_pipeline_step = str(getattr(novel, "active_pipeline_step", "") or "")
+        active_pipeline_run_id = str(getattr(novel, "active_pipeline_run_id", "") or "")
+        last_stable_stage = str(getattr(novel, "last_stable_stage", "") or "")
+        autopilot_recovery_reason = str(
+            getattr(novel, "autopilot_recovery_reason", "") or ""
+        )
         beats_completed = 1 if getattr(novel, 'beats_completed', False) else 0
         lacn = getattr(novel, "last_audit_chapter_number", None)
         lasim = getattr(novel, "last_audit_similarity", None)
@@ -134,6 +152,11 @@ class SqliteNovelRepository(NovelRepository):
             last_chapter_tension,
             consecutive_error_count,
             current_beat_index,
+            autopilot_run_epoch,
+            active_pipeline_step,
+            active_pipeline_run_id,
+            last_stable_stage,
+            autopilot_recovery_reason,
             beats_completed,
             lacn,
             lasim,
@@ -347,6 +370,7 @@ class SqliteNovelRepository(NovelRepository):
             active_pipeline_step=row.get("active_pipeline_step", "") or "",
             active_pipeline_run_id=row.get("active_pipeline_run_id", "") or "",
             last_stable_stage=row.get("last_stable_stage", "") or "",
+            autopilot_recovery_reason=row.get("autopilot_recovery_reason", "") or "",
             beats_completed=bool(row.get('beats_completed', 0)),
             last_audit_chapter_number=row.get("last_audit_chapter_number"),
             last_audit_similarity=row.get("last_audit_similarity"),

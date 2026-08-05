@@ -1,13 +1,17 @@
 """Manual test script for Voice API"""
-import requests
 import json
 import uuid
+
+import pytest
+
+pytestmark = pytest.mark.manual
 
 BASE_URL = "http://localhost:8000/api/v1"
 
 
 def test_voice_api():
     """手动测试 Voice API"""
+    import requests
 
     # 1. 创建测试小说
     novel_id = f"test-voice-{uuid.uuid4().hex[:8]}"
@@ -101,6 +105,8 @@ def test_voice_api():
 
 
 if __name__ == "__main__":
+    import requests
+
     try:
         test_voice_api()
     except requests.exceptions.ConnectionError:

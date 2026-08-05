@@ -53,6 +53,7 @@ class Novel(BaseEntity):
         active_pipeline_step: str = "",
         active_pipeline_run_id: str = "",
         last_stable_stage: str = "",
+        autopilot_recovery_reason: str = "",
         beats_completed: bool = False,  # 当前章节所有节拍是否已完成
         last_audit_chapter_number: Optional[int] = None,
         last_audit_similarity: Optional[float] = None,
@@ -97,6 +98,7 @@ class Novel(BaseEntity):
         self.active_pipeline_step = active_pipeline_step
         self.active_pipeline_run_id = active_pipeline_run_id
         self.last_stable_stage = last_stable_stage
+        self.autopilot_recovery_reason = autopilot_recovery_reason
         self.beats_completed = beats_completed
 
         # 全托管章末审阅快照

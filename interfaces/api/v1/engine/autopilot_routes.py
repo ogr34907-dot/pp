@@ -1,15 +1,18 @@
 """自动驾驶控制 API（v2：含审阅确认 + SSE 生成流）"""
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import sqlite3
 import time
+import uuid
+from collections import deque
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from domain.novel.entities.novel import AutopilotStatus, NovelStage
 from domain.novel.entities.chapter import ChapterStatus
 from domain.novel.value_objects.novel_id import NovelId
@@ -45,6 +48,105 @@ from interfaces.api.v1.engine.autopilot_runtime_settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# General cockpit events need a short reconnect window. Durable log replay remains
+# owned by the existing after_seq ring/file path rather than a second store.
+_AUTOPILOT_SSE_PROCESS_EPOCH = uuid.uuid4().hex
+_autopilot_sse_event_history: Dict[str, Deque[Dict[str, Any]]] = {}
+_autopilot_sse_event_sequences: Dict[str, int] = {}
+_autopilot_sse_event_fingerprints: Dict[str, Dict[str, str]] = {}
+_AUTOPILOT_SSE_EPHEMERAL_TYPES = {"connected", "heartbeat"}
+
+
+def _autopilot_sse_history_for_novel(novel_id: str) -> Deque[Dict[str, Any]]:
+    max_size = get_autopilot_runtime_settings().log_stream_max_events
+    history = _autopilot_sse_event_history.get(novel_id)
+    if history is None or history.maxlen != max_size:
+        history = deque(history or (), maxlen=max_size)
+        _autopilot_sse_event_history[novel_id] = history
+    return history
+
+
+def _autopilot_event_fingerprint(event_data: Dict[str, Any]) -> str:
+    stable_payload = {
+        "type": event_data.get("type"),
+        "message": event_data.get("message"),
+        "metadata": event_data.get("metadata"),
+        "event_type": event_data.get("event_type"),
+    }
+    encoded = json.dumps(
+        stable_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _record_autopilot_sse_event(novel_id: str, event_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Assign one stable ID to each retained semantic cockpit event."""
+    history = _autopilot_sse_history_for_novel(novel_id)
+    fingerprints = _autopilot_sse_event_fingerprints.setdefault(novel_id, {})
+    fingerprint = _autopilot_event_fingerprint(event_data)
+    known_event_id = fingerprints.get(fingerprint)
+    if known_event_id:
+        for retained in history:
+            if retained.get("event_id") == known_event_id:
+                return dict(retained)
+
+    sequence = _autopilot_sse_event_sequences.get(novel_id, 0) + 1
+    _autopilot_sse_event_sequences[novel_id] = sequence
+    event = dict(event_data)
+    event["event_id"] = f"{_AUTOPILOT_SSE_PROCESS_EPOCH}:{sequence}"
+    history.append(event)
+    fingerprints[fingerprint] = event["event_id"]
+
+    retained_ids = {retained.get("event_id") for retained in history}
+    for existing_fingerprint, event_id in list(fingerprints.items()):
+        if event_id not in retained_ids:
+            del fingerprints[existing_fingerprint]
+    return event
+
+
+def _autopilot_events_after_cursor(novel_id: str, cursor: Optional[str]) -> List[Dict[str, Any]]:
+    if not cursor:
+        return []
+    history = list(_autopilot_sse_event_history.get(novel_id, ()))
+    for index, event in enumerate(history):
+        if event.get("event_id") == cursor:
+            return [dict(replayed) for replayed in history[index + 1:]]
+    return []
+
+
+def _log_seq_from_event_id(event_id: Optional[str]) -> Optional[int]:
+    if not event_id:
+        return None
+    prefix = f"{_AUTOPILOT_SSE_PROCESS_EPOCH}:log:"
+    if not event_id.startswith(prefix):
+        return None
+    try:
+        return int(event_id.removeprefix(prefix))
+    except ValueError:
+        return None
+
+
+def _format_autopilot_sse_event(novel_id: str, event_data: Dict[str, Any]) -> str:
+    """Keep the default onmessage transport while attaching a standard SSE ID."""
+    event = dict(event_data)
+    event_type = str(event.get("type", "message"))
+    if event_type == "log_line":
+        metadata = event.get("metadata")
+        sequence = metadata.get("seq") if isinstance(metadata, dict) else None
+        if isinstance(sequence, int):
+            event["event_id"] = f"{_AUTOPILOT_SSE_PROCESS_EPOCH}:log:{sequence}"
+    elif event_type not in _AUTOPILOT_SSE_EPHEMERAL_TYPES and not event.get("event_id"):
+        event = _record_autopilot_sse_event(novel_id, event)
+
+    event_id = event.get("event_id")
+    id_line = f"id: {event_id}\n" if event_id else ""
+    return f"{id_line}data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
 def _open_sqlite_diagnostic_connection(db_path: Any) -> sqlite3.Connection:
@@ -165,6 +267,7 @@ def _persist_autopilot_running_sync(
         active_pipeline_step="",
         active_pipeline_run_id="",
         last_stable_stage=decision.next_stage,
+        autopilot_recovery_reason="",
     )
 
     pq = get_persistence_queue()
@@ -183,7 +286,8 @@ def _persist_autopilot_running_sync(
             ap,
         )
         get_database().execute(
-            """UPDATE novels SET autopilot_status = 'running', updated_at = CURRENT_TIMESTAMP
+            """UPDATE novels SET autopilot_status = 'running',
+               autopilot_recovery_reason = '', updated_at = CURRENT_TIMESTAMP
                WHERE id = ?""",
             (novel_id,),
         )
@@ -204,6 +308,7 @@ def _persist_autopilot_running_sync(
             active_pipeline_step = '',
             active_pipeline_run_id = '',
             last_stable_stage = ?,
+            autopilot_recovery_reason = '',
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
@@ -247,6 +352,7 @@ def _persist_autopilot_resume_sync(
         active_pipeline_step="",
         active_pipeline_run_id="",
         last_stable_stage=resolved_stage.value,
+        autopilot_recovery_reason="",
     )
     return result
 
@@ -663,7 +769,7 @@ def _build_autopilot_status_sync(novel_id: str) -> Optional[Dict[str, Any]]:
         "active_pipeline_run_id": novel.get("active_pipeline_run_id", "") if isinstance(novel, dict) else "",
         "last_stable_stage": novel.get("last_stable_stage", "") if isinstance(novel, dict) else "",
         "autopilot_run_epoch": novel.get("autopilot_run_epoch", 0) if isinstance(novel, dict) else 0,
-        "autopilot_recovery_reason": novel.get("autopilot_recovery_reason", "") if isinstance(novel, dict) else "",
+        "autopilot_recovery_reason": novel.get("autopilot_recovery_reason", "") if isinstance(novel, dict) else getattr(novel, "autopilot_recovery_reason", ""),
     })
 
 
@@ -1233,9 +1339,9 @@ def _autopilot_events_tick_sync(novel_repo, chapter_repo, novel_id: str) -> Tupl
     return data, should_break
 
 
-def _log_stream_replay_sync(novel_id: str, after_seq: int, last_seq_cursor: int) -> Tuple[List[str], int]:
-    """历史快照重放：返回待 yield 的完整 SSE 行与更新后的 last_seq_cursor。"""
-    out: List[str] = []
+def _log_stream_replay_sync(novel_id: str, after_seq: int, last_seq_cursor: int) -> Tuple[List[Dict[str, Any]], int]:
+    """历史快照重放：返回日志事件与更新后的 last_seq_cursor。"""
+    out: List[Dict[str, Any]] = []
     last = last_seq_cursor
     if after_seq == 0:
         for snap in snapshot_for_novel(novel_id, limit=400):
@@ -1250,7 +1356,7 @@ def _log_stream_replay_sync(novel_id: str, after_seq: int, last_seq_cursor: int)
                     "replay": True,
                 },
             }
-            out.append(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
+            out.append(ev)
             last = max(last, snap.seq)
     return out, last
 
@@ -1943,6 +2049,11 @@ async def reset_circuit_breaker(novel_id: str):
 async def autopilot_log_stream(
     novel_id: str,
     after_seq: int = Query(0, ge=0, description="仅推送 seq 大于该值的守护进程日志行；重连时传入上次最后一条 seq"),
+    after_event_id: Optional[str] = Query(
+        default=None,
+        description="主动重连时传入最后处理的普通 SSE event id",
+    ),
+    last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
 ):
     """
     SSE 实时日志流（用于监控大盘）
@@ -1950,6 +2061,14 @@ async def autopilot_log_stream(
     - log_line: API 进程内存环 + LOG_FILE 增量 tail（独立守护进程日志，按书目过滤）
     - beat_start / beat_complete / stage_change / progress 等：状态机摘要
     """
+    after_seq = after_seq if isinstance(after_seq, int) else 0
+    resume_cursor = after_event_id if isinstance(after_event_id, str) and after_event_id else None
+    if resume_cursor is None and isinstance(last_event_id, str) and last_event_id:
+        resume_cursor = last_event_id
+    if after_seq == 0:
+        after_seq = _log_seq_from_event_id(resume_cursor) or 0
+    replayed_general_events = _autopilot_events_after_cursor(novel_id, resume_cursor)
+
     novel_repo = get_novel_repository()
     chapter_repo = get_chapter_repository()
 
@@ -1969,14 +2088,16 @@ async def autopilot_log_stream(
             "timestamp": datetime.now().isoformat(),
             "metadata": init_meta,
         }
-        yield f"data: {json.dumps(init_event, ensure_ascii=False)}\n\n"
+        yield _format_autopilot_sse_event(novel_id, init_event)
 
         last_seq_cursor = after_seq
-        replay_lines, last_seq_cursor = await loop.run_in_executor(
+        replay_log_events, last_seq_cursor = await loop.run_in_executor(
             _SSE_THREAD_POOL, _log_stream_replay_sync, novel_id, after_seq, last_seq_cursor
         )
-        for line in replay_lines:
-            yield line
+        for replayed_log_event in replay_log_events:
+            yield _format_autopilot_sse_event(novel_id, replayed_log_event)
+        for replayed_general_event in replayed_general_events:
+            yield _format_autopilot_sse_event(novel_id, replayed_general_event)
 
         from interfaces.api.settings import get_backend_settings
 
@@ -2066,7 +2187,7 @@ async def autopilot_log_stream(
                                 "source": "file",
                             },
                         }
-                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        yield _format_autopilot_sse_event(novel_id, ev)
                         last_seq_cursor = max(last_seq_cursor, item["seq"])
                     for e in ring_batch:
                         ev = {
@@ -2079,7 +2200,7 @@ async def autopilot_log_stream(
                                 "logger": e.logger_name,
                             },
                         }
-                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        yield _format_autopilot_sse_event(novel_id, ev)
                         last_seq_cursor = max(last_seq_cursor, e.seq)
                     # 🔥 推送审计事件
                     for audit_event in audit_events:
@@ -2092,7 +2213,7 @@ async def autopilot_log_stream(
                                 "data": audit_event["data"],
                             },
                         }
-                        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                        yield _format_autopilot_sse_event(novel_id, event)
                     await asyncio.sleep(runtime_settings.log_poll_seconds)
                     continue
 
@@ -2129,7 +2250,7 @@ async def autopilot_log_stream(
                             "source": "file",
                         },
                     }
-                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                    yield _format_autopilot_sse_event(novel_id, ev)
                     last_seq_cursor = max(last_seq_cursor, item["seq"])
 
                 for e in ring_batch:
@@ -2143,7 +2264,7 @@ async def autopilot_log_stream(
                             "logger": e.logger_name,
                         },
                     }
-                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                    yield _format_autopilot_sse_event(novel_id, ev)
                     last_seq_cursor = max(last_seq_cursor, e.seq)
 
                 # 🔥 推送审计事件
@@ -2157,7 +2278,7 @@ async def autopilot_log_stream(
                             "data": audit_event["data"],
                         },
                     }
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    yield _format_autopilot_sse_event(novel_id, event)
 
                 current_stage = novel.current_stage.value
                 current_beat = getattr(novel, "current_beat_index", 0) or 0
@@ -2189,7 +2310,7 @@ async def autopilot_log_stream(
                                 "to_label": to_zh,
                             },
                         }
-                        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                        yield _format_autopilot_sse_event(novel_id, event)
                         last_emitted_stage = current_stage
                         stage_pending = None
                         stage_pending_ticks = 0
@@ -2213,7 +2334,7 @@ async def autopilot_log_stream(
                             "chapter_number": current_chapter_number,
                         },
                     }
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    yield _format_autopilot_sse_event(novel_id, event)
 
                     # 新 beat 开始
                     event = {
@@ -2231,7 +2352,7 @@ async def autopilot_log_stream(
                             "beat_forbidden_drift": _beat_shared.get("beat_forbidden_drift", ""),
                         },
                     }
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    yield _format_autopilot_sse_event(novel_id, event)
 
                 # 检测错误（仅在计数变化时推送，避免每 2 秒刷屏）
                 error_count = getattr(novel, "consecutive_error_count", 0) or 0
@@ -2253,7 +2374,7 @@ async def autopilot_log_stream(
                         "timestamp": datetime.now().isoformat(),
                         "metadata": {"error_count": error_count},
                     }
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    yield _format_autopilot_sse_event(novel_id, event)
                 if error_count == 0:
                     last_error_broadcast = -1
 
@@ -2276,7 +2397,7 @@ async def autopilot_log_stream(
                                 "tail": True,
                             },
                         }
-                        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                        yield _format_autopilot_sse_event(novel_id, event)
 
                 # 运行中：定期推送进度快照（仅用于前端进度条，不写时间线刷屏）
                 if novel.autopilot_status.value == AutopilotStatus.RUNNING.value:
@@ -2352,7 +2473,7 @@ async def autopilot_log_stream(
                             "beat_forbidden_drift": _shared_sub.get("beat_forbidden_drift", ""),
                         },
                     }
-                    yield f"data: {json.dumps(progress_event, ensure_ascii=False)}\n\n"
+                    yield _format_autopilot_sse_event(novel_id, progress_event)
 
                 heartbeat_counter += 1
                 if heartbeat_counter >= runtime_settings.log_heartbeat_every_ticks:
@@ -2361,7 +2482,7 @@ async def autopilot_log_stream(
                         "message": "keepalive",
                         "timestamp": datetime.now().isoformat()
                     }
-                    yield f"data: {json.dumps(heartbeat_event, ensure_ascii=False)}\n\n"
+                    yield _format_autopilot_sse_event(novel_id, heartbeat_event)
                     heartbeat_counter = 0
 
                 await asyncio.sleep(runtime_settings.log_poll_seconds)

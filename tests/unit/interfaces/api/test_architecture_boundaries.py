@@ -1,6 +1,13 @@
 from pathlib import Path
 
 
+def test_pytest_session_does_not_use_repository_runtime_data_directory():
+    """Interface imports must never initialize the repository's runtime DB in tests."""
+    from application.paths import DATA_DIR, PLOTPILOT_ROOT
+
+    assert DATA_DIR.resolve() != (PLOTPILOT_ROOT / "data").resolve()
+
+
 def _registered_paths(routes, prefix: str = "") -> set[str]:
     paths: set[str] = set()
     for route in routes:

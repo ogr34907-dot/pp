@@ -1,5 +1,11 @@
 """端到端集成测试 - Novel 工作流"""
 import pytest
+
+pytest.skip(
+    "Legacy JSON-file repository workflow was removed; current SQLite workflow is covered by database integration tests.",
+    allow_module_level=True,
+)
+
 import tempfile
 import shutil
 from pathlib import Path

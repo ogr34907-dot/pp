@@ -32,7 +32,7 @@ class TestSettings:
 
         assert settings.default_model == "claude-3-opus-20240229"
         assert settings.default_temperature == 0.5
-        assert settings.default_max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+        assert settings.default_max_tokens == 2048
         assert settings.api_key == "test-key"
         assert settings.http_timeout_settings.timeout_seconds == 240
         assert settings.http_timeout_settings.connect_timeout == 12
@@ -40,10 +40,10 @@ class TestSettings:
         assert settings.http_timeout_settings.write_timeout == 45
         assert settings.http_timeout_settings.pool_timeout == 9
 
-    def test_max_tokens_above_global_floor_is_preserved(self):
-        settings = Settings(default_max_tokens=DEFAULT_MAX_OUTPUT_TOKENS + 1000)
+    def test_explicit_max_tokens_is_preserved(self):
+        settings = Settings(default_max_tokens=240)
 
-        assert settings.default_max_tokens == DEFAULT_MAX_OUTPUT_TOKENS + 1000
+        assert settings.default_max_tokens == 240
 
     def test_temperature_validation(self):
         """测试温度参数验证"""

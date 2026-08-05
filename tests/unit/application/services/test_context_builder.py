@@ -119,6 +119,15 @@ def _make_builder(
     )
 
 
+def test_context_builder_passes_the_novel_repository_to_the_budget_allocator():
+    """SETTING-001: allocator T0 lookup must use the real novel repository."""
+    novel_repo = Mock()
+
+    builder = _make_builder(novel_repo=novel_repo)
+
+    assert builder.budget_allocator.novel_repository is novel_repo
+
+
 class TestContextBuilder:
     def test_build_context_basic(self):
         dto = _empty_bible_dto(

@@ -76,6 +76,21 @@ async def test_mock_provider_chapter_review_returns_review_contract():
 
 
 @pytest.mark.asyncio
+async def test_mock_provider_macro_refactor_returns_proposal_contract_before_character_match():
+    data = _loads(
+        await _generate(
+            """你是一个小说编辑，帮助修复角色的人设冲突。
+请以 JSON 输出 natural_language_suggestion、suggested_mutations、suggested_tags 和 reasoning。"""
+        )
+    )
+
+    assert data["natural_language_suggestion"]
+    assert data["reasoning"]
+    assert data["suggested_mutations"] == []
+    assert data["suggested_tags"] == []
+
+
+@pytest.mark.asyncio
 async def test_mock_provider_does_not_emit_fixed_story_bias_terms():
     provider = MockProvider()
     prompts = [

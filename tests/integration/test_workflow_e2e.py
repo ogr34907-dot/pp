@@ -1,4 +1,6 @@
 """端到端测试 - 完整生成工作流"""
+from types import SimpleNamespace
+
 import pytest
 from unittest.mock import Mock, AsyncMock, patch
 from application.workflows.auto_novel_generation_workflow import AutoNovelGenerationWorkflow
@@ -52,12 +54,22 @@ def mock_dependencies():
         token_usage=TokenUsage(input_tokens=500, output_tokens=500)
     ))
 
+    memory_engine = Mock()
+    memory_engine.bible_repository = object()
+    memory_engine.llm_service = llm_service
+    memory_engine.build_fact_lock_section.return_value = ""
+    memory_engine.get_completed_beats_section.return_value = ""
+    memory_engine.get_revealed_clues_section.return_value = ""
+    memory_engine.update_from_chapter = AsyncMock(return_value={})
+    context_builder.budget_allocator = SimpleNamespace(memory_engine=memory_engine)
+
     return {
         'context_builder': context_builder,
         'consistency_checker': consistency_checker,
         'storyline_manager': storyline_manager,
         'plot_arc_repository': plot_arc_repository,
-        'llm_service': llm_service
+        'llm_service': llm_service,
+        'memory_engine': memory_engine,
     }
 
 
@@ -96,6 +108,8 @@ class TestCompleteGenerationFlow:
         assert result.content == "Generated chapter content with detailed narrative."
         assert result.token_count == 8750
         assert isinstance(result.consistency_report, ConsistencyReport)
+        assert workflow.memory_engine is mock_dependencies['memory_engine']
+        assert workflow.context_builder.budget_allocator.memory_engine is workflow.memory_engine
 
         # 验证调用链（prepare_chapter_generation 使用 build_structured_context）
         mock_dependencies['context_builder'].build_structured_context.assert_called_once()

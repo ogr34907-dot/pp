@@ -15,13 +15,13 @@ class TestGenerationConfig:
             temperature=1.0
         )
         assert config.model == "claude-3-5-sonnet-20241022"
-        assert config.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+        assert config.max_tokens == 4096
         assert config.temperature == 1.0
 
-    def test_generation_config_preserves_values_above_global_floor(self):
-        config = GenerationConfig(max_tokens=DEFAULT_MAX_OUTPUT_TOKENS + 1000)
+    def test_generation_config_preserves_explicit_output_limit(self):
+        config = GenerationConfig(max_tokens=240)
 
-        assert config.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS + 1000
+        assert config.max_tokens == 240
 
     def test_generation_config_default_values(self):
         """测试默认值"""

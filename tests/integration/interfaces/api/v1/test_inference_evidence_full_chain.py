@@ -8,8 +8,6 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from application import paths as paths_mod
-from infrastructure.persistence.database import connection as conn_mod
 from interfaces.main import app
 
 
@@ -29,26 +27,9 @@ def _clear_dependency_overrides():
 
 
 @pytest.fixture
-def isolated_sqlite(tmp_path, monkeypatch):
-    """独立 SQLite 库（默认文件名 plotpilot.db）：与 application.paths.DATA_DIR 及 get_database 对齐。"""
-    data_dir = tmp_path / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(paths_mod, "DATA_DIR", data_dir)
-
-    db_path = str(data_dir / "plotpilot.db")
-    monkeypatch.setattr(conn_mod, "_db_instance", None)
-    db = conn_mod.DatabaseConnection(db_path)
-    monkeypatch.setattr(conn_mod, "_db_instance", db)
-
-    def _get_db(*_a, **_kw):
-        return db
-
-    monkeypatch.setattr(conn_mod, "get_database", _get_db)
-
-    yield db
-
-    db.close()
-    monkeypatch.setattr(conn_mod, "_db_instance", None)
+def isolated_sqlite(db):
+    """复用 API 夹具的文件型 SQLite，保证路由与直接 SQL 访问同一数据库。"""
+    return db
 
 
 def _seed_chapter_and_inference(conn, *, two_triples: bool = False):

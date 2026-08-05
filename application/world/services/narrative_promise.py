@@ -23,6 +23,11 @@ _OPENING_HOOK_RE = re.compile(r"开篇钩子[:：]\s*([^\n]+)")
 class NarrativePromise:
     title: str
     genre_signal: str = ""
+    world_preset: str = ""
+    story_structure: str = ""
+    pacing_control: str = ""
+    writing_style: str = ""
+    special_requirements: str = ""
     core_conflict: str = ""
     opening_hook: str = ""
     promise_keywords: tuple[str, ...] = ()
@@ -32,6 +37,11 @@ class NarrativePromise:
             (
                 self.title.strip(),
                 self.genre_signal.strip(),
+                self.world_preset.strip(),
+                self.story_structure.strip(),
+                self.pacing_control.strip(),
+                self.writing_style.strip(),
+                self.special_requirements.strip(),
                 self.core_conflict.strip(),
                 self.opening_hook.strip(),
                 self.promise_keywords,
@@ -61,7 +71,17 @@ def _dedupe(items: Iterable[str]) -> List[str]:
     return out
 
 
-def extract_narrative_promise(title: str, premise: str) -> NarrativePromise:
+def extract_narrative_promise(
+    title: str,
+    premise: str,
+    *,
+    locked_genre: str = "",
+    locked_world_preset: str = "",
+    locked_story_structure: str = "",
+    locked_pacing_control: str = "",
+    locked_writing_style: str = "",
+    locked_special_requirements: str = "",
+) -> NarrativePromise:
     """Build a compact promise model from a novel setup."""
     clean = _clean_premise(premise)
     genre = _first_match(_TYPE_RE, clean)
@@ -75,7 +95,12 @@ def extract_narrative_promise(title: str, premise: str) -> NarrativePromise:
 
     return NarrativePromise(
         title=(title or "").strip(),
-        genre_signal=genre[:160],
+        genre_signal=(locked_genre or genre).strip()[:160],
+        world_preset=(locked_world_preset or "").strip()[:180],
+        story_structure=(locked_story_structure or "").strip()[:220],
+        pacing_control=(locked_pacing_control or "").strip()[:180],
+        writing_style=(locked_writing_style or "").strip()[:180],
+        special_requirements=(locked_special_requirements or "").strip()[:220],
         core_conflict=conflict[:260],
         opening_hook=hook[:260],
         promise_keywords=tuple(_dedupe(keyword_candidates)[:8]),
@@ -87,9 +112,22 @@ def build_narrative_promise_block(novel: object, chapter_number: int) -> str:
 
     The block is intentionally prescriptive about pacing, not plot content.
     """
+    generation_prefs = getattr(novel, "generation_prefs", None)
+
+    def locked_value(field: str) -> str:
+        return str(
+            getattr(generation_prefs, field, getattr(novel, field, "")) or ""
+        ).strip()
+
     promise = extract_narrative_promise(
         getattr(novel, "title", "") or "",
         getattr(novel, "premise", "") or "",
+        locked_genre=locked_value("locked_genre"),
+        locked_world_preset=locked_value("locked_world_preset"),
+        locked_story_structure=locked_value("locked_story_structure"),
+        locked_pacing_control=locked_value("locked_pacing_control"),
+        locked_writing_style=locked_value("locked_writing_style"),
+        locked_special_requirements=locked_value("locked_special_requirements"),
     )
     if promise.is_empty():
         return ""
@@ -99,6 +137,16 @@ def build_narrative_promise_block(novel: object, chapter_number: int) -> str:
         lines.append(f"书名承诺：{promise.title}")
     if promise.genre_signal:
         lines.append(f"类型信号：{promise.genre_signal}")
+    if promise.world_preset:
+        lines.append(f"世界基调：{promise.world_preset}")
+    if promise.story_structure:
+        lines.append(f"结构承诺：{promise.story_structure}")
+    if promise.pacing_control:
+        lines.append(f"节奏约束：{promise.pacing_control}")
+    if promise.writing_style:
+        lines.append(f"文风约束：{promise.writing_style}")
+    if promise.special_requirements:
+        lines.append(f"特殊要求：{promise.special_requirements}")
     if promise.core_conflict:
         lines.append(f"核心冲突：{promise.core_conflict}")
     if promise.opening_hook and chapter_number <= 20:

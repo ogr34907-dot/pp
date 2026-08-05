@@ -63,7 +63,7 @@ class LLMProfile(BaseModel):
     def _validate_max_tokens(cls, value: int) -> int:
         if value <= 0:
             raise ValueError('value must be positive')
-        return max(value, DEFAULT_MAX_OUTPUT_TOKENS)
+        return int(value)
 
     @field_validator('timeout_seconds')
     @classmethod

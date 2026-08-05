@@ -1,9 +1,12 @@
 import hashlib
+import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import application.blueprint.services.continuous_planning_service as continuous_planning_module
 from application.blueprint.services.continuous_planning_service import (
     ContinuousPlanningService,
     _extract_outer_json_value,
@@ -79,6 +82,52 @@ class _VersionedChapterRepo:
 
     def list_by_novel(self, _novel_id):
         return list(self.chapters)
+
+
+class _NextActCreationRepo:
+    """In-memory structure boundary for next-act preflight tests."""
+
+    def __init__(self, nodes: list[StoryNode]):
+        self._nodes = {node.id: node for node in nodes}
+        self.saved: list[StoryNode] = []
+
+    async def get_by_id(self, node_id: str):
+        return self._nodes.get(node_id)
+
+    async def get_by_novel(self, novel_id: str):
+        return [node for node in self._nodes.values() if node.novel_id == novel_id]
+
+    async def save(self, node: StoryNode):
+        self.saved.append(node)
+        self._nodes[node.id] = node
+        return node
+
+
+def _next_act_service(
+    nodes: list[StoryNode],
+    *,
+    target_chapters: int,
+) -> tuple[ContinuousPlanningService, _NextActCreationRepo]:
+    story_repo = _NextActCreationRepo(nodes)
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+        novel_repository=SimpleNamespace(
+            get_by_id=Mock(
+                return_value=SimpleNamespace(target_chapters=target_chapters)
+            )
+        ),
+    )
+    service._get_bible_context = Mock(return_value={})
+    service._generate_next_act_info = AsyncMock(
+        return_value={
+            "title": "下一幕",
+            "description": "继续推进主线",
+            "suggested_chapter_count": 5,
+        }
+    )
+    return service, story_repo
 
 
 def test_quick_macro_prompt_for_long_book_uses_leading_volume_detail():
@@ -619,6 +668,69 @@ async def test_confirm_act_planning_rejects_chapters_beyond_novel_target_before_
     story_repo.save_batch.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_replanning_act_rejects_existing_authored_chapter_before_delete():
+    """DATA-001: no act-replan path may delete a chapter that has prose."""
+    act = _story_node("act-1", NodeType.ACT, 1, parent_id="volume-1")
+    chapter = _story_node("chapter-1", NodeType.CHAPTER, 1, parent_id="act-1")
+    chapter_repo = SimpleNamespace(
+        get_by_novel_and_number=Mock(return_value=None),
+        list_by_novel=Mock(
+            return_value=[
+                SimpleNamespace(
+                    id=SimpleNamespace(value="chapter-1"),
+                    number=1,
+                    content="Authored body must not be removed by replanning.",
+                )
+            ]
+        ),
+        delete=Mock(),
+    )
+    story_repo = SimpleNamespace(
+        get_children_sync=Mock(return_value=[chapter]),
+        delete=AsyncMock(),
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=SimpleNamespace(delete_by_chapter=AsyncMock()),
+        chapter_repository=chapter_repo,
+        llm_service=Mock(),
+    )
+
+    with pytest.raises(ValueError, match="正文"):
+        await service._remove_chapter_children_of_act(act.id)
+
+    chapter_repo.delete.assert_not_called()
+    story_repo.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_safe_macro_failure_does_not_call_unsafe_fallback():
+    """BLUEPRINT-001: a rejected safe merge must not be written unsafely."""
+
+    class _FailingSafeMergeHost:
+        def __init__(self):
+            self.unsafe_calls = 0
+
+        async def confirm_macro_plan_safe(self, **_kwargs):
+            raise RuntimeError("safe merge conflict")
+
+        async def confirm_macro_plan(self, **_kwargs):
+            self.unsafe_calls += 1
+            return {"success": True}
+
+    host = _FailingSafeMergeHost()
+
+    with pytest.raises(RuntimeError, match="safe merge conflict"):
+        await ContinuousPlanningService.persist_macro_structure_with_fallback(
+            host,
+            "novel-1",
+            [],
+        )
+
+    assert host.unsafe_calls == 0
+
+
 @pytest.mark.parametrize("title", ["description", "描述"])
 def test_act_plan_validation_rejects_description_placeholder_titles(title):
     errors = validate_lightweight_act_plan(
@@ -635,3 +747,131 @@ def test_act_plan_validation_rejects_description_placeholder_titles(title):
     )
 
     assert "placeholder" in " ".join(errors)
+
+
+@pytest.mark.asyncio
+async def test_create_next_act_rejects_a_full_parent_volume_before_invoking_llm():
+    """BLUEPRINT-002: direct creation must not overflow a volume."""
+    volume = _story_node("volume-1", NodeType.VOLUME, 1)
+    current = _story_node("act-3", NodeType.ACT, 3, parent_id=volume.id)
+    service, story_repo = _next_act_service(
+        [
+            volume,
+            _story_node("act-1", NodeType.ACT, 1, parent_id=volume.id),
+            _story_node("act-2", NodeType.ACT, 2, parent_id=volume.id),
+            current,
+        ],
+        target_chapters=30,
+    )
+
+    with pytest.raises(ValueError, match="幕容量"):
+        await service.create_next_act_auto("novel-1", current.id)
+
+    assert story_repo.saved == []
+    service._generate_next_act_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_next_act_rejects_when_planned_chapters_reach_target_before_invoking_llm():
+    """BLUEPRINT-002: a new act cannot be created after target capacity is planned."""
+    volume = _story_node("volume-1", NodeType.VOLUME, 1)
+    current = _story_node("act-1", NodeType.ACT, 1, parent_id=volume.id)
+    chapters = [
+        _story_node(
+            f"chapter-{number}",
+            NodeType.CHAPTER,
+            number,
+            parent_id=current.id,
+        )
+        for number in range(1, 31)
+    ]
+    service, story_repo = _next_act_service(
+        [volume, current, *chapters],
+        target_chapters=30,
+    )
+
+    with pytest.raises(ValueError, match="目标章节数"):
+        await service.create_next_act_auto("novel-1", current.id)
+
+    assert story_repo.saved == []
+    service._generate_next_act_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_next_act_rejects_current_act_without_a_volume_parent():
+    """BLUEPRINT-002: a malformed parent link must not produce an orphan act."""
+    part = _story_node("part-1", NodeType.PART, 1)
+    current = _story_node("act-1", NodeType.ACT, 1, parent_id=part.id)
+    service, story_repo = _next_act_service(
+        [part, current],
+        target_chapters=30,
+    )
+
+    with pytest.raises(ValueError, match="父卷"):
+        await service.create_next_act_auto("novel-1", current.id)
+
+    assert story_repo.saved == []
+    service._generate_next_act_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_next_act_rejects_duplicate_global_act_number_before_invoking_llm():
+    """BLUEPRINT-002: global act numbering drives daemon selection and stays unique."""
+    volume_one = _story_node("volume-1", NodeType.VOLUME, 1)
+    volume_two = _story_node("volume-2", NodeType.VOLUME, 2)
+    current = _story_node("act-3", NodeType.ACT, 3, parent_id=volume_one.id)
+    duplicate_next = _story_node("act-4-existing", NodeType.ACT, 4, parent_id=volume_two.id)
+    service, story_repo = _next_act_service(
+        [volume_one, volume_two, current, duplicate_next],
+        target_chapters=80,
+    )
+
+    with pytest.raises(ValueError, match="第 4 幕"):
+        await service.create_next_act_auto("novel-1", current.id)
+
+    assert story_repo.saved == []
+    service._generate_next_act_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_next_act_creates_the_next_act_after_passing_preflight():
+    """BLUEPRINT-002: valid direct creation keeps the established generation path."""
+    volume = _story_node("volume-1", NodeType.VOLUME, 1)
+    current = _story_node("act-1", NodeType.ACT, 1, parent_id=volume.id)
+    service, story_repo = _next_act_service(
+        [volume, current],
+        target_chapters=30,
+    )
+
+    result = await service.create_next_act_auto("novel-1", current.id)
+
+    assert result["success"] is True
+    assert len(story_repo.saved) == 1
+    assert story_repo.saved[0].parent_id == volume.id
+    assert story_repo.saved[0].number == 2
+    service._generate_next_act_info.assert_awaited_once()
+
+
+def test_parse_llm_response_logs_safe_metadata_without_raw_planning_content(
+    caplog,
+    monkeypatch,
+):
+    """OBS-001: terminal planning parse errors must not disclose model output."""
+    service = _make_service()
+    marker = "TRACE_PRIVATE_PLANNING_MARKER"
+    malformed = f'{{"secret":"{marker}", "parts": [}}'
+    monkeypatch.setattr(continuous_planning_module, "repair_json", lambda value: value)
+    monkeypatch.setattr(
+        continuous_planning_module,
+        "_repair_json_string",
+        lambda value: value,
+    )
+
+    with caplog.at_level(logging.ERROR, logger=continuous_planning_module.__name__):
+        with pytest.raises(json.JSONDecodeError):
+            service._parse_llm_response(malformed)
+
+    assert marker not in caplog.text
+    assert "content_length=" in caplog.text
+    assert "content_sha256=" in caplog.text
+    assert "line=1" in caplog.text

@@ -70,3 +70,111 @@ def test_delete_cascades_to_descendant_story_nodes(repo_db):
 
     assert deleted is True
     assert rows == []
+
+
+def test_save_batch_updates_parent_without_deleting_existing_children(repo_db):
+    """DB-001: a batch upsert must preserve the parent's foreign-key identity."""
+    repo, db_path = repo_db
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-1", "Novel 1", "novel-1", 10),
+    )
+    conn.commit()
+    conn.close()
+
+    repo.save_sync(
+        StoryNode(
+            id="volume-1",
+            novel_id="novel-1",
+            node_type=NodeType.VOLUME,
+            number=1,
+            title="Original volume",
+            order_index=0,
+        )
+    )
+    repo.save_sync(
+        StoryNode(
+            id="act-1",
+            novel_id="novel-1",
+            parent_id="volume-1",
+            node_type=NodeType.ACT,
+            number=1,
+            title="Act 1",
+            order_index=0,
+        )
+    )
+
+    asyncio.run(
+        repo.save_batch(
+            [
+                StoryNode(
+                    id="volume-1",
+                    novel_id="novel-1",
+                    node_type=NodeType.VOLUME,
+                    number=1,
+                    title="Updated volume",
+                    order_index=0,
+                )
+            ]
+        )
+    )
+
+    conn = sqlite3.connect(db_path)
+    child = conn.execute(
+        "SELECT id, parent_id FROM story_nodes WHERE id = 'act-1'"
+    ).fetchone()
+    parent = conn.execute(
+        "SELECT title FROM story_nodes WHERE id = 'volume-1'"
+    ).fetchone()
+    conn.close()
+
+    assert child == ("act-1", "volume-1")
+    assert parent == ("Updated volume",)
+
+
+def test_new_story_nodes_reject_duplicate_parent_type_and_number(repo_db):
+    """DB-001b: new planning rows need a natural-key collision guard."""
+    repo, db_path = repo_db
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-1", "Novel 1", "novel-1", 10),
+    )
+    conn.commit()
+    conn.close()
+
+    repo.save_sync(
+        StoryNode(
+            id="volume-1",
+            novel_id="novel-1",
+            node_type=NodeType.VOLUME,
+            number=1,
+            title="Volume 1",
+            order_index=0,
+        )
+    )
+    repo.save_sync(
+        StoryNode(
+            id="act-1",
+            novel_id="novel-1",
+            parent_id="volume-1",
+            node_type=NodeType.ACT,
+            number=1,
+            title="Act 1",
+            order_index=0,
+        )
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="natural key"):
+        repo.save_sync(
+            StoryNode(
+                id="act-duplicate",
+                novel_id="novel-1",
+                parent_id="volume-1",
+                node_type=NodeType.ACT,
+                number=1,
+                title="Duplicate act",
+                order_index=1,
+            )
+        )

@@ -184,21 +184,28 @@ class SetupContextBuilder:
     def _theme_metadata_from_novel(novel: Any) -> Dict[str, Any]:
         if not novel:
             return {}
+        generation_prefs = getattr(novel, "generation_prefs", None)
+
+        def locked_value(field: str) -> str:
+            return str(
+                getattr(generation_prefs, field, getattr(novel, field, "")) or ""
+            ).strip()
+
         secondary = getattr(novel, "secondary_theme_keys", []) or []
         return {
-            "genre_label": (getattr(novel, "genre_label", "") or getattr(novel, "locked_genre", "") or "").strip(),
-            "world_preset": (getattr(novel, "world_preset", "") or getattr(novel, "locked_world_preset", "") or "").strip(),
+            "genre_label": (getattr(novel, "genre_label", "") or locked_value("locked_genre")).strip(),
+            "world_preset": (getattr(novel, "world_preset", "") or locked_value("locked_world_preset")).strip(),
             "story_structure": (
-                getattr(novel, "story_structure", "") or getattr(novel, "locked_story_structure", "") or ""
+                getattr(novel, "story_structure", "") or locked_value("locked_story_structure")
             ).strip(),
             "pacing_control": (
-                getattr(novel, "pacing_control", "") or getattr(novel, "locked_pacing_control", "") or ""
+                getattr(novel, "pacing_control", "") or locked_value("locked_pacing_control")
             ).strip(),
             "writing_style": (
-                getattr(novel, "writing_style", "") or getattr(novel, "locked_writing_style", "") or ""
+                getattr(novel, "writing_style", "") or locked_value("locked_writing_style")
             ).strip(),
             "special_requirements": (
-                getattr(novel, "special_requirements", "") or getattr(novel, "locked_special_requirements", "") or ""
+                getattr(novel, "special_requirements", "") or locked_value("locked_special_requirements")
             ).strip(),
             "primary_theme_key": (getattr(novel, "primary_theme_key", "") or "").strip(),
             "secondary_theme_keys": [str(x).strip() for x in secondary if str(x).strip()],

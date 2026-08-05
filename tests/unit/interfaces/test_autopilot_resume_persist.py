@@ -43,6 +43,30 @@ def test_resume_persist_keeps_explicit_next_stage(monkeypatch):
     assert fields["last_stable_stage"] == "act_planning"
 
 
+def test_manual_resume_clears_a_persisted_restart_interruption_reason(monkeypatch):
+    """AUTOPILOT-001: an explicit user resume clears stale restart status."""
+    repo = _Repo()
+
+    monkeypatch.setattr(
+        autopilot_routes,
+        "_persist_autopilot_running_sync",
+        lambda *args, **kwargs: {"decision": SimpleNamespace(next_stage="act_planning"), "run_epoch": 8},
+    )
+    monkeypatch.setattr(autopilot_routes, "get_novel_repository", lambda: repo)
+
+    autopilot_routes._persist_autopilot_resume_sync(
+        "novel-1",
+        next_stage=NovelStage.ACT_PLANNING.value,
+        current_act=1,
+        max_auto_chapters=9999,
+        target_chapters=150,
+        target_words_per_chapter=2000,
+    )
+
+    _novel_id, fields = repo.patches[0]
+    assert fields["autopilot_recovery_reason"] == ""
+
+
 def test_manual_resume_blocks_terminal_canonical_failure(tmp_path, monkeypatch):
     db = DatabaseConnection(str(tmp_path / "resume.db"))
     content = "已完成正文"

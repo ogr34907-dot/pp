@@ -2,6 +2,11 @@ import asyncio
 from types import SimpleNamespace
 from typing import Optional
 
+import pytest
+
+from application.blueprint.services.chapter_book_structure_sync import (
+    purge_chapter_book_rows_not_matching_structure,
+)
 from application.blueprint.services.story_structure_service import StoryStructureService
 from domain.novel.value_objects.chapter_id import ChapterId
 from domain.structure.story_node import NodeType
@@ -188,4 +193,23 @@ def test_get_tree_does_not_delete_orphan_chapter_rows():
     result = asyncio.run(service.get_tree("novel-1"))
 
     assert result["novel_id"] == "novel-1"
+    assert chapter_repo.deleted_numbers == []
+
+
+def test_structure_sync_rejects_an_orphan_row_with_authored_prose():
+    """DATA-001: an out-of-tree chapter body must block destructive sync."""
+    repo = _FakeStoryRepo([])
+    chapter_repo = _FakeChapterRepo(
+        {
+            1: SimpleNamespace(
+                id=SimpleNamespace(value="chapter-1"),
+                number=1,
+                content="This chapter has authored prose and must survive.",
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="正文"):
+        purge_chapter_book_rows_not_matching_structure(repo, chapter_repo, "novel-1")
+
     assert chapter_repo.deleted_numbers == []

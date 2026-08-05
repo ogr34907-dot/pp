@@ -157,6 +157,7 @@ class ContextBuilder:
             evolution_presenter=evolution_presenter,
             evolution_repository=evolution_repository,
             character_narrative_kernel=character_kernel,
+            novel_repository=novel_repository,
         )
 
     def estimate_tokens(self, text: str) -> int:

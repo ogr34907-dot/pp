@@ -67,7 +67,11 @@ export const apiRoutes = {
     circuitBreakerReset: (novelId: string) => apiRootPath('autopilot', novelId, 'circuit-breaker', 'reset'),
   },
   dag: {
-    events: (novelId: string) => withQuery(apiRootPath('dag', 'events'), { novel_id: novelId }),
+    events: (novelId: string, afterEventId?: string) =>
+      withQuery(apiRootPath('dag', 'events'), {
+        novel_id: novelId,
+        after_event_id: afterEventId,
+      }),
   },
   monitor: {
     voiceDrift: (novelId: string) => apiRootPath('novels', novelId, 'monitor', 'voice-drift'),

@@ -83,6 +83,13 @@ class VariableHubBackfillService:
 
         before = result.values_written
         context_key = f"novel_id:{novel_id}"
+        generation_prefs = getattr(novel, "generation_prefs", None)
+
+        def locked_value(field: str) -> str:
+            return str(
+                getattr(generation_prefs, field, getattr(novel, field, "")) or ""
+            ).strip()
+
         self._write_missing(
             result,
             key="novel.setup.title",
@@ -119,7 +126,7 @@ class VariableHubBackfillService:
             display_name="每章字数",
             stage="setup",
         )
-        genre_label = str(getattr(novel, "locked_genre", "") or "").strip()
+        genre_label = locked_value("locked_genre")
         if genre_label:
             parts = [part.strip() for part in genre_label.split("/") if part.strip()]
             self._write_missing(
@@ -149,7 +156,7 @@ class VariableHubBackfillService:
                 display_name="主题",
                 stage="setup",
             )
-        world_preset = str(getattr(novel, "locked_world_preset", "") or "").strip()
+        world_preset = locked_value("locked_world_preset")
         if world_preset:
             self._write_missing(
                 result,
@@ -160,7 +167,7 @@ class VariableHubBackfillService:
                 display_name="基调",
                 stage="setup",
             )
-        story_structure = str(getattr(novel, "locked_story_structure", "") or "").strip()
+        story_structure = locked_value("locked_story_structure")
         if story_structure:
             self._write_missing(
                 result,
@@ -171,7 +178,7 @@ class VariableHubBackfillService:
                 display_name="剧情结构",
                 stage="setup",
             )
-        pacing_control = str(getattr(novel, "locked_pacing_control", "") or "").strip()
+        pacing_control = locked_value("locked_pacing_control")
         if pacing_control:
             self._write_missing(
                 result,
@@ -182,7 +189,7 @@ class VariableHubBackfillService:
                 display_name="节奏把控",
                 stage="setup",
             )
-        writing_style = str(getattr(novel, "locked_writing_style", "") or "").strip()
+        writing_style = locked_value("locked_writing_style")
         if writing_style:
             self._write_missing(
                 result,
@@ -193,7 +200,7 @@ class VariableHubBackfillService:
                 display_name="写作风格",
                 stage="setup",
             )
-        special_requirements = str(getattr(novel, "locked_special_requirements", "") or "").strip()
+        special_requirements = locked_value("locked_special_requirements")
         if special_requirements:
             self._write_missing(
                 result,

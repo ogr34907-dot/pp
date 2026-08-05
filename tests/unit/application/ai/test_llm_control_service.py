@@ -1,5 +1,4 @@
 from application.ai.llm_control_service import LLMControlService, LLMProfile
-from domain.ai.services.llm_service import DEFAULT_MAX_OUTPUT_TOKENS
 from infrastructure.ai.llm_environment import ARK_DEFAULT_BASE_URL
 
 
@@ -79,13 +78,13 @@ def test_initial_config_keeps_ark_default_base_url(monkeypatch):
     assert active.model == "ark-model"
 
 
-def test_profile_lifts_small_max_tokens_to_global_floor():
+def test_profile_preserves_explicit_max_tokens():
     profile = LLMProfile(id="p", name="Profile", max_tokens=4096)
 
-    assert profile.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+    assert profile.max_tokens == 4096
 
 
-def test_row_to_profile_preserves_max_tokens_above_global_floor():
+def test_row_to_profile_preserves_explicit_max_tokens():
     row = {
         "id": "p",
         "name": "Profile",
@@ -95,7 +94,7 @@ def test_row_to_profile_preserves_max_tokens_above_global_floor():
         "api_key": "",
         "model": "",
         "temperature": 0.7,
-        "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS + 1000,
+        "max_tokens": 2048,
         "timeout_seconds": 300,
         "extra_headers": "{}",
         "extra_query": "{}",
@@ -106,4 +105,4 @@ def test_row_to_profile_preserves_max_tokens_above_global_floor():
 
     profile = LLMControlService()._row_to_profile(row)
 
-    assert profile.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS + 1000
+    assert profile.max_tokens == 2048

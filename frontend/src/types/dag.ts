@@ -122,6 +122,7 @@ export interface NodeRunState {
 // ─── SSE 节点事件 ───
 
 export interface NodeEvent {
+  event_id?: string
   type: 'node_status_change' | 'node_output' | 'edge_data_flow'
   novel_id: string
   node_id?: string

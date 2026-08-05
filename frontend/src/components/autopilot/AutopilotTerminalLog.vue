@@ -128,6 +128,7 @@ const rows = ref<Row[]>([])
 const bodyRef = ref<HTMLElement | null>(null)
 const connectionStatus = ref<'connected' | 'reconnecting' | 'disconnected'>('disconnected')
 const lastLogSeq = ref(0)
+const lastEventId = ref('')
 const progressHint = ref('')
 const progressMeta = ref<Record<string, unknown> | undefined>(undefined)
 const autoScroll = ref(true)
@@ -239,6 +240,7 @@ let eventSource: EventSource | null = null
 let reconnectTimer: number | null = null
 /** 日志 SSE 重连退避（onerror 在部分浏览器上较频繁，避免打满连接） */
 let logStreamReconnectFailCount = 0
+const seenEventIds = new Set<string>()
 
 // desk-refresh 去抖：短时间内多次事件只触发一次 emit，避免连续 loadDesk。
 let deskRefreshDebounceTimer: number | null = null
@@ -264,6 +266,21 @@ function scheduleLogStreamReconnect() {
 
 const pending: Array<{ data: Record<string, unknown> }> = []
 let flushScheduled = false
+
+function acceptSSEEvent(event: MessageEvent, data: Record<string, unknown>): boolean {
+  const payloadEventId = typeof data.event_id === 'string' ? data.event_id : ''
+  const eventId = event.lastEventId || payloadEventId
+  if (!eventId) return true
+  if (seenEventIds.has(eventId)) return false
+
+  seenEventIds.add(eventId)
+  lastEventId.value = eventId
+  if (seenEventIds.size > MAX_ROWS) {
+    const oldest = seenEventIds.values().next().value
+    if (oldest) seenEventIds.delete(oldest)
+  }
+  return true
+}
 
 function clearScrollUnlockTimer() {
   if (scrollUnlockTimer != null) {
@@ -602,7 +619,11 @@ function onScroll() {
 
 function connect() {
   if (eventSource) eventSource.close()
-  const url = autopilotApi.streamUrl(props.novelId, lastLogSeq.value)
+  const url = autopilotApi.streamUrl(
+    props.novelId,
+    lastLogSeq.value,
+    lastEventId.value || undefined,
+  )
   eventSource = new EventSource(url)
 
   eventSource.onopen = () => {
@@ -617,6 +638,7 @@ function connect() {
   eventSource.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data) as Record<string, unknown>
+      if (!acceptSSEEvent(e, data)) return
       const typ = String(data.type || '')
 
       if (typ === 'heartbeat') return
@@ -687,6 +709,8 @@ watch(
     behaviorAutopilotStatus.value = ''
     behaviorLabel.value = '—'
     lastLogSeq.value = 0
+    lastEventId.value = ''
+    seenEventIds.clear()
     connectionStatus.value = 'disconnected'
     logStreamReconnectFailCount = 0
     pending.length = 0

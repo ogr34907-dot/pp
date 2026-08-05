@@ -442,6 +442,7 @@ def _backfill_bible_setup_variable_hub(*, variable_repo, novel_id: str, novel) -
         display_name="每章字数",
         stage="setup",
     )
+    generation_prefs = getattr(novel, "generation_prefs", None)
     for key, attr, label in (
         ("novel.genre_label", "locked_genre", "类型"),
         ("novel.world_preset", "locked_world_preset", "基调"),
@@ -453,13 +454,18 @@ def _backfill_bible_setup_variable_hub(*, variable_repo, novel_id: str, novel) -
         _write_variable_if_missing(
             variable_repo,
             key=key,
-            value=str(getattr(novel, attr, "") or "").strip(),
+            value=str(
+                getattr(generation_prefs, attr, getattr(novel, attr, "")) or ""
+            ).strip(),
             context_key=context_key,
             value_type="string",
             display_name=label,
             stage="setup",
         )
-    genre_label = str(getattr(novel, "locked_genre", "") or "").strip()
+    genre_label = str(
+        getattr(generation_prefs, "locked_genre", getattr(novel, "locked_genre", ""))
+        or ""
+    ).strip()
     if genre_label:
         parts = [part.strip() for part in genre_label.split("/") if part.strip()]
         _write_variable_if_missing(

@@ -1,8 +1,9 @@
 """Fixtures for API integration tests."""
 
 import pytest
-from pathlib import Path
 from fastapi.testclient import TestClient
+import infrastructure.ai.prompt_manager as prompt_manager_module
+import infrastructure.ai.prompt_registry as prompt_registry_module
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_entity_base_repository import (
     SqliteEntityBaseRepository
@@ -11,46 +12,44 @@ from infrastructure.persistence.database.sqlite_narrative_event_repository impor
     SqliteNarrativeEventRepository
 )
 
-# pathlib: parents[0]==parent；v1/conftest.py → 仓库根为 parents[5]
-SCHEMA_PATH = (
-    Path(__file__).resolve().parents[5]
-    / "infrastructure"
-    / "persistence"
-    / "database"
-    / "schema.sql"
-)
-
-
 @pytest.fixture
-def db():
-    """In-memory database fixture."""
-    db = DatabaseConnection(":memory:")
-    schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
-    db.get_connection().executescript(schema_sql)
-    db.get_connection().commit()
-    yield db
-    db.close()
+def db(tmp_path):
+    """File-backed SQLite fixture shared by the TestClient worker thread."""
+    database = DatabaseConnection(str(tmp_path / "plotpilot.db"))
+    yield database
+    database.close_all(skip_checkpoint=True)
 
 
-@pytest.fixture
-def client(db, monkeypatch):
-    """FastAPI test client with mocked database."""
-    # Mock get_database to return our test database
-    def mock_get_database():
+@pytest.fixture(autouse=True)
+def _isolate_api_database(db, monkeypatch):
+    """Route API and CPMS singleton dependencies to this test's SQLite database."""
+    def get_test_database(*_args, **_kwargs):
         return db
 
+    prompt_manager_module._manager_instance = None
+    prompt_registry_module._registry_instance = None
     monkeypatch.setattr(
         "infrastructure.persistence.database.connection.get_database",
-        mock_get_database,
+        get_test_database,
     )
-    # dependencies 内 `from connection import get_database` 会绑定旧引用，需同步 patch
     monkeypatch.setattr(
         "interfaces.api.dependencies.get_database",
-        mock_get_database,
+        get_test_database,
     )
+    monkeypatch.setattr(
+        "interfaces.api.v1.engine.generation.get_database",
+        get_test_database,
+    )
+    yield
+    prompt_registry_module._registry_instance = None
+    prompt_manager_module._manager_instance = None
 
-    # Import app after monkeypatching
+
+@pytest.fixture
+def client():
+    """FastAPI test client using the autouse isolated database fixture."""
     from interfaces.main import app
+
     return TestClient(app)
 
 

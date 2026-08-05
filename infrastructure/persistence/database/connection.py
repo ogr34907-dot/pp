@@ -14,6 +14,7 @@ from infrastructure.persistence.database.sqlite_pragmas import (
 )
 from infrastructure.persistence.database.migration_runner import (
     apply_migration_files as run_migration_files,
+    ordered_migration_paths,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,9 @@ def _migrate_novels_columns_before_schema_script(conn: sqlite3.Connection) -> No
         "last_stable_stage": (
             "ALTER TABLE novels ADD COLUMN last_stable_stage TEXT DEFAULT ''"
         ),
+        "autopilot_recovery_reason": (
+            "ALTER TABLE novels ADD COLUMN autopilot_recovery_reason TEXT DEFAULT ''"
+        ),
     }
     for col, sql in migrations.items():
         if col not in cols:
@@ -153,6 +157,7 @@ def _apply_autopilot_v2_migrations(conn: sqlite3.Connection) -> None:
         "active_pipeline_step": "ALTER TABLE novels ADD COLUMN active_pipeline_step TEXT DEFAULT ''",
         "active_pipeline_run_id": "ALTER TABLE novels ADD COLUMN active_pipeline_run_id TEXT DEFAULT ''",
         "last_stable_stage": "ALTER TABLE novels ADD COLUMN last_stable_stage TEXT DEFAULT ''",
+        "autopilot_recovery_reason": "ALTER TABLE novels ADD COLUMN autopilot_recovery_reason TEXT DEFAULT ''",
     }
     for col, sql in migrations.items():
         if col not in cols:
@@ -520,7 +525,7 @@ def _apply_migration_files_legacy(conn: sqlite3.Connection) -> None:
         logger.warning("未找到迁移目录（将仅依赖 schema.sql 与代码内补丁）: %s", migrations_dir)
         return
 
-    for migration_path in sorted(migrations_dir.glob("*.sql")):
+    for migration_path in ordered_migration_paths(migrations_dir):
         migration_file = migration_path.name
         try:
             migration_sql = migration_path.read_text(encoding="utf-8")

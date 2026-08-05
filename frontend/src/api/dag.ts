@@ -83,5 +83,6 @@ export const dagApi = {
     apiClient.put<DAGDefinition>(`/dag/${novelId}/nodes/${nodeId}`, config) as unknown as Promise<DAGDefinition>,
 
   /** GET /api/v1/dag/events?novel_id=... — DAG SSE 事件流 URL */
-  eventsUrl: (novelId: string) => fetchUrl(apiRoutes.dag.events(novelId)),
+  eventsUrl: (novelId: string, afterEventId?: string) =>
+    fetchUrl(apiRoutes.dag.events(novelId, afterEventId)),
 }

@@ -180,7 +180,7 @@ class StoryNodeRepository:
             for node in nodes:
                 try:
                     cursor.execute("""
-                        INSERT OR REPLACE INTO story_nodes (
+                        INSERT INTO story_nodes (
                             id, novel_id, parent_id, node_type, number, title, description, order_index,
                             planning_status, planning_source,
                             chapter_start, chapter_end, chapter_count, suggested_chapter_count,
@@ -189,6 +189,33 @@ class StoryNodeRepository:
                             pov_character_id, timeline_start, timeline_end,
                             metadata, created_at, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            novel_id = excluded.novel_id,
+                            parent_id = excluded.parent_id,
+                            node_type = excluded.node_type,
+                            number = excluded.number,
+                            title = excluded.title,
+                            description = excluded.description,
+                            order_index = excluded.order_index,
+                            planning_status = excluded.planning_status,
+                            planning_source = excluded.planning_source,
+                            chapter_start = excluded.chapter_start,
+                            chapter_end = excluded.chapter_end,
+                            chapter_count = excluded.chapter_count,
+                            suggested_chapter_count = excluded.suggested_chapter_count,
+                            content = excluded.content,
+                            outline = excluded.outline,
+                            word_count = excluded.word_count,
+                            status = excluded.status,
+                            themes = excluded.themes,
+                            key_events = excluded.key_events,
+                            narrative_arc = excluded.narrative_arc,
+                            conflicts = excluded.conflicts,
+                            pov_character_id = excluded.pov_character_id,
+                            timeline_start = excluded.timeline_start,
+                            timeline_end = excluded.timeline_end,
+                            metadata = excluded.metadata,
+                            updated_at = excluded.updated_at
                     """, (
                         node.id,
                         node.novel_id,

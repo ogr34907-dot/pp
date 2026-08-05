@@ -333,7 +333,10 @@ class BackendLifecycle:
 
                 if running_count > 0:
                     db.execute(
-                        """UPDATE novels SET autopilot_status = 'stopped', updated_at = CURRENT_TIMESTAMP
+                        """UPDATE novels
+                           SET autopilot_status = 'stopped',
+                               autopilot_recovery_reason = 'service_restart_interrupted',
+                               updated_at = CURRENT_TIMESTAMP
                            WHERE autopilot_status = 'running'"""
                     )
                     db.commit()

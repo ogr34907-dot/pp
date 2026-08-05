@@ -15,6 +15,40 @@ from infrastructure.persistence.database.sqlite_retry import (
 logger = logging.getLogger(__name__)
 
 
+_MIGRATION_DEPENDENCIES = {
+    "add_macro_diagnosis_context_patch.sql": (
+        "add_macro_diagnosis_results.sql",
+    ),
+}
+
+
+def ordered_migration_paths(migrations_dir: Path) -> list[Path]:
+    """Return published migrations in lexical order with explicit prerequisites."""
+    paths = {path.name: path for path in migrations_dir.glob("*.sql")}
+    ordered: list[Path] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            raise RuntimeError(f"Migration dependency cycle detected at {name}")
+        path = paths.get(name)
+        if path is None:
+            return
+        visiting.add(name)
+        for dependency in _MIGRATION_DEPENDENCIES.get(name, ()):
+            visit(dependency)
+        visiting.remove(name)
+        visited.add(name)
+        ordered.append(path)
+
+    for name in sorted(paths):
+        visit(name)
+    return ordered
+
+
 def apply_migration_files(conn: sqlite3.Connection, migrations_dir: Path) -> None:
     """Apply SQL migrations idempotently using the existing tracking table."""
     retry_settings = get_sqlite_retry_settings()
@@ -64,7 +98,7 @@ def apply_migration_files(conn: sqlite3.Connection, migrations_dir: Path) -> Non
         return
 
     new_migrations = 0
-    for migration_path in sorted(migrations_dir.glob("*.sql")):
+    for migration_path in ordered_migration_paths(migrations_dir):
         migration_file = migration_path.name
         if migration_file in applied:
             continue
@@ -111,7 +145,7 @@ def apply_migration_files_legacy(
         )
         return
 
-    for migration_path in sorted(migrations_dir.glob("*.sql")):
+    for migration_path in ordered_migration_paths(migrations_dir):
         migration_file = migration_path.name
         try:
             migration_sql = migration_path.read_text(encoding="utf-8")

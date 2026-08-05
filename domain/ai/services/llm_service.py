@@ -28,7 +28,8 @@ class GenerationConfig:
             raise ValueError("Temperature must be between 0.0 and 2.0")
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be greater than 0")
-        self.max_tokens = max(int(self.max_tokens), DEFAULT_MAX_OUTPUT_TOKENS)
+        # The default belongs to the constructor; an explicit operation limit is a cap.
+        self.max_tokens = int(self.max_tokens)
 
 
 class GenerationResult:

@@ -5,6 +5,7 @@ from application.world.services.narrative_promise import (
     extract_narrative_promise,
 )
 from application.world.services.narrative_lexicon import get_narrative_lexicon
+from domain.novel.value_objects.generation_preferences import GenerationPreferences
 
 
 def test_extract_narrative_promise_strips_internal_header_and_keeps_conflict():
@@ -45,3 +46,32 @@ def test_build_narrative_promise_block_keeps_opening_from_full_resolution():
     assert "前12章" in block
     assert "彻底平反" in block
     assert "反命题" in block
+
+
+def test_narrative_promise_block_carries_locked_generation_preferences():
+    """SETTING-001: T0 must retain the locked setup that prose relies on."""
+    novel = SimpleNamespace(
+        title="TRACE_TITLE",
+        premise="TRACE_PREMISE",
+        generation_prefs=GenerationPreferences(
+            locked_genre="TRACE_GENRE",
+            locked_world_preset="TRACE_WORLD",
+            locked_story_structure="TRACE_STRUCTURE",
+            locked_pacing_control="TRACE_PACING",
+            locked_writing_style="TRACE_STYLE",
+            locked_special_requirements="TRACE_TABOO",
+        ),
+    )
+
+    block = build_narrative_promise_block(novel, chapter_number=3)
+
+    for marker in (
+        "TRACE_TITLE",
+        "TRACE_GENRE",
+        "TRACE_WORLD",
+        "TRACE_STRUCTURE",
+        "TRACE_PACING",
+        "TRACE_STYLE",
+        "TRACE_TABOO",
+    ):
+        assert marker in block

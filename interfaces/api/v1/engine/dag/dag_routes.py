@@ -26,10 +26,11 @@ import asyncio
 import json
 import logging
 import time
-from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+import uuid
+from collections import OrderedDict, deque
+from typing import Any, Deque, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -60,6 +61,12 @@ router = APIRouter(prefix="/dag", tags=["DAG 工作流"])
 # SSE 事件订阅者管理
 _sse_subscribers: Dict[str, List[asyncio.Queue]] = {}  # novel_id -> [Queue]
 
+# SSE 断线恢复只需覆盖当前进程生命周期。持久化状态仍由 /status 作为权威来源。
+_SSE_PROCESS_EPOCH = uuid.uuid4().hex
+_sse_event_history: Dict[str, Deque[Dict[str, Any]]] = {}
+_sse_event_sequences: Dict[str, int] = {}
+_sse_projection_snapshots: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
 # ★ DAG 定义内存缓存（暂时不走数据库）
 _dag_cache: "OrderedDict[str, DAGDefinition]" = OrderedDict()
 
@@ -83,13 +90,75 @@ def _get_dag_for_novel(novel_id: str) -> DAGDefinition:
     return dag
 
 
+def _event_history_for_novel(novel_id: str) -> Deque[Dict[str, Any]]:
+    """Return the bounded in-process replay history for one novel."""
+    max_size = get_dag_runtime_settings().sse_queue_size
+    history = _sse_event_history.get(novel_id)
+    if history is None or history.maxlen != max_size:
+        history = deque(history or (), maxlen=max_size)
+        _sse_event_history[novel_id] = history
+    return history
+
+
+def _record_sse_event(novel_id: str, event_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Give an event a process-scoped ID and retain it before fan-out."""
+    sequence = _sse_event_sequences.get(novel_id, 0) + 1
+    _sse_event_sequences[novel_id] = sequence
+
+    event = dict(event_data)
+    event["novel_id"] = novel_id
+    event["event_id"] = f"{_SSE_PROCESS_EPOCH}:{sequence}"
+    _event_history_for_novel(novel_id).append(event)
+    return event
+
+
+def _events_after_cursor(novel_id: str, cursor: Optional[str]) -> List[Dict[str, Any]]:
+    """Replay only a complete suffix after a cursor retained by this process."""
+    if not cursor:
+        return []
+
+    history = list(_sse_event_history.get(novel_id, ()))
+    for index, event in enumerate(history):
+        if event.get("event_id") == cursor:
+            return [dict(replayed) for replayed in history[index + 1:]]
+
+    # A foreign process epoch or an evicted cursor cannot be safely resumed.
+    return []
+
+
+def _format_sse_event(event_data: Dict[str, Any]) -> str:
+    """Serialize one event using the standard SSE id/event/data frame."""
+    event_id = event_data.get("event_id")
+    event_type = str(event_data.get("type", "message"))
+    id_line = f"id: {event_id}\n" if event_id else ""
+    return (
+        f"{id_line}event: {event_type}\n"
+        f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+    )
+
+
+def _publish_projected_node_state_changes(
+    novel_id: str,
+    new_projection: Dict[str, Dict[str, Any]],
+) -> None:
+    """Publish each shared-state transition once for all active subscribers."""
+    previous_projection = _sse_projection_snapshots.get(novel_id)
+    _sse_projection_snapshots[novel_id] = new_projection
+    if previous_projection is None:
+        return
+
+    for event in node_states_to_sse_events(novel_id, previous_projection, new_projection):
+        publish_sse_event(novel_id, event)
+
+
 def publish_sse_event(novel_id: str, event_data: dict):
     """向指定小说的 SSE 订阅者推送事件"""
+    event = _record_sse_event(novel_id, event_data)
     subscribers = _sse_subscribers.get(novel_id, [])
     dead_queues = []
     for queue in subscribers:
         try:
-            queue.put_nowait(event_data)
+            queue.put_nowait(event)
         except asyncio.QueueFull:
             dead_queues.append(queue)
     # 清理满队列
@@ -176,10 +245,22 @@ async def get_dag_registry_linkage():
 
 
 @router.get("/events")
-async def dag_event_stream(novel_id: str = Query(..., description="小说 ID")):
+async def dag_event_stream(
+    novel_id: str = Query(..., description="小说 ID"),
+    after_event_id: Optional[str] = Query(
+        default=None,
+        description="主动重连时传入最后处理的 SSE event id",
+    ),
+    last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+):
     """SSE 事件流 — 前端实时接收节点状态变更"""
     runtime_settings = get_dag_runtime_settings()
     queue: asyncio.Queue = asyncio.Queue(maxsize=runtime_settings.sse_queue_size)
+    # Direct route tests receive FastAPI Query/Header default objects; live requests receive strings.
+    cursor = after_event_id if isinstance(after_event_id, str) and after_event_id else None
+    if cursor is None and isinstance(last_event_id, str) and last_event_id:
+        cursor = last_event_id
+    replay_events = _events_after_cursor(novel_id, cursor)
 
     # 注册订阅者
     if novel_id not in _sse_subscribers:
@@ -192,9 +273,9 @@ async def dag_event_stream(novel_id: str = Query(..., description="小说 ID")):
 
             # 发送初始连接确认
             yield f"event: connected\ndata: {json.dumps({'novel_id': novel_id, 'timestamp': time.time()})}\n\n"
+            for replayed_event in replay_events:
+                yield _format_sse_event(replayed_event)
 
-            prev_proj: Dict[str, Dict[str, Any]] = {}
-            projection_bootstrapped = False
             idle_ticks = 0
 
             while True:
@@ -204,8 +285,7 @@ async def dag_event_stream(novel_id: str = Query(..., description="小说 ID")):
                         timeout=runtime_settings.sse_idle_poll_seconds,
                     )
                     idle_ticks = 0
-                    event_type = event_data.get("type", "message")
-                    yield f"event: {event_type}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                    yield _format_sse_event(event_data)
                 except asyncio.TimeoutError:
                     idle_ticks += 1
                     event_data = None
@@ -215,14 +295,7 @@ async def dag_event_stream(novel_id: str = Query(..., description="小说 ID")):
                 snap = snapshot_from_shared(novel_id, shared)
                 node_ids = [(n.id, n.type, n.enabled) for n in dag.nodes]
                 new_proj = project_node_states(node_ids, snap)
-                if not projection_bootstrapped:
-                    prev_proj = new_proj
-                    projection_bootstrapped = True
-                else:
-                    for ev in node_states_to_sse_events(novel_id, prev_proj, new_proj):
-                        et = ev.get("type", "node_status_change")
-                        yield f"event: {et}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
-                    prev_proj = new_proj
+                _publish_projected_node_state_changes(novel_id, new_proj)
                 if idle_ticks >= runtime_settings.sse_heartbeat_every_idle_ticks:
                     yield f"event: heartbeat\ndata: {json.dumps({'timestamp': time.time()})}\n\n"
                     idle_ticks = 0

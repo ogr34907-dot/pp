@@ -70,8 +70,11 @@ export const autopilotApi = {
     })
   },
 
-  streamUrl(novelId: string, afterSeq?: number): string {
-    const params = afterSeq && afterSeq > 0 ? { after_seq: afterSeq } : undefined
+  streamUrl(novelId: string, afterSeq?: number, afterEventId?: string): string {
+    const params = {
+      ...(afterSeq && afterSeq > 0 ? { after_seq: afterSeq } : {}),
+      ...(afterEventId ? { after_event_id: afterEventId } : {}),
+    }
     return fetchUrl(apiRoutes.autopilot.stream(novelId, params))
   },
 

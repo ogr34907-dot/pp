@@ -7,6 +7,7 @@ from application.world.services.chapter_narrative_sync import (
     CHAPTER_NARRATIVE_PIPELINE_VERSION,
 )
 from domain.novel.entities.chapter import Chapter, ChapterStatus
+from domain.novel.value_objects.generation_preferences import GenerationPreferences
 from domain.novel.value_objects.novel_id import NovelId
 from domain.structure.story_node import NodeType, StoryNode
 from infrastructure.persistence.database.connection import DatabaseConnection
@@ -83,6 +84,45 @@ class _VectorFacade:
             {"collection": collection, "query_text": query_text, "limit": limit}
         )
         return list(self.results)
+
+
+def test_allocator_emits_locked_preferences_in_its_t0_narrative_promise_slot():
+    """SETTING-001: persisted setup must reach the budgeted prose context."""
+    novel = SimpleNamespace(
+        title="TRACE_TITLE",
+        premise="TRACE_PREMISE",
+        target_chapters=30,
+        generation_prefs=GenerationPreferences(
+            locked_genre="TRACE_GENRE",
+            locked_world_preset="TRACE_WORLD",
+            locked_story_structure="TRACE_STRUCTURE",
+            locked_pacing_control="TRACE_PACING",
+            locked_writing_style="TRACE_STYLE",
+            locked_special_requirements="TRACE_TABOO",
+        ),
+    )
+    allocator = ContextBudgetAllocator(
+        novel_repository=SimpleNamespace(get_by_id=lambda _novel_id: novel)
+    )
+
+    allocation = allocator.allocate(
+        novel_id="novel-1",
+        chapter_number=2,
+        outline="TRACE_OUTLINE",
+        total_budget=4000,
+    )
+    context = allocation.get_final_context()
+
+    for marker in (
+        "TRACE_TITLE",
+        "TRACE_GENRE",
+        "TRACE_WORLD",
+        "TRACE_STRUCTURE",
+        "TRACE_PACING",
+        "TRACE_STYLE",
+        "TRACE_TABOO",
+    ):
+        assert marker in context
 
 
 def test_recent_act_summaries_use_valid_metadata_and_fallback_for_stale_nodes():

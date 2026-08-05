@@ -128,22 +128,22 @@ class NovelService:
         ]
         repo = SqliteVariableHubRepository(get_database())
         for key, value, value_type, display_name in values:
-            if value in ("", None):
-                continue
-            repo.set_value(
-                VariableWrite(
-                    key=key,
-                    value=value,
-                    context_key=context_key,
-                    source_trace_id="novel_service_sync",
-                    source_node_key="novel_service",
-                    lineage={"source": "novel_service"},
-                    value_type=value_type,
-                    display_name=display_name,
-                    scope="global",
-                    stage="setup",
+            keys = (key, f"novel.setup.{key.removeprefix('novel.')}")
+            for variable_key in keys:
+                repo.set_value(
+                    VariableWrite(
+                        key=variable_key,
+                        value=value,
+                        context_key=context_key,
+                        source_trace_id="novel_service_sync",
+                        source_node_key="novel_service",
+                        lineage={"source": "novel_service"},
+                        value_type=value_type,
+                        display_name=display_name,
+                        scope="global",
+                        stage="setup",
+                    )
                 )
-            )
 
     def create_novel(
         self,
