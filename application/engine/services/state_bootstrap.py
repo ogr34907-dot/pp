@@ -84,6 +84,9 @@ class StateBootstrap:
                     # 加载 Bible
                     self._load_bible(novel_id)
 
+                    # 加载叙事知识
+                    self._load_knowledge(novel_id)
+
                     # 加载三元组
                     self._load_triples(novel_id)
 
@@ -134,6 +137,9 @@ class StateBootstrap:
 
             # 加载剧情弧光
             self._load_plot_arc(novel_id)
+
+            # 加载叙事知识
+            self._load_knowledge(novel_id)
 
             return True
 
@@ -427,6 +433,52 @@ class StateBootstrap:
 
         except Exception as e:
             logger.debug(f"加载 Bible 失败（可能不存在）: {novel_id}, {e}")
+            return None
+
+    def _load_knowledge(self, novel_id: str) -> Optional[Dict[str, Any]]:
+        """加载叙事知识到共享内存。"""
+        try:
+            from application.world.services.knowledge_service import KnowledgeService
+            from infrastructure.persistence.database.connection import get_database
+            from infrastructure.persistence.database.sqlite_knowledge_repository import (
+                SqliteKnowledgeRepository,
+            )
+
+            knowledge = KnowledgeService(
+                SqliteKnowledgeRepository(get_database())
+            ).get_knowledge(novel_id)
+            knowledge_dict = {
+                "version": knowledge.version,
+                "premise_lock": knowledge.premise_lock or "",
+                "chapters": [
+                    {
+                        "chapter_id": chapter.chapter_id,
+                        "summary": chapter.summary,
+                        "key_events": chapter.key_events,
+                        "open_threads": chapter.open_threads,
+                        "consistency_note": chapter.consistency_note,
+                        "beat_sections": list(chapter.beat_sections or []),
+                        "sync_status": chapter.sync_status,
+                    }
+                    for chapter in knowledge.chapters
+                ],
+                "facts": [
+                    {
+                        "id": fact.id,
+                        "subject": fact.subject,
+                        "predicate": fact.predicate,
+                        "object": fact.object,
+                        "chapter_id": fact.chapter_id,
+                        "note": fact.note or "",
+                    }
+                    for fact in knowledge.facts
+                ],
+            }
+            self._shared.set_knowledge(novel_id, knowledge_dict)
+            return knowledge_dict
+
+        except Exception as e:
+            logger.debug(f"加载叙事知识失败（可能不存在）: {novel_id}, {e}")
             return None
 
     def _load_triples(self, novel_id: str) -> List[Dict[str, Any]]:
