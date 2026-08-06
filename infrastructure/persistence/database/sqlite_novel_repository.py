@@ -388,11 +388,47 @@ class SqliteNovelRepository(NovelRepository):
         )
 
     def delete(self, novel_id: NovelId) -> None:
-        """删除小说（级联删除所有关联数据）"""
-        sql = "DELETE FROM novels WHERE id = ?"
-        self.db.execute(sql, (novel_id.value,))
-        self.db.get_connection().commit()
-        logger.info(f"Deleted novel: {novel_id.value}")
+        """删除小说及其全部按 novel_id 归属的数据。"""
+        conn = self.db.get_connection()
+        # Foreign-key enforcement is per SQLite connection. Older migrations
+        # also contain novel-scoped tables without a foreign key, so remove
+        # every direct novel_id row before deleting the aggregate root.
+        conn.execute("PRAGMA foreign_keys = ON")
+
+        table_rows = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+              AND name <> 'novels'
+            ORDER BY name
+            """
+        ).fetchall()
+        novel_scoped_tables = []
+        for row in table_rows:
+            table_name = row[0]
+            quoted_table = table_name.replace('"', '""')
+            columns = conn.execute(
+                f'PRAGMA table_info("{quoted_table}")'
+            ).fetchall()
+            if any(column[1] == "novel_id" for column in columns):
+                novel_scoped_tables.append(table_name)
+
+        with self.db.transaction() as transaction:
+            for table_name in novel_scoped_tables:
+                quoted_table = table_name.replace('"', '""')
+                transaction.execute(
+                    f'DELETE FROM "{quoted_table}" WHERE novel_id = ?',
+                    (novel_id.value,),
+                )
+            transaction.execute("DELETE FROM novels WHERE id = ?", (novel_id.value,))
+
+        logger.info(
+            "Deleted novel and %d novel-scoped tables: %s",
+            len(novel_scoped_tables),
+            novel_id.value,
+        )
 
     def exists(self, novel_id: NovelId) -> bool:
         """检查小说是否存在"""

@@ -181,6 +181,7 @@ import { novelApi } from '@/api/novel'
 import { parseGenreWorldFromPremise } from '@/utils/premisePresets'
 import { formatApiError, getHttpStatus } from '@/utils/apiError'
 import StylePresetSelector from './StylePresetSelector.vue'
+import { toBibleApiPayload } from './biblePayload'
 
 const props = withDefaults(
   defineProps<{ slug: string; reloadNonce?: number }>(),
@@ -351,35 +352,6 @@ const fromApiFormat = (bible: any) => {
   }
 }
 
-// Convert old format to new API format
-const toApiFormat = (data: any) => {
-  const characters: CharacterDTO[] = data.characters.map((c: BibleCharacter, i: number) => ({
-    id: `char-${i + 1}`,
-    name: c.name || '',
-    description: [c.role, c.traits, c.arc_note].filter(Boolean).join('\n---\n'),
-    relationships: [],
-  }))
-
-  const locations: LocationDTO[] = data.locations.map((l: BibleLocation, i: number) => ({
-    id: `loc-${i + 1}`,
-    name: l.name || '',
-    description: l.description || '',
-    location_type: 'general',
-  }))
-
-  const style_notes: StyleNoteDTO[] = data.style_notes
-    ? [
-        {
-          id: 'style-1',
-          category: 'general',
-          content: data.style_notes,
-        },
-      ]
-    : []
-
-  return { characters, world_settings: [], locations, timeline_notes: [], style_notes }
-}
-
 function styleNotesWithCreationDefault(styleNotes: string): string {
   const t = (styleNotes || '').trim()
   if (t) return styleNotes
@@ -477,7 +449,7 @@ const save = async () => {
       locations: state.value.locations.filter(l => (l.name || '').trim()),
       style_notes: state.value.style_notes,
     }
-    const apiData = toApiFormat(payload)
+    const apiData = toBibleApiPayload(props.slug, payload)
     await bibleApi.updateBible(props.slug, apiData)
 
     const k = await knowledgeApi.getKnowledge(props.slug)
@@ -514,7 +486,7 @@ const saveFromJson = async () => {
   saving.value = true
   try {
     const payload = JSON.parse(jsonRaw.value)
-    const apiData = toApiFormat(payload)
+    const apiData = toBibleApiPayload(props.slug, payload)
     await bibleApi.updateBible(props.slug, apiData)
     message.success('设定已保存')
     await load({ preserveSurface: true })
