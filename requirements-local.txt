@@ -2,7 +2,8 @@
 # PlotPilot — 本地模型扩展依赖（~2GB）
 # ════════════════════════════════════════════
 #
-# 用法: pip install -r requirements-local.txt
+# Windows: .\.venv\Scripts\python.exe -m pip install -r requirements-local.txt
+# Linux/macOS: ./.venv/bin/python -m pip install -r requirements-local.txt
 #
 # 包含本地 Embedding 模型所需的大型依赖。
 # 仅在需要使用「本地向量模式」时才安装。

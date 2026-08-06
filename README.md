@@ -197,18 +197,24 @@ PlotPilot 内核（本仓库）
 
 ```bash
 # 后端 — Windows
-py -3.14 -m venv .venv && .venv\Scripts\activate
-pip install -r requirements.txt
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# 使用本地向量模型时再安装：
+.\.venv\Scripts\python.exe -m pip install -r requirements-local.txt
 copy .env.example .env    # 填写 LLM 凭证
-uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
+.\.venv\Scripts\python.exe -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
 ```
 
 ```bash
 # 后端 — Linux / macOS
-python3.14 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+python3.14 -m venv .venv
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/python -m pip install -r requirements.txt
+# 使用本地向量模型时再安装：
+./.venv/bin/python -m pip install -r requirements-local.txt
 cp .env.example .env
-uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
+./.venv/bin/python -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
 ```
 
 ```bash

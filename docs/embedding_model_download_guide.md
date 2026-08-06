@@ -8,7 +8,10 @@ ModelScope 是阿里云提供的国内模型托管平台，速度快且稳定。
 
 ### 安装 ModelScope
 ```bash
-pip install modelscope
+# Windows
+.\.venv\Scripts\python.exe -m pip install modelscope
+# Linux/macOS
+# ./.venv/bin/python -m pip install modelscope
 ```
 
 ### 下载模型
@@ -43,7 +46,10 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 ### 下载模型
 ```bash
-python scripts/utils/download_embedding_model.py
+# Windows
+.\.venv\Scripts\python.exe scripts/utils/download_embedding_model.py
+# Linux/macOS
+# ./.venv/bin/python scripts/utils/download_embedding_model.py
 ```
 
 ## 方案 3：手动下载文件
@@ -83,7 +89,10 @@ EMBEDDING_API_KEY=your_key_here
 
 运行下载/校验脚本：
 ```bash
-python scripts/utils/download_embedding_model.py
+# Windows
+.\.venv\Scripts\python.exe scripts/utils/download_embedding_model.py
+# Linux/macOS
+# ./.venv/bin/python scripts/utils/download_embedding_model.py
 ```
 
 如果成功，会显示：

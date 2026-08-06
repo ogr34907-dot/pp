@@ -218,7 +218,7 @@ async def get_extensions_status(request: Request):
 async def install_extensions(request: Request):
     """安装本地 AI 扩展包（SSE 流式返回日志）
 
-    执行 `pip install -r requirements-local.txt`，
+    执行当前项目解释器的 `python -m pip install -r requirements-local.txt`，
     通过 Server-Sent Events 实时推送安装进度和日志。
     """
     _assert_localhost(request)

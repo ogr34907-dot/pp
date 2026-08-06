@@ -93,7 +93,8 @@ class AppContainer:
             self._vector_store_init_failed = True
             logger.warning(
                 "向量存储初始化失败，已降级禁用。"
-                "如需使用向量功能，请安装依赖: pip install -r requirements-local.txt"
+                "如需使用向量功能，请在项目虚拟环境中运行 "
+                "python -m pip install -r requirements-local.txt"
                 " 或设置 VECTOR_STORE_TYPE=qdrant。错误: %s",
                 exc,
             )

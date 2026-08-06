@@ -2,7 +2,8 @@
 # PlotPilot — 核心依赖（轻量级，秒级安装）
 # ════════════════════════════════════════════
 #
-# 用法: pip install -r requirements.txt
+# Windows: .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# Linux/macOS: ./.venv/bin/python -m pip install -r requirements.txt
 #
 # 仅包含运行核心功能所需的最小依赖集。
 # 本地向量模型（sentence-transformers / torch / faiss）

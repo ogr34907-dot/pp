@@ -37,8 +37,9 @@ pytest tests/integration -v
 pytest tests/ --cov=. --cov-report=term-missing
 
 # Install dependencies
-pip install -r requirements.txt           # core (lightweight)
-pip install -r requirements-local.txt     # + local embedding models
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt       # Windows core
+.\.venv\Scripts\python.exe -m pip install -r requirements-local.txt # Windows local embeddings
+# Linux/macOS: ./.venv/bin/python -m pip install -r requirements.txt
 ```
 
 ## Architecture: DDD Four-Layer

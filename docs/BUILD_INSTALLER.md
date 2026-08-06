@@ -8,7 +8,7 @@
 | **Tauri 源码** | `frontend/src-tauri/` **在仓库中**；**构建产物** `frontend/src-tauri/target/` 由 `.gitignore` 忽略，需本地 `cargo tauri build` 生成 |
 | **命令** | `python scripts/build_installer.py`（若本机存在该脚本；部分环境可能被 `.gitignore` 排除，由发行维护者自备）。`--dev` 只到前端；`--clean` 清理后再构建（见下文「`--clean` 清理范围」）；`--skip-frozen-backend` 跳过 PyInstaller（需已有 exe） |
 | **冻结后端**       | `python scripts/build_backend_pyinstaller.py`（或由 `build_installer` 步骤 4 调用）。产出：`out/tauri/plotpilot-backend/plotpilot-backend.exe`                               |
-| **构建机 Python** | **推荐 Python 3.14.5**，在**专用 venv** 内执行：`pip install pyinstaller` 与 `pip install -r requirements-nsis.txt`。勿用混装过 `requirements-local.txt`（torch/faiss 等）的环境，否则 PyInstaller 会把重型依赖打进包，体积与耗时暴涨。 |
+| **构建机 Python** | **推荐 Python 3.14.5**，在**专用 venv** 内执行：`.\.venv\Scripts\python.exe -m pip install pyinstaller` 与 `.\.venv\Scripts\python.exe -m pip install -r requirements-nsis.txt`。勿用混装过 `requirements-local.txt`（torch/faiss 等）的环境，否则 PyInstaller 会把重型依赖打进包，体积与耗时暴涨。 |
 | **占位**         | `out/tauri/plotpilot-backend/.gitkeep` 已入库，便于未打冻结包时通过 Tauri 资源 glob 校验                                                                                           |
 | **安装包路径**      | `frontend/src-tauri/target/release/bundle/nsis/*.exe`                                                                                                            |
 | **运行时**        | Tauri 优先启动 `plotpilot-backend.exe`；若无则回退 `python -m uvicorn`（本地开发）                                                                                               |
@@ -39,10 +39,10 @@
 ```powershell
 py -3.14 -m venv .venv-nsis
 .\.venv-nsis\Scripts\activate
-pip install -U pip
-pip install pyinstaller
-pip install -r requirements-nsis.txt
-python scripts/build_installer.py --clean
+.\.venv-nsis\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-nsis\Scripts\python.exe -m pip install pyinstaller
+.\.venv-nsis\Scripts\python.exe -m pip install -r requirements-nsis.txt
+.\.venv-nsis\Scripts\python.exe scripts/build_installer.py --clean
 ```
 
 仅重打冻结后端时，同样先 `activate` 该 venv，再执行 `python scripts/build_backend_pyinstaller.py`（可加 `--force`）。

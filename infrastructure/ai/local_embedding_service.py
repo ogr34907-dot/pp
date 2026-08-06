@@ -11,6 +11,7 @@
 支持 GPU 加速。优先使用本地目录，避免联网下载。
 """
 
+import sys
 from typing import List
 
 import logging
@@ -54,7 +55,7 @@ class LocalEmbeddingService(EmbeddingService):
                 "但缺少必要的依赖包！\n\n"
                 "请选择以下任一方式解决：\n"
                 "  方式 A — 安装扩展依赖（~2GB）：\n"
-                "    pip install -r requirements-local.txt\n\n"
+                f"    {sys.executable} -m pip install -r requirements-local.txt\n\n"
                 "  方式 B — 切换到 OpenAI API 模式（推荐，无需下载大包）：\n"
                 "    在设置页面将「嵌入模式」改为「openai」,\n"
                 "    并填写 EMBEDDING_API_KEY 和 EMBEDDING_BASE_URL\n\n"

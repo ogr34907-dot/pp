@@ -76,7 +76,8 @@ class EmbeddingEnvironmentSettings:
 
     @property
     def db_default_model_path(self) -> str:
-        return self.legacy_local_model_path
+        """Return the current path setting, with the legacy name as fallback."""
+        return self.model_path or self.legacy_local_model_path
 
     @property
     def http_timeout_settings(self) -> HttpTimeoutSettings:

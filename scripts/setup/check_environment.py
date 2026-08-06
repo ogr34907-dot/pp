@@ -1,6 +1,27 @@
 """环境检查脚本：确保验证原型可以运行"""
+import os
+import subprocess
 import sys
 from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def project_python() -> Path:
+    """Return the repository virtualenv interpreter when it is available."""
+    venv_python = (
+        PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else PROJECT_ROOT / ".venv" / "bin" / "python"
+    )
+    return venv_python if venv_python.exists() else Path(sys.executable)
+
+
+def pip_install_command(*packages: str) -> list[str]:
+    """Build an install command that cannot accidentally target global Python."""
+    return [str(project_python()), "-m", "pip", "install", *packages]
+
 
 def check_python_version():
     """检查 Python 版本"""
@@ -31,7 +52,8 @@ def check_dependencies():
             missing.append(package_name)
 
     if missing:
-        print(f"\n请运行: pip install {' '.join(missing)}")
+        command = subprocess.list2cmdline(pip_install_command(*missing))
+        print(f"\n请运行: {command}")
         return False
     return True
 

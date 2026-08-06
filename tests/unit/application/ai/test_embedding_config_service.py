@@ -9,5 +9,5 @@ def test_embedding_config_default_row_uses_embedding_environment(monkeypatch):
     defaults = EmbeddingConfigService._default_row_values()
 
     assert defaults["model"] == "env-embedding-model"
-    assert defaults["model_path"] == "/legacy/local/model"
+    assert defaults["model_path"] == "/current/local/model"
     assert defaults["mode"] == "openai"

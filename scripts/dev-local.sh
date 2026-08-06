@@ -9,9 +9,8 @@ echo "[1/4] root: ${ROOT_DIR}"
 if [[ ! -d "${ROOT_DIR}/.venv" ]]; then
   echo "Missing Python virtualenv at ${ROOT_DIR}/.venv"
   echo "Create it with:"
-  echo "  python3 -m venv .venv"
-  echo "  source .venv/bin/activate"
-  echo "  pip install -r requirements.txt"
+  echo "  python3.14 -m venv .venv"
+  echo "  ./.venv/bin/python -m pip install -r requirements.txt"
   exit 1
 fi
 
@@ -25,8 +24,7 @@ fi
 echo "[2/4] starting backend on http://127.0.0.1:8005"
 (
   cd "${ROOT_DIR}"
-  source ".venv/bin/activate"
-  python -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
+  ".venv/bin/python" -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
 ) &
 BACKEND_PID=$!
 

@@ -55,13 +55,22 @@ def test_embedding_environment_overrides_and_fallbacks(monkeypatch):
     assert settings.base_url == "https://embeddings.example"
     assert settings.model == "embedding-model"
     assert settings.model_path == "/models/current"
-    assert settings.db_default_model_path == "/models/legacy"
+    assert settings.db_default_model_path == "/models/current"
     assert settings.use_gpu is False
     assert settings.http_timeout_settings.timeout_seconds == 44.0
     assert settings.http_timeout_settings.connect_timeout == 5.0
     assert settings.http_timeout_settings.read_timeout == 33.0
     assert settings.http_timeout_settings.write_timeout == 22.0
     assert settings.http_timeout_settings.pool_timeout == 3.0
+
+
+def test_db_default_model_path_prefers_current_environment_name(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_MODEL_PATH", "/models/current")
+    monkeypatch.setenv("LOCAL_EMBEDDING_MODEL_PATH", "/models/legacy")
+
+    settings = EmbeddingEnvironmentSettings.from_env()
+
+    assert settings.db_default_model_path == "/models/current"
 
 
 def test_embedding_environment_embedding_key_takes_precedence(monkeypatch):

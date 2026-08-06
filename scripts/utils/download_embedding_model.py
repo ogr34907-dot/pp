@@ -1,70 +1,88 @@
-"""下载并测试本地向量模型
+"""Download and verify the bundled local embedding model.
 
-下载 BAAI/bge-small-zh-v1.5 模型到本地
+The weights are stored under the repository's ``.models`` directory so the
+runtime's ``EMBEDDING_MODEL_PATH`` and this utility always refer to the same
+location.  Heavy ML imports stay lazy so the script can be inspected without
+installing ``requirements-local.txt`` first.
 """
-import sys
+
+from __future__ import annotations
+
+import os
 from pathlib import Path
 
-# 添加项目根目录到路径
-sys.path.insert(0, str(Path(__file__).parent.parent))
+MODEL_ID = "BAAI/bge-small-zh-v1.5"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODEL_DIR = PROJECT_ROOT / ".models" / "bge-small-zh-v1.5"
 
-from sentence_transformers import SentenceTransformer
 
-print("=" * 60)
-print("下载本地向量模型")
-print("=" * 60)
+def download_model() -> Path:
+    """Download the model snapshot into the repository workspace."""
+    from huggingface_hub import snapshot_download
 
-print("\n[1] 下载模型: BAAI/bge-small-zh-v1.5")
-print("    模型大小: ~100MB")
-print("    首次运行会自动下载到 ~/.cache/huggingface/")
-print()
+    MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+    endpoint = os.getenv("HF_ENDPOINT") or None
+    snapshot_download(
+        MODEL_ID,
+        local_dir=MODEL_DIR,
+        endpoint=endpoint,
+        # The safetensors file is sufficient for sentence-transformers; avoid
+        # storing the duplicate PyTorch checkpoint in the workspace.
+        ignore_patterns=["pytorch_model.bin"],
+        max_workers=4,
+    )
+    return MODEL_DIR
 
-try:
-    # 下载模型（首次运行会从 HuggingFace 下载）
-    model = SentenceTransformer('BAAI/bge-small-zh-v1.5')
-    print("✓ 模型下载成功！")
 
-    # 测试模型
-    print("\n[2] 测试模型...")
-    test_texts = [
+def verify_model(model_dir: Path = MODEL_DIR):
+    """Load the downloaded snapshot without any network access."""
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(
+        str(model_dir),
+        device="cpu",
+        trust_remote_code=False,
+        local_files_only=True,
+    )
+    samples = [
         "林雪站在雪山之巅，寒风刺骨。",
         "李明在图书馆里翻阅古籍，寻找线索。",
-        "雪山上的风越来越大，林雪感到一丝不安。"
+        "雪山上的风越来越大，林雪感到一丝不安。",
     ]
+    embeddings = model.encode(samples, convert_to_numpy=True)
+    return model, embeddings
 
-    print(f"    测试文本数量: {len(test_texts)}")
-    embeddings = model.encode(test_texts)
-    print(f"✓ 生成向量维度: {embeddings.shape}")
-    print(f"✓ 向量维度: {embeddings.shape[1]}")
 
-    # 计算相似度
-    print("\n[3] 计算语义相似度...")
-    from sklearn.metrics.pairwise import cosine_similarity
-
-    query = "雪山上的场景"
-    query_embedding = model.encode([query])
-
-    similarities = cosine_similarity(query_embedding, embeddings)[0]
-
-    print(f"    查询: '{query}'")
-    print("    相似度排名:")
-    for i, (text, sim) in enumerate(sorted(zip(test_texts, similarities), key=lambda x: x[1], reverse=True), 1):
-        print(f"    {i}. [{sim:.4f}] {text}")
-
-    print("\n" + "=" * 60)
-    print("✓ 本地模型下载并测试成功！")
+def main() -> int:
     print("=" * 60)
-    print("\n模型信息:")
-    print(f"  - 模型名称: BAAI/bge-small-zh-v1.5")
-    print(f"  - 向量维度: {embeddings.shape[1]}")
-    print(f"  - 缓存位置: ~/.cache/huggingface/hub/")
-    print("\n下一步:")
-    print("  1. 配置 .env: EMBEDDING_SERVICE=local")
-    print("  2. 使用本地模型替代 OpenAI API")
+    print("下载本地向量模型")
+    print("=" * 60)
+    print(f"\n[1] 下载模型: {MODEL_ID}")
+    print(f"    目标路径: {MODEL_DIR}")
+    print("    首次运行会下载约 100MB，请稍候。")
 
-except Exception as e:
-    print(f"\n✗ 错误: {e}")
-    print("\n可能的解决方案:")
-    print("  1. 检查网络连接（需要访问 HuggingFace）")
-    print("  2. 使用镜像: export HF_ENDPOINT=https://hf-mirror.com")
-    sys.exit(1)
+    try:
+        model_dir = download_model()
+        print(f"✓ 模型下载成功: {model_dir}")
+
+        print("\n[2] 离线加载并测试模型...")
+        model, embeddings = verify_model(model_dir)
+        print(f"✓ 生成向量维度: {embeddings.shape}")
+
+        print("\n" + "=" * 60)
+        print("✓ 本地模型下载并测试成功！")
+        print("=" * 60)
+        print(f"  EMBEDDING_SERVICE=local")
+        print(f"  EMBEDDING_MODEL_PATH={model_dir}")
+        print(f"  向量维度: {model.get_sentence_embedding_dimension()}")
+        return 0
+    except Exception as exc:
+        print(f"\n✗ 错误: {exc}")
+        print("\n可能的解决方案:")
+        print("  1. 检查网络连接（需要访问 HuggingFace）")
+        print("  2. 设置 HF_ENDPOINT=https://hf-mirror.com 后重试")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
