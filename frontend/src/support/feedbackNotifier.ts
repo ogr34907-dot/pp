@@ -26,7 +26,7 @@ const dedupeHits = new Map<string, number>()
 const ringBuffer: FeedbackIncidentPayload[] = []
 
 /** @internal 供测试或可观测性挂接（勿在业务中依赖） */
-let _axiosAggBuffer: FeedbackIncidentPayload[] = []
+const _axiosAggBuffer: FeedbackIncidentPayload[] = []
 let _axiosAggTimer: ReturnType<typeof setTimeout> | null = null
 
 const { notification } = createDiscreteApi(['notification'], {

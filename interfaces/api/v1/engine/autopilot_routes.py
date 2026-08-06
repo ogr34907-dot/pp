@@ -1594,7 +1594,12 @@ def _clamp_autopilot_words_per_chapter(w: int) -> int:
 
 
 class StartRequest(BaseModel):
-    max_auto_chapters: Optional[int] = 9999  # 保护上限，默认几乎无限制，由 target_chapters 控制实际完成点
+    max_auto_chapters: Optional[int] = Field(
+        default=9999,
+        ge=1,
+        le=9999,
+        description="本次运行最多自动生成的章节数；独立于全书目标章节数。",
+    )
     target_chapters: Optional[int] = Field(
         default=None,
         ge=1,
@@ -1705,6 +1710,7 @@ async def start_autopilot(novel_id: str, body: StartRequest = StartRequest()):
             current_chapter_in_act=current_chapter_in_act,
             current_beat_index=current_beat_index,
             consecutive_error_count=0,
+            max_auto_chapters=body.max_auto_chapters,
             target_chapters=resolved_tc,
             target_words_per_chapter=resolved_twpc,
             needs_review=False,

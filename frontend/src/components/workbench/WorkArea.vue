@@ -1241,7 +1241,7 @@ function handleChapterContentUpdate(data: { chapterNumber: number; content: stri
 
   // 如果当前正在查看的章节就是正在写作的章节，实时更新编辑框内容
   if (currentChapter.value && currentChapter.value.number === data.chapterNumber) {
-    chapterContent.value = data.content
+    editorContent.value = data.content
   }
 }
 
@@ -1259,7 +1259,7 @@ function handleChapterChunkStream(data: {
   streamingContent.value = data.content
   streamingBeatIndex.value = data.beatIndex ?? 0
   if (currentChapter.value && currentChapter.value.number === n) {
-    chapterContent.value = data.content
+    editorContent.value = data.content
   }
 }
 
@@ -1298,7 +1298,7 @@ watch(
 )
 
 // 章节编辑
-const chapterContent = ref('')
+const editorContent = ref('')
 const originalContent = ref('')
 const loading = computed(() => props.chapterLoading)
 const saving = ref(false)
@@ -1478,9 +1478,9 @@ const nextProseChapterNumber = computed(() => {
   return getNextProseChapterNumber(props.chapters)
 })
 
-/** 当前是否有可重写的正文：以编辑器 `chapterContent` 为准（列表项通常不带全文，不能用 currentChapter.content） */
+/** 当前是否有可重写的正文：以编辑器内容为准（列表项通常不带全文，不能用 currentChapter.content） */
 const hasChapterContent = computed(() => {
-  return hasEditableChapterContent(chapterContent.value, currentChapter.value?.content)
+  return hasEditableChapterContent(editorContent.value, currentChapter.value?.content)
 })
 
 const prosePrimaryGenerationTarget = computed<ProseGenerationChapterTarget | null>(() => {
@@ -1515,7 +1515,7 @@ const { snapshot: guardrailSnapshot, load: loadGuardrailSnapshot } = useChapterG
 })
 
 const hasChanges = computed(() => {
-  return chapterContent.value !== originalContent.value
+  return editorContent.value !== originalContent.value
 })
 
 const wordCount = computed(() => {
@@ -1523,7 +1523,7 @@ const wordCount = computed(() => {
   if (isAutopilotRunning.value && streamingChapterNumber.value === currentChapter.value?.number && streamingContent.value) {
     return streamingContent.value.length
   }
-  return chapterContent.value.length
+  return editorContent.value.length
 })
 
 /** 托管流式：用 /status 的已定稿字数与单章目标拆分展示，避免只显示「三千多字」误解为终稿 */
@@ -1552,16 +1552,16 @@ const editorDisplayContent = computed({
     if (isAutopilotRunning.value && streamingChapterNumber.value === currentChapter.value?.number && streamingContent.value) {
       return streamingContent.value
     }
-    return chapterContent.value
+    return editorContent.value
   },
   set: (val: string) => {
-    chapterContent.value = val
+    editorContent.value = val
   }
 })
 
 // 监听传入的章节内容变化
 watch(() => props.chapterContent, (newContent) => {
-  chapterContent.value = newContent
+  editorContent.value = newContent
   originalContent.value = newContent
 }, { immediate: true })
 
@@ -1585,8 +1585,8 @@ const handleSave = async () => {
 
   saving.value = true
   try {
-    await chapterApi.updateChapter(props.slug, currentChapter.value.id, { content: chapterContent.value })
-    originalContent.value = chapterContent.value
+    await chapterApi.updateChapter(props.slug, currentChapter.value.id, { content: editorContent.value })
+    originalContent.value = editorContent.value
     message.success('保存成功')
     emit('chapterUpdated')
     scheduleGuardrailSnapshotRefresh()
@@ -1601,7 +1601,7 @@ const handleReload = async () => {
   if (!currentChapter.value) return
   try {
     const fresh = await chapterApi.getChapter(props.slug, currentChapter.value.number)
-    chapterContent.value = fresh.content ?? ''
+    editorContent.value = fresh.content ?? ''
     originalContent.value = fresh.content ?? ''
     message.success('已重新加载')
   } catch {
@@ -1973,7 +1973,7 @@ const handleSaveGenerated = async () => {
       ...(mb?.length ? { micro_beats: mb } : {}),
     })
     if (saveTarget.id === props.currentChapterId) {
-      chapterContent.value = generatedContent.value
+      editorContent.value = generatedContent.value
       originalContent.value = generatedContent.value
     }
     message.success(`已保存到${ordinalUnit(saveTarget.number)}`)

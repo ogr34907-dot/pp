@@ -74,6 +74,7 @@ class StatePublisher:
                 current_chapter_in_act=fields.get("current_chapter_in_act"),
                 current_beat_index=fields.get("current_beat_index", 0),
                 current_auto_chapters=fields.get("current_auto_chapters", 0),
+                max_auto_chapters=fields.get("max_auto_chapters", 9999),
                 target_chapters=fields.get("target_chapters", 0),
                 target_words_per_chapter=fields.get("target_words_per_chapter", 2500),
                 consecutive_error_count=fields.get("consecutive_error_count", 0),

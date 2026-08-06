@@ -539,7 +539,7 @@ const formatJson = () => {
   try {
     const parsed = JSON.parse(jsonRaw.value)
     jsonRaw.value = JSON.stringify(parsed, null, 2)
-  } catch (e) {
+  } catch {
     message.error('JSON 格式错误，无法格式化')
   }
 }
@@ -591,11 +591,11 @@ watch(
 )
 
 onMounted(() => {
-  window.addEventListener(BIBLE_PANEL_SOFT_RELOAD, onBiblePanelSoftReload as EventListener)
+  window.addEventListener(BIBLE_PANEL_SOFT_RELOAD, onBiblePanelSoftReload)
 })
 
 onUnmounted(() => {
-  window.removeEventListener(BIBLE_PANEL_SOFT_RELOAD, onBiblePanelSoftReload as EventListener)
+  window.removeEventListener(BIBLE_PANEL_SOFT_RELOAD, onBiblePanelSoftReload)
 })
 
 function onBiblePanelSoftReload() {

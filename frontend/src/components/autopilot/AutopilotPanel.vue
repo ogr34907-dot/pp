@@ -298,7 +298,7 @@
           <n-form-item label="保护上限（章节数，防止意外消耗）">
             <n-input-number
               v-model:value="startConfig.max_auto_chapters"
-              :min="startConfig.target_chapters"
+              :min="1"
               :max="9999"
               :step="10"
               style="width: 100%"
@@ -352,6 +352,7 @@ import { buildAutopilotStagePresentation } from '../../constants/autopilotStageP
 import { useAIInvocationStore } from '../../stores/aiInvocationStore'
 import { featureFlags } from '../../config/features'
 import { runtimePerformance } from '../../config/performance'
+import { normalizeAutopilotStartConfig } from './autopilotStartConfig'
 
 const props = defineProps({
   novelId: String,
@@ -1224,28 +1225,28 @@ function openStartModal() {
   const target = status.value?.target_chapters || 100
   const wpc = status.value?.target_words_per_chapter ?? 2500
   const autoApprove = status.value?.auto_approve_mode ?? false
-  startConfig.value = {
+  startConfig.value = normalizeAutopilotStartConfig({
     target_chapters: target,
     target_words_per_chapter: wpc,
-    max_auto_chapters: target + 20,
+    max_auto_chapters: status.value?.max_auto_chapters ?? target,
     auto_approve_mode: autoApprove
-  }
+  })
   showStartModal.value = true
 }
 
 function updateProtectionLimit() {
-  const target = startConfig.value.target_chapters
-  if (startConfig.value.max_auto_chapters < target + 20) {
-    startConfig.value.max_auto_chapters = target + 20
-  }
+  startConfig.value.max_auto_chapters = normalizeAutopilotStartConfig(startConfig.value).max_auto_chapters
 }
 
 async function start() {
   if (isToggleThrottled()) return
   toggling.value = true
   try {
-    const newTarget = startConfig.value.target_chapters
-    const newWpc = startConfig.value.target_words_per_chapter
+    const normalizedStartConfig = normalizeAutopilotStartConfig(startConfig.value)
+    startConfig.value = normalizedStartConfig
+    const newTarget = normalizedStartConfig.target_chapters
+    const newWpc = normalizedStartConfig.target_words_per_chapter
+    const maxAutoChapters = normalizedStartConfig.max_auto_chapters
     const currentAutoApprove = status.value?.auto_approve_mode ?? false
     const newAutoApprove = startConfig.value.auto_approve_mode
     activePreviewRunId = ''
@@ -1260,6 +1261,7 @@ async function start() {
       current_stage: prevStatus?.current_stage || 'macro_planning',
       target_chapters: newTarget,
       target_words_per_chapter: newWpc,
+      max_auto_chapters: maxAutoChapters,
       auto_approve_mode: newAutoApprove,
       consecutive_error_count: 0,
       needs_review: preserveReviewGate ? true : false,
@@ -1290,7 +1292,7 @@ async function start() {
 
     requests.push(
       autopilotApi.start(props.novelId, {
-        max_auto_chapters: startConfig.value.max_auto_chapters,
+        max_auto_chapters: maxAutoChapters,
         target_chapters: newTarget,
         target_words_per_chapter: newWpc,
       }).catch(err => {
@@ -1421,10 +1423,7 @@ async function retry() {
   const prevStatus = status.value
   const targetChapters = Number(status.value?.target_chapters || startConfig.value.target_chapters || 1)
   const targetWords = Number(status.value?.target_words_per_chapter || startConfig.value.target_words_per_chapter || 2500)
-  const maxAutoChapters = Math.max(
-    Number(startConfig.value.max_auto_chapters || 1),
-    targetChapters + 20,
-  )
+  const maxAutoChapters = normalizeAutopilotStartConfig(startConfig.value).max_auto_chapters
   toggling.value = true
 
   try {

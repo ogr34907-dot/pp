@@ -77,8 +77,6 @@ export const useNodeEditorStore = defineStore('nodeEditor', () => {
         prompt_variables: variables.value,
       })
       originalTemplate.value = promptTemplate.value
-    } catch (e: unknown) {
-      throw e
     } finally {
       isSaving.value = false
     }

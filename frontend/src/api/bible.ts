@@ -423,7 +423,7 @@ export async function consumeBibleGenerateStream(
         if (!parsed) continue
 
         const { event, data: dataStr } = parsed
-        let payload: Record<string, unknown> | null = null
+        let payload: Record<string, unknown>
         try {
           payload = JSON.parse(dataStr) as Record<string, unknown>
         } catch {

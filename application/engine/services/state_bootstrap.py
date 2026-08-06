@@ -151,7 +151,7 @@ class StateBootstrap:
             rows = db.fetch_all(
                 """SELECT id, title, autopilot_status, current_stage,
                           current_act, current_chapter_in_act, current_beat_index,
-                          current_auto_chapters, target_chapters, target_words_per_chapter,
+                          current_auto_chapters, max_auto_chapters, target_chapters, target_words_per_chapter,
                           consecutive_error_count, last_chapter_tension, auto_approve_mode,
                           autopilot_recovery_reason
                    FROM novels"""
@@ -180,7 +180,7 @@ class StateBootstrap:
             row = db.fetch_one(
                 """SELECT id, title, autopilot_status, current_stage,
                           current_act, current_chapter_in_act, current_beat_index,
-                          current_auto_chapters, target_chapters, target_words_per_chapter,
+                          current_auto_chapters, max_auto_chapters, target_chapters, target_words_per_chapter,
                           consecutive_error_count, last_chapter_tension, auto_approve_mode,
                           autopilot_recovery_reason
                    FROM novels WHERE id = ?""",
@@ -211,6 +211,7 @@ class StateBootstrap:
             current_chapter_in_act=novel.get("current_chapter_in_act"),
             current_beat_index=novel.get("current_beat_index", 0),
             current_auto_chapters=novel.get("current_auto_chapters", 0),
+            max_auto_chapters=novel.get("max_auto_chapters", 9999),
             target_chapters=novel.get("target_chapters", 0),
             target_words_per_chapter=novel.get("target_words_per_chapter", 2500),
             consecutive_error_count=novel.get("consecutive_error_count", 0),

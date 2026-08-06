@@ -4,6 +4,36 @@ from application.engine.services.query_service import QueryService
 from application.engine.services.shared_state_repository import NovelState, SharedStateRepository
 
 
+def test_query_service_exposes_configured_protection_limit_from_shared_state():
+    """STATUS-003: cockpit status must render the configured safety cap, not 9999."""
+    repo = SharedStateRepository(shared_dict={})
+    repo.set_novel_state(
+        "novel-1",
+        NovelState(
+            novel_id="novel-1",
+            title="Demo",
+            autopilot_status="running",
+            current_stage="writing",
+            current_act=0,
+            current_chapter_in_act=0,
+            current_beat_index=0,
+            current_auto_chapters=0,
+            max_auto_chapters=1,
+            target_chapters=500,
+            target_words_per_chapter=2000,
+            consecutive_error_count=0,
+            last_chapter_tension=0,
+            auto_approve_mode=False,
+            needs_review=False,
+        ),
+    )
+
+    status = QueryService(repo).get_novel_status_dict("novel-1")
+
+    assert status is not None
+    assert status["max_auto_chapters"] == 1
+
+
 def test_query_service_status_dict_exposes_active_invocation_flag():
     repo = SharedStateRepository(shared_dict={})
     repo.set_novel_state(

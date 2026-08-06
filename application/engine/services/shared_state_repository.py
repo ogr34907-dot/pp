@@ -64,6 +64,7 @@ class NovelState:
     last_chapter_tension: float
     auto_approve_mode: bool
     needs_review: bool
+    max_auto_chapters: int = 9999
     active_invocation_session_id: str = ""
     active_invocation_operation: str = ""
     active_invocation_node_key: str = ""
@@ -85,6 +86,7 @@ class NovelState:
             "current_chapter_in_act": self.current_chapter_in_act,
             "current_beat_index": self.current_beat_index,
             "current_auto_chapters": self.current_auto_chapters,
+            "max_auto_chapters": self.max_auto_chapters,
             "target_chapters": self.target_chapters,
             "target_words_per_chapter": self.target_words_per_chapter,
             "consecutive_error_count": self.consecutive_error_count,
@@ -114,6 +116,7 @@ class NovelState:
             current_chapter_in_act=data.get("current_chapter_in_act"),
             current_beat_index=data.get("current_beat_index", 0),
             current_auto_chapters=data.get("current_auto_chapters", 0),
+            max_auto_chapters=data.get("max_auto_chapters", 9999),
             target_chapters=data.get("target_chapters", 0),
             target_words_per_chapter=data.get("target_words_per_chapter", 2500),
             consecutive_error_count=data.get("consecutive_error_count", 0),

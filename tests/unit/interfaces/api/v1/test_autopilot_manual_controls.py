@@ -6,6 +6,59 @@ from interfaces.api.v1.engine import autopilot_routes
 
 
 @pytest.mark.asyncio
+async def test_start_publishes_selected_protection_limit_to_shared_state(monkeypatch):
+    """AUTOPILOT-UI-003: the daemon must receive the user-selected safety cap."""
+    shared_updates = []
+    start_signals = []
+
+    monkeypatch.setattr(
+        autopilot_routes,
+        "get_autopilot_runtime_settings",
+        lambda: SimpleNamespace(db_persist_timeout_seconds=1),
+    )
+    monkeypatch.setattr(
+        autopilot_routes,
+        "_get_shared_state_for_novel",
+        lambda _novel_id: {
+            "_updated_at": 1,
+            "current_stage": "writing",
+            "current_act": 0,
+            "current_chapter_in_act": 0,
+            "current_beat_index": 0,
+            "target_chapters": 500,
+            "target_words_per_chapter": 2000,
+        },
+    )
+    monkeypatch.setattr(
+        "interfaces.runtime_state.update_shared_novel_state",
+        lambda novel_id, **fields: shared_updates.append((novel_id, fields)),
+    )
+    monkeypatch.setattr(
+        autopilot_routes,
+        "_persist_autopilot_running_sync",
+        lambda _novel_id, **_kwargs: {"decision": None, "run_epoch": 7},
+    )
+    monkeypatch.setattr(
+        "application.engine.services.novel_stop_signal.publish_start_signal",
+        lambda novel_id: start_signals.append(novel_id),
+    )
+
+    response = await autopilot_routes.start_autopilot(
+        "novel-1",
+        autopilot_routes.StartRequest(
+            max_auto_chapters=1,
+            target_chapters=500,
+            target_words_per_chapter=2000,
+        ),
+    )
+
+    assert response["success"] is True
+    assert shared_updates[0][0] == "novel-1"
+    assert shared_updates[0][1]["max_auto_chapters"] == 1
+    assert start_signals == ["novel-1"]
+
+
+@pytest.mark.asyncio
 async def test_pause_publishes_a_resumable_manual_pause_intent(monkeypatch):
     """AUTOPILOT-002: pause is distinct from destructive stop/cleanup."""
     shared_updates = []

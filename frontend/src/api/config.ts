@@ -19,10 +19,11 @@ function isTauri(): boolean {
       _isTauri = false
     } else {
       const w = window as Window & {
-        __TAURI__?: unknown
-        __TAURI_INTERNALS__?: unknown
+        __TAURI_INTERNALS__?: {
+          invoke?: unknown
+        }
       }
-      _isTauri = !!(w.__TAURI__ || w.__TAURI_INTERNALS__)
+      _isTauri = typeof w.__TAURI_INTERNALS__?.invoke === 'function'
     }
   }
   return _isTauri
@@ -215,21 +216,23 @@ async function ensureTauriBackendReady(): Promise<void> {
  */
 export async function initApiClient(): Promise<void> {
   let port: number | null = null
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    const first = await invoke<number>('get_backend_port')
-    if (first > 0) {
-      port = first
-    } else if (isTauri()) {
-      console.log('[API] 等待后端就绪...')
-      port = await waitForTauriBackendPort(
-        cmd => invoke<number>(cmd),
-        runtimePerformance.network.tauriBackendWaitMs,
-        runtimePerformance.network.tauriBackendPollMs,
-      )
+  if (isTauri()) {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const first = await invoke<number>('get_backend_port')
+      if (first > 0) {
+        port = first
+      } else {
+        console.log('[API] 等待后端就绪...')
+        port = await waitForTauriBackendPort(
+          cmd => invoke<number>(cmd),
+          runtimePerformance.network.tauriBackendWaitMs,
+          runtimePerformance.network.tauriBackendPollMs,
+        )
+      }
+    } catch (e) {
+      console.warn('[API] Tauri IPC 调用失败:', e)
     }
-  } catch (e) {
-    console.warn('[API] Tauri IPC 调用失败:', e)
   }
 
   if (port != null && port > 0) {

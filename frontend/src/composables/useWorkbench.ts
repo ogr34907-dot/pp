@@ -131,7 +131,7 @@ export function useWorkbench(options: UseWorkbenchOptions) {
     chapterLoading.value = true
     const novelId = toValue(slug)
     try {
-      let chapter = await chapterApi.getChapter(novelId, id).catch(async (err) => {
+      const chapter = await chapterApi.getChapter(novelId, id).catch(async (err) => {
         if (!is404(err)) throw err
         // 章节正文不存在：静默创建空白记录（对应结构树手动添加的节点）
         await chapterApi.ensureChapter(novelId, id, nodeTitle ?? '')

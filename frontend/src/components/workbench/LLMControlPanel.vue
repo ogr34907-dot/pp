@@ -518,7 +518,7 @@ function parseJsonObject(label: string, text: string): Record<string, unknown> {
     return parsed as Record<string, unknown>
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'JSON 解析失败'
-    throw new Error(`${label} 格式错误：${reason}`)
+    throw new Error(`${label} 格式错误：${reason}`, { cause: error })
   }
 }
 
