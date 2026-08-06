@@ -198,6 +198,90 @@ def test_recent_act_summaries_use_valid_metadata_and_fallback_for_stale_nodes():
     assert "失效幕描述回退" in context
 
 
+def test_allocator_includes_current_part_and_volume_contract_in_t0_context():
+    """PROSE-STRUCTURE-001: prose must receive the active part and volume promise."""
+    part = _node(
+        "part-1",
+        NodeType.PART,
+        1,
+        description="先解决安丰塘的春汛与修堤危机。",
+    )
+    part.title = "安丰塘前"
+    volume = _node(
+        "volume-1",
+        NodeType.VOLUME,
+        1,
+        parent_id=part.id,
+        description="公开记账、按工发粮，并在汛期前堵住管涌。",
+    )
+    volume.title = "春汛决堤"
+    act = _node(
+        "act-1",
+        NodeType.ACT,
+        1,
+        parent_id=volume.id,
+        chapter_start=1,
+        chapter_end=3,
+        description="沈砺回到安丰。",
+    )
+    chapter = _node("chapter-1", NodeType.CHAPTER, 1, parent_id=act.id)
+    allocator = ContextBudgetAllocator(
+        story_node_repository=_StoryNodeRepository([part, volume, act, chapter])
+    )
+
+    allocation = allocator.allocate(
+        novel_id="novel-1",
+        chapter_number=1,
+        outline="沈砺查看安丰塘。",
+        total_budget=4000,
+    )
+    context = allocation.get_final_context()
+
+    for marker in (
+        "安丰塘前",
+        "先解决安丰塘的春汛与修堤危机。",
+        "春汛决堤",
+        "公开记账、按工发粮，并在汛期前堵住管涌。",
+    ):
+        assert marker in context
+
+
+def test_recent_act_summaries_exclude_the_current_volume():
+    """PROSE-STRUCTURE-002: a current volume is a T0 contract, not a prior-volume summary."""
+    previous_volume = _node(
+        "volume-previous",
+        NodeType.VOLUME,
+        1,
+        description="上一卷已经完成的约定。",
+    )
+    current_volume = _node(
+        "volume-current",
+        NodeType.VOLUME,
+        2,
+        description="当前卷只能由 T0 结构契约提供。",
+    )
+    current_act = _node(
+        "act-current",
+        NodeType.ACT,
+        1,
+        parent_id=current_volume.id,
+        chapter_start=1,
+        chapter_end=3,
+    )
+    current_act.order_index = 3
+    chapter = _node("chapter-1", NodeType.CHAPTER, 1, parent_id=current_act.id)
+    allocator = ContextBudgetAllocator(
+        story_node_repository=_StoryNodeRepository(
+            [previous_volume, current_volume, current_act, chapter]
+        )
+    )
+
+    context = allocator._get_recent_act_summaries("novel-1", 1)
+
+    assert "上一卷已经完成的约定。" in context
+    assert "当前卷只能由 T0 结构契约提供。" not in context
+
+
 def test_vector_recall_combines_narrative_query_and_filters_invalid_evidence():
     chapters = [
         SimpleNamespace(number=number, content_sha256=f"hash-{number}", content_revision=1)

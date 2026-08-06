@@ -178,3 +178,50 @@ def test_new_story_nodes_reject_duplicate_parent_type_and_number(repo_db):
                 order_index=1,
             )
         )
+
+
+def test_apply_merge_plan_updates_persisted_suggested_chapter_capacity(repo_db):
+    """DB-STRUCTURE-001: safe macro merges must not discard volume capacity."""
+    repo, db_path = repo_db
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-1", "Novel 1", "novel-1", 12),
+    )
+    conn.commit()
+    conn.close()
+    repo.save_sync(
+        StoryNode(
+            id="volume-1",
+            novel_id="novel-1",
+            node_type=NodeType.VOLUME,
+            number=1,
+            title="Original volume",
+            order_index=0,
+            suggested_chapter_count=6,
+        )
+    )
+
+    asyncio.run(
+        repo.apply_merge_plan(
+            creates=[],
+            updates=[
+                {
+                    "id": "volume-1",
+                    "title": "Updated volume",
+                    "description": "Updated contract",
+                    "order_index": 0,
+                    "suggested_chapter_count": 12,
+                }
+            ],
+            deletes=[],
+        )
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT title, suggested_chapter_count FROM story_nodes WHERE id = 'volume-1'"
+    ).fetchone()
+    conn.close()
+
+    assert row == ("Updated volume", 12)

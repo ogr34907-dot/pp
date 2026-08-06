@@ -101,8 +101,12 @@ class MacroMergeEngine:
                     'id': old_id,
                     'title': new_node['title'],
                     'description': new_node.get('description', ''),
-                    'order_index': new_node['order_index']
+                    'order_index': new_node['order_index'],
                 }
+                if new_node.get('suggested_chapter_count') is not None:
+                    updated_node['suggested_chapter_count'] = new_node[
+                        'suggested_chapter_count'
+                    ]
                 self.to_update.append(updated_node)
             else:
                 # 场景 A/B：旧的有，新的没有 -> 判断是否可以删除

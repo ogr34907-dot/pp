@@ -1267,6 +1267,10 @@ class ContinuousPlanningService:
         """
         logger.info(f"[SafeMerge] Starting safe macro plan confirmation for novel {novel_id}")
 
+        target_chapters = self._target_chapter_limit(novel_id) or 0
+        if not self._validate_macro_structure_completeness(structure, target_chapters):
+            raise ValueError("宏观规划结构或章节容量无效，未写入")
+
         # 阶段 1：深度扫描 - 获取旧结构
         old_nodes_entities = await self.story_node_repo.get_by_novel(novel_id)
         logger.info(f"[SafeMerge] Found {len(old_nodes_entities)} existing nodes")
@@ -1402,28 +1406,100 @@ class ContinuousPlanningService:
             structure.append(part_node)
         return structure
 
-    def _validate_macro_structure_completeness(self, structure: List[Dict], target_chapters: int) -> bool:
-        """Validate that the macro structure has minimum viable nodes (parts + volumes).
+    @staticmethod
+    def _macro_node_capacity(data: Dict) -> Optional[int]:
+        """Return a positive macro capacity from an explicit estimate or child acts."""
+        for field in ("suggested_chapter_count", "estimated_chapters"):
+            try:
+                value = int(data.get(field) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
 
-        Returns False if structure is missing volumes, which would cause act planning to fail.
-        """
+        children = data.get("acts")
+        if not isinstance(children, list) or not children:
+            children = data.get("volumes")
+        if not isinstance(children, list) or not children:
+            return None
+        child_capacities = [
+            ContinuousPlanningService._macro_node_capacity(child)
+            for child in children
+            if isinstance(child, dict)
+        ]
+        if len(child_capacities) != len(children) or any(capacity is None for capacity in child_capacities):
+            return None
+        return sum(int(capacity) for capacity in child_capacities)
+
+    def _validate_macro_structure_completeness(self, structure: List[Dict], target_chapters: int) -> bool:
+        """Require every planned part and volume to provide executable capacity."""
         if not structure or not isinstance(structure, list):
             return False
 
-        has_volumes = False
+        total_volume_capacity = 0
         for part in structure:
-            volumes = part.get("volumes", [])
-            if volumes and len(volumes) > 0:
-                has_volumes = True
-                break
+            if not isinstance(part, dict):
+                return False
+            volumes = part.get("volumes")
+            if not isinstance(volumes, list) or not volumes:
+                logger.warning("Macro structure validation failed: part has no volumes")
+                return False
 
-        if not has_volumes:
+            part_capacity = 0
+            for volume in volumes:
+                if not isinstance(volume, dict):
+                    return False
+                capacity = self._macro_node_capacity(volume)
+                if capacity is None:
+                    logger.warning(
+                        "Macro structure validation failed: volume lacks a positive chapter capacity"
+                    )
+                    return False
+                acts = volume.get("acts")
+                if isinstance(acts, list) and acts:
+                    act_capacities = [
+                        self._macro_node_capacity(act)
+                        for act in acts
+                        if isinstance(act, dict)
+                    ]
+                    if (
+                        len(act_capacities) != len(acts)
+                        or any(act_capacity is None for act_capacity in act_capacities)
+                        or sum(int(act_capacity) for act_capacity in act_capacities)
+                        != capacity
+                    ):
+                        logger.warning(
+                            "Macro structure validation failed: volume capacity=%s "
+                            "but acts total=%s",
+                            capacity,
+                            sum(
+                                int(act_capacity)
+                                for act_capacity in act_capacities
+                                if act_capacity is not None
+                            ),
+                        )
+                        return False
+                part_capacity += capacity
+
+            explicit_part_capacity = self._macro_node_capacity(
+                {key: part.get(key) for key in ("suggested_chapter_count", "estimated_chapters")}
+            )
+            if explicit_part_capacity is not None and explicit_part_capacity != part_capacity:
+                logger.warning(
+                    "Macro structure validation failed: part capacity=%s but volumes total=%s",
+                    explicit_part_capacity,
+                    part_capacity,
+                )
+                return False
+            total_volume_capacity += part_capacity
+
+        if target_chapters > 0 and total_volume_capacity != int(target_chapters):
             logger.warning(
-                f"Macro structure validation failed: structure has parts but no volumes. "
-                f"This will cause act planning to fail."
+                "Macro structure validation failed: volume capacity=%s but target=%s",
+                total_volume_capacity,
+                target_chapters,
             )
             return False
-
         return True
 
     async def apply_macro_plan_from_llm_result(
@@ -1497,7 +1573,63 @@ class ContinuousPlanningService:
                 f"[ActPlanning] act={act_id} 无自定义章数且无 suggested_chapter_count，"
                 f"使用引擎推荐值 {_default_cpa}"
             )
+        nodes = await self._get_story_nodes(act_node.novel_id)
+        remaining_capacity = self._remaining_parent_volume_capacity(
+            nodes,
+            act_node.parent_id,
+            exclude_act_id=act_node.id,
+        )
+        if remaining_capacity is not None:
+            if remaining_capacity <= 0:
+                raise ValueError(f"父卷已无剩余章节容量: {act_node.parent_id}")
+            chapter_count = min(chapter_count, remaining_capacity)
         return chapter_count
+
+    @staticmethod
+    def _reserved_act_chapter_count(act_node: StoryNode) -> int:
+        for field in ("chapter_count", "suggested_chapter_count"):
+            try:
+                value = int(getattr(act_node, field, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        return 0
+
+    def _remaining_parent_volume_capacity(
+        self,
+        nodes: List[StoryNode],
+        parent_volume_id: Optional[str],
+        *,
+        exclude_act_id: Optional[str] = None,
+    ) -> Optional[int]:
+        if not parent_volume_id:
+            return None
+        parent_volume = next((node for node in nodes if node.id == parent_volume_id), None)
+        if parent_volume is None or not self._is_story_node_type(parent_volume, NodeType.VOLUME):
+            return None
+        try:
+            capacity = int(getattr(parent_volume, "suggested_chapter_count", 0) or 0)
+        except (TypeError, ValueError):
+            capacity = 0
+        if capacity <= 0:
+            return None
+        reserved = sum(
+            max(
+                self._reserved_act_chapter_count(node),
+                sum(
+                    1
+                    for child in nodes
+                    if self._is_story_node_type(child, NodeType.CHAPTER)
+                    and child.parent_id == node.id
+                ),
+            )
+            for node in nodes
+            if self._is_story_node_type(node, NodeType.ACT)
+            and node.parent_id == parent_volume_id
+            and node.id != exclude_act_id
+        )
+        return max(capacity - reserved, 0)
 
     async def plan_act_chapters(
         self, act_id: str, custom_chapter_count: Optional[int] = None
@@ -1654,6 +1786,21 @@ class ContinuousPlanningService:
                     f"幕级规划将写入第 {projected_start}—{projected_end} 章，"
                     f"超过目标章节数 {target_limit}"
                 )
+
+        nodes = await self._get_story_nodes(novel_id_str)
+        remaining_volume_capacity = self._remaining_parent_volume_capacity(
+            nodes,
+            act_node.parent_id,
+            exclude_act_id=act_node.id,
+        )
+        if (
+            remaining_volume_capacity is not None
+            and len(chapters) > remaining_volume_capacity
+        ):
+            raise ValueError(
+                f"幕级规划需要 {len(chapters)} 章，超过父卷剩余章节容量 "
+                f"{remaining_volume_capacity}"
+            )
 
         await self._remove_chapter_children_of_act(act_id)
 
@@ -1845,6 +1992,13 @@ class ContinuousPlanningService:
         ):
             raise ValueError(f"下一幕父卷不存在或类型错误: {parent_id}")
 
+        remaining_capacity = self._remaining_parent_volume_capacity(
+            nodes,
+            parent_volume.id,
+        )
+        if remaining_capacity is not None and remaining_capacity <= 0:
+            raise ValueError(f"父卷已无剩余章节容量: {parent_volume.id}")
+
         target_limit = self._target_chapter_limit(novel_id)
         if target_limit is not None:
             highest_planned_chapter = max(
@@ -1860,16 +2014,19 @@ class ContinuousPlanningService:
                     f"已规划至目标章节数 {target_limit}，不能继续创建新幕"
                 )
 
-            acts_per_volume = calculate_structure_params(target_limit)["acts_per_volume"]
-            act_count = sum(
-                1
-                for node in nodes
-                if node.node_type == NodeType.ACT and node.parent_id == parent_volume.id
-            )
-            if act_count >= acts_per_volume:
-                raise ValueError(
-                    f"父卷已达到幕容量 {acts_per_volume}，请先创建或选择下一卷"
+            # Explicit volume capacity is the executable contract. The recommended
+            # act count remains a fallback only for legacy volumes without one.
+            if remaining_capacity is None:
+                acts_per_volume = calculate_structure_params(target_limit)["acts_per_volume"]
+                act_count = sum(
+                    1
+                    for node in nodes
+                    if node.node_type == NodeType.ACT and node.parent_id == parent_volume.id
                 )
+                if act_count >= acts_per_volume:
+                    raise ValueError(
+                        f"父卷已达到幕容量 {acts_per_volume}，请先创建或选择下一卷"
+                    )
 
         next_act_number = int(current_act.number) + 1
         if any(
@@ -1901,6 +2058,17 @@ class ContinuousPlanningService:
 
         bible_context = self._get_bible_context(novel_id)
         next_act_info = await self._generate_next_act_info(novel_id, current_act, bible_context)
+        nodes = list(await self.story_node_repo.get_by_novel(novel_id))
+        remaining_capacity = self._remaining_parent_volume_capacity(nodes, parent_id)
+        if remaining_capacity is not None:
+            if remaining_capacity <= 0:
+                raise ValueError(f"父卷已无剩余章节容量: {parent_id}")
+            requested_capacity = self._macro_node_capacity(next_act_info)
+            next_act_info = dict(next_act_info)
+            next_act_info["suggested_chapter_count"] = min(
+                requested_capacity or remaining_capacity,
+                remaining_capacity,
+            )
 
         next_act = self._create_node_from_data(
             novel_id,
@@ -1964,7 +2132,7 @@ class ContinuousPlanningService:
             order_index=order_index,
             planning_status=PlanningStatus.CONFIRMED,
             planning_source=PlanningSource.AI_MACRO,
-            suggested_chapter_count=data.get("suggested_chapter_count"),
+            suggested_chapter_count=self._macro_node_capacity(data),
             themes=data.get("themes", []),
             key_events=data.get("key_events", []) if node_type == NodeType.ACT else [],
             narrative_arc=data.get("narrative_arc") if node_type == NodeType.ACT else None,
@@ -2001,6 +2169,7 @@ class ContinuousPlanningService:
                 "title": part_data["title"],
                 "description": part_data.get("description", ""),
                 "order_index": order_index,
+                "suggested_chapter_count": self._macro_node_capacity(part_data),
             })
             order_index += 1
 
@@ -2018,6 +2187,7 @@ class ContinuousPlanningService:
                     "title": volume_data["title"],
                     "description": volume_data.get("description", ""),
                     "order_index": order_index,
+                    "suggested_chapter_count": self._macro_node_capacity(volume_data),
                 })
                 order_index += 1
 
@@ -2035,6 +2205,7 @@ class ContinuousPlanningService:
                         "title": act_data["title"],
                         "description": act_data.get("description", ""),
                         "order_index": order_index,
+                        "suggested_chapter_count": self._macro_node_capacity(act_data),
                     })
                     order_index += 1
 
@@ -2723,7 +2894,11 @@ class ContinuousPlanningService:
         chapter_count: int,
     ) -> Prompt:
         """构建幕级章节规划提示词。"""
-        context_parts = [f"幕信息：《{act_node.title}》"]
+        context_parts = []
+        structural_contract = self._get_parent_structure_contract(act_node)
+        if structural_contract:
+            context_parts.append(structural_contract)
+        context_parts.append(f"幕信息：《{act_node.title}》")
         if act_node.description:
             context_parts.append(f"幕简介：{act_node.description}")
         if previous_summary:
@@ -2768,6 +2943,37 @@ class ContinuousPlanningService:
             },
         )
 
+    def _get_parent_structure_contract(self, act_node: StoryNode) -> str:
+        """Render the active part and volume promises for an act-planning prompt."""
+        getter = getattr(self.story_node_repo, "get_by_novel_sync", None)
+        if not callable(getter):
+            return ""
+        try:
+            nodes = list(getter(act_node.novel_id) or [])
+        except Exception as exc:
+            logger.debug(
+                "[ActPlanning] 读取父结构契约失败 act=%s: %s",
+                act_node.id,
+                exc,
+            )
+            return ""
+
+        by_id = {node.id: node for node in nodes if getattr(node, "id", None)}
+        volume = by_id.get(act_node.parent_id)
+        if volume is None or not self._is_story_node_type(volume, NodeType.VOLUME):
+            return ""
+        part = by_id.get(volume.parent_id)
+
+        lines = []
+        if part is not None and self._is_story_node_type(part, NodeType.PART):
+            lines.append(f"【当前部约定】《{part.title}》")
+            if part.description:
+                lines.append(str(part.description))
+        lines.append(f"【当前卷约定】《{volume.title}》")
+        if volume.description:
+            lines.append(str(volume.description))
+        return "\n".join(lines)
+
     def _build_act_contract_variables(self, novel_id: str) -> Dict[str, str]:
         """Collect locked narrative contract fields for CPMS rendering."""
         prefs = self._get_generation_preferences(novel_id)
@@ -2809,15 +3015,30 @@ class ContinuousPlanningService:
             ),
             key=self._story_node_order,
         )
-        previous_volumes = sorted(
-            (
-                node
-                for node in nodes
-                if self._is_story_node_type(node, NodeType.VOLUME)
-                and self._node_precedes_act(node, act_node, current_order)
-            ),
-            key=self._story_node_order,
-        )
+        nodes_by_id = {node.id: node for node in nodes if getattr(node, "id", None)}
+        current_volume = nodes_by_id.get(getattr(act_node, "parent_id", None))
+        if current_volume is not None and self._is_story_node_type(current_volume, NodeType.VOLUME):
+            previous_volumes = sorted(
+                (
+                    node
+                    for node in nodes
+                    if self._is_story_node_type(node, NodeType.VOLUME)
+                    and node.id != current_volume.id
+                    and int(getattr(node, "number", 0) or 0)
+                    < int(getattr(current_volume, "number", 0) or 0)
+                ),
+                key=self._story_node_order,
+            )
+        else:
+            previous_volumes = sorted(
+                (
+                    node
+                    for node in nodes
+                    if self._is_story_node_type(node, NodeType.VOLUME)
+                    and self._node_precedes_act(node, act_node, current_order)
+                ),
+                key=self._story_node_order,
+            )
         parts = []
         for previous_act in previous_acts[-3:]:
             summary = self._get_current_node_summary(previous_act)
@@ -3068,7 +3289,6 @@ class ContinuousPlanningService:
         Returns:
             {
                 "volume_summary": "前一卷的摘要",
-                "current_volume_summary": "当前卷的摘要",
                 "pending_foreshadowings": "待回收伏笔列表",
                 "character_states": "角色状态锚点",
             }
@@ -3091,12 +3311,6 @@ class ContinuousPlanningService:
                     (n for n in all_nodes if n.id == current_act.parent_id),
                     None
                 )
-            
-            # 轨道一：获取卷摘要
-            if current_volume:
-                vol_summary = self._get_current_node_summary(current_volume)
-                if vol_summary:
-                    context["current_volume_summary"] = f"【当前卷进度】{current_volume.title}\n{vol_summary}"
             
             # 获取前一卷的摘要
             volume_nodes = sorted(
@@ -3166,7 +3380,6 @@ class ContinuousPlanningService:
             dual_track_context[key]
             for key in (
                 "volume_summary",
-                "current_volume_summary",
                 "pending_foreshadowings",
                 "character_states",
             )

@@ -62,7 +62,7 @@ class _DeterministicLLM:
                             "node_id": "A1_1_1",
                             "title": "审计第一幕",
                             "description": "开局冲突",
-                            "estimated_chapters": 10,
+                            "estimated_chapters": 12,
                             "narrative_goal": "建立核心冲突",
                             "plot_points": ["发现线索"],
                             "key_characters": ["审计主角"],
@@ -227,7 +227,7 @@ def test_mock_llm_api_chain_persists_structure_chapters_and_beat_sheet(
         macro = asyncio.run(
             planning_service.generate_macro_plan(
                 novel_id="mock-llm-e2e",
-                target_chapters=10,
+                target_chapters=12,
                 structure_preference={
                     "parts": 1,
                     "volumes_per_part": 1,

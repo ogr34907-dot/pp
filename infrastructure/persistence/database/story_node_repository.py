@@ -384,17 +384,20 @@ class StoryNodeRepository:
                 placeholders = ",".join(["?"] * len(deletes))
                 cursor.execute(f"DELETE FROM story_nodes WHERE id IN ({placeholders})", deletes)
 
-            # 2. 批量更新（只更新 title, description, order_index）
+            # 2. 批量更新（保留宏观结构的可执行容量）
             if updates:
                 for u in updates:
                     cursor.execute("""
                         UPDATE story_nodes
-                        SET title=?, description=?, order_index=?, updated_at=?
+                        SET title=?, description=?, order_index=?,
+                            suggested_chapter_count=COALESCE(?, suggested_chapter_count),
+                            updated_at=?
                         WHERE id=?
                     """, (
                         u['title'],
                         u.get('description', ''),
                         u['order_index'],
+                        u.get('suggested_chapter_count'),
                         datetime.now().isoformat(),
                         u['id']
                     ))

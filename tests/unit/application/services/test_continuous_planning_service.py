@@ -151,7 +151,7 @@ async def test_previous_act_summaries_use_committed_metadata_and_stale_fallback(
         "act-committed",
         NodeType.ACT,
         1,
-        parent_id="volume-1",
+        parent_id="volume-previous",
         chapter_start=1,
         chapter_end=2,
         metadata={
@@ -165,7 +165,7 @@ async def test_previous_act_summaries_use_committed_metadata_and_stale_fallback(
         },
     )
     previous_volume = _story_node(
-        "volume-1",
+        "volume-previous",
         NodeType.VOLUME,
         1,
         chapter_start=1,
@@ -179,6 +179,12 @@ async def test_previous_act_summaries_use_committed_metadata_and_stale_fallback(
                 "source_version": _summary_source_version(*chapters),
             },
         },
+    )
+    current_volume = _story_node(
+        "volume-current",
+        NodeType.VOLUME,
+        2,
+        description="当前卷契约不应作为前卷摘要。",
     )
     checkpoint = _story_node("chapter-2", NodeType.CHAPTER, 2, parent_id="act-committed")
     checkpoint.metadata = {
@@ -194,7 +200,7 @@ async def test_previous_act_summaries_use_committed_metadata_and_stale_fallback(
         "act-stale",
         NodeType.ACT,
         2,
-        parent_id="volume-1",
+        parent_id="volume-current",
         chapter_start=3,
         chapter_end=4,
         description="失效幕描述",
@@ -207,12 +213,14 @@ async def test_previous_act_summaries_use_committed_metadata_and_stale_fallback(
         "act-current",
         NodeType.ACT,
         3,
-        parent_id="volume-1",
+        parent_id="volume-current",
         chapter_start=5,
         chapter_end=6,
     )
     service = ContinuousPlanningService(
-        story_node_repo=_AsyncStoryNodeRepo([previous_volume, committed, checkpoint, stale, current]),
+        story_node_repo=_AsyncStoryNodeRepo(
+            [previous_volume, current_volume, committed, checkpoint, stale, current]
+        ),
         chapter_element_repo=Mock(),
         chapter_repository=_VersionedChapterRepo(chapters),
         llm_service=Mock(),
@@ -225,6 +233,7 @@ async def test_previous_act_summaries_use_committed_metadata_and_stale_fallback(
     assert "最近有效检查点摘要" in previous
     assert "失效幕摘要" not in previous
     assert "失效幕描述" in previous
+    assert "当前卷契约不应作为前卷摘要。" not in previous
 
 
 @pytest.mark.asyncio
@@ -261,7 +270,7 @@ async def test_find_act_for_chapter_uses_chapter_parent_before_range_fallback():
 
 
 @pytest.mark.asyncio
-async def test_dual_track_context_uses_only_current_source_matched_volume_summaries():
+async def test_dual_track_context_excludes_current_volume_summary_from_next_act_planning():
     chapters = [
         SimpleNamespace(number=number, content_sha256=f"hash-{number}", content_revision=1)
         for number in range(1, 7)
@@ -328,9 +337,39 @@ async def test_dual_track_context_uses_only_current_source_matched_volume_summar
 
     context = await service._collect_dual_track_context("novel-1", current_act, {})
 
-    assert "当前有效卷摘要" in context["current_volume_summary"]
+    assert context["current_volume_summary"] == ""
     assert "最近有效前卷摘要" in context["volume_summary"]
     assert "不应进入规划的失效卷摘要" not in context["volume_summary"]
+
+
+def test_next_act_prompt_excludes_current_volume_summary_even_if_provided(monkeypatch):
+    service = _make_service()
+    current_act = _story_node("act-current", NodeType.ACT, 3, parent_id="volume-current")
+    captured = {}
+
+    def fake_render(_contract, variables):
+        captured.update(variables)
+        return Prompt(system="system", user=variables["context_block"])
+
+    monkeypatch.setattr(
+        ContinuousPlanningService,
+        "_render_contract_prompt",
+        staticmethod(fake_render),
+    )
+
+    prompt = service._build_next_act_prompt_with_dual_track(
+        current_act,
+        {
+            "volume_summary": "【前一卷回顾】上一卷有效摘要",
+            "current_volume_summary": "【当前卷进度】不得泄漏到下一幕",
+            "pending_foreshadowings": "",
+            "character_states": "",
+        },
+    )
+
+    assert "上一卷有效摘要" in prompt.user
+    assert "不得泄漏到下一幕" not in prompt.user
+    assert "不得泄漏到下一幕" not in captured["context_block"]
 
 
 def test_parse_llm_response_repairs_truncated_macro_plan_json():
@@ -503,6 +542,267 @@ def test_act_planning_prompt_passes_locked_contract_variables_to_cpms(monkeypatc
     assert prompt.user == str(captured)
 
 
+def test_act_planning_prompt_includes_parent_part_and_volume_contract(monkeypatch):
+    """PLANNING-STRUCTURE-001: an act plan must retain its parent promises."""
+    part = StoryNode(
+        id="part-1",
+        novel_id="novel-1",
+        node_type=NodeType.PART,
+        number=1,
+        title="安丰塘前",
+        description="先解决安丰塘的春汛与修堤危机。",
+        order_index=1,
+    )
+    volume = StoryNode(
+        id="volume-1",
+        novel_id="novel-1",
+        parent_id=part.id,
+        node_type=NodeType.VOLUME,
+        number=1,
+        title="春汛决堤",
+        description="公开记账、按工发粮，并在汛期前堵住管涌。",
+        order_index=2,
+    )
+    act = StoryNode(
+        id="act-1",
+        novel_id="novel-1",
+        parent_id=volume.id,
+        node_type=NodeType.ACT,
+        number=1,
+        title="第一幕 · 开端",
+        description="沈砺回到安丰。",
+        order_index=3,
+    )
+    story_repo = Mock()
+    story_repo.get_by_novel_sync.return_value = [part, volume, act]
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+    )
+    captured = {}
+
+    def fake_render(_contract, variables):
+        captured.update(variables)
+        return Prompt(system="system", user=variables["context"])
+
+    monkeypatch.setattr(
+        ContinuousPlanningService,
+        "_render_contract_prompt",
+        staticmethod(fake_render),
+    )
+
+    prompt = service._build_act_planning_prompt(
+        act_node=act,
+        bible_context={},
+        previous_summary=None,
+        chapter_count=6,
+    )
+
+    for marker in (
+        "安丰塘前",
+        "先解决安丰塘的春汛与修堤危机。",
+        "春汛决堤",
+        "公开记账、按工发粮，并在汛期前堵住管涌。",
+    ):
+        assert marker in prompt.user
+
+
+def test_flatten_macro_structure_preserves_part_and_volume_estimated_capacity():
+    """PLANNING-CAPACITY-001: macro estimates must reach StoryNode capacity fields."""
+    service = _make_service()
+
+    nodes = service._flatten_structure_to_nodes(
+        "novel-1",
+        [
+            {
+                "title": "安丰塘前",
+                "description": "县域生存危机。",
+                "estimated_chapters": 12,
+                "volumes": [
+                    {
+                        "title": "春汛决堤",
+                        "description": "先修堤再追查粮仓。",
+                        "estimated_chapters": 12,
+                        "acts": [],
+                    }
+                ],
+            }
+        ],
+    )
+
+    part, volume = nodes
+    assert part["suggested_chapter_count"] == 12
+    assert volume["suggested_chapter_count"] == 12
+
+
+def test_flatten_macro_structure_derives_part_capacity_from_its_volumes():
+    """PLANNING-CAPACITY-001b: a part inherits the sum of its executable volumes."""
+    service = _make_service()
+
+    nodes = service._flatten_structure_to_nodes(
+        "novel-1",
+        [
+            {
+                "title": "安丰塘前",
+                "volumes": [
+                    {
+                        "title": "春汛决堤",
+                        "estimated_chapters": 12,
+                        "acts": [],
+                    }
+                ],
+            }
+        ],
+    )
+
+    assert nodes[0]["suggested_chapter_count"] == 12
+
+
+def test_macro_structure_rejects_any_part_without_a_volume():
+    """PLANNING-CAPACITY-002: every part needs an executable volume."""
+    service = _make_service()
+
+    structure = [
+        {
+            "title": "第一部",
+            "volumes": [
+                {"title": "开篇卷", "estimated_chapters": 10, "acts": []}
+            ],
+        },
+        {"title": "第二部", "volumes": []},
+    ]
+
+    assert service._validate_macro_structure_completeness(structure, 10) is False
+
+
+def test_macro_structure_rejects_volume_capacity_that_misses_target():
+    """PLANNING-CAPACITY-003: executable volume capacity must equal the novel target."""
+    service = _make_service()
+
+    structure = [
+        {
+            "title": "第一部",
+            "volumes": [
+                {"title": "开篇卷", "estimated_chapters": 9, "acts": []}
+            ],
+        }
+    ]
+
+    assert service._validate_macro_structure_completeness(structure, 10) is False
+
+
+def test_macro_structure_rejects_volume_capacity_inconsistent_with_child_acts():
+    """PLANNING-CAPACITY-003b: a volume promise must equal its act reservations."""
+    service = _make_service()
+
+    structure = [
+        {
+            "title": "第一部",
+            "estimated_chapters": 5,
+            "volumes": [
+                {
+                    "title": "开篇卷",
+                    "estimated_chapters": 5,
+                    "acts": [
+                        {"title": "第一幕", "estimated_chapters": 5},
+                        {"title": "第二幕", "estimated_chapters": 5},
+                    ],
+                }
+            ],
+        }
+    ]
+
+    assert service._validate_macro_structure_completeness(structure, 5) is False
+
+
+@pytest.mark.asyncio
+async def test_safe_macro_confirmation_rejects_missing_capacity_before_merge():
+    """PLANNING-CAPACITY-003c: UI confirmation cannot persist unbounded containers."""
+    story_repo = SimpleNamespace(
+        get_by_novel=AsyncMock(return_value=[]),
+        apply_merge_plan=AsyncMock(),
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+        novel_repository=SimpleNamespace(
+            get_by_id=Mock(return_value=SimpleNamespace(target_chapters=10))
+        ),
+    )
+
+    with pytest.raises(ValueError, match="容量"):
+        await service.confirm_macro_plan_safe(
+            novel_id="novel-1",
+            structure=[
+                {
+                    "title": "第一部",
+                    "volumes": [{"title": "开篇卷", "acts": []}],
+                }
+            ],
+        )
+
+    story_repo.apply_merge_plan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_next_act_caps_its_plan_to_remaining_parent_volume_capacity():
+    """PLANNING-CAPACITY-005: a new act cannot reserve past its parent volume."""
+    volume = _story_node("volume-1", NodeType.VOLUME, 1)
+    volume.suggested_chapter_count = 8
+    current_act = _story_node("act-1", NodeType.ACT, 1, parent_id=volume.id)
+    current_act.chapter_count = 6
+    current_act.suggested_chapter_count = 6
+    service, story_repo = _next_act_service(
+        [volume, current_act],
+        target_chapters=100,
+    )
+    service._generate_next_act_info = AsyncMock(
+        return_value={
+            "title": "第二幕",
+            "description": "继续推进当前卷。",
+            "suggested_chapter_count": 5,
+        }
+    )
+
+    result = await service.create_next_act_auto(
+        novel_id="novel-1",
+        current_act_id=current_act.id,
+        parent_volume_id=volume.id,
+    )
+
+    assert result["success"] is True
+    assert story_repo.saved[-1].suggested_chapter_count == 2
+
+
+@pytest.mark.asyncio
+async def test_create_next_act_allows_remaining_volume_capacity_after_recommended_act_count():
+    """PLANNING-CAPACITY-009: an explicit volume capacity outranks act-count advice."""
+    volume = _story_node("volume-1", NodeType.VOLUME, 1)
+    volume.suggested_chapter_count = 12
+    acts = [
+        _story_node(f"act-{number}", NodeType.ACT, number, parent_id=volume.id)
+        for number in range(1, 5)
+    ]
+    for act in acts:
+        act.suggested_chapter_count = 2
+    service, story_repo = _next_act_service(
+        [volume, *acts],
+        target_chapters=100,
+    )
+
+    result = await service.create_next_act_auto(
+        novel_id="novel-1",
+        current_act_id=acts[-1].id,
+        parent_volume_id=volume.id,
+    )
+
+    assert result["success"] is True
+    assert story_repo.saved[-1].parent_id == volume.id
+    assert story_repo.saved[-1].suggested_chapter_count == 4
+
+
 @pytest.mark.asyncio
 async def test_stream_macro_llm_text_repairs_partial_text_when_stream_breaks():
     async def broken_stream(_prompt, _config):
@@ -663,6 +963,78 @@ async def test_confirm_act_planning_rejects_chapters_beyond_novel_target_before_
 
     with pytest.raises(ValueError, match="目标章节数"):
         await service.confirm_act_planning("act-1", chapters)
+
+    story_repo.delete.assert_not_awaited()
+    story_repo.save_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_act_planning_rejects_parent_volume_over_capacity_before_replacing_children():
+    """PLANNING-CAPACITY-007: confirmation must preserve siblings' volume reservations."""
+    volume = _story_node("volume-1", NodeType.VOLUME, 1)
+    volume.suggested_chapter_count = 4
+    target_act = _story_node("act-target", NodeType.ACT, 2, parent_id=volume.id)
+    existing_target_chapter = _story_node(
+        "chapter-target-1", NodeType.CHAPTER, 1, parent_id=target_act.id
+    )
+    reserved_act = _story_node("act-reserved", NodeType.ACT, 1, parent_id=volume.id)
+    reserved_act.suggested_chapter_count = 2
+    child_backed_act = _story_node("act-child-backed", NodeType.ACT, 3, parent_id=volume.id)
+    existing_sibling_chapter = _story_node(
+        "chapter-sibling-1", NodeType.CHAPTER, 2, parent_id=child_backed_act.id
+    )
+    story_repo = SimpleNamespace(
+        get_by_id=AsyncMock(return_value=target_act),
+        get_by_novel=AsyncMock(
+            return_value=[
+                volume,
+                target_act,
+                existing_target_chapter,
+                reserved_act,
+                child_backed_act,
+                existing_sibling_chapter,
+            ]
+        ),
+        get_by_novel_sync=Mock(
+            return_value=[
+                volume,
+                target_act,
+                existing_target_chapter,
+                reserved_act,
+                child_backed_act,
+                existing_sibling_chapter,
+            ]
+        ),
+        get_children_sync=Mock(return_value=[existing_target_chapter]),
+        delete=AsyncMock(),
+        save_batch=AsyncMock(),
+        update=AsyncMock(),
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=SimpleNamespace(
+            delete_by_chapter=AsyncMock(),
+            save_batch=AsyncMock(),
+        ),
+        chapter_repository=None,
+        novel_repository=SimpleNamespace(
+            get_by_id=Mock(return_value=SimpleNamespace(target_chapters=10))
+        ),
+        llm_service=Mock(),
+    )
+    chapters = [
+        {
+            "number": number,
+            "title": f"超额{number}",
+            "main_event": "推进冲突",
+            "handoff_from_previous": "承接前章",
+            "handoff_to_next": "留下悬念",
+        }
+        for number in (1, 2)
+    ]
+
+    with pytest.raises(ValueError, match="父卷.*容量"):
+        await service.confirm_act_planning(target_act.id, chapters)
 
     story_repo.delete.assert_not_awaited()
     story_repo.save_batch.assert_not_awaited()

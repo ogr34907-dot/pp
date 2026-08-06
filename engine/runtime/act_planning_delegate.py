@@ -10,6 +10,49 @@ from domain.structure.story_node import StoryNode, NodeType, PlanningStatus, Pla
 logger = logging.getLogger(__name__)
 
 
+def _positive_node_capacity(node: StoryNode, field: str) -> int:
+    try:
+        value = int(getattr(node, field, 0) or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return max(value, 0)
+
+
+def _reserved_act_capacity(act_node: StoryNode) -> int:
+    for field in ("chapter_count", "suggested_chapter_count"):
+        capacity = _positive_node_capacity(act_node, field)
+        if capacity > 0:
+            return capacity
+    return 0
+
+
+def _reserved_volume_capacity(volume_node: StoryNode, act_nodes: List[StoryNode]) -> int:
+    return max(
+        _positive_node_capacity(volume_node, "suggested_chapter_count"),
+        sum(
+            _reserved_act_capacity(act_node)
+            for act_node in act_nodes
+            if act_node.parent_id == volume_node.id
+        ),
+    )
+
+
+def _remaining_part_capacity(
+    part_node: StoryNode,
+    volume_nodes: List[StoryNode],
+    act_nodes: List[StoryNode],
+) -> int | None:
+    part_capacity = _positive_node_capacity(part_node, "suggested_chapter_count")
+    if part_capacity <= 0:
+        return None
+    reserved = sum(
+        _reserved_volume_capacity(volume_node, act_nodes)
+        for volume_node in volume_nodes
+        if volume_node.parent_id == part_node.id
+    )
+    return max(part_capacity - reserved, 0)
+
+
 def _read_shared_state(novel_id: str) -> dict[str, Any]:
     from application.ai_invocation.autopilot.shared_state import read_autopilot_shared_state
 
@@ -189,14 +232,29 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
         [n for n in all_nodes if n.node_type.value == "act"],
         key=lambda n: n.number,
     )
+    volume_nodes = sorted(
+        [n for n in all_nodes if n.node_type.value == "volume"],
+        key=lambda n: n.number,
+    )
+    volume_ids = {node.id for node in volume_nodes}
+    reserved_novel_capacity = sum(
+        _reserved_volume_capacity(node, act_nodes) for node in volume_nodes
+    ) + sum(
+        _reserved_act_capacity(node)
+        for node in act_nodes
+        if node.parent_id not in volume_ids
+    )
+    unreserved_chapter_capacity = max(
+        min(
+            remaining_chapter_capacity,
+            target_chapters - reserved_novel_capacity,
+        ),
+        0,
+    )
 
     target_act = next((n for n in act_nodes if n.number == target_act_number), None)
 
     if not target_act:
-        volume_nodes = sorted(
-            [n for n in all_nodes if n.node_type.value == "volume"],
-            key=lambda n: n.number,
-        )
         if not volume_nodes:
             logger.error(
                 "[%s] 宏观规划缺少卷节点！无法进行幕级规划。"
@@ -220,6 +278,17 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
         )
 
         if parent_volume is None:
+            if unreserved_chapter_capacity <= 0:
+                logger.info(
+                    "[%s] 已无未预留章节容量（target=%s reserved=%s），暂停新增幕",
+                    novel.novel_id,
+                    target_chapters,
+                    target_chapters - unreserved_chapter_capacity,
+                )
+                novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+                novel.autopilot_status = AutopilotStatus.STOPPED
+                host._flush_novel(novel)
+                return
             next_chapter_number = (
                 max((int(n.number) for n in chapter_nodes), default=0) + 1
             )
@@ -245,7 +314,37 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
                 host._flush_novel(novel)
                 return
 
+            parent_part = next(
+                (
+                    node
+                    for node in all_nodes
+                    if node.id == last_volume.parent_id
+                    and node.node_type == NodeType.PART
+                ),
+                None,
+            )
+            remaining_part_capacity = (
+                _remaining_part_capacity(parent_part, volume_nodes, act_nodes)
+                if parent_part is not None
+                else None
+            )
             next_volume_number = max(int(node.number) for node in volume_nodes) + 1
+            continuation_volume_capacity = min(
+                rec_chapters_per_act * rec_acts_per_volume,
+                unreserved_chapter_capacity,
+                remaining_part_capacity
+                if remaining_part_capacity is not None
+                else unreserved_chapter_capacity,
+            )
+            if continuation_volume_capacity <= 0:
+                logger.info(
+                    "[%s] 父部或全书已无剩余章节容量，暂停新增卷",
+                    novel.novel_id,
+                )
+                novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+                novel.autopilot_status = AutopilotStatus.STOPPED
+                host._flush_novel(novel)
+                return
             parent_volume = StoryNode(
                 id=f"volume-{novel_id}-{next_volume_number}",
                 novel_id=novel_id,
@@ -260,8 +359,24 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
                 ) + 1,
                 planning_status=PlanningStatus.CONFIRMED,
                 planning_source=PlanningSource.AI_MACRO,
+                suggested_chapter_count=continuation_volume_capacity,
             )
             await host.story_node_repo.save(parent_volume)
+            if (
+                parent_part is not None
+                and hasattr(parent_part, "suggested_chapter_count")
+                and _positive_node_capacity(parent_part, "suggested_chapter_count") <= 0
+            ):
+                existing_volume_capacity = sum(
+                    _reserved_volume_capacity(node, act_nodes)
+                    for node in volume_nodes
+                    if node.parent_id == parent_part.id
+                )
+                parent_part.suggested_chapter_count = min(
+                    target_chapters,
+                    existing_volume_capacity + continuation_volume_capacity,
+                )
+                await host.story_node_repo.save(parent_part)
             logger.info(
                 "[%s] 所有现有卷已满，已创建第 %s 卷承接后续幕",
                 novel.novel_id,
@@ -286,6 +401,35 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
                     )
                 else:
                     logger.info("[%s] 创建首幕", novel.novel_id)
+                    try:
+                        parent_volume_capacity = int(
+                            getattr(parent_volume, "suggested_chapter_count", 0) or 0
+                        )
+                    except (TypeError, ValueError):
+                        parent_volume_capacity = 0
+                    first_act_capacity = min(
+                        rec_chapters_per_act,
+                        parent_volume_capacity,
+                    ) if parent_volume_capacity > 0 else rec_chapters_per_act
+                    parent_part = next(
+                        (
+                            node
+                            for node in all_nodes
+                            if node.id == parent_volume.parent_id
+                            and node.node_type == NodeType.PART
+                        ),
+                        None,
+                    )
+                    contract_lines = []
+                    if parent_part is not None:
+                        contract_lines.append(f"当前部《{parent_part.title}》")
+                        if parent_part.description:
+                            contract_lines.append(str(parent_part.description))
+                    contract_lines.append(f"当前卷《{parent_volume.title}》")
+                    if parent_volume.description:
+                        contract_lines.append(str(parent_volume.description))
+                    else:
+                        contract_lines.append("首幕必须先落实当前卷已经确认的核心约定。")
                     first_act = StoryNode(
                         id=f"act-{novel_id}-1",
                         novel_id=novel_id,
@@ -293,11 +437,14 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
                         node_type=NodeType.ACT,
                         number=1,
                         title="第一幕 · 开端",
-                        description="故事起始，建立世界观与主角目标",
-                        order_index=0,
+                        description="\n".join(contract_lines),
+                        order_index=max(
+                            (int(getattr(node, "order_index", 0) or 0) for node in all_nodes),
+                            default=0,
+                        ) + 1,
                         planning_status=PlanningStatus.CONFIRMED,
                         planning_source=PlanningSource.AI_MACRO,
-                        suggested_chapter_count=rec_chapters_per_act,
+                        suggested_chapter_count=first_act_capacity,
                     )
                     await host.story_node_repo.save(first_act)
 
@@ -330,6 +477,52 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
             target_act.suggested_chapter_count or rec_chapters_per_act,
             remaining_chapter_capacity,
         )
+        parent_volume = next(
+            (
+                node
+                for node in all_nodes
+                if node.id == target_act.parent_id and node.node_type == NodeType.VOLUME
+            ),
+            None,
+        )
+        if parent_volume is not None:
+            try:
+                parent_volume_capacity = int(
+                    getattr(parent_volume, "suggested_chapter_count", 0) or 0
+                )
+            except (TypeError, ValueError):
+                parent_volume_capacity = 0
+            if parent_volume_capacity > 0:
+                reserved_capacity = sum(
+                    _reserved_act_capacity(sibling_act)
+                    for sibling_act in act_nodes
+                    if sibling_act.id != target_act.id
+                    and sibling_act.parent_id == parent_volume.id
+                )
+                remaining_volume_capacity = max(
+                    parent_volume_capacity - reserved_capacity,
+                    0,
+                )
+                chapter_budget = min(chapter_budget, remaining_volume_capacity)
+                logger.info(
+                    "[%s] 第%s卷剩余章节容量 %s/%s，幕 %s 本次规划预算=%s",
+                    novel.novel_id,
+                    parent_volume.number,
+                    remaining_volume_capacity,
+                    parent_volume_capacity,
+                    target_act_number,
+                    chapter_budget,
+                )
+        if chapter_budget <= 0:
+            logger.info(
+                "[%s] 幕 %s 没有正章节预算，暂停幕级规划",
+                novel.novel_id,
+                target_act_number,
+            )
+            novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+            novel.autopilot_status = AutopilotStatus.STOPPED
+            host._flush_novel(novel)
+            return
         if not target_act.suggested_chapter_count:
             logger.info(
                 "[%s] 幕 %s 无 suggested_chapter_count，使用引擎推荐值 %s",

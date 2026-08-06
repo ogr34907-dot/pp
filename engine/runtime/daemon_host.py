@@ -2343,10 +2343,45 @@ class DaemonHostMixin:
                 1 for a in act_nodes if a.parent_id == v.id
             )
 
-        # 策略：从第一个卷开始找，返回第一个「幕数 < rec_acts_per_volume」的卷
-        # 如果所有卷都满了，返回最后一个卷（允许超发）
+        # 优先遵守已持久化的卷容量；旧结构没有容量时才回退到推荐幕数。
         for v in volume_nodes:
             current_count = volume_act_counts.get(v.number, 0)
+            try:
+                volume_capacity = int(getattr(v, "suggested_chapter_count", 0) or 0)
+            except (TypeError, ValueError):
+                volume_capacity = 0
+            if volume_capacity > 0:
+                reserved_capacity = 0
+                for act in act_nodes:
+                    if act.parent_id != v.id:
+                        continue
+                    try:
+                        act_capacity = int(getattr(act, "chapter_count", 0) or 0)
+                    except (TypeError, ValueError):
+                        act_capacity = 0
+                    if act_capacity <= 0:
+                        try:
+                            act_capacity = int(
+                                getattr(act, "suggested_chapter_count", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            act_capacity = 0
+                    reserved_capacity += max(act_capacity, 0)
+                if reserved_capacity >= volume_capacity:
+                    logger.info(
+                        "[%s] 第%s卷章节容量已满（%s/%s），选择下一卷",
+                        novel_id,
+                        v.number,
+                        reserved_capacity,
+                        volume_capacity,
+                    )
+                    continue
+                logger.info(
+                    "[%s] 第%s卷仍有章节容量，继续在本卷创建新幕",
+                    novel_id,
+                    v.number,
+                )
+                return v
             if current_count < rec_acts_per_volume:
                 logger.info(
                     f"[{novel_id}] 父卷选择：第{v}卷已有{current_count}幕"

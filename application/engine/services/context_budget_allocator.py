@@ -1178,7 +1178,7 @@ class ContextBudgetAllocator:
         return ""
 
     def _get_current_act_summary(self, novel_id: str, chapter_number: int) -> str:
-        """获取当前幕摘要"""
+        """获取当前部、卷、幕的强制结构契约。"""
         if not self.story_node_repo:
             return ""
         
@@ -1187,7 +1187,23 @@ class ContextBudgetAllocator:
             current_act = self._resolve_act_for_chapter(nodes, chapter_number)
             
             if current_act:
-                parts = [f"【{current_act.title}】"]
+                by_id = {node.id: node for node in nodes if getattr(node, "id", None)}
+                current_volume = by_id.get(getattr(current_act, "parent_id", None))
+                current_part = (
+                    by_id.get(getattr(current_volume, "parent_id", None))
+                    if current_volume is not None
+                    else None
+                )
+                parts = []
+                if current_part is not None and self._is_node_type(current_part, NodeType.PART):
+                    parts.append(f"【当前部约定】《{current_part.title}》")
+                    if current_part.description:
+                        parts.append(str(current_part.description))
+                if current_volume is not None and self._is_node_type(current_volume, NodeType.VOLUME):
+                    parts.append(f"【当前卷约定】《{current_volume.title}》")
+                    if current_volume.description:
+                        parts.append(str(current_volume.description))
+                parts.append(f"【{current_act.title}】")
                 summary = self._get_valid_node_summary(novel_id, current_act)
                 if summary:
                     parts.append(summary)
@@ -2030,6 +2046,8 @@ class ContextBudgetAllocator:
             current_act = self._resolve_act_for_chapter(nodes, chapter_number)
             if current_act is not None:
                 current_order = self._node_order(current_act)
+                by_id = {node.id: node for node in nodes if getattr(node, "id", None)}
+                current_volume = by_id.get(getattr(current_act, "parent_id", None))
                 act_nodes = [
                     node
                     for node in nodes
@@ -2046,21 +2064,13 @@ class ContextBudgetAllocator:
                 ]
             act_nodes = sorted(act_nodes, key=self._node_order, reverse=True)[:limit]
 
-            if current_act is not None:
+            if current_act is not None and current_volume is not None:
                 volume_nodes = [
                     node
                     for node in nodes
                     if self._is_node_type(node, NodeType.VOLUME)
-                    and (
-                        (
-                            getattr(node, "chapter_end", None) is not None
-                            and int(node.chapter_end) < int(chapter_number)
-                        )
-                        or (
-                            getattr(node, "chapter_end", None) is None
-                            and self._node_order(node) < current_order
-                        )
-                    )
+                    and node.id != current_volume.id
+                    and self._node_order(node) < self._node_order(current_volume)
                 ]
             else:
                 volume_nodes = [
