@@ -206,7 +206,16 @@
           打开 AI 面板
         </n-button>
         <n-button
-          v-else-if="canResumeReview"
+          v-else-if="canonicalAftermathFailure"
+          type="warning"
+          size="small"
+          :loading="toggling"
+          @click="retryCanonicalAftermath"
+        >
+          {{ reviewGateActionLabel }}
+        </n-button>
+        <n-button
+          v-else-if="canResumeReview && !canonicalAftermathFailure"
           type="warning"
           size="small"
           :loading="toggling"
@@ -235,7 +244,7 @@
 
     <!-- 操作按钮 -->
     <n-space justify="end" size="small">
-      <n-button v-if="canResumeReview" type="warning" ghost size="small" :loading="toggling" @click="resume">
+      <n-button v-if="canResumeReview && !canonicalAftermathFailure" type="warning" ghost size="small" :loading="toggling" @click="resume">
         再次确认 · 继续
       </n-button>
       <n-button v-else-if="isManualPause" type="primary" size="small" :loading="toggling" @click="resume">
@@ -353,6 +362,7 @@ import { useAIInvocationStore } from '../../stores/aiInvocationStore'
 import { featureFlags } from '../../config/features'
 import { runtimePerformance } from '../../config/performance'
 import { normalizeAutopilotStartConfig } from './autopilotStartConfig'
+import { getCanonicalAftermathPresentation } from './canonicalAftermathGate'
 
 const props = defineProps({
   novelId: String,
@@ -480,6 +490,8 @@ const reviewGateStatus = computed(() => String(reviewGate.value?.status || 'read
 const reviewGateNeedsAIPanel = computed(() =>
   !isTerminalStopped.value && (reviewGate.value?.primary_action === 'open_ai_panel' || requiresAIReview.value)
 )
+const canonicalAftermathPresentation = computed(() => getCanonicalAftermathPresentation(status.value))
+const canonicalAftermathFailure = computed(() => canonicalAftermathPresentation.value.isFailure)
 const showReviewGate = computed(() => needsReview.value || reviewGateNeedsAIPanel.value)
 const canResumeReview = computed(() => (
   needsReview.value &&
@@ -491,6 +503,7 @@ const reviewGateAlertType = computed(() => (
   reviewGateStatus.value === 'failed' ? 'error' : 'warning'
 ))
 const reviewGateTitle = computed(() => {
+  if (canonicalAftermathFailure.value) return canonicalAftermathPresentation.value.title
   if (reviewGateStatus.value === 'failed') {
     if (reviewGateType.value === 'macro_plan') return '宏观结构生成失败'
     if (reviewGateType.value === 'act_plan') return '章节规划生成失败'
@@ -511,7 +524,9 @@ const reviewGateMessage = computed(() => {
   return '请在侧栏核对刚生成的结构或审阅结果，核对无误后继续。'
 })
 const reviewGateActionLabel = computed(() => (
-  reviewGate.value?.action_label || '确认后继续'
+  canonicalAftermathFailure.value
+    ? canonicalAftermathPresentation.value.actionLabel
+    : (reviewGate.value?.action_label || '确认后继续')
 ))
 function statusHasActiveInvocation(s) {
   return Boolean(s?.active_invocation_session_id && (s?.has_active_invocation || s?.requires_ai_review))
@@ -1413,6 +1428,25 @@ async function resume() {
     status.value = prevStatus
     emit('status-change', prevStatus)
     message.error('恢复请求失败，请重试')
+  } finally {
+    toggling.value = false
+  }
+}
+
+async function retryCanonicalAftermath() {
+  if (isToggleThrottled() || !canonicalAftermathFailure.value) return
+  toggling.value = true
+  try {
+    const body = await autopilotApi.retryCanonicalAftermath(props.novelId)
+    message.success(body.message || '已重新同步章后记忆')
+    void fetchStatus()
+  } catch (err) {
+    if (isAutopilotHttpError(err)) {
+      message.error(getAutopilotErrorDetail(err) || '规范章后同步失败，请稍后重试')
+    } else {
+      message.error('规范章后同步请求失败，请重试')
+    }
+    void fetchStatus()
   } finally {
     toggling.value = false
   }

@@ -1,5 +1,6 @@
 import hashlib
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -186,6 +187,48 @@ def test_terminal_failure_can_only_be_reclaimed_for_current_content_version(tmp_
     )
     assert claim.disposition == "claimed"
     assert claim.attempt_count == 1
+
+
+def test_terminal_recovery_reclaims_only_stale_or_expired_in_progress_claims(tmp_path):
+    db, _chapter_repo, chapter, _knowledge = _canonical_services(tmp_path)
+    content_sha256 = hashlib.sha256(chapter.content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status, failure_reason, attempt_count, updated_at) "
+        "VALUES (?, ?, ?, 'chapter-narrative-sync:v1', 1, 'stale', ?, 3, ?)",
+        (
+            "novel-1",
+            chapter.number,
+            content_sha256,
+            "interrupted recovery",
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    db.commit()
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    kwargs = {
+        "novel_id": "novel-1",
+        "chapter_number": chapter.number,
+        "content_sha256": content_sha256,
+        "pipeline_version": "chapter-narrative-sync:v1",
+        "content_revision": 1,
+    }
+
+    assert repository.reclaim_terminal_failure(**kwargs)
+    db.execute(
+        "UPDATE chapter_narrative_commits SET status = 'in_progress', updated_at = ?",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    db.commit()
+    assert not repository.reclaim_terminal_failure(**kwargs)
+
+    db.execute(
+        "UPDATE chapter_narrative_commits SET updated_at = ?",
+        ((datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(),),
+    )
+    db.commit()
+    assert repository.reclaim_terminal_failure(**kwargs)
 
 
 def test_chapter_narrative_artifacts_are_idempotent_across_audit_retries():

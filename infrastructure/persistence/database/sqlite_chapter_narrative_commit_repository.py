@@ -15,6 +15,7 @@ MAX_MEMORY_SYNC_ATTEMPTS = 3
 # The daemon allows five minutes for the complete aftermath stage.  Keep the
 # lease longer so a live writer cannot be reclaimed by a concurrent process.
 MEMORY_SYNC_LEASE_SECONDS = 600
+CANONICAL_RECOVERY_LEASE_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -376,7 +377,7 @@ class SqliteChapterNarrativeCommitRepository:
         pipeline_version: str,
         content_revision: int,
     ) -> bool:
-        """Explicitly open one new bounded retry cycle for a current terminal failure.
+        """Make an abandoned current recovery claim available for one manual cycle.
 
         Automatic retries deliberately stop after three attempts.  This method is
         intentionally separate from :meth:`claim`: it can only be called by the
@@ -402,6 +403,50 @@ class SqliteChapterNarrativeCommitRepository:
                 ):
                     return False
 
+                claim = conn.execute(
+                    """
+                    SELECT status, attempt_count, updated_at
+                    FROM chapter_narrative_commits
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ?
+                    """,
+                    (
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                    ),
+                ).fetchone()
+                if claim is None:
+                    return False
+
+                status = str(claim[0] or "")
+                attempt_count = int(claim[1] or 0)
+                updated_at = claim[2]
+                lease_expired = False
+                if status == "in_progress":
+                    try:
+                        modified_at = datetime.fromisoformat(
+                            str(updated_at).replace("Z", "+00:00")
+                        )
+                        if modified_at.tzinfo is None:
+                            modified_at = modified_at.replace(tzinfo=timezone.utc)
+                        lease_expired = modified_at <= (
+                            datetime.now(timezone.utc)
+                            - timedelta(seconds=CANONICAL_RECOVERY_LEASE_SECONDS)
+                        )
+                    except (TypeError, ValueError):
+                        lease_expired = True
+
+                if not (
+                    (status == "failed" and attempt_count >= 3)
+                    or status == "stale"
+                    or (status == "in_progress" and lease_expired)
+                ):
+                    return False
+
                 cursor = conn.execute(
                     """
                     UPDATE chapter_narrative_commits
@@ -409,7 +454,7 @@ class SqliteChapterNarrativeCommitRepository:
                     WHERE novel_id = ? AND chapter_number = ?
                       AND content_sha256 = ? AND pipeline_version = ?
                       AND content_revision = ?
-                      AND status = 'failed' AND attempt_count >= 3
+                      AND status = ? AND updated_at IS ?
                     """,
                     (
                         now,
@@ -418,6 +463,8 @@ class SqliteChapterNarrativeCommitRepository:
                         content_sha256,
                         pipeline_version,
                         int(content_revision),
+                        status,
+                        updated_at,
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -446,6 +493,56 @@ class SqliteChapterNarrativeCommitRepository:
                     ),
                 )
                 return True
+
+    def restore_terminal_failure(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+        content_revision: int,
+        failure_reason: str,
+    ) -> None:
+        """Return an interrupted manual recovery to a visible terminal failure."""
+        now = datetime.now(timezone.utc).isoformat()
+        reason = (failure_reason or "canonical_aftermath_retry_failed")[:1000]
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                source = conn.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (novel_id, chapter_number),
+                ).fetchone()
+                actual_sha256 = hashlib.sha256(
+                    (source[0] or "").encode("utf-8")
+                ).hexdigest() if source is not None else ""
+                if (
+                    source is None
+                    or actual_sha256 != content_sha256
+                    or (source[1] or "") != content_sha256
+                    or int(source[2] or 0) != int(content_revision)
+                ):
+                    return
+                conn.execute(
+                    """
+                    UPDATE chapter_narrative_commits
+                    SET status = 'failed', attempt_count = 3, failure_reason = ?, updated_at = ?
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ?
+                      AND status IN ('stale', 'in_progress')
+                    """,
+                    (
+                        reason,
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                    ),
+                )
 
     def commit(
         self,

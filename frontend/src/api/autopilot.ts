@@ -22,6 +22,14 @@ export interface AutopilotResumeResponse {
   [key: string]: unknown
 }
 
+export interface CanonicalAftermathRetryResponse {
+  current_stage?: string
+  chapter_number?: number
+  message?: string
+  status?: string
+  [key: string]: unknown
+}
+
 export interface AutopilotErrorRecord {
   message: string
   timestamp: string
@@ -91,6 +99,12 @@ export const autopilotApi = {
       ...(afterEventId ? { after_event_id: afterEventId } : {}),
     }
     return fetchUrl(apiRoutes.autopilot.stream(novelId, params))
+  },
+
+  retryCanonicalAftermath(novelId: string): Promise<CanonicalAftermathRetryResponse> {
+    return fetchJson<CanonicalAftermathRetryResponse>(apiRoutes.autopilot.canonicalAftermathRetry(novelId), {
+      method: 'POST',
+    })
   },
 
   logStreamUrl(novelId: string): string {

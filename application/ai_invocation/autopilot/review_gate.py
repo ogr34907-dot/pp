@@ -49,17 +49,14 @@ def _is_initial_macro_review_context(status: Mapping[str, Any]) -> bool:
 
 
 def review_gate_from_status(status: Mapping[str, Any]) -> dict[str, Any] | None:
-    if str(status.get("autopilot_status") or "").strip().lower() in {"stopped", "completed"}:
-        return None
+    autopilot_status = str(status.get("autopilot_status") or "").strip().lower()
 
-    stage = str(status.get("current_stage") or "")
-    needs_review = bool(status.get("needs_review")) or stage_needs_human_review(stage)
-    active_session = str(status.get("active_invocation_session_id") or "").strip()
-    active_status = str(status.get("active_invocation_status") or "").strip()
-    operation = str(status.get("active_invocation_operation") or "")
-    substep = str(status.get("writing_substep") or "")
-
-    if str(status.get("autopilot_pause_reason") or "").strip() == "canonical_aftermath_not_ready":
+    # A terminal canonical failure is actionable even after a manual stop.  It
+    # must remain visible so the author can repair the current memory barrier;
+    # completed novels have no chapter to recover.
+    if autopilot_status != "completed" and str(
+        status.get("autopilot_pause_reason") or ""
+    ).strip() == "canonical_aftermath_not_ready":
         chapter_number = status.get("canonical_aftermath_chapter_number") or status.get(
             "current_chapter_number"
         )
@@ -78,6 +75,16 @@ def review_gate_from_status(status: Mapping[str, Any]) -> dict[str, Any] | None:
             "error": failure_reason,
             "message": f"{chapter_label}的规范记忆同步尚未完成（{failure_reason}），请重新同步后再继续。",
         }
+
+    if autopilot_status in {"stopped", "completed"}:
+        return None
+
+    stage = str(status.get("current_stage") or "")
+    needs_review = bool(status.get("needs_review")) or stage_needs_human_review(stage)
+    active_session = str(status.get("active_invocation_session_id") or "").strip()
+    active_status = str(status.get("active_invocation_status") or "").strip()
+    operation = str(status.get("active_invocation_operation") or "")
+    substep = str(status.get("writing_substep") or "")
 
     if active_session and (
         status.get("has_active_invocation")

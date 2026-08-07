@@ -1,5 +1,8 @@
+import hashlib
+
 from application.engine.services.shared_state_repository import SharedStateRepository
 from application.engine.services.state_bootstrap import StateBootstrap
+from infrastructure.persistence.database.connection import DatabaseConnection
 
 
 def test_state_bootstrap_preserves_autopilot_recovery_reason(monkeypatch):
@@ -93,3 +96,43 @@ def test_state_bootstrap_does_not_relabel_canonical_pause_as_macro_review(monkey
     raw = shared.get_raw_state("novel-1")
 
     assert raw.get("writing_substep", "") != "macro_planning"
+
+
+def test_state_bootstrap_ignores_terminal_failure_before_latest_completed_chapter(
+    tmp_path, monkeypatch
+):
+    db = DatabaseConnection(str(tmp_path / "latest-chapter.db"))
+    old_content = "旧章"
+    latest_content = "最新章"
+    old_sha = hashlib.sha256(old_content.encode()).hexdigest()
+    latest_sha = hashlib.sha256(latest_content.encode()).hexdigest()
+    db.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) "
+        "VALUES ('novel-1', 'Demo', 'demo', 20)"
+    )
+    db.execute(
+        "INSERT INTO chapters (id, novel_id, number, content, content_sha256, content_revision, status) "
+        "VALUES ('chapter-7', 'novel-1', 7, ?, ?, 1, 'completed')",
+        (old_content, old_sha),
+    )
+    db.execute(
+        "INSERT INTO chapters (id, novel_id, number, content, content_sha256, content_revision, status) "
+        "VALUES ('chapter-8', 'novel-1', 8, ?, ?, 1, 'completed')",
+        (latest_content, latest_sha),
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status, attempt_count, failure_reason) "
+        "VALUES ('novel-1', 7, ?, 'chapter-narrative-sync:v1', 1, 'failed', 3, 'old failure')",
+        (old_sha,),
+    )
+    db.commit()
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_database", lambda *_args, **_kwargs: db
+    )
+
+    failure = StateBootstrap(shared_state=SharedStateRepository(shared_dict={}))._canonical_aftermath_failure(
+        "novel-1"
+    )
+
+    assert failure is None

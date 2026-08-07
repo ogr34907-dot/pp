@@ -2000,21 +2000,45 @@ async def retry_canonical_aftermath(novel_id: str):
             raise HTTPException(409, "当前章节的规范记忆已经就绪，无需重新同步")
         raise HTTPException(409, "当前章节没有可重新同步的终态失败记录")
 
-    result = await get_chapter_aftermath_pipeline().run_after_chapter_saved(
-        novel_id,
-        chapter_number,
-        content,
-        expected_content_sha256=content_sha256,
-        expected_content_revision=content_revision,
-    )
+    try:
+        result = await get_chapter_aftermath_pipeline().run_after_chapter_saved(
+            novel_id,
+            chapter_number,
+            content,
+            expected_content_sha256=content_sha256,
+            expected_content_revision=content_revision,
+        )
+    except asyncio.CancelledError:
+        commits.restore_terminal_failure(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision=content_revision,
+            failure_reason="canonical_aftermath_retry_cancelled",
+        )
+        raise
+    except Exception as exc:
+        reason = f"canonical_aftermath_retry_failed:{exc}"
+        commits.restore_terminal_failure(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision=content_revision,
+            failure_reason=reason,
+        )
+        raise HTTPException(502, f"规范记忆重新同步失败：{reason}") from exc
     if not commits.is_current_version_ready(
         novel_id=novel_id,
         chapter_number=chapter_number,
         pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
     ):
         failure_reason = str(
-            result.get("failure_reason") or "canonical_aftermath_retry_failed"
-        )
+            (result or {}).get("failure_reason")
+            if isinstance(result, dict)
+            else "canonical_aftermath_retry_failed"
+        ) or "canonical_aftermath_retry_failed"
         raise HTTPException(502, f"规范记忆重新同步失败：{failure_reason}")
 
     return {

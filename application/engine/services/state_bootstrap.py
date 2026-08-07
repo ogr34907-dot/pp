@@ -272,6 +272,11 @@ class StateBootstrap:
                  AND chapters.number = commits.chapter_number
                 WHERE commits.novel_id = ?
                   AND chapters.status = 'completed'
+                  AND commits.chapter_number = (
+                      SELECT MAX(number)
+                      FROM chapters
+                      WHERE novel_id = ? AND status = 'completed'
+                  )
                   AND commits.content_sha256 = chapters.content_sha256
                   AND commits.content_revision = chapters.content_revision
                   AND commits.pipeline_version = ?
@@ -280,7 +285,7 @@ class StateBootstrap:
                 ORDER BY commits.chapter_number DESC
                 LIMIT 1
                 """,
-                (novel_id, CHAPTER_NARRATIVE_PIPELINE_VERSION),
+                (novel_id, novel_id, CHAPTER_NARRATIVE_PIPELINE_VERSION),
             )
             if row is None:
                 return None

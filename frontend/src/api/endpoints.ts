@@ -62,6 +62,8 @@ export const apiRoutes = {
     pause: (novelId: string) => apiRootPath('autopilot', novelId, 'pause'),
     terminate: (novelId: string) => apiRootPath('autopilot', novelId, 'terminate'),
     resume: (novelId: string) => apiRootPath('autopilot', novelId, 'resume'),
+    canonicalAftermathRetry: (novelId: string) =>
+      apiRootPath('autopilot', novelId, 'canonical-aftermath', 'retry'),
     stream: (novelId: string, params?: QueryParams) =>
       withQuery(apiRootPath('autopilot', novelId, 'stream'), params),
     logStream: (novelId: string) => apiRootPath('autopilot', novelId, 'log-stream'),

@@ -101,6 +101,7 @@ def test_manual_resume_blocks_terminal_canonical_failure(tmp_path, monkeypatch):
 async def test_canonical_retry_route_preserves_resume_guard(monkeypatch):
     """Retry completion does not auto-resume; normal resume remains explicit."""
     calls = []
+    resume_calls = []
 
     class _Db:
         def fetch_one(self, query, params=()):
@@ -136,9 +137,57 @@ async def test_canonical_retry_route_preserves_resume_guard(monkeypatch):
     monkeypatch.setattr(autopilot_routes, "get_database", lambda *_args, **_kwargs: _Db())
     monkeypatch.setattr(autopilot_routes, "get_chapter_aftermath_pipeline", lambda: _Pipeline())
     monkeypatch.setattr(autopilot_routes, "SqliteChapterNarrativeCommitRepository", _Claims, raising=False)
+    monkeypatch.setattr(
+        autopilot_routes,
+        "resume_from_review",
+        lambda *_args, **_kwargs: resume_calls.append(True),
+    )
 
     result = await autopilot_routes.retry_canonical_aftermath("novel-1")
 
     assert result["success"] is True
     assert result["remains_paused"] is True
     assert [call[0] for call in calls] == ["reclaim", "pipeline", "ready"]
+    assert resume_calls == []
+
+
+@pytest.mark.asyncio
+async def test_canonical_retry_route_restores_terminal_failure_when_pipeline_raises(monkeypatch):
+    calls = []
+
+    class _Db:
+        def fetch_one(self, query, params=()):
+            return {
+                "number": 8,
+                "content": "正文",
+                "content_sha256": hashlib.sha256("正文".encode()).hexdigest(),
+                "content_revision": 2,
+                "status": "completed",
+            }
+
+    class _Claims:
+        def __init__(self, _db):
+            pass
+
+        def reclaim_terminal_failure(self, **kwargs):
+            return True
+
+        def restore_terminal_failure(self, **kwargs):
+            calls.append(kwargs)
+
+        def is_current_version_ready(self, **kwargs):
+            return False
+
+    class _Pipeline:
+        async def run_after_chapter_saved(self, *args, **kwargs):
+            raise RuntimeError("provider disconnected")
+
+    monkeypatch.setattr(autopilot_routes, "get_database", lambda *_args, **_kwargs: _Db())
+    monkeypatch.setattr(autopilot_routes, "get_chapter_aftermath_pipeline", lambda: _Pipeline())
+    monkeypatch.setattr(autopilot_routes, "SqliteChapterNarrativeCommitRepository", _Claims, raising=False)
+
+    with pytest.raises(Exception) as error:
+        await autopilot_routes.retry_canonical_aftermath("novel-1")
+
+    assert getattr(error.value, "status_code", None) == 502
+    assert calls and calls[0]["failure_reason"].startswith("canonical_aftermath_retry_failed:")

@@ -126,3 +126,19 @@ def test_review_gate_prioritizes_canonical_aftermath_failure_over_macro_review()
     assert gate["can_resume"] is False
     assert gate["primary_action"] == "retry_canonical_aftermath"
     assert "8" in gate["message"]
+
+
+def test_stopped_canonical_failure_still_exposes_recovery_gate():
+    gate = review_gate_from_status(
+        {
+            "autopilot_status": "stopped",
+            "current_stage": "paused_for_review",
+            "current_chapter_number": 8,
+            "autopilot_pause_reason": "canonical_aftermath_not_ready",
+            "canonical_aftermath_failure_reason": "API returned empty content",
+        }
+    )
+
+    assert gate["type"] == "canonical_aftermath"
+    assert gate["can_resume"] is False
+    assert "API returned empty content" in gate["message"]
