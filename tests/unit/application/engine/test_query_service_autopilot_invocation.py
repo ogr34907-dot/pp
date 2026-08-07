@@ -34,6 +34,43 @@ def test_query_service_exposes_configured_protection_limit_from_shared_state():
     assert status["max_auto_chapters"] == 1
 
 
+def test_query_service_exposes_canonical_failure_details_to_the_review_gate():
+    repo = SharedStateRepository(shared_dict={})
+    repo.set_novel_state(
+        "novel-1",
+        NovelState(
+            novel_id="novel-1",
+            title="Demo",
+            autopilot_status="stopped",
+            current_stage="paused_for_review",
+            current_act=1,
+            current_chapter_in_act=7,
+            current_beat_index=0,
+            current_auto_chapters=7,
+            target_chapters=20,
+            target_words_per_chapter=2500,
+            consecutive_error_count=0,
+            last_chapter_tension=0,
+            auto_approve_mode=False,
+            needs_review=True,
+            autopilot_pause_reason="canonical_aftermath_not_ready",
+        ),
+    )
+    repo.merge_raw_state(
+        "novel-1",
+        canonical_aftermath_chapter_number=8,
+        canonical_aftermath_failure_reason="API returned empty content",
+    )
+
+    status = QueryService(repo).get_novel_status_dict("novel-1")
+
+    assert status is not None
+    assert status["canonical_aftermath_chapter_number"] == 8
+    assert status["canonical_aftermath_failure_reason"] == "API returned empty content"
+    assert status["review_gate"]["chapter_number"] == 8
+    assert "API returned empty content" in status["review_gate"]["message"]
+
+
 def test_query_service_status_dict_exposes_active_invocation_flag():
     repo = SharedStateRepository(shared_dict={})
     repo.set_novel_state(

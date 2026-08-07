@@ -66,6 +66,8 @@ _RUNTIME_STATUS_KEYS: tuple[str, ...] = (
     "requires_ai_review",
     "autopilot_pause_reason",
     "autopilot_recovery_reason",
+    "canonical_aftermath_chapter_number",
+    "canonical_aftermath_failure_reason",
     "autopilot_pending_chapter_number",
     "autopilot_pending_chapter_plan",
     "autopilot_pending_macro_plan",
