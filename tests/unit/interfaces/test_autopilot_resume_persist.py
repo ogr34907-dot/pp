@@ -1,6 +1,8 @@
 import hashlib
 from types import SimpleNamespace
 
+import pytest
+
 from domain.novel.entities.novel import AutopilotStatus, NovelStage
 from interfaces.api.v1.engine import autopilot_routes
 from infrastructure.persistence.database.connection import DatabaseConnection
@@ -93,3 +95,50 @@ def test_manual_resume_blocks_terminal_canonical_failure(tmp_path, monkeypatch):
         autopilot_routes._canonical_resume_block_reason("novel-1", db=db)
         == "canonical_aftermath_not_ready"
     )
+
+
+@pytest.mark.asyncio
+async def test_canonical_retry_route_preserves_resume_guard(monkeypatch):
+    """Retry completion does not auto-resume; normal resume remains explicit."""
+    calls = []
+
+    class _Db:
+        def fetch_one(self, query, params=()):
+            if "MAX(number)" in query:
+                return {"chapter_number": 8}
+            if "FROM chapters" in query:
+                return {
+                    "number": 8,
+                    "content": "正文",
+                    "content_sha256": hashlib.sha256("正文".encode()).hexdigest(),
+                    "content_revision": 2,
+                    "status": "completed",
+                }
+            return None
+
+    class _Claims:
+        def __init__(self, _db):
+            pass
+
+        def reclaim_terminal_failure(self, **kwargs):
+            calls.append(("reclaim", kwargs))
+            return True
+
+        def is_current_version_ready(self, **kwargs):
+            calls.append(("ready", kwargs))
+            return True
+
+    class _Pipeline:
+        async def run_after_chapter_saved(self, *args, **kwargs):
+            calls.append(("pipeline", args, kwargs))
+            return {"narrative_sync_ok": True, "commit_status": "committed"}
+
+    monkeypatch.setattr(autopilot_routes, "get_database", lambda *_args, **_kwargs: _Db())
+    monkeypatch.setattr(autopilot_routes, "get_chapter_aftermath_pipeline", lambda: _Pipeline())
+    monkeypatch.setattr(autopilot_routes, "SqliteChapterNarrativeCommitRepository", _Claims, raising=False)
+
+    result = await autopilot_routes.retry_canonical_aftermath("novel-1")
+
+    assert result["success"] is True
+    assert result["remains_paused"] is True
+    assert [call[0] for call in calls] == ["reclaim", "pipeline", "ready"]

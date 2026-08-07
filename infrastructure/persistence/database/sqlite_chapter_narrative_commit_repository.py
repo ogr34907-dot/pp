@@ -367,6 +367,86 @@ class SqliteChapterNarrativeCommitRepository:
         )
         return claim is not None
 
+    def reclaim_terminal_failure(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+        content_revision: int,
+    ) -> bool:
+        """Explicitly open one new bounded retry cycle for a current terminal failure.
+
+        Automatic retries deliberately stop after three attempts.  This method is
+        intentionally separate from :meth:`claim`: it can only be called by the
+        explicit recovery action and it verifies the persisted prose version in
+        the same transaction before making the claim reclaimable again.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                source = conn.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (novel_id, chapter_number),
+                ).fetchone()
+                actual_sha256 = hashlib.sha256(
+                    (source[0] or "").encode("utf-8")
+                ).hexdigest() if source is not None else ""
+                if (
+                    source is None
+                    or actual_sha256 != content_sha256
+                    or (source[1] or "") != content_sha256
+                    or int(source[2] or 0) != int(content_revision)
+                ):
+                    return False
+
+                cursor = conn.execute(
+                    """
+                    UPDATE chapter_narrative_commits
+                    SET status = 'stale', updated_at = ?
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ?
+                      AND status = 'failed' AND attempt_count >= 3
+                    """,
+                    (
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    return False
+
+                # A stale failed summary must never be selected as an active
+                # canonical input while the new recovery cycle is in progress.
+                conn.execute(
+                    """
+                    UPDATE chapter_summaries
+                    SET sync_status = 'stale', updated_at = ?
+                    WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?)
+                      AND chapter_number = ?
+                      AND source_content_sha256 = ?
+                      AND source_content_revision = ?
+                      AND pipeline_version = ?
+                      AND sync_status = 'failed'
+                    """,
+                    (
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        int(content_revision),
+                        pipeline_version,
+                    ),
+                )
+                return True
+
     def commit(
         self,
         *,

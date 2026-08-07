@@ -208,6 +208,7 @@ class StateBootstrap:
     def _load_novel_state(self, novel: Dict[str, Any]) -> None:
         """加载小说状态到共享内存"""
         macro_structure_ready = self._macro_structure_ready(novel["id"])
+        canonical_failure = self._canonical_aftermath_failure(novel["id"])
         state = NovelState(
             novel_id=novel["id"],
             title=novel.get("title", ""),
@@ -224,16 +225,72 @@ class StateBootstrap:
             last_chapter_tension=novel.get("last_chapter_tension", 0),
             auto_approve_mode=novel.get("auto_approve_mode", False),
             needs_review=novel.get("needs_review", False),
+            autopilot_pause_reason=(
+                "canonical_aftermath_not_ready" if canonical_failure else ""
+            ),
             autopilot_recovery_reason=novel.get("autopilot_recovery_reason", ""),
         )
 
         self._shared.set_novel_state(novel["id"], state)
         extra = {"macro_structure_ready": macro_structure_ready}
-        if macro_structure_ready and novel.get("current_stage") in ("paused_for_review", "reviewing"):
+        if canonical_failure:
+            extra.update(
+                {
+                    "canonical_aftermath_chapter_number": canonical_failure["chapter_number"],
+                    "canonical_aftermath_failure_reason": canonical_failure["failure_reason"],
+                }
+            )
+        elif (
+            macro_structure_ready
+            and novel.get("current_stage") in ("paused_for_review", "reviewing")
+            and int(novel.get("current_auto_chapters") or 0) == 0
+        ):
             extra["writing_substep"] = "macro_planning"
             extra["writing_substep_label"] = "宏观规划 · 结构已生成"
         if not self._shared.merge_raw_state(novel["id"], **extra):
             logger.debug(f"写入宏观结构运行态失败（可忽略）: {novel['id']}")
+
+    def _canonical_aftermath_failure(self, novel_id: str) -> Optional[Dict[str, Any]]:
+        """Return the terminal failure for the latest completed prose version.
+
+        Bootstrap is allowed to derive this durable gate, but never to repair or
+        clear it.  That remains the explicit canonical recovery route.
+        """
+        try:
+            from application.world.services.chapter_narrative_sync import (
+                CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            )
+            from infrastructure.persistence.database.connection import get_database
+
+            db = get_database()
+            row = db.fetch_one(
+                """
+                SELECT commits.chapter_number, commits.failure_reason
+                FROM chapter_narrative_commits AS commits
+                JOIN chapters AS chapters
+                  ON chapters.novel_id = commits.novel_id
+                 AND chapters.number = commits.chapter_number
+                WHERE commits.novel_id = ?
+                  AND chapters.status = 'completed'
+                  AND commits.content_sha256 = chapters.content_sha256
+                  AND commits.content_revision = chapters.content_revision
+                  AND commits.pipeline_version = ?
+                  AND commits.status = 'failed'
+                  AND commits.attempt_count >= 3
+                ORDER BY commits.chapter_number DESC
+                LIMIT 1
+                """,
+                (novel_id, CHAPTER_NARRATIVE_PIPELINE_VERSION),
+            )
+            if row is None:
+                return None
+            return {
+                "chapter_number": int(row["chapter_number"]),
+                "failure_reason": str(row["failure_reason"] or "canonical_aftermath_not_ready"),
+            }
+        except Exception as exc:
+            logger.debug("检查规范记忆失败（可忽略） novel=%s: %s", novel_id, exc)
+            return None
 
     def _macro_structure_ready(self, novel_id: str) -> bool:
         """从结构表推导宏观结构是否可审阅；仅 bootstrap/加载时访问 DB。"""

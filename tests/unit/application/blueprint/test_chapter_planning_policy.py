@@ -105,3 +105,24 @@ def test_review_gate_prefers_act_plan_over_macro_ready_flag():
 
     assert gate["type"] == "act_plan"
     assert gate["action_label"] == "确认章节规划，继续"
+
+
+def test_review_gate_prioritizes_canonical_aftermath_failure_over_macro_review():
+    gate = review_gate_from_status(
+        {
+            "autopilot_status": "running",
+            "current_stage": "paused_for_review",
+            "writing_substep": "chapter_aftermath_done",
+            "current_chapter_number": 8,
+            "current_auto_chapters": 7,
+            "macro_structure_ready": True,
+            "autopilot_pause_reason": "canonical_aftermath_not_ready",
+            "needs_review": True,
+        }
+    )
+
+    assert gate["type"] == "canonical_aftermath"
+    assert gate["status"] == "failed"
+    assert gate["can_resume"] is False
+    assert gate["primary_action"] == "retry_canonical_aftermath"
+    assert "8" in gate["message"]

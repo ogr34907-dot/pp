@@ -38,8 +38,6 @@ def _is_initial_macro_review_context(status: Mapping[str, Any]) -> bool:
         str(status.get("writing_substep") or ""),
     ) != "manual_review":
         return False
-    if status.get("macro_structure_ready") is not None:
-        return True
     if int(status.get("current_auto_chapters") or 0) != 0:
         return False
     if status.get("current_chapter_number") is not None:
@@ -60,6 +58,26 @@ def review_gate_from_status(status: Mapping[str, Any]) -> dict[str, Any] | None:
     active_status = str(status.get("active_invocation_status") or "").strip()
     operation = str(status.get("active_invocation_operation") or "")
     substep = str(status.get("writing_substep") or "")
+
+    if str(status.get("autopilot_pause_reason") or "").strip() == "canonical_aftermath_not_ready":
+        chapter_number = status.get("canonical_aftermath_chapter_number") or status.get(
+            "current_chapter_number"
+        )
+        failure_reason = str(
+            status.get("canonical_aftermath_failure_reason")
+            or status.get("autopilot_pause_reason")
+        )
+        chapter_label = f"第 {chapter_number} 章" if chapter_number is not None else "当前章节"
+        return {
+            "type": "canonical_aftermath",
+            "status": "failed",
+            "artifact_status": "failed",
+            "can_resume": False,
+            "primary_action": "retry_canonical_aftermath",
+            "chapter_number": chapter_number,
+            "error": failure_reason,
+            "message": f"{chapter_label}的规范记忆同步尚未完成（{failure_reason}），请重新同步后再继续。",
+        }
 
     if active_session and (
         status.get("has_active_invocation")

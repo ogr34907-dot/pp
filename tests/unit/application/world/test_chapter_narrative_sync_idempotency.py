@@ -142,6 +142,52 @@ def _canonical_services(tmp_path, content="第一版正文"):
     return db, chapter_repo, chapter, knowledge
 
 
+def test_terminal_failure_can_only_be_reclaimed_for_current_content_version(tmp_path):
+    db, _chapter_repo, chapter, _knowledge = _canonical_services(tmp_path)
+    content_sha256 = hashlib.sha256(chapter.content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status, failure_reason, attempt_count) "
+        "VALUES (?, ?, ?, 'chapter-narrative-sync:v1', 1, 'failed', ?, 3)",
+        ("novel-1", chapter.number, content_sha256, "provider unavailable"),
+    )
+    db.commit()
+    repository = SqliteChapterNarrativeCommitRepository(db)
+
+    assert not repository.reclaim_terminal_failure(
+        novel_id="novel-1",
+        chapter_number=chapter.number,
+        content_sha256="0" * 64,
+        pipeline_version="chapter-narrative-sync:v1",
+        content_revision=1,
+    )
+    assert db.fetch_one(
+        "SELECT status, attempt_count FROM chapter_narrative_commits"
+    )["status"] == "failed"
+
+    assert repository.reclaim_terminal_failure(
+        novel_id="novel-1",
+        chapter_number=chapter.number,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+        content_revision=1,
+    )
+    row = db.fetch_one(
+        "SELECT status, attempt_count, failure_reason FROM chapter_narrative_commits"
+    )
+    assert dict(row) == {"status": "stale", "attempt_count": 3, "failure_reason": "provider unavailable"}
+    claim = repository.claim(
+        novel_id="novel-1",
+        chapter_number=chapter.number,
+        content_sha256=content_sha256,
+        pipeline_version="chapter-narrative-sync:v1",
+        expected_content_revision=1,
+    )
+    assert claim.disposition == "claimed"
+    assert claim.attempt_count == 1
+
+
 def test_chapter_narrative_artifacts_are_idempotent_across_audit_retries():
     bundle = {
         "relation_triples": [{"data": {"subject": "林澈", "predicate": "持有", "object": "铜铃"}, "status": "pending"}],

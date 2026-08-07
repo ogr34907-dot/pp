@@ -63,3 +63,33 @@ def test_state_bootstrap_preserves_configured_protection_limit(monkeypatch):
     raw = shared.get_raw_state("novel-1")
 
     assert raw["max_auto_chapters"] == 1
+
+
+def test_state_bootstrap_does_not_relabel_canonical_pause_as_macro_review(monkeypatch):
+    shared = SharedStateRepository(shared_dict={})
+    bootstrap = StateBootstrap(shared_state=shared)
+    monkeypatch.setattr(bootstrap, "_macro_structure_ready", lambda _novel_id: True)
+
+    bootstrap._load_novel_state(
+        {
+            "id": "novel-1",
+            "title": "Demo",
+            "autopilot_status": "running",
+            "current_stage": "paused_for_review",
+            "current_act": 1,
+            "current_chapter_in_act": 7,
+            "current_beat_index": 0,
+            "current_auto_chapters": 7,
+            "max_auto_chapters": 20,
+            "target_chapters": 20,
+            "target_words_per_chapter": 2500,
+            "consecutive_error_count": 0,
+            "last_chapter_tension": 0,
+            "auto_approve_mode": False,
+            "needs_review": True,
+        }
+    )
+
+    raw = shared.get_raw_state("novel-1")
+
+    assert raw.get("writing_substep", "") != "macro_planning"
