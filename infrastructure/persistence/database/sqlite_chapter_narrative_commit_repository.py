@@ -64,6 +64,106 @@ class SqliteChapterNarrativeCommitRepository:
     def __init__(self, db: DatabaseConnection):
         self._db = db
 
+    def claim_full_resync(
+        self, *, novel_id: str, run_id: str, lease_seconds: int = 600
+    ) -> bool:
+        """Claim the durable per-novel full-resync marker with a SQLite CAS."""
+        if not run_id:
+            raise ValueError("run_id_required")
+        now = datetime.now(timezone.utc)
+        marker = f"canonical_aftermath_full_resync:{run_id}:{now.timestamp():.6f}"
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT autopilot_recovery_reason FROM novels WHERE id = ?",
+                    (novel_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+                current = str(row[0] or "")
+                if current.startswith("canonical_aftermath_full_resync:"):
+                    if "|failed" in current or "|cancelled" in current:
+                        started = 0.0
+                    else:
+                        started = None
+                    try:
+                        if started is None:
+                            started = float(current.split(":")[-1].split("|", 1)[0])
+                    except (TypeError, ValueError):
+                        started = now.timestamp()
+                    if started > now.timestamp() - max(1, int(lease_seconds)):
+                        return current.startswith(f"canonical_aftermath_full_resync:{run_id}:")
+                elif current and current not in {
+                    "canonical_aftermath_not_ready",
+                    "paused_for_review_preserved",
+                }:
+                    return False
+                cursor = conn.execute(
+                    "UPDATE novels SET autopilot_recovery_reason = ?, "
+                    "current_stage = 'paused_for_review', autopilot_status = 'paused', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND autopilot_recovery_reason = ?",
+                    (marker, novel_id, current),
+                )
+                return cursor.rowcount == 1
+
+    def mark_full_resync_failure(
+        self, *, novel_id: str, run_id: str, reason: str, status: str = "failed"
+    ) -> bool:
+        prefix = f"canonical_aftermath_full_resync:{run_id}:"
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT autopilot_recovery_reason FROM novels WHERE id = ?", (novel_id,)
+                ).fetchone()
+                current = str(row[0] or "") if row else ""
+                if not current.startswith(prefix):
+                    return False
+                marker = f"{current.split('|', 1)[0]}|{status}:{reason[:240]}"
+                cursor = conn.execute(
+                    "UPDATE novels SET autopilot_recovery_reason = ?, current_stage='paused_for_review', "
+                    "autopilot_status='paused', updated_at=CURRENT_TIMESTAMP WHERE id=? AND autopilot_recovery_reason=?",
+                    (marker, novel_id, current),
+                )
+                return cursor.rowcount == 1
+
+    def renew_full_resync(self, *, novel_id: str, run_id: str) -> bool:
+        """Refresh a run marker while retaining ownership."""
+        prefix = f"canonical_aftermath_full_resync:{run_id}:"
+        now = datetime.now(timezone.utc)
+        marker = f"{prefix}{now.timestamp():.6f}"
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT autopilot_recovery_reason FROM novels WHERE id = ?", (novel_id,)
+                ).fetchone()
+                current = str(row[0] or "") if row else ""
+                if not current.startswith(prefix):
+                    return False
+                cursor = conn.execute(
+                    "UPDATE novels SET autopilot_recovery_reason = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND autopilot_recovery_reason = ?",
+                    (marker, novel_id, current),
+                )
+                return cursor.rowcount == 1
+
+    def finish_full_resync(self, *, novel_id: str, run_id: str) -> bool:
+        """Clear the marker only when this run still owns it."""
+        prefix = f"canonical_aftermath_full_resync:{run_id}:"
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT autopilot_recovery_reason FROM novels WHERE id = ?", (novel_id,)
+                ).fetchone()
+                current = str(row[0] or "") if row else ""
+                if not current.startswith(prefix):
+                    return False
+                cursor = conn.execute(
+                    "UPDATE novels SET autopilot_recovery_reason = '', updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND autopilot_recovery_reason = ?",
+                    (novel_id, current),
+                )
+                return cursor.rowcount == 1
+
     def claim(
         self,
         *,
