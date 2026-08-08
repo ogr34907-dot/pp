@@ -40,7 +40,12 @@ async def resync_all_completed_chapters(
     emit: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> FullResyncResult:
     run_id = str(uuid.uuid4())
-    if database is None or aftermath_pipeline is None:
+    if (
+        database is None
+        or aftermath_pipeline is None
+        or (hasattr(aftermath_pipeline, "_memory_engine")
+            and getattr(aftermath_pipeline, "_memory_engine") is None)
+    ):
         return FullResyncResult(
             run_id=run_id,
             total_chapters=0,
@@ -80,6 +85,7 @@ async def resync_all_completed_chapters(
         if not claimed:
             result.status = "conflict"
             return result
+        result.remains_paused = True
         pending = 0
         for raw in rows:
             content = str(raw.get("content") or "")
@@ -224,6 +230,10 @@ async def resync_all_completed_chapters(
         result.failure_reason = str(exc) or "database_unavailable"
         try:
             commit_repository.mark_full_resync_failure(novel_id=novel_id, run_id=run_id, reason=result.failure_reason, status="unavailable")
+        except Exception:
+            pass
+        try:
+            await _emit_failure(emit, result)
         except Exception:
             pass
         return result

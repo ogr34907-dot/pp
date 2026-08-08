@@ -71,3 +71,5 @@ GREEN output: `7 passed in 1.47s`.
 Regression command and output: the canonical history/idempotency/auto-recovery command above completed with `48 passed in 48.32s`.
 
 Fix commit: `d169a7e92d061a696fa505ca2e10d67f72326388`.
+
+Post-review hardening additionally treats an explicitly missing `_memory_engine` dependency as `unavailable`, marks the result paused immediately after a successful durable claim, and emits a diagnostic failure event for unexpected infrastructure exceptions. Focused verification remains `7 passed in 1.62s`; latest fix commit follows in Git history.

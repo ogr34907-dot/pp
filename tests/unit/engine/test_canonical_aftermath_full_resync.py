@@ -182,6 +182,13 @@ async def test_unavailable_dependency_and_pipeline_shape_are_reported(tmp_path):
     unavailable = await resync_all_completed_chapters(novel_id="novel-1", database=None, aftermath_pipeline=None)
     assert unavailable.status == "unavailable"
 
+    class MissingMemory:
+        _memory_engine = None
+    db_missing = DatabaseConnection(str(tmp_path / "missing-memory.db"))
+    _seed(db_missing)
+    missing_memory = await resync_all_completed_chapters(novel_id="novel-1", database=db_missing, aftermath_pipeline=MissingMemory())
+    assert missing_memory.status == "unavailable"
+
     db = DatabaseConnection(str(tmp_path / "unavailable.db"))
     _seed(db)
     class BrokenPipeline(FakePipeline):
