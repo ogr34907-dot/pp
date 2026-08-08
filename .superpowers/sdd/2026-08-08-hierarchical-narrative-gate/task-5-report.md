@@ -58,4 +58,4 @@ The initial unbounded full-suite attempt was terminated by the parent after a Wi
 ## Commits
 
 - `4c91c9f6` — `chore: complete hierarchy gate verification` (API factory gate wiring and installer compile repair).
-- `55a32c48` — `docs: record final hierarchy gate verification` (this report and the SDD ledger).
+- `4d9e28f9` — `docs: record final hierarchy gate verification` (this report and the SDD ledger).
