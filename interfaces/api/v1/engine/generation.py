@@ -119,6 +119,10 @@ def get_continuous_planning_service() -> ContinuousPlanningService:
     llm_service = get_llm_service()
     chapter_repository = get_chapter_repository()
 
+    from application.engine.services.hierarchical_narrative_alignment_gate import (
+        HierarchicalNarrativeAlignmentGate,
+    )
+
     return ContinuousPlanningService(
         story_node_repo=story_node_repo,
         chapter_element_repo=chapter_element_repo,
@@ -126,6 +130,7 @@ def get_continuous_planning_service() -> ContinuousPlanningService:
         bible_service=bible_service,
         chapter_repository=chapter_repository,
         novel_repository=get_novel_repository(),
+        alignment_gate=HierarchicalNarrativeAlignmentGate(),
     )
 
 

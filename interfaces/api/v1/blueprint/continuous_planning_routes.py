@@ -134,6 +134,10 @@ def get_service() -> ContinuousPlanningService:
     from application.world.services.bible_service import BibleService
     bible_service = BibleService(get_bible_repository())
 
+    from application.engine.services.hierarchical_narrative_alignment_gate import (
+        HierarchicalNarrativeAlignmentGate,
+    )
+
     return ContinuousPlanningService(
         story_node_repo,
         chapter_element_repo,
@@ -141,6 +145,7 @@ def get_service() -> ContinuousPlanningService:
         bible_service,
         chapter_repository=SqliteChapterRepository(get_database()),
         novel_repository=get_novel_repository(),
+        alignment_gate=HierarchicalNarrativeAlignmentGate(),
     )
 
 
