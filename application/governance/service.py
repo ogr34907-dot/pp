@@ -47,22 +47,224 @@ class NarrativeGovernanceService:
         novel_repository: Any | None = None,
         legacy_storyline_repository: Any | None = None,
         db: Any | None = None,
+        hierarchy_gate: Any | None = None,
+        story_node_repository: Any | None = None,
     ) -> None:
         self.repository = repository
         self.novel_repository = novel_repository
         self.legacy_storyline_repository = legacy_storyline_repository
         self.db = db
+        self.hierarchy_gate = hierarchy_gate
+        self.story_node_repository = story_node_repository
+        self._hierarchy_reports: dict[tuple[str, str], dict[str, Any]] = {}
+        self._hierarchy_report_objects: dict[tuple[str, str], Any] = {}
+
+    def _hierarchy_gate(self) -> Any:
+        if self.hierarchy_gate is None:
+            from application.engine.services.hierarchical_narrative_alignment_gate import (
+                HierarchicalNarrativeAlignmentGate,
+            )
+
+            self.hierarchy_gate = HierarchicalNarrativeAlignmentGate()
+        return self.hierarchy_gate
+
+    def _hierarchy_nodes(self, novel_id: str) -> list[Any]:
+        repository = self.story_node_repository
+        if repository is None and self.db is not None:
+            try:
+                from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+
+                repository = self.story_node_repository = StoryNodeRepository(self.db)
+            except Exception:
+                repository = None
+        if repository is None:
+            return []
+        for name in ("get_by_novel_sync", "list_by_novel", "get_by_novel"):
+            operation = getattr(repository, name, None)
+            if operation is None:
+                continue
+            try:
+                result = operation(novel_id)
+                if hasattr(result, "__await__"):
+                    import asyncio
+
+                    result = asyncio.run(result)
+                return list(result or [])
+            except Exception:
+                continue
+        return []
+
+    @staticmethod
+    def _alignment_payload(report: Any) -> dict[str, Any]:
+        data = report.to_dict() if hasattr(report, "to_dict") else dict(report)
+        violations = data.get("violations") or []
+        refs: list[str] = []
+        for violation in violations:
+            refs.extend(str(ref) for ref in (violation.get("evidence_refs") or []))
+        data["evidence_refs"] = list(dict.fromkeys(refs))
+        # The UI/API use one stable vocabulary for the five gate states.
+        if data.get("overridden"):
+            data["decision"] = "overridden"
+        elif data.get("evidence_degraded") and data.get("decision") == "pass":
+            data["decision"] = "evidence_degraded"
+        return data
+
+    def preview_hierarchy_alignment(
+        self,
+        novel_id: str,
+        chapter_id: str,
+        candidate: dict[str, Any],
+        *,
+        nodes: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(candidate, dict):
+            raise ValueError("candidate must be an object")
+        gate = self._hierarchy_gate()
+        snapshot = gate.build_snapshot(
+            chapter_id,
+            self._hierarchy_nodes(novel_id) if nodes is None else nodes,
+            novel_id=novel_id,
+        )
+        report = gate.check(snapshot, candidate)
+        payload = self._alignment_payload(report)
+        payload["snapshot"] = snapshot.to_dict()
+        self._hierarchy_reports[(novel_id, str(payload["candidate_digest"]))] = payload
+        self._hierarchy_report_objects[(novel_id, str(payload["candidate_digest"]))] = report
+        self._emit(novel_id, "HierarchyAlignmentEvaluated", snapshot.chapter_number, payload)
+        return payload
+
+    # Explicit status/preview aliases make the API seam discoverable.
+    hierarchy_alignment_status = preview_hierarchy_alignment
+    preview_hierarchy_alignment_status = preview_hierarchy_alignment
+    get_hierarchy_alignment_status = preview_hierarchy_alignment
+
+    def override_hierarchy_alignment(
+        self,
+        novel_id: str,
+        candidate_digest: str | dict[str, Any],
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(candidate_digest, dict):
+            payload = candidate_digest
+            candidate_digest = str(payload.get("candidate_digest") or "").strip()
+            reason = payload.get("reason") if reason is None else reason
+        digest = str(candidate_digest or "").strip()
+        reason_text = str(reason or "").strip()
+        if not digest or not reason_text:
+            raise ValueError("candidate_digest and non-empty reason are required")
+        list_events = getattr(self.repository, "list_events", None)
+        if list_events is not None:
+            try:
+                for event in list_events(novel_id, "HierarchyAlignmentOverrideApplied", 100):
+                    if str((event.get("payload") or {}).get("candidate_digest") or "") == digest:
+                        raise ValueError("override has already been consumed")
+            except ValueError:
+                raise
+            except Exception:
+                pass
+        report_data = self._hierarchy_reports.get((novel_id, digest))
+        report = self._hierarchy_report_objects.get((novel_id, digest))
+        if report_data is None or report is None:
+            report_data, report = self._load_persisted_alignment_report(novel_id, digest)
+        if report_data is None:
+            raise ValueError("candidate digest is stale or unknown")
+        if report_data.get("overridden"):
+            raise ValueError("override has already been consumed")
+        from application.engine.services.hierarchical_narrative_alignment_gate import OneShotOverride
+
+        if report is None:
+            raise ValueError("candidate digest is stale or unknown")
+        overridden = self._hierarchy_gate().apply_override(report, OneShotOverride(digest, reason_text))
+        payload = self._alignment_payload(overridden)
+        payload["override_reason"] = reason_text
+        self._hierarchy_reports[(novel_id, digest)] = payload
+        self._emit(novel_id, "HierarchyAlignmentOverrideApplied", None, payload)
+        return payload
+
+    apply_hierarchy_override = override_hierarchy_alignment
+    apply_hierarchy_one_shot_override = override_hierarchy_alignment
+
+    def _load_persisted_alignment_report(self, novel_id: str, digest: str) -> tuple[dict[str, Any] | None, Any | None]:
+        list_events = getattr(self.repository, "list_events", None)
+        if list_events is None:
+            return None, None
+        try:
+            events = list_events(novel_id, "HierarchyAlignmentEvaluated", 100)
+        except Exception:
+            return None, None
+        for event in events:
+            payload = event.get("payload") or {}
+            if str(payload.get("candidate_digest") or "") != digest:
+                continue
+            try:
+                from application.engine.services.hierarchical_narrative_alignment_gate import (
+                    AlignmentReport,
+                    AlignmentViolation,
+                    CharacterAgency,
+                )
+
+                violations = tuple(AlignmentViolation(**item) for item in payload.get("violations", []) if isinstance(item, dict))
+                agency = tuple(CharacterAgency(**item) for item in payload.get("character_agency", []) if isinstance(item, dict))
+                report = AlignmentReport(
+                    decision=str(payload.get("decision", "review")),
+                    confidence=float(payload.get("confidence", 0) or 0),
+                    candidate_digest=digest,
+                    snapshot_digest=str(payload.get("snapshot_digest", "")),
+                    served_commitments=tuple(payload.get("served_commitments", [])),
+                    missing_commitments=tuple(payload.get("missing_commitments", [])),
+                    violations=violations,
+                    character_agency=agency,
+                    repair_plan=tuple(payload.get("repair_plan", [])),
+                    evidence_degraded=bool(payload.get("evidence_degraded")),
+                    overridden=False,
+                )
+                self._hierarchy_reports[(novel_id, digest)] = payload
+                self._hierarchy_report_objects[(novel_id, digest)] = report
+                return payload, report
+            except Exception:
+                return None, None
+        return None, None
+
+    def preview_hierarchy_replan(
+        self,
+        novel_id: str,
+        chapter_id: str,
+        candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        alignment = self.preview_hierarchy_alignment(novel_id, chapter_id, candidate)
+        result = {
+            "novel_id": novel_id,
+            "chapter_id": chapter_id,
+            "would_write": False,
+            "mutations": [],
+            "alignment_report": alignment,
+            "repair_plan": alignment.get("repair_plan", []),
+        }
+        self._emit(novel_id, "HierarchyReplanPreviewed", alignment.get("chapter_number"), result)
+        return result
+
+    safe_replan_preview = preview_hierarchy_replan
+    preview_replan = preview_hierarchy_replan
 
     def get_state(self, novel_id: str) -> dict[str, Any]:
         contract = self.get_or_create_contract(novel_id)
         self.backfill_canonical_storylines(novel_id)
         latest_report = self.repository.latest_report(novel_id)
+        latest_hierarchy = None
+        list_events = getattr(self.repository, "list_events", None)
+        if list_events is not None:
+            try:
+                events = list_events(novel_id, "HierarchyAlignmentEvaluated", 1)
+                latest_hierarchy = (events[0].get("payload") if events else None)
+            except Exception:
+                latest_hierarchy = None
         return {
             "contract": contract.to_dict(),
             "canonical_storylines": [s.to_dict() for s in self.repository.list_storylines(novel_id)],
             "open_debts": self.repository.list_open_debts(novel_id),
             "latest_report": latest_report.to_dict() if latest_report else None,
             "chapter_budget_preview": self.preview_chapter_budget(novel_id).to_dict(),
+            "hierarchy_alignment": latest_hierarchy,
         }
 
     def get_or_create_contract(self, novel_id: str) -> NarrativeContract:

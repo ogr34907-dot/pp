@@ -40,6 +40,20 @@ class ReviewActionPayload(BaseModel):
     patch: dict[str, Any] | None = None
 
 
+class HierarchyAlignmentPayload(BaseModel):
+    chapter_id: str
+    candidate: dict[str, Any] = Field(default_factory=dict)
+
+
+class HierarchyOverridePayload(BaseModel):
+    candidate_digest: str
+    reason: str
+
+
+class HierarchyReplanPayload(HierarchyAlignmentPayload):
+    pass
+
+
 def _service() -> NarrativeGovernanceService:
     db = get_database()
     repo = SqliteGovernanceRepository(db)
@@ -57,7 +71,25 @@ def _service() -> NarrativeGovernanceService:
         storyline_repo = SqliteStorylineRepository(db)
     except Exception:
         storyline_repo = None
-    return NarrativeGovernanceService(repo, novel_repo, storyline_repo, db)
+    story_node_repo = None
+    try:
+        from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+
+        story_node_repo = StoryNodeRepository(db)
+    except Exception:
+        story_node_repo = None
+    from application.engine.services.hierarchical_narrative_alignment_gate import (
+        HierarchicalNarrativeAlignmentGate,
+    )
+
+    return NarrativeGovernanceService(
+        repo,
+        novel_repo,
+        storyline_repo,
+        db,
+        hierarchy_gate=HierarchicalNarrativeAlignmentGate(),
+        story_node_repository=story_node_repo,
+    )
 
 
 def _payload_dict(model: BaseModel, *, exclude_none: bool = False) -> dict[str, Any]:
@@ -104,3 +136,40 @@ async def apply_governance_review_action(novel_id: str, payload: ReviewActionPay
         return _service().review_action(novel_id, _payload_dict(payload))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"governance review action failed: {exc}") from exc
+
+
+@router.post("/hierarchy/status")
+@router.post("/hierarchy/preview")
+@router.post("/hierarchy-alignment/status")
+@router.post("/hierarchy-alignment/preview")
+async def preview_hierarchy_alignment(novel_id: str, payload: HierarchyAlignmentPayload) -> dict[str, Any]:
+    try:
+        return _service().preview_hierarchy_alignment(novel_id, payload.chapter_id, payload.candidate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"hierarchy alignment preview failed: {exc}") from exc
+
+
+@router.post("/hierarchy/override")
+@router.post("/hierarchy-alignment/override")
+async def override_hierarchy_alignment(novel_id: str, payload: HierarchyOverridePayload) -> dict[str, Any]:
+    try:
+        return _service().override_hierarchy_alignment(novel_id, payload.candidate_digest, payload.reason)
+    except ValueError as exc:
+        # Exact/stale digest and malformed reasons are client errors and never mutate data.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"hierarchy override failed: {exc}") from exc
+
+
+@router.post("/replan/preview")
+@router.post("/hierarchy/replan/preview")
+@router.post("/safe-replan/preview")
+async def preview_hierarchy_replan(novel_id: str, payload: HierarchyReplanPayload) -> dict[str, Any]:
+    try:
+        return _service().preview_hierarchy_replan(novel_id, payload.chapter_id, payload.candidate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"hierarchy replan preview failed: {exc}") from exc

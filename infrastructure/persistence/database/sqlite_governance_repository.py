@@ -268,6 +268,36 @@ class SqliteGovernanceRepository:
             (event_id, novel_id, event_type, chapter_number, _json(payload)),
         )
 
+    def list_events(
+        self,
+        novel_id: str,
+        event_type: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return auditable governance events without introducing another store."""
+        if event_type:
+            rows = self.db.fetch_all(
+                """SELECT * FROM governance_events WHERE novel_id = ? AND event_type = ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (novel_id, event_type, limit),
+            )
+        else:
+            rows = self.db.fetch_all(
+                "SELECT * FROM governance_events WHERE novel_id = ? ORDER BY created_at DESC LIMIT ?",
+                (novel_id, limit),
+            )
+        return [
+            {
+                "event_id": row["event_id"],
+                "novel_id": row["novel_id"],
+                "event_type": row["event_type"],
+                "chapter_number": row["chapter_number"],
+                "payload": _loads(row["payload_json"], {}),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
     def list_open_debts(self, novel_id: str, limit: int = 50) -> list[dict[str, Any]]:
         try:
             rows = self.db.fetch_all(

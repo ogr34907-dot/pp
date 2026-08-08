@@ -27,6 +27,22 @@
       </div>
     </div>
 
+    <article v-if="state?.hierarchy_alignment" class="ng-hierarchy-status" :class="`ng-hierarchy-status--${hierarchyDecision}`">
+      <div class="ng-panel__head">
+        <h3>层级对齐</h3>
+        <strong>{{ hierarchyDecision }}</strong>
+      </div>
+      <p v-if="hierarchyReport?.evidence_degraded" class="ng-hierarchy-note">证据降级，需人工复核</p>
+      <p v-else-if="hierarchyDecision === 'block'" class="ng-hierarchy-note">候选未通过层级契约</p>
+      <p v-else-if="hierarchyDecision === 'review'" class="ng-hierarchy-note">候选需要复核</p>
+      <p v-else class="ng-hierarchy-note">最近一次候选已通过</p>
+      <ul v-if="hierarchyRepairs.length" class="ng-repair-list">
+        <li v-for="repair in hierarchyRepairs.slice(0, 3)" :key="repair">{{ repair }}</li>
+      </ul>
+      <small v-if="hierarchyReport" class="ng-digests">候选 {{ hierarchyReport.candidate_digest.slice(0, 12) }} · 快照 {{ hierarchyReport.snapshot_digest.slice(0, 12) }}</small>
+    </article>
+    <p v-else-if="state" class="ng-hierarchy-empty">尚未生成层级对齐报告。</p>
+
     <div v-if="state" class="ng-grid">
       <article class="ng-panel">
         <div class="ng-panel__head">
@@ -112,6 +128,7 @@
       </aside>
     </div>
 
+    <p v-else-if="loadError" class="ng-loading ng-loading--error">治理状态读取失败：{{ loadError }}</p>
     <p v-else class="ng-loading">正在读取叙事治理状态...</p>
   </section>
 </template>
@@ -131,6 +148,7 @@ const props = defineProps<{
 }>()
 
 const state = ref<GovernanceStateDTO | null>(null)
+const loadError = ref('')
 const saving = ref(false)
 const contractDraft = reactive({
   title_promise: '',
@@ -152,6 +170,9 @@ const promiseHitRate = computed(() => {
 })
 
 const reportSeverity = computed(() => state.value?.latest_report?.severity ?? 'ready')
+const hierarchyReport = computed(() => state.value?.hierarchy_alignment ?? null)
+const hierarchyDecision = computed(() => hierarchyReport.value?.decision ?? 'empty')
+const hierarchyRepairs = computed(() => hierarchyReport.value?.repair_plan ?? [])
 const severityClass = computed(() => `ng-status-text--${reportSeverity.value}`)
 const blockReason = computed(() => {
   if (state.value?.latest_report?.should_pause_autopilot) return '严重结构风险已阻断'
@@ -174,7 +195,13 @@ watch(
 onMounted(loadState)
 
 async function loadState() {
-  state.value = await getGovernanceState(props.novelId)
+  loadError.value = ''
+  try {
+    state.value = await getGovernanceState(props.novelId)
+  } catch (error) {
+    state.value = null
+    loadError.value = error instanceof Error ? error.message : '未知错误'
+  }
 }
 
 async function saveContract() {
@@ -311,6 +338,30 @@ h3 {
   margin-top: 14px;
 }
 
+.ng-hierarchy-status {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--app-border);
+  border-left: 3px solid var(--app-accent);
+  border-radius: 7px;
+  background: var(--app-surface-subtle);
+}
+
+.ng-hierarchy-status strong {
+  text-transform: uppercase;
+  font-size: 12px;
+}
+
+.ng-hierarchy-status--block { border-left-color: var(--app-danger, #b42318); }
+.ng-hierarchy-status--review,
+.ng-hierarchy-status--evidence_degraded { border-left-color: var(--app-warning, #b54708); }
+.ng-hierarchy-status--overridden { border-left-color: var(--app-success, #027a48); }
+.ng-hierarchy-note,
+.ng-digests { color: var(--app-text-muted); font-size: 12px; }
+.ng-hierarchy-note { margin-top: 4px; }
+.ng-repair-list { margin: 6px 0 0 16px; padding: 0; color: var(--app-text-muted); font-size: 12px; line-height: 1.5; }
+.ng-digests { display: block; margin-top: 5px; }
+
 .ng-panel {
   min-width: 0;
   min-height: 0;
@@ -440,6 +491,9 @@ textarea {
   padding: 14px 0;
   font-size: 13px;
 }
+
+.ng-loading--error { color: var(--app-danger, #b42318); }
+.ng-hierarchy-empty { margin-top: 12px; color: var(--app-text-muted); font-size: 12px; }
 
 @media (max-width: 1180px) {
   .ng-cockpit {

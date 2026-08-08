@@ -64,6 +64,38 @@ export interface GovernanceStateDTO {
   open_debts: Array<Record<string, unknown>>
   latest_report: GovernanceReportDTO | null
   chapter_budget_preview: ChapterNarrativeBudgetDTO
+  hierarchy_alignment?: HierarchyAlignmentReportDTO | null
+}
+
+export interface HierarchyAlignmentViolationDTO {
+  scope: string
+  severity: string
+  expected: string
+  actual: string
+  evidence_refs: string[]
+  repair: string
+}
+
+export interface HierarchyAlignmentReportDTO {
+  decision: 'pass' | 'review' | 'block' | 'evidence_degraded' | 'overridden' | string
+  confidence: number
+  candidate_digest: string
+  snapshot_digest: string
+  violations: HierarchyAlignmentViolationDTO[]
+  repair_plan: string[]
+  evidence_refs: string[]
+  evidence_degraded: boolean
+  overridden: boolean
+  override_reason?: string | null
+}
+
+export interface HierarchyReplanPreviewDTO {
+  novel_id: string
+  chapter_id: string
+  would_write: false
+  mutations: Array<Record<string, unknown>>
+  alignment_report: HierarchyAlignmentReportDTO
+  repair_plan: string[]
 }
 
 export function getGovernanceState(novelId: string) {
@@ -95,5 +127,32 @@ export function applyGovernanceReviewAction(
   return apiClient.post<{ report_id: string; status: string }>(
     `/novels/${novelId}/governance/review-action`,
     payload,
+  )
+}
+
+export function previewHierarchyAlignment(
+  novelId: string,
+  payload: { chapter_id: string; candidate: Record<string, unknown> },
+) {
+  return apiClient.post<HierarchyAlignmentReportDTO>(
+    `/novels/${novelId}/governance/hierarchy/preview`, payload,
+  )
+}
+
+export function overrideHierarchyAlignment(
+  novelId: string,
+  payload: { candidate_digest: string; reason: string },
+) {
+  return apiClient.post<HierarchyAlignmentReportDTO>(
+    `/novels/${novelId}/governance/hierarchy/override`, payload,
+  )
+}
+
+export function previewHierarchyReplan(
+  novelId: string,
+  payload: { chapter_id: string; candidate: Record<string, unknown> },
+) {
+  return apiClient.post<HierarchyReplanPreviewDTO>(
+    `/novels/${novelId}/governance/hierarchy/replan/preview`, payload,
   )
 }
