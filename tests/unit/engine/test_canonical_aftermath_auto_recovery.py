@@ -153,6 +153,29 @@ async def test_non_retryable_terminal_failure_does_not_run_recovery(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_manual_recovery_allows_explicit_retry_of_hard_failure(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "manual-hard.db"))
+    content_sha256, content_revision = _seed_terminal_failure(
+        database,
+        failure_reason="canonical_summary_write_missing",
+    )
+    pipeline = _SuccessfulPipeline(database, content_sha256, content_revision)
+
+    result = await canonical_aftermath_recovery.attempt_manual_canonical_aftermath_recovery(
+        novel_id="novel-1",
+        database=database,
+        aftermath_pipeline=pipeline,
+    )
+
+    assert result.disposition == "recovered"
+    assert pipeline.calls == 1
+    marker = database.fetch_one(
+        "SELECT autopilot_recovery_reason FROM novels WHERE id = 'novel-1'"
+    )["autopilot_recovery_reason"]
+    assert marker == ""
+
+
+@pytest.mark.asyncio
 async def test_failed_recovery_marker_blocks_same_version_on_later_tick(tmp_path):
     database = DatabaseConnection(str(tmp_path / "exhausted.db"))
     _seed_terminal_failure(

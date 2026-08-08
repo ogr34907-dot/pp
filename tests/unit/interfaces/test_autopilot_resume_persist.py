@@ -1,5 +1,6 @@
 import hashlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -100,43 +101,24 @@ def test_manual_resume_blocks_terminal_canonical_failure(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_canonical_retry_route_preserves_resume_guard(monkeypatch):
     """Retry completion does not auto-resume; normal resume remains explicit."""
-    calls = []
     resume_calls = []
-
-    class _Db:
-        def fetch_one(self, query, params=()):
-            if "MAX(number)" in query:
-                return {"chapter_number": 8}
-            if "FROM chapters" in query:
-                return {
-                    "number": 8,
-                    "content": "正文",
-                    "content_sha256": hashlib.sha256("正文".encode()).hexdigest(),
-                    "content_revision": 2,
-                    "status": "completed",
-                }
-            return None
-
-    class _Claims:
-        def __init__(self, _db):
-            pass
-
-        def reclaim_terminal_failure(self, **kwargs):
-            calls.append(("reclaim", kwargs))
-            return True
-
-        def is_current_version_ready(self, **kwargs):
-            calls.append(("ready", kwargs))
-            return True
-
-    class _Pipeline:
-        async def run_after_chapter_saved(self, *args, **kwargs):
-            calls.append(("pipeline", args, kwargs))
-            return {"narrative_sync_ok": True, "commit_status": "committed"}
-
-    monkeypatch.setattr(autopilot_routes, "get_database", lambda *_args, **_kwargs: _Db())
-    monkeypatch.setattr(autopilot_routes, "get_chapter_aftermath_pipeline", lambda: _Pipeline())
-    monkeypatch.setattr(autopilot_routes, "SqliteChapterNarrativeCommitRepository", _Claims, raising=False)
+    database = object()
+    pipeline = object()
+    recovery = SimpleNamespace(
+        disposition="recovered",
+        chapter_number=8,
+        content_revision=2,
+        failure_reason="",
+    )
+    attempt = AsyncMock(return_value=recovery)
+    monkeypatch.setattr(autopilot_routes, "get_database", lambda *_args, **_kwargs: database)
+    monkeypatch.setattr(autopilot_routes, "get_chapter_aftermath_pipeline", lambda: pipeline)
+    monkeypatch.setattr(
+        autopilot_routes,
+        "attempt_manual_canonical_aftermath_recovery",
+        attempt,
+        raising=False,
+    )
     monkeypatch.setattr(
         autopilot_routes,
         "resume_from_review",
@@ -147,47 +129,34 @@ async def test_canonical_retry_route_preserves_resume_guard(monkeypatch):
 
     assert result["success"] is True
     assert result["remains_paused"] is True
-    assert [call[0] for call in calls] == ["reclaim", "pipeline", "ready"]
+    attempt.assert_awaited_once_with(
+        novel_id="novel-1",
+        database=database,
+        aftermath_pipeline=pipeline,
+    )
     assert resume_calls == []
 
 
 @pytest.mark.asyncio
-async def test_canonical_retry_route_restores_terminal_failure_when_pipeline_raises(monkeypatch):
-    calls = []
-
-    class _Db:
-        def fetch_one(self, query, params=()):
-            return {
-                "number": 8,
-                "content": "正文",
-                "content_sha256": hashlib.sha256("正文".encode()).hexdigest(),
-                "content_revision": 2,
-                "status": "completed",
-            }
-
-    class _Claims:
-        def __init__(self, _db):
-            pass
-
-        def reclaim_terminal_failure(self, **kwargs):
-            return True
-
-        def restore_terminal_failure(self, **kwargs):
-            calls.append(kwargs)
-
-        def is_current_version_ready(self, **kwargs):
-            return False
-
-    class _Pipeline:
-        async def run_after_chapter_saved(self, *args, **kwargs):
-            raise RuntimeError("provider disconnected")
-
-    monkeypatch.setattr(autopilot_routes, "get_database", lambda *_args, **_kwargs: _Db())
-    monkeypatch.setattr(autopilot_routes, "get_chapter_aftermath_pipeline", lambda: _Pipeline())
-    monkeypatch.setattr(autopilot_routes, "SqliteChapterNarrativeCommitRepository", _Claims, raising=False)
+async def test_canonical_retry_route_surfaces_shared_service_failure(monkeypatch):
+    recovery = SimpleNamespace(
+        disposition="failed",
+        chapter_number=8,
+        content_revision=2,
+        failure_reason="canonical_aftermath_manual_recovery_failed:provider disconnected",
+    )
+    attempt = AsyncMock(return_value=recovery)
+    monkeypatch.setattr(autopilot_routes, "get_database", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(autopilot_routes, "get_chapter_aftermath_pipeline", lambda: object())
+    monkeypatch.setattr(
+        autopilot_routes,
+        "attempt_manual_canonical_aftermath_recovery",
+        attempt,
+        raising=False,
+    )
 
     with pytest.raises(Exception) as error:
         await autopilot_routes.retry_canonical_aftermath("novel-1")
 
     assert getattr(error.value, "status_code", None) == 502
-    assert calls and calls[0]["failure_reason"].startswith("canonical_aftermath_retry_failed:")
+    assert "provider disconnected" in str(getattr(error.value, "detail", ""))

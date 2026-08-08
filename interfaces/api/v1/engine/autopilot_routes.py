@@ -49,6 +49,9 @@ from application.engine.services.autopilot_log_ring import (
     shorten_log_message,
     snapshot_for_novel,
 )
+from application.engine.services.canonical_aftermath_recovery import (
+    attempt_manual_canonical_aftermath_recovery,
+)
 from application.ai_invocation.autopilot.review_gate import (
     resume_block_reason_from_status,
     stage_needs_human_review,
@@ -1959,94 +1962,33 @@ async def retry_canonical_aftermath(novel_id: str):
     budget is exhausted.  It never changes prose or resumes the daemon; a
     successful canonical commit still requires a separate normal resume.
     """
-    database = get_database(get_db_path())
-    source = database.fetch_one(
-        """
-        SELECT number, content, content_sha256, content_revision
-        FROM chapters
-        WHERE novel_id = ? AND status = 'completed'
-        ORDER BY number DESC
-        LIMIT 1
-        """,
-        (novel_id,),
+    recovery = await attempt_manual_canonical_aftermath_recovery(
+        novel_id=novel_id,
+        database=get_database(get_db_path()),
+        aftermath_pipeline=get_chapter_aftermath_pipeline(),
     )
-    if source is None:
+    if recovery.disposition == "no_completed_chapter":
         raise HTTPException(404, "没有可重新同步的已完成章节")
-
-    chapter_number = int(source["number"])
-    content = str(source["content"] or "")
-    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    content_revision = int(source["content_revision"] or 0)
-    if (
-        not content.strip()
-        or source["content_sha256"] != content_sha256
-        or content_revision < 1
-    ):
-        raise HTTPException(409, "章节正文版本已变化，请先重新加载后再同步")
-
-    commits = SqliteChapterNarrativeCommitRepository(database)
-    if not commits.reclaim_terminal_failure(
-        novel_id=novel_id,
-        chapter_number=chapter_number,
-        content_sha256=content_sha256,
-        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-        content_revision=content_revision,
-    ):
-        if commits.is_current_version_ready(
-            novel_id=novel_id,
-            chapter_number=chapter_number,
-            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-        ):
-            raise HTTPException(409, "当前章节的规范记忆已经就绪，无需重新同步")
+    if recovery.disposition == "ready":
+        raise HTTPException(409, "当前章节的规范记忆已经就绪，无需重新同步")
+    if recovery.disposition in {
+        "source_version_mismatch",
+        "not_terminal",
+        "blocked",
+        "conflict",
+    }:
         raise HTTPException(409, "当前章节没有可重新同步的终态失败记录")
-
-    try:
-        result = await get_chapter_aftermath_pipeline().run_after_chapter_saved(
-            novel_id,
-            chapter_number,
-            content,
-            expected_content_sha256=content_sha256,
-            expected_content_revision=content_revision,
-        )
-    except asyncio.CancelledError:
-        commits.restore_terminal_failure(
-            novel_id=novel_id,
-            chapter_number=chapter_number,
-            content_sha256=content_sha256,
-            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-            content_revision=content_revision,
-            failure_reason="canonical_aftermath_retry_cancelled",
-        )
-        raise
-    except Exception as exc:
-        reason = f"canonical_aftermath_retry_failed:{exc}"
-        commits.restore_terminal_failure(
-            novel_id=novel_id,
-            chapter_number=chapter_number,
-            content_sha256=content_sha256,
-            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-            content_revision=content_revision,
-            failure_reason=reason,
-        )
-        raise HTTPException(502, f"规范记忆重新同步失败：{reason}") from exc
-    if not commits.is_current_version_ready(
-        novel_id=novel_id,
-        chapter_number=chapter_number,
-        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-    ):
-        failure_reason = str(
-            (result or {}).get("failure_reason")
-            if isinstance(result, dict)
-            else "canonical_aftermath_retry_failed"
-        ) or "canonical_aftermath_retry_failed"
-        raise HTTPException(502, f"规范记忆重新同步失败：{failure_reason}")
+    if recovery.disposition == "unavailable":
+        raise HTTPException(503, f"规范记忆重新同步暂不可用：{recovery.failure_reason}")
+    if recovery.disposition != "recovered":
+        raise HTTPException(502, f"规范记忆重新同步失败：{recovery.failure_reason}")
 
     return {
         "success": True,
-        "chapter_number": chapter_number,
-        "content_revision": content_revision,
+        "chapter_number": recovery.chapter_number,
+        "content_revision": recovery.content_revision,
         "remains_paused": True,
-        "message": f"第 {chapter_number} 章规范记忆同步完成，请手动继续自动驾驶。",
+        "message": f"第 {recovery.chapter_number} 章规范记忆同步完成，请手动继续自动驾驶。",
     }
 
 
