@@ -265,7 +265,10 @@ class HierarchicalNarrativeAlignmentGate:
                     return [{"degraded": True, "error": "async vector retriever requires async evaluation"}], True
             if isinstance(result, Mapping):
                 degraded = bool(result.get("degraded") or result.get("error"))
-                result = result.get("items") or result.get("evidence") or []
+                items = result.get("items") or result.get("evidence") or []
+                if degraded and not items:
+                    return [dict(result)], True
+                result = items
                 return list(result), degraded
             return list(result or []), False
         except Exception as exc:
@@ -482,7 +485,10 @@ class HierarchicalNarrativeAlignmentGate:
                 result = await result
             if isinstance(result, Mapping):
                 degraded = bool(result.get("degraded") or result.get("error"))
-                result = result.get("items") or result.get("evidence") or []
+                items = result.get("items") or result.get("evidence") or []
+                if degraded and not items:
+                    return [dict(result)], True
+                result = items
                 return list(result), degraded
             return list(result or []), False
         except Exception as exc:
