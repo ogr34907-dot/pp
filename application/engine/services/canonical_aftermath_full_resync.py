@@ -39,13 +39,28 @@ async def resync_all_completed_chapters(
     emit: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> FullResyncResult:
     run_id = str(uuid.uuid4())
+    if database is None or aftermath_pipeline is None:
+        return FullResyncResult(
+            run_id=run_id,
+            total_chapters=0,
+            status="unavailable",
+            failure_reason="database_or_pipeline_unavailable",
+        )
     commit_repository = SqliteChapterNarrativeCommitRepository(database)
-    rows = database.fetch_all(
-        "SELECT number, content, content_sha256, content_revision FROM chapters "
-        "WHERE novel_id = ? AND status = 'completed' AND trim(COALESCE(content, '')) != '' "
-        "ORDER BY number ASC",
-        (novel_id,),
-    )
+    try:
+        rows = database.fetch_all(
+            "SELECT number, content, content_sha256, content_revision FROM chapters "
+            "WHERE novel_id = ? AND status = 'completed' AND trim(COALESCE(content, '')) != '' "
+            "ORDER BY number ASC",
+            (novel_id,),
+        )
+    except Exception as exc:
+        return FullResyncResult(
+            run_id=run_id,
+            total_chapters=0,
+            status="unavailable",
+            failure_reason=str(exc) or "database_unavailable",
+        )
     result = FullResyncResult(run_id=run_id, total_chapters=len(rows))
 
     with _RUN_LOCK:
@@ -55,7 +70,12 @@ async def resync_all_completed_chapters(
         _ACTIVE_RUNS.add(novel_id)
     claimed = False
     try:
-        claimed = commit_repository.claim_full_resync(novel_id=novel_id, run_id=run_id)
+        try:
+            claimed = commit_repository.claim_full_resync(novel_id=novel_id, run_id=run_id)
+        except Exception as exc:
+            result.status = "unavailable"
+            result.failure_reason = str(exc) or "database_unavailable"
+            return result
         if not claimed:
             result.status = "conflict"
             return result
