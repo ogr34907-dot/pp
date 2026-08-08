@@ -56,6 +56,9 @@ from application.blueprint.services.chapter_book_structure_sync import (
     collect_structure_chapter_numbers,
     purge_chapter_book_rows_not_matching_structure,
 )
+from application.engine.services.hierarchical_narrative_alignment_gate import (
+    HierarchicalNarrativeAlignmentGate,
+)
 
 logger = logging.getLogger(__name__)
 _macro_plan_progress_store: Dict[str, Dict] = {}
@@ -479,6 +482,8 @@ class ContinuousPlanningService:
         bible_service=None,
         chapter_repository: Optional[ChapterRepository] = None,
         novel_repository: Optional[NovelRepository] = None,
+        alignment_gate: Optional[HierarchicalNarrativeAlignmentGate] = None,
+        narrative_alignment_gate: Optional[HierarchicalNarrativeAlignmentGate] = None,
     ):
         self.story_node_repo = story_node_repo
         self.chapter_element_repo = chapter_element_repo
@@ -486,6 +491,7 @@ class ContinuousPlanningService:
         self.bible_service = bible_service
         self.chapter_repository = chapter_repository
         self.novel_repository = novel_repository
+        self.alignment_gate = alignment_gate or narrative_alignment_gate
 
     # CPMS 提示词渲染
 
@@ -1276,19 +1282,7 @@ class ContinuousPlanningService:
         logger.info(f"[SafeMerge] Found {len(old_nodes_entities)} existing nodes")
 
         # 标准化旧节点：Entity → Dict（Enum 序列化）
-        old_nodes = [
-            {
-                "id": node.id,
-                "novel_id": node.novel_id,
-                "parent_id": node.parent_id,
-                "node_type": node.node_type.value,  # NodeType.CHAPTER → 'CHAPTER'
-                "number": node.number,
-                "title": node.title,
-                "description": node.description,
-                "order_index": node.order_index,
-            }
-            for node in old_nodes_entities
-        ]
+        old_nodes = [self._story_node_merge_dict(node) for node in old_nodes_entities]
 
         # 标准化新节点：扁平化嵌套结构 → 平面列表
         new_nodes = self._flatten_structure_to_nodes(novel_id, structure)
@@ -1688,6 +1682,16 @@ class ContinuousPlanningService:
                 "validation_errors": errors,
             }
 
+        chapters = await self._prepare_act_chapters(act_node, chapters)
+        alignment_report = await self._evaluate_act_alignment(act_node, chapters)
+        if alignment_report and alignment_report.get("decision") in {"block", "review"}:
+            return {
+                "success": False,
+                "act_id": act_id,
+                "chapters": [],
+                "error": "层级叙事契约校验未通过",
+                "alignment_report": alignment_report,
+            }
         return {
             "success": True,
             "act_id": act_id,
@@ -1754,6 +1758,72 @@ class ContinuousPlanningService:
             return None
         return limit if limit > 0 else None
 
+    async def _evaluate_act_alignment(self, act_node: StoryNode, chapters: List[Dict]) -> Optional[Dict]:
+        if self.alignment_gate is None:
+            return None
+        nodes = await self._get_story_nodes(act_node.novel_id)
+        reports = []
+        for index, row in enumerate(chapters):
+            chapter_id = f"candidate-{act_node.id}-{index + 1}"
+            candidate = dict(row)
+            digests = dict(candidate.get("contract_digests") or {})
+            digests.setdefault("chapter", self._contract_digest(row))
+            candidate["contract_digests"] = digests
+            synthetic = StoryNode(
+                id=chapter_id, novel_id=act_node.novel_id, node_type=NodeType.CHAPTER,
+                number=int(row.get("number") or index + 1), title=str(row.get("title") or f"第{index + 1}章"),
+                order_index=index + 1, parent_id=act_node.id,
+                metadata={"contract_digest": digests["chapter"]},
+            )
+            snapshot = self.alignment_gate.build_snapshot(chapter_id, [*nodes, synthetic])
+            reports.append((await self.alignment_gate.evaluate(snapshot, candidate)).to_dict())
+        return next((r for r in reports if r.get("decision") in {"block", "review"}), reports[0] if reports else None)
+
+    @staticmethod
+    def _node_contract_digest(node: Optional[StoryNode]) -> Optional[str]:
+        if node is None:
+            return None
+        metadata = getattr(node, "metadata", {}) or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                metadata = {}
+        return metadata.get("contract_digest") or metadata.get("contract_hash") or metadata.get("plan_digest")
+
+    async def _prepare_act_chapters(self, act_node: StoryNode, chapters: List[Dict]) -> List[Dict]:
+        if not chapters:
+            return chapters
+        nodes = await self._get_story_nodes(act_node.novel_id)
+        by_id = {node.id: node for node in nodes}
+        volume = by_id.get(act_node.parent_id)
+        part = by_id.get(getattr(volume, "parent_id", None)) if volume else None
+        act_goal = self._node_value_for_contract(act_node, "narrative_goal") or act_node.description or ""
+        prepared = []
+        for row in chapters:
+            item = dict(row)
+            digests = dict(item.get("contract_digests") or {})
+            digests.setdefault("act", self._node_contract_digest(act_node))
+            digests.setdefault("volume", self._node_contract_digest(volume))
+            digests.setdefault("part", self._node_contract_digest(part))
+            digests.setdefault("chapter", self._contract_digest(item))
+            item["contract_digests"] = {key: value for key, value in digests.items() if value}
+            item.setdefault("serves_volume_commitments", [])
+            item.setdefault("serves_part_commitments", [])
+            item.setdefault("act_goal", act_goal)
+            item.setdefault("out_of_scope", [])
+            item.setdefault("character_agency", [])
+            prepared.append(item)
+        return prepared
+
+    @staticmethod
+    def _node_value_for_contract(node: StoryNode, key: str):
+        value = getattr(node, key, None)
+        if value not in (None, [], ""):
+            return value
+        metadata = getattr(node, "metadata", {}) or {}
+        return metadata.get(key) if isinstance(metadata, dict) else None
+
     async def confirm_act_planning(self, act_id: str, chapters: List[Dict]) -> Dict:
         """确认幕级规划：写入 story_nodes + chapters 表（供工作台侧栏列表），并关联 Bible 元素。"""
         logger.info(f"Confirming act planning for act {act_id}")
@@ -1765,6 +1835,18 @@ class ContinuousPlanningService:
         validation_errors = validate_lightweight_act_plan(chapters, expected_count=len(chapters))
         if validation_errors:
             raise ValueError("章节规划不完整/被截断：" + "；".join(validation_errors))
+
+        chapters = await self._prepare_act_chapters(act_node, chapters)
+        alignment_report = await self._evaluate_act_alignment(act_node, chapters)
+        if alignment_report and alignment_report.get("decision") in {"block", "review"}:
+            return {
+                "success": False,
+                "act_id": act_id,
+                "created_chapters": 0,
+                "created_elements": 0,
+                "error": "层级叙事契约校验未通过",
+                "alignment_report": alignment_report,
+            }
 
         novel_id_str = act_node.novel_id
         target_limit = self._target_chapter_limit(novel_id_str)
@@ -1858,6 +1940,12 @@ class ContinuousPlanningService:
             story_chapter_id = f"chapter-{act_node.novel_id}-chapter-{global_number}"
 
             metadata = {"act_chapter_plan": row.get("act_chapter_plan") or row}
+            metadata["contract_digest"] = self._contract_digest(row)
+            metadata["contract_digests"] = dict(row.get("contract_digests") or {})
+            metadata["contract_digests"].setdefault("chapter", metadata["contract_digest"])
+            for key in ("serves_volume_commitments", "serves_part_commitments", "act_goal", "out_of_scope", "character_agency"):
+                if key in row:
+                    metadata[key] = row[key]
             if row.get("chapter_plan"):
                 metadata["chapter_plan"] = row.get("chapter_plan")
             chapter_node = StoryNode(
@@ -2137,7 +2225,33 @@ class ContinuousPlanningService:
             key_events=data.get("key_events", []) if node_type == NodeType.ACT else [],
             narrative_arc=data.get("narrative_arc") if node_type == NodeType.ACT else None,
             conflicts=data.get("conflicts", []) if node_type == NodeType.ACT else [],
+            metadata=self._macro_metadata(data),
         )
+
+    @staticmethod
+    def _contract_digest(data: Dict) -> str:
+        payload = {
+            key: value for key, value in (data or {}).items()
+            if key not in {"metadata", "contract_digest", "contract_hash", "plan_digest"}
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def _macro_metadata(cls, data: Dict) -> Dict:
+        existing = data.get("metadata") if isinstance(data, dict) else {}
+        metadata = dict(existing) if isinstance(existing, dict) else {}
+        for key in (
+            "themes", "key_events", "narrative_arc", "conflicts", "narrative_goal",
+            "plot_points", "key_characters", "key_locations", "emotional_arc",
+            "setup_for", "payoff_from", "capacities", "required_threads", "out_of_scope",
+            "character_agency", "handoff_from_previous", "handoff_to_next",
+        ):
+            if key in data:
+                metadata[key] = data[key]
+        metadata["contract_digest"] = cls._contract_digest(data)
+        return metadata
 
     def _flatten_structure_to_nodes(self, novel_id: str, structure: List[Dict]) -> List[Dict]:
         """将嵌套的部-卷-幕结构扁平化为节点列表（用于 MacroMergeEngine）
@@ -2160,7 +2274,7 @@ class ContinuousPlanningService:
             part_data["number"] = part_number
             part_id = f"part-{novel_id}-{part_number}"
 
-            nodes.append({
+            part_node = {
                 "id": part_id,
                 "novel_id": novel_id,
                 "parent_id": None,
@@ -2170,7 +2284,13 @@ class ContinuousPlanningService:
                 "description": part_data.get("description", ""),
                 "order_index": order_index,
                 "suggested_chapter_count": self._macro_node_capacity(part_data),
-            })
+                **{key: part_data[key] for key in (
+                    "themes", "key_events", "narrative_arc", "conflicts", "narrative_goal",
+                    "plot_points", "key_characters", "key_locations", "emotional_arc", "setup_for", "payoff_from", "capacities",
+                ) if key in part_data},
+            }
+            part_node["metadata"] = self._macro_metadata(part_data)
+            nodes.append(part_node)
             order_index += 1
 
             for volume_data in part_data.get("volumes", []):
@@ -2178,7 +2298,7 @@ class ContinuousPlanningService:
                 volume_data["number"] = volume_number
                 volume_id = f"volume-{novel_id}-{volume_number}"
 
-                nodes.append({
+                volume_node = {
                     "id": volume_id,
                     "novel_id": novel_id,
                     "parent_id": part_id,
@@ -2188,7 +2308,13 @@ class ContinuousPlanningService:
                     "description": volume_data.get("description", ""),
                     "order_index": order_index,
                     "suggested_chapter_count": self._macro_node_capacity(volume_data),
-                })
+                    **{key: volume_data[key] for key in (
+                        "themes", "key_events", "narrative_arc", "conflicts", "narrative_goal",
+                        "plot_points", "key_characters", "key_locations", "emotional_arc", "setup_for", "payoff_from", "capacities",
+                    ) if key in volume_data},
+                }
+                volume_node["metadata"] = self._macro_metadata(volume_data)
+                nodes.append(volume_node)
                 order_index += 1
 
                 for act_data in volume_data.get("acts", []):
@@ -2196,7 +2322,7 @@ class ContinuousPlanningService:
                     act_data["number"] = act_number
                     act_id = f"act-{novel_id}-{act_number}"
 
-                    nodes.append({
+                    act_node = {
                         "id": act_id,
                         "novel_id": novel_id,
                         "parent_id": volume_id,
@@ -2206,10 +2332,22 @@ class ContinuousPlanningService:
                         "description": act_data.get("description", ""),
                         "order_index": order_index,
                         "suggested_chapter_count": self._macro_node_capacity(act_data),
-                    })
+                        **{key: act_data[key] for key in (
+                            "themes", "key_events", "narrative_arc", "conflicts", "narrative_goal",
+                            "plot_points", "key_characters", "key_locations", "emotional_arc", "setup_for", "payoff_from", "capacities",
+                        ) if key in act_data},
+                    }
+                    act_node["metadata"] = self._macro_metadata(act_data)
+                    nodes.append(act_node)
                     order_index += 1
 
         return nodes
+
+    @staticmethod
+    def _story_node_merge_dict(node: StoryNode) -> Dict:
+        data = node.to_dict() if hasattr(node, "to_dict") else dict(vars(node))
+        data["node_type"] = getattr(node.node_type, "value", node.node_type)
+        return data
 
     def _normalize_act_chapter_row(self, raw: Dict, act_local_index: int) -> Dict:
         """LLM / 前端可能缺 number、title，或 number 为字符串；统一为可落库结构。"""
@@ -2250,6 +2388,12 @@ class ContinuousPlanningService:
                     "thrill_description",
                     "foreshadow_action",
                     "foreshadow_detail",
+                    "contract_digests",
+                    "serves_volume_commitments",
+                    "serves_part_commitments",
+                    "act_goal",
+                    "out_of_scope",
+                    "character_agency",
                 )
                 if key in raw
             },
@@ -2969,10 +3113,37 @@ class ContinuousPlanningService:
             lines.append(f"【当前部约定】《{part.title}》")
             if part.description:
                 lines.append(str(part.description))
+            lines.extend(self._format_structure_contract(part))
         lines.append(f"【当前卷约定】《{volume.title}》")
         if volume.description:
             lines.append(str(volume.description))
+        lines.extend(self._format_structure_contract(volume))
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_structure_contract(node: StoryNode) -> List[str]:
+        metadata = getattr(node, "metadata", {}) or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                metadata = {}
+        fields = (
+            "themes", "key_events", "narrative_arc", "conflicts", "narrative_goal",
+            "plot_points", "key_characters", "key_locations", "emotional_arc",
+            "setup_for", "payoff_from", "capacities",
+        )
+        values = {}
+        for key in fields:
+            value = getattr(node, key, None)
+            if value not in (None, [], ""):
+                values[key] = value
+            elif key in metadata and metadata[key] not in (None, [], ""):
+                values[key] = metadata[key]
+        digest = metadata.get("contract_digest") or metadata.get("contract_hash") or metadata.get("plan_digest")
+        lines = ["结构化契约：" + json.dumps(values, ensure_ascii=False, sort_keys=True, default=str)] if values else ["结构化契约缺失：仅有旧版标题/简介"]
+        lines.append("契约摘要：" + str(digest) if digest else "契约摘要缺失：旧版节点")
+        return lines
 
     def _build_act_contract_variables(self, novel_id: str) -> Dict[str, str]:
         """Collect locked narrative contract fields for CPMS rendering."""

@@ -103,10 +103,20 @@ class MacroMergeEngine:
                     'description': new_node.get('description', ''),
                     'order_index': new_node['order_index'],
                 }
-                if new_node.get('suggested_chapter_count') is not None:
-                    updated_node['suggested_chapter_count'] = new_node[
-                        'suggested_chapter_count'
-                    ]
+                for key in (
+                    'suggested_chapter_count', 'themes', 'key_events', 'narrative_arc',
+                    'conflicts', 'metadata', 'narrative_goal', 'plot_points',
+                    'key_characters', 'key_locations', 'emotional_arc', 'setup_for',
+                    'payoff_from', 'capacities', 'out_of_scope', 'character_agency',
+                ):
+                    if key in new_node:
+                        updated_node[key] = new_node[key]
+                    elif key in old_node:
+                        updated_node[key] = old_node[key]
+                old_metadata = old_node.get('metadata') or {}
+                new_metadata = updated_node.get('metadata') or {}
+                if isinstance(old_metadata, dict) and isinstance(new_metadata, dict):
+                    updated_node['metadata'] = {**old_metadata, **new_metadata}
                 self.to_update.append(updated_node)
             else:
                 # 场景 A/B：旧的有，新的没有 -> 判断是否可以删除

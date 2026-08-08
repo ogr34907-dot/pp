@@ -20,6 +20,9 @@ from application.blueprint.services.chapter_planning_policy import (
 from domain.ai.value_objects.prompt import Prompt
 from domain.novel.value_objects.generation_preferences import GenerationPreferences
 from domain.structure.story_node import NodeType, StoryNode
+from application.engine.services.hierarchical_narrative_alignment_gate import (
+    HierarchicalNarrativeAlignmentGate,
+)
 
 
 def _make_service() -> ContinuousPlanningService:
@@ -657,6 +660,85 @@ def test_flatten_macro_structure_derives_part_capacity_from_its_volumes():
     )
 
     assert nodes[0]["suggested_chapter_count"] == 12
+
+
+def test_flatten_macro_structure_preserves_structured_contract_fields_and_digest():
+    service = _make_service()
+    structure = [{
+        "title": "第一部", "description": "部约定", "themes": ["主题"],
+        "key_events": ["部事件"], "narrative_arc": "部弧线", "conflicts": ["部冲突"],
+        "narrative_goal": "部目标", "plot_points": ["部节点"],
+        "key_characters": ["甲"], "key_locations": ["城"],
+        "emotional_arc": "冷->热", "setup_for": ["伏笔"], "payoff_from": ["前因"],
+        "metadata": {"legacy": "keep"}, "volumes": [{
+            "title": "第一卷", "description": "卷约定", "estimated_chapters": 2,
+            "themes": ["卷主题"], "narrative_goal": "卷目标", "metadata": {"v": 1},
+            "acts": [{
+                "title": "第一幕", "description": "幕约定", "estimated_chapters": 2,
+                "themes": ["幕主题"], "key_events": ["幕事件"],
+                "narrative_arc": "幕弧线", "conflicts": ["幕冲突"],
+                "narrative_goal": "幕目标", "plot_points": ["幕节点"],
+                "key_characters": ["乙"], "key_locations": ["村"],
+                "emotional_arc": "惧->勇", "setup_for": ["幕伏笔"], "payoff_from": ["幕前因"],
+                "metadata": {"a": True},
+            }],
+        }],
+    }]
+
+    nodes = service._flatten_structure_to_nodes("novel-1", structure)
+    part, volume, act = nodes
+    for node, key, value in (
+        (part, "narrative_goal", "部目标"), (volume, "narrative_goal", "卷目标"),
+        (act, "narrative_goal", "幕目标"), (act, "key_events", ["幕事件"]),
+    ):
+        assert node["metadata"][key] == value
+    assert part["metadata"]["legacy"] == "keep"
+    assert all(node["metadata"].get("contract_digest") for node in nodes)
+
+
+def test_act_prompt_reports_missing_structured_contract_and_includes_digest(monkeypatch):
+    part = _story_node("part-1", NodeType.PART, 1, description="旧部简介")
+    volume = _story_node("volume-1", NodeType.VOLUME, 1, parent_id=part.id, description="旧卷简介")
+    act = _story_node("act-1", NodeType.ACT, 1, parent_id=volume.id)
+    repo = Mock()
+    repo.get_by_novel_sync.return_value = [part, volume, act]
+    service = ContinuousPlanningService(repo, Mock(), Mock())
+    captured = {}
+    monkeypatch.setattr(ContinuousPlanningService, "_render_contract_prompt", staticmethod(lambda _c, v: captured.update(v) or Prompt(system="s", user=v["context"])))
+    service._build_act_planning_prompt(act, {}, None, 1)
+    assert "结构化契约缺失" in captured["context"]
+    assert "旧部简介" in captured["context"]
+
+
+@pytest.mark.asyncio
+async def test_act_alignment_block_returns_report_without_writes():
+    part = _story_node("part-1", NodeType.PART, 1, metadata={"contract_digest": "p"})
+    volume = _story_node("volume-1", NodeType.VOLUME, 1, parent_id=part.id, metadata={"contract_digest": "v", "narrative_goal": "卷目标"})
+    act = _story_node("act-1", NodeType.ACT, 1, parent_id=volume.id, metadata={"contract_digest": "a", "narrative_goal": "幕目标"})
+    repo = Mock()
+    repo.get_by_id = AsyncMock(return_value=act)
+    repo.get_by_novel = AsyncMock(return_value=[part, volume, act])
+    repo.get_by_novel_sync.return_value = [part, volume, act]
+    repo.save_batch = AsyncMock()
+    service = ContinuousPlanningService(repo, Mock(), Mock(), alignment_gate=HierarchicalNarrativeAlignmentGate())
+    service._get_bible_context = Mock(return_value={})
+    service._stream_act_plan_llm_text = AsyncMock(return_value=json.dumps({"chapters": [{"number": 1, "title": "章", "main_event": "事", "handoff_from_previous": "承", "handoff_to_next": "接", "contract_digests": {"act": "a", "volume": "v", "chapter": "bad"}, "serves_volume_commitments": ["调查古墓"], "serves_act_commitments": ["幕目标"], "character_agency": []}]}))
+    result = await service.plan_act_chapters(act.id, 1)
+    assert result["success"] is False
+    assert result["alignment_report"]["decision"] == "block"
+    repo.save_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_act_alignment_block_does_not_replace_existing_chapters():
+    act = _story_node("act-1", NodeType.ACT, 1, parent_id="volume-1", metadata={"contract_digest": "a"})
+    existing = _story_node("chapter-existing", NodeType.CHAPTER, 1, parent_id=act.id)
+    repo = Mock(get_by_id=AsyncMock(return_value=act), get_by_novel=AsyncMock(return_value=[act, existing]), get_by_novel_sync=Mock(return_value=[act, existing]), get_children_sync=Mock(return_value=[existing]), delete=AsyncMock(), save_batch=AsyncMock(), update=AsyncMock())
+    service = ContinuousPlanningService(repo, Mock(), Mock(), alignment_gate=HierarchicalNarrativeAlignmentGate())
+    result = await service.confirm_act_planning(act.id, [{"number": 1, "title": "重排", "main_event": "事", "handoff_from_previous": "承", "handoff_to_next": "接"}])
+    assert result["success"] is False
+    repo.delete.assert_not_awaited()
+    repo.save_batch.assert_not_awaited()
 
 
 def test_macro_structure_rejects_any_part_without_a_volume():

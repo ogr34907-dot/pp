@@ -391,6 +391,7 @@ class StoryNodeRepository:
                         UPDATE story_nodes
                         SET title=?, description=?, order_index=?,
                             suggested_chapter_count=COALESCE(?, suggested_chapter_count),
+                            themes=?, key_events=?, narrative_arc=?, conflicts=?, metadata=?,
                             updated_at=?
                         WHERE id=?
                     """, (
@@ -398,6 +399,11 @@ class StoryNodeRepository:
                         u.get('description', ''),
                         u['order_index'],
                         u.get('suggested_chapter_count'),
+                        json.dumps(u.get('themes', [])),
+                        json.dumps(u.get('key_events', [])),
+                        u.get('narrative_arc'),
+                        json.dumps(u.get('conflicts', [])),
+                        json.dumps(u.get('metadata', {})),
                         datetime.now().isoformat(),
                         u['id']
                     ))
