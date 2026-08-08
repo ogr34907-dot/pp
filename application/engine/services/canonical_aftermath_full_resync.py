@@ -98,10 +98,10 @@ async def resync_all_completed_chapters(
             if not ready or str((commit or {}).get("vector_status") or "not_started") != "stored":
                 pending += 1
         result.remains_paused = True
+        current_number: int | None = None
         await _emit(emit, {"type": "started", "run_id": run_id, "total": result.total_chapters,
                            "pending_chapters": pending})
 
-        current_number: int | None = None
         for raw in rows:
             number = int(raw["number"])
             current_number = number
@@ -190,6 +190,7 @@ async def resync_all_completed_chapters(
             latest_vector = str((latest or {}).get("vector_status") or "not_started")
             if not isinstance(outcome, dict):
                 result.status = "unavailable"
+                result.failed_chapter = number
                 result.failure_reason = "pipeline_invalid_result"
                 commit_repository.mark_full_resync_failure(novel_id=novel_id, run_id=run_id, reason=result.failure_reason, status="unavailable")
                 await _emit_failure(emit, result)
@@ -227,6 +228,8 @@ async def resync_all_completed_chapters(
         return result
     except Exception as exc:
         result.status = "unavailable"
+        if result.processed_count < result.total_chapters:
+            result.failed_chapter = current_number
         result.failure_reason = str(exc) or "database_unavailable"
         try:
             commit_repository.mark_full_resync_failure(novel_id=novel_id, run_id=run_id, reason=result.failure_reason, status="unavailable")

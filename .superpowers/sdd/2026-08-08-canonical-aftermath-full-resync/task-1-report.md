@@ -89,3 +89,19 @@ GREEN command:
 GREEN output: `7 passed in 1.63s`.
 
 Regression output: canonical history/idempotency/auto-recovery suite `48 passed in 48.77s`.
+
+## Scoped Fix Round 3
+
+RED regressions covered immediate cross-connection takeover of a `|unavailable` lease marker and chapter identity on invalid-pipeline failure. The lease parser now treats `|unavailable` like other terminal markers, and invalid/outer infrastructure paths set `failed_chapter` from the active chapter and emit a `failed` event with `chapter_number`. Malformed source hash/revision handling continues to use `source_version_mismatch` before pipeline invocation.
+
+RED command: the two new regressions failed (`failed_chapter` was `None`; unavailable marker claim returned `False`).
+
+GREEN command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\unit\engine\test_canonical_aftermath_full_resync.py
+```
+
+GREEN output: `7 passed in 1.59s`.
+
+Regression output: canonical history/idempotency/auto-recovery suite `48 passed in 48.01s`.

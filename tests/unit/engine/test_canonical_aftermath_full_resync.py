@@ -196,9 +196,13 @@ async def test_unavailable_dependency_and_pipeline_shape_are_reported(tmp_path):
     class BrokenPipeline(FakePipeline):
         async def run_after_chapter_saved(self, *args, **kwargs):
             return None
-    result = await resync_all_completed_chapters(novel_id="novel-1", database=db, aftermath_pipeline=BrokenPipeline(db, {}))
+    events = []
+    result = await resync_all_completed_chapters(novel_id="novel-1", database=db, aftermath_pipeline=BrokenPipeline(db, {}), emit=events.append)
     assert result.status == "unavailable"
     assert result.failure_reason == "pipeline_invalid_result"
+    assert result.failed_chapter == 2
+    assert events[-1]["type"] == "failed"
+    assert events[-1]["chapter_number"] == 2
 
 
 @pytest.mark.asyncio
@@ -242,3 +246,5 @@ def test_full_resync_marker_cas_across_database_connections(tmp_path):
     assert repo_two.renew_full_resync(novel_id="novel-1", run_id="run-one", chapter_number=2, processed_count=1, total_chapters=3)
     marker = second.fetch_one("SELECT autopilot_recovery_reason FROM novels WHERE id='novel-1'")["autopilot_recovery_reason"]
     assert "chapter=2" in marker and "processed=1" in marker and "total=3" in marker
+    assert repo_one.mark_full_resync_failure(novel_id="novel-1", run_id="run-one", reason="db down", status="unavailable")
+    assert repo_two.claim_full_resync(novel_id="novel-1", run_id="run-two")

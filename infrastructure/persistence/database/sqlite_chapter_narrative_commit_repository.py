@@ -82,7 +82,7 @@ class SqliteChapterNarrativeCommitRepository:
                     return False
                 current = str(row[0] or "")
                 if current.startswith("canonical_aftermath_full_resync:"):
-                    if "|failed" in current or "|cancelled" in current:
+                    if "|failed" in current or "|cancelled" in current or "|unavailable" in current:
                         started = 0.0
                     else:
                         started = None
