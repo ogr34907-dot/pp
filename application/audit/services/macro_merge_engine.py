@@ -55,6 +55,10 @@ class MacroMergeEngine:
         self.to_delete: List[str] = []
         self.conflicts: List[Dict] = []
 
+    @staticmethod
+    def _is_type(node: Dict, node_type: str) -> bool:
+        return str(node.get("node_type", "")).lower() == node_type.lower()
+
     def _mark_carriers_bottom_up(self) -> Set[str]:
         """自底向上标记承载者（Bottom-Up Contagion）
 
@@ -69,7 +73,7 @@ class MacroMergeEngine:
         carrier_ids = set()
 
         # 找到所有正文节点（Chapter）
-        chapter_nodes = [n for n in self.old_map.values() if n['node_type'] == 'CHAPTER']
+        chapter_nodes = [n for n in self.old_map.values() if self._is_type(n, 'chapter')]
 
         for chapter in chapter_nodes:
             # Chapter 本身有内容，回溯其所有祖先
@@ -91,7 +95,7 @@ class MacroMergeEngine:
         # 1. 遍历旧结构（寻找需要更新、删除或引发冲突的节点）
         for old_id, old_node in self.old_map.items():
             # 跳过 Chapter 节点（我们只 merge 宏观框架）
-            if old_node['node_type'] == 'CHAPTER':
+            if self._is_type(old_node, 'chapter'):
                 continue
 
             if old_id in self.new_map:
@@ -154,7 +158,7 @@ class MacroMergeEngine:
             summary 字典，包含 status（GREEN/YELLOW/RED）和 message
         """
         # 检查是否是纯空结构（没有任何 Chapter 节点）
-        is_pure_empty = all(n['node_type'] != 'CHAPTER' for n in self.old_map.values())
+        is_pure_empty = all(not self._is_type(n, 'chapter') for n in self.old_map.values())
 
         if len(self.conflicts) > 0:
             # 红色阻断：发现数据冲突
