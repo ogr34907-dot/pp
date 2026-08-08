@@ -43,6 +43,7 @@ export interface CanonicalAftermathFullResyncEvent {
   skipped?: number
   action?: string
   status?: string
+  failure_reason?: string
   reason?: string
   message?: string
   remains_paused?: boolean

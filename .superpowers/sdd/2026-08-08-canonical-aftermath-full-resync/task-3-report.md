@@ -40,3 +40,25 @@ Implementation commit SHA: `aa61ae3c`.
 
 - The browser stream consumer stops dispatching after the first terminal (`failed`, `completed`, or `cancelled`) event; the backend contract treats those as terminal frames.
 - The panel keeps the first failure chapter/reason for display while later failure frames cannot overwrite that first-failure diagnostic.
+
+## Reviewer Fix Round 1
+
+- Made full-resync progress visibility depend on local active-run state or retained first-failure diagnostics, so a transient `/status` pause-marker change cannot hide an active stream.
+- Added `failure_reason` to the typed SSE event and made it the first-choice failure diagnostic; the first failure chapter is retained as well.
+- Added focused coverage for local visibility and `failure_reason` precedence.
+
+Verification:
+
+```powershell
+npm run test:unit -- src/api/autopilotFullResync.spec.ts src/components/autopilot/canonicalAftermathFullResync.spec.ts src/api/autopilotCanonicalAftermath.spec.ts src/components/autopilot/canonicalAftermathGate.spec.ts
+```
+
+Output: `4 passed`, `7 passed`.
+
+```powershell
+npx vue-tsc -b
+npm run lint -- --no-warn-ignored
+git diff --check
+```
+
+All passed.

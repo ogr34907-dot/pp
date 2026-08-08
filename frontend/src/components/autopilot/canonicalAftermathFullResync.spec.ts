@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { createCanonicalAftermathFullResyncState } from './canonicalAftermathGate'
+import {
+  createCanonicalAftermathFullResyncState,
+  shouldShowCanonicalAftermathFullResyncProgress,
+} from './canonicalAftermathGate'
 
 describe('canonical aftermath full resync presentation state', () => {
   it('tracks processed/total, current chapter, and first failure reason', () => {
@@ -7,14 +10,27 @@ describe('canonical aftermath full resync presentation state', () => {
     state.started({ type: 'started', total: 4, processed: 0 })
     state.chapter({ type: 'chapter', chapter_number: 8, processed: 1, total: 4 })
     state.vector({ type: 'vector', chapter_number: 8, status: 'failed', processed: 1, total: 4 })
-    state.failed({ type: 'failed', chapter_number: 8, reason: '向量写入失败', processed: 1, total: 4 })
+    state.failed({
+      type: 'failed',
+      chapter_number: 8,
+      failure_reason: '持久化向量失败',
+      reason: '向量写入失败',
+      processed: 1,
+      total: 4,
+    })
     state.failed({ type: 'failed', chapter_number: 9, reason: 'later failure', processed: 2, total: 4 })
 
     expect(state.processed.value).toBe(1)
     expect(state.total.value).toBe(4)
     expect(state.currentChapter.value).toBe(8)
-    expect(state.firstFailureReason.value).toBe('向量写入失败')
+    expect(state.firstFailureReason.value).toBe('持久化向量失败')
     expect(state.vectorFailed.value).toBe(1)
+  })
+
+  it('keeps progress visible from local active state or terminal diagnostics', () => {
+    expect(shouldShowCanonicalAftermathFullResyncProgress(true, '')).toBe(true)
+    expect(shouldShowCanonicalAftermathFullResyncProgress(false, '持久化向量失败')).toBe(true)
+    expect(shouldShowCanonicalAftermathFullResyncProgress(false, '')).toBe(false)
   })
 
   it('marks completion without requesting a resume', () => {

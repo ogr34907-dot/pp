@@ -239,7 +239,7 @@
     </n-alert>
 
     <n-alert
-      v-if="canonicalAftermathFailure && (fullResyncActive || fullResyncFirstFailureReason)"
+      v-if="showFullResyncProgress"
       :type="fullResyncFirstFailureReason ? 'error' : 'info'"
       :show-icon="true"
       class="ap-inline-alert"
@@ -408,7 +408,11 @@ import { useAIInvocationStore } from '../../stores/aiInvocationStore'
 import { featureFlags } from '../../config/features'
 import { runtimePerformance } from '../../config/performance'
 import { normalizeAutopilotStartConfig } from './autopilotStartConfig'
-import { createCanonicalAftermathFullResyncState, getCanonicalAftermathPresentation } from './canonicalAftermathGate'
+import {
+  createCanonicalAftermathFullResyncState,
+  getCanonicalAftermathPresentation,
+  shouldShowCanonicalAftermathFullResyncProgress,
+} from './canonicalAftermathGate'
 import { RefreshOutline } from '@vicons/ionicons5'
 
 const props = defineProps({
@@ -588,6 +592,10 @@ const fullResyncPercent = computed(() => fullResyncTotal.value > 0
   : 0)
 const fullResyncFailureChapter = ref(null)
 let fullResyncCtrl = null
+const showFullResyncProgress = computed(() => shouldShowCanonicalAftermathFullResyncProgress(
+  fullResyncActive.value,
+  fullResyncFirstFailureReason.value,
+))
 const reviewGateActionLabel = computed(() => (
   canonicalAftermathFailure.value
     ? canonicalAftermathPresentation.value.actionLabel
@@ -1532,7 +1540,9 @@ async function startCanonicalAftermathFullResync() {
       onChapter: event => fullResyncState.chapter(event),
       onVector: event => fullResyncState.vector(event),
       onFailed: event => {
-        fullResyncFailureChapter.value = event.chapter_number ?? null
+        if (fullResyncFailureChapter.value == null && event.chapter_number != null) {
+          fullResyncFailureChapter.value = event.chapter_number
+        }
         fullResyncState.failed(event)
       },
       onCompleted: event => {
@@ -1544,7 +1554,10 @@ async function startCanonicalAftermathFullResync() {
     })
   } catch (err) {
     if (!(err instanceof Error && err.name === 'AbortError')) {
-      fullResyncState.failed({ type: 'failed', reason: getAutopilotErrorDetail(err) || '全章重同步请求失败' })
+      fullResyncState.failed({
+        type: 'failed',
+        failure_reason: getAutopilotErrorDetail(err) || '全章重同步请求失败',
+      })
       message.error(getAutopilotErrorDetail(err) || '全章重同步请求失败，请重试')
     }
     void fetchStatus()

@@ -29,7 +29,9 @@ export function createCanonicalAftermathFullResyncState() {
   const recordFailure = (event: CanonicalAftermathFullResyncEvent) => {
     if (!firstFailureReason.value) {
       updateProgress(event)
-      firstFailureReason.value = String(event.reason || event.message || event.status || '同步失败')
+      firstFailureReason.value = String(
+        event.failure_reason || event.reason || event.message || event.status || '同步失败',
+      )
     } else if (typeof event.total === 'number') {
       total.value = event.total
     }
@@ -78,6 +80,13 @@ export function createCanonicalAftermathFullResyncState() {
       firstFailureReason.value = ''
     },
   }
+}
+
+export function shouldShowCanonicalAftermathFullResyncProgress(
+  active: boolean,
+  firstFailureReason: string,
+): boolean {
+  return active || Boolean(firstFailureReason)
 }
 
 export function getCanonicalAftermathPresentation(
