@@ -2046,6 +2046,14 @@ def _persist_full_resync_pause_sync(novel_id: str) -> str:
 async def _guard_active_full_resync(novel_id: str) -> None:
     """Reject start/resume while another full-resync lease is active."""
     runtime_settings = get_autopilot_runtime_settings()
+    # Runtime settings normally expose the dedicated read timeout. Keep this
+    # guard compatible with lightweight settings objects used by manual-control
+    # callers/tests without changing the production value when it is configured.
+    db_read_timeout = getattr(
+        runtime_settings,
+        "db_read_timeout_seconds",
+        getattr(runtime_settings, "db_persist_timeout_seconds", 5.0),
+    )
     loop = asyncio.get_running_loop()
     def _read_marker_sync():
         database = get_database(get_db_path())
@@ -2058,7 +2066,7 @@ async def _guard_active_full_resync(novel_id: str) -> None:
     try:
         marker = await asyncio.wait_for(
             loop.run_in_executor(_SSE_THREAD_POOL, _read_marker_sync),
-            timeout=runtime_settings.db_read_timeout_seconds,
+            timeout=db_read_timeout,
         )
     except asyncio.TimeoutError as exc:
         raise HTTPException(503, "数据库繁忙，请稍后重试") from exc
