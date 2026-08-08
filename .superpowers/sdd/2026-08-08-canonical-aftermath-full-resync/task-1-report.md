@@ -41,7 +41,7 @@ Additional checks: `py_compile` succeeded for the two Python implementation file
 
 ## Commit
 
-Commit SHA: filled after commit.
+Implementation commit SHA: `3a0bb5b5666c8533287942a728013a6ebcae8630`.
 
 ## Concerns
 
