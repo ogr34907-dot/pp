@@ -48,9 +48,10 @@ def candidate_from_outline(outline: str, chapter_node: Any = None) -> dict[str, 
     return candidate
 
 
-async def _nodes_for_repo(repo: Any, novel_id: str) -> list[Any]:
+async def _nodes_for_repo(repo: Any, novel_id: str) -> tuple[list[Any], str | None]:
     if repo is None:
-        return []
+        return [], None
+    errors: list[str] = []
     for name in ("get_by_novel_sync", "get_tree_sync", "get_by_novel", "get_tree"):
         operation = getattr(repo, name, None)
         if not callable(operation):
@@ -61,10 +62,11 @@ async def _nodes_for_repo(repo: Any, novel_id: str) -> list[Any]:
                 result = await result
             if hasattr(result, "nodes"):
                 result = result.nodes
-            return list(result or [])
-        except Exception:
+            return list(result or []), None
+        except Exception as exc:
+            errors.append(str(exc))
             continue
-    return []
+    return [], "; ".join(errors) if errors else "story node repository unavailable"
 
 
 async def evaluate_chapter_candidate(
@@ -89,15 +91,17 @@ async def evaluate_chapter_candidate(
         except Exception:
             cache = None
     candidate_digest = None
+    cache_key = None
     digest_fn = getattr(gate, "_candidate_digest", None)
     if callable(digest_fn):
         try:
             candidate_digest = str(digest_fn(candidate))
-            if cache is not None and candidate_digest in cache:
-                return cache[candidate_digest]
+            cache_key = (str(novel_id), int(chapter_number), candidate_digest)
+            if cache is not None and cache_key in cache:
+                return cache[cache_key]
         except Exception:
             candidate_digest = None
-    nodes = await _nodes_for_repo(story_node_repo, novel_id)
+    nodes, node_error = await _nodes_for_repo(story_node_repo, novel_id)
     chapter_id = str(_node_value(chapter_node, "id", "") or "")
     if not chapter_id:
         for node in nodes:
@@ -124,11 +128,13 @@ async def evaluate_chapter_candidate(
     if context_evidence is not None and isinstance(candidate, dict):
         candidate = dict(candidate)
         candidate.setdefault("context_evidence", context_evidence)
+    vector_evidence = {"degraded": True, "error": node_error} if node_error else None
     snapshot = gate.build_snapshot(
         chapter_id,
         nodes,
         novel_id=novel_id,
         memory_state=memory_state,
+        vector_evidence=vector_evidence,
     )
     evaluator = getattr(gate, "evaluate", None) or getattr(gate, "acheck", None)
     if evaluator is None:
@@ -136,8 +142,8 @@ async def evaluate_chapter_candidate(
     report = evaluator(snapshot, candidate)
     if inspect.isawaitable(report):
         report = await report
-    if cache is not None and candidate_digest:
-        cache[candidate_digest] = report
+    if cache is not None and cache_key:
+        cache[cache_key] = report
     return report
 
 

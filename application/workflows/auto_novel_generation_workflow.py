@@ -346,7 +346,7 @@ class AutoNovelGenerationWorkflow:
             chapter_node=node,
             candidate=candidate,
             memory_engine=self.memory_engine,
-            context_evidence=getattr(self.context_builder, "last_context", None),
+            context_evidence=None,
         )
 
     async def _gate_nodes(self, novel_id: str) -> list[Any]:

@@ -89,6 +89,17 @@ class StoryPipelineRunner(DaemonHostMixin, BaseStoryPipeline):
             planning_service=self.planning_service,
             chapter_preplanning_service=getattr(self, "chapter_preplanning_service", None),
             chapter_workflow=self.chapter_workflow,
+            hierarchy_gate=(
+                getattr(self, "hierarchy_gate", None)
+                or getattr(self.chapter_workflow, "hierarchy_gate", None)
+                or getattr(self.chapter_workflow, "narrative_alignment_gate", None)
+            ),
+            memory_engine=(
+                getattr(self, "memory_engine", None)
+                or getattr(self.chapter_workflow, "memory_engine", None)
+                or getattr(getattr(self.context_builder, "budget_allocator", None), "memory_engine", None)
+            ),
+            vector_retriever=getattr(self.context_builder, "vector_store", None),
             background_task_service=self.background_task_service,
             circuit_breaker=self.circuit_breaker,
             volume_summary_service=self.volume_summary_service,

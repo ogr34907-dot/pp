@@ -1,6 +1,7 @@
 import pytest
 
 from application.engine.services.hierarchical_narrative_alignment_gate import AlignmentReport, AlignmentViolation
+from application.engine.services.narrative_gate_guard import evaluate_chapter_candidate
 from application.workflows.auto_novel_generation_workflow import AutoNovelGenerationWorkflow
 
 
@@ -19,6 +20,23 @@ class _Gate:
             violations=(AlignmentViolation("chapter", "warning", "review"),),
             repair_plan=("人工审阅候选",),
         )
+
+
+class _RecordingGate:
+    def __init__(self):
+        self.calls = []
+
+    @staticmethod
+    def _candidate_digest(candidate):
+        return "same-candidate"
+
+    def build_snapshot(self, chapter_id, nodes, **kwargs):
+        self.calls.append(("snapshot", chapter_id, kwargs))
+        return {"chapter_id": chapter_id}
+
+    async def evaluate(self, snapshot, candidate):
+        self.calls.append(("evaluate", snapshot["chapter_id"], candidate))
+        return AlignmentReport("pass", 1.0, "same-candidate", snapshot["chapter_id"])
 
 
 class _LLM:
@@ -44,3 +62,31 @@ async def test_stream_returns_typed_gate_report_before_generation():
     assert events[0]["alignment_report"]["decision"] == "review"
     assert events[0]["alignment_report"]["candidate_digest"] == "candidate-digest"
     assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_gate_cache_is_scoped_to_novel_chapter_and_snapshot():
+    gate = _RecordingGate()
+    evidence = {"layer3": "vector evidence"}
+
+    first = await evaluate_chapter_candidate(
+        gate,
+        story_node_repo=None,
+        novel_id="novel-a",
+        chapter_number=1,
+        candidate={"outline": "same"},
+        context_evidence=evidence,
+    )
+    second = await evaluate_chapter_candidate(
+        gate,
+        story_node_repo=None,
+        novel_id="novel-a",
+        chapter_number=2,
+        candidate={"outline": "same"},
+        context_evidence=evidence,
+    )
+
+    assert first.snapshot_digest != second.snapshot_digest
+    assert len([call for call in gate.calls if call[0] == "evaluate"]) == 2
+    evaluate_calls = [call for call in gate.calls if call[0] == "evaluate"]
+    assert evaluate_calls[0][2]["context_evidence"] == evidence

@@ -18,6 +18,11 @@ from domain.novel.entities.novel import Novel, NovelStage, AutopilotStatus
 from domain.novel.entities.chapter import ChapterStatus
 from domain.novel.value_objects.novel_id import NovelId
 from domain.structure.story_node import StoryNode
+from application.engine.services.narrative_gate_guard import (
+    NarrativeAlignmentGateError,
+    candidate_from_outline,
+    enforce_chapter_candidate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +208,32 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
         history_block_reason = str(
             getattr(host, "_canonical_history_block_reason", "") or ""
         )
+
+    # Legacy beat/full prose paths do not pass through AutoNovelGenerationWorkflow;
+    # enforce the same hierarchy contract before any context/LLM call.
+    gate = getattr(host, "hierarchy_gate", None) or getattr(getattr(host, "chapter_workflow", None), "hierarchy_gate", None)
+    if gate is not None:
+        try:
+            await enforce_chapter_candidate(
+                gate,
+                story_node_repo=getattr(host, "story_node_repo", None),
+                novel_id=str(novel.novel_id.value),
+                chapter_number=int(chapter_num),
+                chapter_node=next_chapter_node,
+                candidate=candidate_from_outline(outline, next_chapter_node),
+                memory_engine=getattr(host, "memory_engine", None) or getattr(getattr(host, "chapter_workflow", None), "memory_engine", None),
+            )
+        except NarrativeAlignmentGateError as exc:
+            host._update_shared_state(
+                novel.novel_id.value,
+                current_stage="paused_for_review",
+                writing_substep="narrative_alignment_blocked",
+                narrative_alignment_report=exc.report.to_dict(),
+            )
+            novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+            novel.autopilot_status = AutopilotStatus.STOPPED
+            host._flush_novel(novel)
+            return
         if history_block_reason:
             novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
             novel.last_audit_narrative_ok = False

@@ -255,6 +255,9 @@ async def _create_pre_call_review_invocation(
     workflow: AutoNovelGenerationWorkflow,
     scene_director: Optional[SceneDirectorAnalysis],
 ) -> dict:
+    gate_check = getattr(workflow, "_enforce_narrative_gate", None)
+    if callable(gate_check):
+        await gate_check(novel_id, request.chapter_number, request.outline)
     _ensure_chapter_generation_invocation_contract()
     bundle = workflow.prepare_chapter_generation(
         novel_id,
@@ -507,7 +510,11 @@ async def generate_chapter_stream(
                 yield f"data: {json.dumps({'type': 'approval_required', 'session_id': session.get('id', ''), 'status': session.get('status', ''), 'next_action': payload.get('next_action', '')}, ensure_ascii=False)}\n\n"
             except Exception as exc:
                 logger.exception("AI Invocation 生成前审阅创建失败: %s", exc)
-                yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+                report = getattr(exc, "report", None)
+                payload = {"type": "error", "message": str(exc)}
+                if report is not None:
+                    payload["alignment_report"] = report.to_dict() if hasattr(report, "to_dict") else report
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             return
 
         async for event in workflow.generate_chapter_stream(
