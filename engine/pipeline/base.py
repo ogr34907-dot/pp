@@ -711,34 +711,53 @@ class BaseStoryPipeline(ABC):
 
         from application.blueprint.services.chapter_planning_policy import has_rendered_chapter_execution_plan
 
-        if has_rendered_chapter_execution_plan(outline):
-            ctx.metadata["chapter_plan_mode"] = "full_chapter_script"
-            ctx.metadata["outline_plan_mode"] = "full_chapter_script"
-        else:
-            if ctx.llm_service is None:
-                return StepResult.fail("llm_service 未设置，无法生成章前执行剧本")
-            preplanning_service = ctx.get_dep("chapter_preplanning_service")
-            if preplanning_service is None:
-                from application.blueprint.services.chapter_preplanning_service import ChapterPreplanningService
+        preplanning_service = ctx.get_dep("chapter_preplanning_service")
+        if preplanning_service is None:
+            from application.blueprint.services.chapter_preplanning_service import ChapterPreplanningService
 
-                preplanning_service = ChapterPreplanningService(
-                    llm_service=ctx.llm_service,
-                    chapter_repository=ctx.chapter_repository,
-                    story_node_repo=ctx.story_node_repo,
+            preplanning_service = ChapterPreplanningService(
+                llm_service=ctx.llm_service,
+                chapter_repository=ctx.chapter_repository,
+                story_node_repo=ctx.story_node_repo,
+                hierarchy_gate=ctx.get_dep("hierarchy_gate") or ctx.get_dep("narrative_alignment_gate"),
+                memory_engine=ctx.get_dep("memory_engine"),
+                context_evidence=ctx.bundle,
+            )
+        try:
+            if ctx.llm_service is None and not has_rendered_chapter_execution_plan(outline):
+                return StepResult.fail("llm_service 未设置，无法生成章前执行剧本")
+            outline = await preplanning_service.ensure_execution_plan(
+                novel_id=ctx.novel_id,
+                chapter_number=ctx.chapter_number,
+                chapter_node=ctx.chapter_node,
+                current_outline=outline,
+                target_words=ctx.target_word_count,
+            )
+            hierarchy_gate = ctx.get_dep("hierarchy_gate") or ctx.get_dep("narrative_alignment_gate")
+            if hierarchy_gate is not None and getattr(preplanning_service, "hierarchy_gate", None) is None:
+                from application.engine.services.narrative_gate_guard import (
+                    candidate_from_outline,
+                    enforce_chapter_candidate,
                 )
-            try:
-                outline = await preplanning_service.ensure_execution_plan(
+                await enforce_chapter_candidate(
+                    hierarchy_gate,
+                    story_node_repo=ctx.story_node_repo,
                     novel_id=ctx.novel_id,
                     chapter_number=ctx.chapter_number,
                     chapter_node=ctx.chapter_node,
-                    current_outline=outline,
-                    target_words=ctx.target_word_count,
+                    candidate=candidate_from_outline(outline, ctx.chapter_node),
+                    memory_engine=ctx.get_dep("memory_engine"),
+                    context_evidence=ctx.bundle,
                 )
-            except Exception as exc:
-                return StepResult.fail(f"章前执行剧本生成失败: {exc}")
-            ctx.outline = outline
-            ctx.metadata["chapter_plan_mode"] = "chapter_preplan"
-            ctx.metadata["outline_plan_mode"] = "chapter_preplan"
+        except Exception as exc:
+            report = getattr(exc, "report", None)
+            if report is not None:
+                ctx.metadata["narrative_alignment_report"] = report.to_dict() if hasattr(report, "to_dict") else report
+            return StepResult.fail(f"章前执行剧本生成失败: {exc}")
+        ctx.outline = outline
+        mode = "full_chapter_script" if has_rendered_chapter_execution_plan(outline) else "chapter_preplan"
+        ctx.metadata["chapter_plan_mode"] = mode
+        ctx.metadata["outline_plan_mode"] = mode
 
         logger.info(
             "[%s] 第 %s 章使用整章执行剧本生成，plan_chars=%d target_words=%d",

@@ -23,6 +23,11 @@ from infrastructure.ai.generation_profiles import generation_config_from_profile
 from infrastructure.ai.prompt_contracts.continuous_planning import PLANNING_CHAPTER_PREPLAN_CONTRACT
 from infrastructure.ai.prompt_gateway import get_prompt_gateway
 from infrastructure.ai.prompt_keys import PLANNING_CHAPTER_PREPLAN
+from application.engine.services.narrative_gate_guard import (
+    NarrativeAlignmentGateError,
+    candidate_from_outline,
+    enforce_chapter_candidate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +40,20 @@ class ChapterPreplanningService:
         chapter_repository: Any = None,
         story_node_repo: Any = None,
         policy: ChapterPlanningPolicy = DEFAULT_CHAPTER_PLANNING_POLICY,
+        hierarchy_gate: Any = None,
+        alignment_gate: Any = None,
+        narrative_alignment_gate: Any = None,
+        memory_engine: Any = None,
+        context_evidence: Any = None,
     ) -> None:
         self.llm_service = llm_service
         self.chapter_repository = chapter_repository
         self.story_node_repo = story_node_repo
         self.policy = policy
+        self.hierarchy_gate = hierarchy_gate or alignment_gate or narrative_alignment_gate
+        self.memory_engine = memory_engine
+        self.context_evidence = context_evidence
+        self.last_alignment_report = None
         self.ledger_service = ChapterContinuityLedgerService(
             chapter_repository=chapter_repository,
             story_node_repo=story_node_repo,
@@ -57,8 +71,13 @@ class ChapterPreplanningService:
     ) -> str:
         """Return a seven-section execution plan, generating it when needed."""
         outline = (current_outline or "").strip()
+        node = chapter_node or self._get_chapter_node(novel_id, chapter_number)
         if has_rendered_chapter_execution_plan(outline):
             continuity_context = self.ledger_service.build_for_chapter(novel_id, chapter_number).to_planning_context_text()
+            await self._enforce_gate(
+                novel_id, chapter_number, outline, chapter_node=node,
+                chapter_plan=self._extract_legacy_chapter_plan(node),
+            )
             self._write_plan_variables(
                 novel_id,
                 chapter_number,
@@ -67,13 +86,16 @@ class ChapterPreplanningService:
             )
             return outline
 
-        node = chapter_node or self._get_chapter_node(novel_id, chapter_number)
         act_plan = self._extract_act_plan(node, outline)
         legacy_plan = self._extract_legacy_chapter_plan(node)
         ledger = self.ledger_service.build_for_chapter(novel_id, chapter_number)
         continuity_context = ledger.to_planning_context_text()
         if legacy_plan and has_rendered_chapter_execution_plan(render_chapter_execution_plan(legacy_plan)):
             rendered = render_chapter_execution_plan(legacy_plan)
+            await self._enforce_gate(
+                novel_id, chapter_number, rendered, chapter_node=node,
+                chapter_plan=legacy_plan,
+            )
             await self._persist_outline(
                 novel_id,
                 chapter_number,
@@ -119,6 +141,12 @@ class ChapterPreplanningService:
         ) or self._derive_chapter_characters(chapter_plan, act_plan)
         detail_title = str(data.get("detail_title") or title).strip() or title
 
+        await self._enforce_gate(
+            novel_id, chapter_number, rendered, chapter_node=node,
+            chapter_plan=chapter_plan,
+            candidate_data=data,
+        )
+
         await self._persist_outline(
             novel_id,
             chapter_number,
@@ -138,6 +166,39 @@ class ChapterPreplanningService:
             target_words,
         )
         return rendered
+
+    async def _enforce_gate(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        outline: str,
+        *,
+        chapter_node: Any = None,
+        chapter_plan: Any = None,
+        candidate_data: Any = None,
+    ) -> None:
+        if self.hierarchy_gate is None:
+            return
+        candidate = candidate_from_outline(outline, chapter_node)
+        if isinstance(candidate_data, dict):
+            candidate.update(candidate_data)
+        if isinstance(chapter_plan, dict):
+            candidate.update(chapter_plan)
+        try:
+            report = await enforce_chapter_candidate(
+                self.hierarchy_gate,
+                story_node_repo=self.story_node_repo,
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                chapter_node=chapter_node,
+                candidate=candidate,
+                memory_engine=self.memory_engine or getattr(self.hierarchy_gate, "memory_engine", None),
+                context_evidence=self.context_evidence,
+            )
+            self.last_alignment_report = report
+        except NarrativeAlignmentGateError as exc:
+            self.last_alignment_report = exc.report
+            raise
 
     def build_continuity_context(self, novel_id: str, chapter_number: int) -> str:
         return self.ledger_service.build_for_chapter(novel_id, chapter_number).to_planning_context_text()

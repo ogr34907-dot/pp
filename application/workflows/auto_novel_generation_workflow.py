@@ -33,6 +33,11 @@ from application.workflows.beat_continuation import format_prior_draft_for_promp
 from application.workflows.prose_discipline import build_prose_discipline_block
 
 from application.core.chapter_target_limits import clamp_chapter_target_words
+from application.engine.services.narrative_gate_guard import (
+    NarrativeAlignmentGateError,
+    candidate_from_outline,
+    enforce_chapter_candidate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +248,10 @@ class AutoNovelGenerationWorkflow:
         cliche_scanner: Optional['ClicheScanner'] = None,
         memory_engine: Optional['MemoryEngine'] = None,
         evolution_gate_service: Optional[Any] = None,
+        hierarchy_gate: Optional[Any] = None,
+        alignment_gate: Optional[Any] = None,
+        narrative_alignment_gate: Optional[Any] = None,
+        story_node_repo: Optional[Any] = None,
     ):
         """初始化工作流
 
@@ -267,6 +276,8 @@ class AutoNovelGenerationWorkflow:
         self.plot_arc_repository = plot_arc_repository
         self.llm_service = llm_service
         self.evolution_gate_service = evolution_gate_service
+        self.hierarchy_gate = hierarchy_gate or alignment_gate or narrative_alignment_gate
+        self.story_node_repo = story_node_repo
 
         # ★ V6 记忆引擎（跨章节状态机）
         # Prefer the ContextBudgetAllocator's configured instance so prompt
@@ -316,6 +327,43 @@ class AutoNovelGenerationWorkflow:
         # ★ Theme 集成器（延迟初始化）
         self._theme_integrator = None
         self._genre: Optional[str] = None
+
+    async def _enforce_narrative_gate(self, novel_id: str, chapter_number: int, outline: str) -> None:
+        if self.hierarchy_gate is None:
+            return
+        node = None
+        try:
+            nodes = await self._gate_nodes(novel_id)
+            node = next((item for item in nodes if int(getattr(item, "number", 0) or 0) == int(chapter_number)), None)
+        except Exception:
+            nodes = []
+        candidate = candidate_from_outline(outline, node)
+        await enforce_chapter_candidate(
+            self.hierarchy_gate,
+            story_node_repo=self.story_node_repo,
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            chapter_node=node,
+            candidate=candidate,
+            memory_engine=self.memory_engine,
+            context_evidence=getattr(self.context_builder, "last_context", None),
+        )
+
+    async def _gate_nodes(self, novel_id: str) -> list[Any]:
+        repo = self.story_node_repo
+        if repo is None:
+            return []
+        for name in ("get_by_novel_sync", "get_tree_sync", "get_by_novel", "get_tree"):
+            fn = getattr(repo, name, None)
+            if not callable(fn):
+                continue
+            result = fn(novel_id)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if hasattr(result, "nodes"):
+                result = result.nodes
+            return list(result or [])
+        return []
 
     def set_genre(self, genre: str) -> None:
         """设置小说题材，激活对应的 Theme Agent"""
@@ -627,6 +675,8 @@ class AutoNovelGenerationWorkflow:
         if not outline or not outline.strip():
             raise ValueError("outline cannot be empty")
 
+        await self._enforce_narrative_gate(novel_id, chapter_number, outline)
+
         self._require_narrative_memory()
 
         logger.info(f"========================================")
@@ -736,6 +786,12 @@ class AutoNovelGenerationWorkflow:
                 raise ValueError("chapter_number must be positive")
             if not outline or not outline.strip():
                 raise ValueError("outline cannot be empty")
+
+            try:
+                await self._enforce_narrative_gate(novel_id, chapter_number, outline)
+            except NarrativeAlignmentGateError as exc:
+                yield {"type": "error", "message": str(exc), "alignment_report": exc.report.to_dict()}
+                return
 
             self._require_narrative_memory()
 

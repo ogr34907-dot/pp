@@ -9,6 +9,11 @@ from application.core.services.chapter_service import ChapterService
 from application.core.services.novel_service import NovelService
 from application.workflows.auto_novel_generation_workflow import AutoNovelGenerationWorkflow
 from domain.shared.exceptions import EntityNotFoundError
+from application.engine.services.narrative_gate_guard import (
+    NarrativeAlignmentGateError,
+    candidate_from_outline,
+    enforce_chapter_candidate,
+)
 if TYPE_CHECKING:
     from application.engine.services.chapter_aftermath_pipeline import ChapterAftermathPipeline
 
@@ -24,11 +29,16 @@ class HostedWriteService:
         chapter_service: ChapterService,
         novel_service: Optional[NovelService] = None,
         chapter_aftermath_pipeline: Optional["ChapterAftermathPipeline"] = None,
+        hierarchy_gate: Any = None,
+        alignment_gate: Any = None,
+        story_node_repo: Any = None,
     ):
         self._workflow = workflow
         self._chapter = chapter_service
         self._novel = novel_service
         self._aftermath = chapter_aftermath_pipeline
+        self._hierarchy_gate = hierarchy_gate or alignment_gate
+        self._story_node_repo = story_node_repo or getattr(workflow, "story_node_repo", None)
 
     def _schedule_chapter_aftermath(
         self,
@@ -127,6 +137,26 @@ class HostedWriteService:
                 outline = self._fallback_outline(novel_id, n)
 
             yield {"type": "outline", "chapter": n, "text": outline}
+
+            # Workflow normally owns this check.  Keep a service-level seam for
+            # hosted callers that supply a lightweight workflow stub.
+            if self._hierarchy_gate is not None and getattr(self._workflow, "hierarchy_gate", None) is None:
+                try:
+                    await enforce_chapter_candidate(
+                        self._hierarchy_gate,
+                        story_node_repo=self._story_node_repo,
+                        novel_id=novel_id,
+                        chapter_number=n,
+                        candidate=candidate_from_outline(outline),
+                    )
+                except NarrativeAlignmentGateError as exc:
+                    yield {
+                        "type": "error",
+                        "chapter": n,
+                        "message": str(exc),
+                        "alignment_report": exc.report.to_dict(),
+                    }
+                    return
 
             async for ev in self._workflow.generate_chapter_stream(novel_id, n, outline, enable_beats=True):
                 merged: Dict[str, Any] = dict(ev)

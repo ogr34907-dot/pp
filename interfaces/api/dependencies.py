@@ -803,6 +803,13 @@ def build_auto_workflow(
     if hasattr(memory_engine, "llm_service") and getattr(memory_engine, "llm_service", None) is None:
         memory_engine.llm_service = llm_service
 
+    # The hierarchy gate is injectable and shares StoryNodes/MemoryEngine with
+    # the rest of the workflow; callers and tests that do not provide it retain
+    # the legacy behavior.
+    from application.engine.services.hierarchical_narrative_alignment_gate import HierarchicalNarrativeAlignmentGate
+    hierarchy_gate = HierarchicalNarrativeAlignmentGate(memory_engine=memory_engine)
+    story_node_repo = get_story_node_repository()
+
     return AutoNovelGenerationWorkflow(
         context_builder=context_builder,
         consistency_checker=get_consistency_checker(),
@@ -818,6 +825,8 @@ def build_auto_workflow(
         cliche_scanner=ClicheScanner(),
         memory_engine=memory_engine,
         evolution_gate_service=get_evolution_gate_service(),
+        hierarchy_gate=hierarchy_gate,
+        story_node_repo=story_node_repo,
     )
 
 
