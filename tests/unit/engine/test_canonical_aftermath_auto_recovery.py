@@ -12,6 +12,9 @@ from domain.novel.entities.novel import AutopilotStatus, NovelStage
 from engine.runtime.novel_lifecycle import process_novel
 from engine.runtime.daemon_host import DaemonHostMixin
 from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+    SqliteChapterNarrativeCommitRepository,
+)
 
 
 def _seed_terminal_failure(
@@ -102,6 +105,33 @@ class _NoopPipeline:
             "narrative_sync_ok": False,
             "failure_reason": "API returned empty content",
         }
+
+
+class _SuccessfulMemoryPipeline:
+    def __init__(self, database: DatabaseConnection) -> None:
+        self.database = database
+        self.calls = 0
+
+    async def run_after_chapter_saved(self, *args, **kwargs):
+        self.calls += 1
+        claim = self.database.fetch_one(
+            "SELECT status, memory_status, content_sha256, pipeline_version, "
+            "content_revision FROM chapter_narrative_commits "
+            "WHERE novel_id = 'novel-1' AND chapter_number = 63"
+        )
+        assert claim["status"] == "committed"
+        assert claim["memory_status"] == "pending"
+        commits = SqliteChapterNarrativeCommitRepository(self.database)
+        memory_kwargs = {
+            "novel_id": "novel-1",
+            "chapter_number": 63,
+            "content_sha256": claim["content_sha256"],
+            "pipeline_version": claim["pipeline_version"],
+            "content_revision": claim["content_revision"],
+        }
+        assert commits.claim_memory_sync(**memory_kwargs) == "claimed"
+        assert commits.finish_memory_sync(**memory_kwargs)
+        return {"narrative_sync_ok": True, "memory_sync_ok": True}
 
 
 @pytest.mark.asyncio
@@ -239,6 +269,109 @@ async def test_failed_recovery_marker_blocks_same_version_on_later_tick(tmp_path
     assert second.disposition == "exhausted"
     assert second.recovery_marker == first.recovery_marker
     assert pipeline.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_recovery_stays_exhausted_after_runtime_marker_is_cleared(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "restart-exhausted.db"))
+    _seed_terminal_failure(
+        database,
+        failure_reason="API returned empty content",
+    )
+    pipeline = _NoopPipeline()
+
+    first = await canonical_aftermath_recovery.attempt_automatic_canonical_aftermath_recovery(
+        novel_id="novel-1",
+        database=database,
+        aftermath_pipeline=pipeline,
+    )
+    database.execute(
+        "UPDATE novels SET autopilot_recovery_reason = '' WHERE id = 'novel-1'"
+    )
+    database.commit()
+    second = await canonical_aftermath_recovery.attempt_automatic_canonical_aftermath_recovery(
+        novel_id="novel-1",
+        database=database,
+        aftermath_pipeline=pipeline,
+    )
+
+    assert first.disposition == "failed"
+    assert second.disposition == "exhausted"
+    assert pipeline.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_recovery_retries_exhausted_memory_sync(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "manual-memory.db"))
+    content_sha256, content_revision = _seed_terminal_failure(
+        database,
+        failure_reason="API returned empty content",
+    )
+    database.execute(
+        "INSERT INTO knowledge (id, novel_id) VALUES ('knowledge-1', 'novel-1')"
+    )
+    database.execute(
+        "INSERT INTO chapter_summaries "
+        "(id, knowledge_id, chapter_number, summary, source_content_sha256, "
+        "source_content_revision, pipeline_version, sync_status, sync_attempts) "
+        "VALUES ('summary-63', 'knowledge-1', 63, 'summary', ?, ?, ?, "
+        "'committed', 3)",
+        (
+            content_sha256,
+            content_revision,
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        ),
+    )
+    database.execute(
+        "UPDATE chapter_narrative_commits "
+        "SET status = 'committed', failure_reason = '', memory_status = 'failed', "
+        "memory_failure_reason = 'memory write failed', memory_attempt_count = 3 "
+        "WHERE novel_id = 'novel-1' AND chapter_number = 63"
+    )
+    database.commit()
+    pipeline = _SuccessfulMemoryPipeline(database)
+
+    result = await canonical_aftermath_recovery.attempt_manual_canonical_aftermath_recovery(
+        novel_id="novel-1",
+        database=database,
+        aftermath_pipeline=pipeline,
+    )
+
+    assert result.disposition == "recovered"
+    assert pipeline.calls == 1
+
+
+def test_recent_automatic_stale_claim_cannot_be_stolen_by_manual_recovery(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "claim-owner.db"))
+    content_sha256, content_revision = _seed_terminal_failure(
+        database,
+        failure_reason="API returned empty content",
+    )
+    commits = SqliteChapterNarrativeCommitRepository(database)
+    marker = (
+        "canonical_aftermath_auto_recovery:v1:63:2:"
+        f"{content_sha256}:{CHAPTER_NARRATIVE_PIPELINE_VERSION}"
+    )
+
+    claimed = commits.claim_bounded_automatic_recovery(
+        novel_id="novel-1",
+        chapter_number=63,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        content_revision=content_revision,
+        expected_failure_reason="API returned empty content",
+        recovery_marker=marker,
+    )
+    manually_reclaimed = commits.reclaim_terminal_failure(
+        novel_id="novel-1",
+        chapter_number=63,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        content_revision=content_revision,
+    )
+
+    assert claimed == "claimed"
+    assert manually_reclaimed is False
 
 
 @pytest.mark.asyncio

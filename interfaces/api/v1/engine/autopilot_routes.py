@@ -2184,15 +2184,23 @@ async def resume_from_review(novel_id: str):
 async def get_autopilot_status(novel_id: str):
     """获取完整运行状态。
 
-    🔥 核心架构优化：纯内存读取，纳秒级响应，永不阻塞事件循环。
-
-    所有数据都从共享内存读取，完全不走 DB。
-    这是"内存优先读取"架构的核心端点。
+    共享状态是主读取路径；规范章后状态的持久化对账在线程池执行。
     """
     from application.engine.services.query_service import get_query_service
 
+    runtime_settings = get_autopilot_runtime_settings()
     query = get_query_service()
-    status = query.get_novel_status_dict(novel_id)
+    try:
+        status = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                _SSE_THREAD_POOL,
+                query.get_novel_status_dict,
+                novel_id,
+            ),
+            timeout=runtime_settings.db_read_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(503, "数据库繁忙，请稍后重试")
 
     if status is None:
         # 小说不在共享内存中，可能是不存在或未加载

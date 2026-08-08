@@ -22,6 +22,9 @@ _CANONICAL_FIELDS = (
 )
 _CANONICAL_PAUSE_REASON = "canonical_aftermath_not_ready"
 _MAX_CANONICAL_ATTEMPTS = 3
+_AUTOMATIC_RECOVERY_EXHAUSTED_PREFIX = (
+    "canonical_aftermath_auto_recovery_exhausted:"
+)
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,15 @@ def _restore_terminal_failure_safely(
         )
 
 
+def _persisted_recovery_failure_reason(
+    failure_prefix: str,
+    failure_reason: str,
+) -> str:
+    if failure_prefix == "canonical_aftermath_auto_recovery":
+        return f"{_AUTOMATIC_RECOVERY_EXHAUSTED_PREFIX}{failure_reason}"
+    return failure_reason
+
+
 async def _run_claimed_canonical_recovery(
     *,
     novel_id: str,
@@ -164,7 +176,10 @@ async def _run_claimed_canonical_recovery(
             commits,
             novel_id=novel_id,
             source=source,
-            failure_reason=f"{failure_prefix}_cancelled",
+            failure_reason=_persisted_recovery_failure_reason(
+                failure_prefix,
+                f"{failure_prefix}_cancelled",
+            ),
         )
         raise
     except Exception as exc:
@@ -173,7 +188,10 @@ async def _run_claimed_canonical_recovery(
             commits,
             novel_id=novel_id,
             source=source,
-            failure_reason=failure_reason,
+            failure_reason=_persisted_recovery_failure_reason(
+                failure_prefix,
+                failure_reason,
+            ),
         )
         return CanonicalAftermathRecoveryResult(
             "failed",
@@ -193,7 +211,10 @@ async def _run_claimed_canonical_recovery(
             commits,
             novel_id=novel_id,
             source=source,
-            failure_reason=failure_reason,
+            failure_reason=_persisted_recovery_failure_reason(
+                failure_prefix,
+                failure_reason,
+            ),
         )
         return CanonicalAftermathRecoveryResult(
             "failed",
@@ -216,7 +237,10 @@ async def _run_claimed_canonical_recovery(
         commits,
         novel_id=novel_id,
         source=source,
-        failure_reason=failure_reason,
+        failure_reason=_persisted_recovery_failure_reason(
+            failure_prefix,
+            failure_reason,
+        ),
     )
     return CanonicalAftermathRecoveryResult(
         "failed",
@@ -271,6 +295,16 @@ async def attempt_automatic_canonical_aftermath_recovery(
         return CanonicalAftermathRecoveryResult("ready", **base)
     if source.status != "failed" or source.attempt_count < _MAX_CANONICAL_ATTEMPTS:
         return CanonicalAftermathRecoveryResult("not_terminal", **base)
+    if source.failure_reason.startswith(_AUTOMATIC_RECOVERY_EXHAUSTED_PREFIX):
+        return CanonicalAftermathRecoveryResult(
+            "exhausted",
+            **{
+                **base,
+                "failure_reason": source.failure_reason.removeprefix(
+                    _AUTOMATIC_RECOVERY_EXHAUSTED_PREFIX
+                ),
+            },
+        )
     if not is_retryable_llm_error(source.failure_reason):
         return CanonicalAftermathRecoveryResult("not_retryable", **base)
 
@@ -346,6 +380,14 @@ async def attempt_manual_canonical_aftermath_recovery(
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
             content_revision=source.content_revision,
         )
+        if not reclaimed:
+            reclaimed = commits.reclaim_terminal_memory_failure(
+                novel_id=novel_id,
+                chapter_number=source.chapter_number,
+                content_sha256=source.content_sha256,
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                content_revision=source.content_revision,
+            )
     except Exception as exc:
         return CanonicalAftermathRecoveryResult(
             "unavailable",
@@ -402,12 +444,10 @@ def resolve_canonical_aftermath_status(
         ):
             return CanonicalAftermathStatus()
 
-        failure = db.fetch_one(
+        durable_row = db.fetch_one(
             """
-            SELECT CASE
-                     WHEN commits.status = 'failed' THEN commits.failure_reason
-                     ELSE commits.memory_failure_reason
-                   END AS failure_reason
+            SELECT commits.status, commits.failure_reason,
+                   commits.memory_status, commits.memory_failure_reason
             FROM chapter_narrative_commits AS commits
             JOIN chapters AS chapters
               ON chapters.novel_id = commits.novel_id
@@ -417,29 +457,29 @@ def resolve_canonical_aftermath_status(
               AND commits.content_sha256 = chapters.content_sha256
               AND commits.content_revision = chapters.content_revision
               AND commits.pipeline_version = ?
-              AND (
-                    (commits.status = 'failed' AND commits.attempt_count >= ?)
-                    OR (
-                        commits.status = 'committed'
-                        AND commits.memory_status = 'failed'
-                        AND commits.memory_attempt_count >= ?
-                    )
-              )
             LIMIT 1
             """,
             (
                 novel_id,
                 chapter_number,
                 CHAPTER_NARRATIVE_PIPELINE_VERSION,
-                _MAX_CANONICAL_ATTEMPTS,
-                _MAX_CANONICAL_ATTEMPTS,
             ),
         )
-        if failure is None:
-            return CanonicalAftermathStatus()
+        failure_reason = ""
+        if durable_row is not None:
+            if str(durable_row["status"] or "") == "failed":
+                failure_reason = str(durable_row["failure_reason"] or "")
+            elif (
+                str(durable_row["status"] or "") == "committed"
+                and str(durable_row["memory_status"] or "") == "failed"
+            ):
+                failure_reason = str(durable_row["memory_failure_reason"] or "")
+        failure_reason = failure_reason.removeprefix(
+            _AUTOMATIC_RECOVERY_EXHAUSTED_PREFIX
+        )
         return CanonicalAftermathStatus(
             chapter_number=chapter_number,
-            failure_reason=str(failure["failure_reason"] or _CANONICAL_PAUSE_REASON),
+            failure_reason=failure_reason or _CANONICAL_PAUSE_REASON,
         )
     except Exception as exc:
         logger.debug("读取规范章后状态失败，保留共享状态 novel=%s: %s", novel_id, exc)

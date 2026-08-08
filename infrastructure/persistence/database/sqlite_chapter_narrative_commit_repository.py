@@ -427,7 +427,7 @@ class SqliteChapterNarrativeCommitRepository:
                 attempt_count = int(claim[1] or 0)
                 updated_at = claim[2]
                 lease_expired = False
-                if status == "in_progress":
+                if status in {"stale", "in_progress"}:
                     try:
                         modified_at = datetime.fromisoformat(
                             str(updated_at).replace("Z", "+00:00")
@@ -443,8 +443,7 @@ class SqliteChapterNarrativeCommitRepository:
 
                 if not (
                     (status == "failed" and attempt_count >= 3)
-                    or status == "stale"
-                    or (status == "in_progress" and lease_expired)
+                    or (status in {"stale", "in_progress"} and lease_expired)
                 ):
                     return False
 
@@ -494,6 +493,60 @@ class SqliteChapterNarrativeCommitRepository:
                     ),
                 )
                 return True
+
+    def reclaim_terminal_memory_failure(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+        content_revision: int,
+    ) -> bool:
+        """Reopen one explicit retry cycle for an exhausted MemoryEngine sync."""
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                source = conn.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (novel_id, chapter_number),
+                ).fetchone()
+                actual_sha256 = (
+                    hashlib.sha256((source[0] or "").encode("utf-8")).hexdigest()
+                    if source is not None
+                    else ""
+                )
+                if (
+                    source is None
+                    or actual_sha256 != content_sha256
+                    or (source[1] or "") != content_sha256
+                    or int(source[2] or 0) != int(content_revision)
+                ):
+                    return False
+
+                cursor = conn.execute(
+                    """
+                    UPDATE chapter_narrative_commits
+                    SET memory_status = 'pending', memory_failure_reason = '',
+                        memory_attempt_count = 0, updated_at = ?
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ? AND status = 'committed'
+                      AND memory_status = 'failed'
+                      AND memory_attempt_count >= ?
+                    """,
+                    (
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                        MAX_MEMORY_SYNC_ATTEMPTS,
+                    ),
+                )
+                return cursor.rowcount == 1
 
     def claim_bounded_automatic_recovery(
         self,

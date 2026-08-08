@@ -189,7 +189,7 @@ def test_terminal_failure_can_only_be_reclaimed_for_current_content_version(tmp_
     assert claim.attempt_count == 1
 
 
-def test_terminal_recovery_reclaims_only_stale_or_expired_in_progress_claims(tmp_path):
+def test_terminal_recovery_reclaims_only_expired_stale_or_in_progress_claims(tmp_path):
     db, _chapter_repo, chapter, _knowledge = _canonical_services(tmp_path)
     content_sha256 = hashlib.sha256(chapter.content.encode("utf-8")).hexdigest()
     db.execute(
@@ -215,6 +215,12 @@ def test_terminal_recovery_reclaims_only_stale_or_expired_in_progress_claims(tmp
         "content_revision": 1,
     }
 
+    assert not repository.reclaim_terminal_failure(**kwargs)
+    db.execute(
+        "UPDATE chapter_narrative_commits SET updated_at = ?",
+        ((datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(),),
+    )
+    db.commit()
     assert repository.reclaim_terminal_failure(**kwargs)
     db.execute(
         "UPDATE chapter_narrative_commits SET status = 'in_progress', updated_at = ?",

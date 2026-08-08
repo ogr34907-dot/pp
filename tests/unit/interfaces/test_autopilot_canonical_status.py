@@ -1,7 +1,13 @@
+import asyncio
 import hashlib
+import threading
 
+import pytest
+
+from application.engine.services import query_service as query_service_module
 from application.engine.services.query_service import QueryService
 from application.engine.services.shared_state_repository import NovelState, SharedStateRepository
+from interfaces.api.v1.engine import autopilot_routes
 from infrastructure.persistence.database import connection as database_connection
 from infrastructure.persistence.database.connection import DatabaseConnection
 
@@ -134,3 +140,72 @@ def test_status_surfaces_exhausted_durable_memory_sync_failure(tmp_path, monkeyp
     assert status is not None
     assert status["canonical_aftermath_chapter_number"] == 63
     assert status["canonical_aftermath_failure_reason"] == "durable memory failure"
+
+
+def test_status_preserves_gate_when_latest_commit_is_missing(tmp_path, monkeypatch):
+    database = DatabaseConnection(str(tmp_path / "durable-missing.db"))
+    _seed_novel(database)
+    _seed_completed_chapter(database, 63, "第六十三章正文")
+    database.commit()
+    monkeypatch.setattr(database_connection, "get_database", lambda *_args, **_kwargs: database)
+
+    status = QueryService(_shared_status_with_stale_canonical_failure()).get_novel_status_dict("novel-1")
+
+    assert status is not None
+    assert status["canonical_aftermath_chapter_number"] == 63
+    assert status["canonical_aftermath_failure_reason"] == "canonical_aftermath_not_ready"
+    assert status["autopilot_pause_reason"] == "canonical_aftermath_not_ready"
+
+
+def test_status_preserves_gate_while_memory_sync_is_pending(tmp_path, monkeypatch):
+    database = DatabaseConnection(str(tmp_path / "durable-memory-pending.db"))
+    _seed_novel(database)
+    content_sha256, content_revision = _seed_completed_chapter(database, 63, "第六十三章正文")
+    database.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, "
+        "status, memory_status) VALUES ('novel-1', 63, ?, "
+        "'chapter-narrative-sync:v1', ?, 'committed', 'pending')",
+        (content_sha256, content_revision),
+    )
+    database.commit()
+    monkeypatch.setattr(database_connection, "get_database", lambda *_args, **_kwargs: database)
+
+    status = QueryService(_shared_status_with_stale_canonical_failure()).get_novel_status_dict("novel-1")
+
+    assert status is not None
+    assert status["canonical_aftermath_chapter_number"] == 63
+    assert status["canonical_aftermath_failure_reason"] == "canonical_aftermath_not_ready"
+    assert status["autopilot_pause_reason"] == "canonical_aftermath_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_status_durable_reconciliation_does_not_block_event_loop(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingQuery:
+        def get_novel_status_dict(self, novel_id: str):
+            entered.set()
+            release.wait(timeout=1.0)
+            return {"novel_id": novel_id}
+
+    monkeypatch.setattr(
+        query_service_module,
+        "get_query_service",
+        lambda: _BlockingQuery(),
+    )
+    timer = threading.Timer(0.5, release.set)
+    timer.start()
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    task = asyncio.create_task(autopilot_routes.get_autopilot_status("novel-1"))
+    try:
+        await asyncio.sleep(0.02)
+        elapsed = loop.time() - started_at
+        assert entered.is_set()
+        assert elapsed < 0.2
+    finally:
+        release.set()
+        timer.cancel()
+    assert await task == {"novel_id": "novel-1"}
