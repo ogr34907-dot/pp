@@ -66,4 +66,3 @@
 - [ ] Run `git diff --check` and review the complete diff.
 - [ ] Commit and push the new branch.
 - [ ] Fast-forward the formal workspace to the pushed branch, restart services, and verify health plus durable chapter status.
-

@@ -33,4 +33,3 @@ On success, the novel remains subject to the existing canonical advance CAS. The
 - A transient terminal failure gets exactly one automatic recovery cycle.
 - A hard failure and an already-exhausted chapter version remain paused.
 - Recovery success never generates prose and never bypasses the canonical advance gate.
-
