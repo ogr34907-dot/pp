@@ -42,7 +42,7 @@ Additional checks: `py_compile` succeeded and `git diff --check` reported no whi
 
 ## Commit
 
-Commit SHA: `422de92b` (amended once to include this report).
+Implementation commit SHA: `082f9a05`.
 
 ## Concerns
 
