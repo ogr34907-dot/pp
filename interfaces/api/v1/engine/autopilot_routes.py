@@ -52,6 +52,9 @@ from application.engine.services.autopilot_log_ring import (
 from application.engine.services.canonical_aftermath_recovery import (
     attempt_manual_canonical_aftermath_recovery,
 )
+from application.engine.services.canonical_aftermath_full_resync import (
+    resync_all_completed_chapters,
+)
 from application.ai_invocation.autopilot.review_gate import (
     resume_block_reason_from_status,
     stage_needs_human_review,
@@ -1991,6 +1994,159 @@ async def retry_canonical_aftermath(novel_id: str):
         "remains_paused": True,
         "message": f"第 {recovery.chapter_number} 章规范记忆同步完成，请手动继续自动驾驶。",
     }
+
+
+def _full_resync_marker_is_active(marker: str, *, now: Optional[float] = None) -> bool:
+    """Return whether a durable full-resync lease should reject a new request."""
+    marker = str(marker or "")
+    prefix = "canonical_aftermath_full_resync:"
+    if not marker.startswith(prefix):
+        return False
+    if any(f"|{terminal}" in marker for terminal in ("failed", "cancelled", "unavailable")):
+        return False
+    try:
+        started = float(marker.split("|", 1)[0].rsplit(":", 1)[-1])
+    except (TypeError, ValueError):
+        return True
+    return (time.time() if now is None else now) - started < 600.0
+
+
+@router.post("/{novel_id}/canonical-aftermath/resync-all")
+async def resync_all_canonical_aftermath(novel_id: str):
+    """Stream an ordered full canonical-aftermath resynchronization run."""
+    loop = asyncio.get_running_loop()
+
+    def _preflight_sync():
+        database = get_database(get_db_path())
+        row = database.fetch_one(
+            "SELECT id, autopilot_recovery_reason FROM novels WHERE id = ?",
+            (novel_id,),
+        )
+        if row is None:
+            return None, None, "missing"
+        marker = str(row.get("autopilot_recovery_reason") or "")
+        if _full_resync_marker_is_active(marker):
+            return database, None, "conflict"
+        pipeline = get_chapter_aftermath_pipeline()
+        if pipeline is None or (
+            hasattr(pipeline, "_memory_engine")
+            and getattr(pipeline, "_memory_engine") is None
+        ):
+            return database, None, "unavailable"
+        return database, pipeline, None
+
+    try:
+        database, aftermath_pipeline, preflight_error = await loop.run_in_executor(
+            _SSE_THREAD_POOL, _preflight_sync
+        )
+    except Exception as exc:
+        raise HTTPException(503, f"规范记忆全章重同步暂不可用：{exc}") from exc
+    if preflight_error == "missing":
+        raise HTTPException(404, "小说不存在")
+    if preflight_error == "conflict":
+        raise HTTPException(409, "该小说已有全章规范记忆重同步任务正在运行")
+    if preflight_error == "unavailable":
+        raise HTTPException(503, "规范记忆全章重同步暂不可用")
+
+    # Establish the legal durable pause before starting any asynchronous work.
+    try:
+        await _request_manual_stop(
+            novel_id,
+            recovery_reason="paused_for_review_preserved",
+            cleanup_transient=False,
+            message="规范记忆全章重同步已暂停自动驾驶",
+        )
+    except Exception as exc:
+        raise HTTPException(503, f"无法暂停自动驾驶：{exc}") from exc
+
+    import queue
+
+    events: queue.SimpleQueue = queue.SimpleQueue()
+    sentinel = object()
+    terminal_seen = [False]
+
+    async def _emit(event: Dict[str, Any]) -> None:
+        if event.get("type") in {"completed", "failed", "cancelled"}:
+            terminal_seen[0] = True
+        events.put(dict(event))
+
+    def _run_service_sync() -> None:
+        try:
+            result = asyncio.run(
+                resync_all_completed_chapters(
+                    novel_id=novel_id,
+                    database=database,
+                    aftermath_pipeline=aftermath_pipeline,
+                    emit=_emit,
+                )
+            )
+            if not terminal_seen[0]:
+                status = str(getattr(result, "status", "") or "")
+                if status == "completed":
+                    events.put({
+                        "type": "completed",
+                        "run_id": getattr(result, "run_id", ""),
+                        "processed": getattr(result, "processed_count", 0),
+                        "synced": getattr(result, "synced_count", 0),
+                        "skipped": getattr(result, "skipped_count", 0),
+                        "vector_failed": getattr(result, "vector_failed_chapters", []),
+                        "total": getattr(result, "total_chapters", 0),
+                        "remains_paused": True,
+                    })
+                elif status in {"failed", "conflict", "unavailable", "cancelled"}:
+                    events.put({
+                        "type": "cancelled" if status == "cancelled" else "failed",
+                        "run_id": getattr(result, "run_id", ""),
+                        "chapter_number": getattr(result, "failed_chapter", None),
+                        "processed": getattr(result, "processed_count", 0),
+                        "synced": getattr(result, "synced_count", 0),
+                        "skipped": getattr(result, "skipped_count", 0),
+                        "total": getattr(result, "total_chapters", 0),
+                        "failure_reason": getattr(result, "failure_reason", "") or status,
+                    })
+        except BaseException as exc:
+            events.put({
+                "type": "failed",
+                "run_id": "",
+                "processed": 0,
+                "synced": 0,
+                "skipped": 0,
+                "total": 0,
+                "failure_reason": str(exc) or "resync_failed",
+            })
+        finally:
+            events.put(sentinel)
+
+    worker = loop.run_in_executor(_SSE_THREAD_POOL, _run_service_sync)
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    event = events.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.01)
+                    continue
+                if event is sentinel:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            # The pause and durable marker are intentionally left in place.
+            logger.info("full canonical aftermath SSE cancelled novel=%s", novel_id)
+            raise
+        finally:
+            # Consume worker completion when it is already done without blocking.
+            if worker.done():
+                try:
+                    worker.result()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/{novel_id}/resume")
