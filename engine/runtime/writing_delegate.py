@@ -92,6 +92,96 @@ def _apply_story_pipeline_advance(novel: Any, advance: Any) -> None:
         novel.current_stage = stage
 
 
+def _durable_chapter_stats(
+    daemon: Any,
+    novel_id: str,
+    *,
+    chapter_number: int | None = None,
+) -> Dict[str, Any]:
+    reader = getattr(daemon, "_read_chapter_stats_ephemeral", None)
+    if not callable(reader):
+        return {}
+    try:
+        stats = reader(novel_id)
+    except Exception as exc:
+        logger.debug("[%s] 读取章节统计失败，保留现有共享状态: %s", novel_id, exc)
+        return {}
+    if not isinstance(stats, (tuple, list)) or len(stats) != 3:
+        return {}
+    completed, manuscript, total_words = (int(value or 0) for value in stats)
+    fields: Dict[str, Any] = {
+        "_cached_completed_chapters": completed,
+        "_cached_manuscript_chapters": manuscript,
+        "_cached_total_words": total_words,
+    }
+    if chapter_number is not None:
+        fields["_cached_current_chapter_number"] = int(chapter_number)
+    return fields
+
+
+def _canonical_failure_publication(
+    daemon: Any,
+    runner: Any,
+    novel_id: str,
+    *,
+    fallback_chapter_number: int | None,
+    fallback_reason: str,
+) -> Dict[str, Any]:
+    from application.engine.services.canonical_aftermath_recovery import (
+        resolve_canonical_aftermath_status,
+    )
+
+    db = getattr(getattr(runner, "chapter_repository", None), "db", None)
+    durable = resolve_canonical_aftermath_status(novel_id, database=db)
+    chapter_number = (
+        durable.chapter_number
+        if durable is not None and durable.chapter_number is not None
+        else fallback_chapter_number
+    )
+    failure_reason = (
+        durable.failure_reason
+        if durable is not None and durable.failure_reason
+        else fallback_reason
+    )
+    fields: Dict[str, Any] = {
+        "canonical_aftermath_chapter_number": chapter_number,
+        "canonical_aftermath_failure_reason": failure_reason,
+    }
+    if chapter_number is not None:
+        fields["current_chapter_number"] = int(chapter_number)
+    fields.update(
+        _durable_chapter_stats(
+            daemon,
+            novel_id,
+            chapter_number=chapter_number,
+        )
+    )
+    return fields
+
+
+def _canonical_ready_publication(
+    daemon: Any,
+    novel_id: str,
+    *,
+    chapter_number: int,
+) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {
+        "autopilot_pause_reason": "",
+        "canonical_aftermath_chapter_number": None,
+        "canonical_aftermath_failure_reason": "",
+        "requires_ai_review": False,
+        "has_active_invocation": False,
+    }
+    fields.update(
+        _durable_chapter_stats(
+            daemon,
+            novel_id,
+            chapter_number=chapter_number,
+        )
+    )
+    return fields
+
+
 def _pause_for_story_pipeline_advance_failure(
     daemon: Any,
     novel: Any,
@@ -180,6 +270,11 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
             current_chapter_number=recovery.chapter_number,
             audit_aftermath_reused=True,
             audit_aftermath_rebuilt=False,
+            **_canonical_ready_publication(
+                daemon,
+                novel_id,
+                chapter_number=recovery.chapter_number,
+            ),
         )
         daemon._flush_novel(novel)
         logger.info(
@@ -295,11 +390,23 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
     ):
         novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
         novel.last_audit_narrative_ok = False
+        canonical_fields: Dict[str, Any] = {}
+        if error == "canonical_aftermath_not_ready":
+            canonical_fields = _canonical_failure_publication(
+                daemon,
+                runner,
+                novel_id,
+                fallback_chapter_number=(
+                    result.chapter_number or getattr(ctx, "chapter_number", None)
+                ),
+                fallback_reason=error,
+            )
         daemon._update_shared_state(
             novel_id,
             current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
             last_audit_narrative_ok=False,
             autopilot_pause_reason=error,
+            **canonical_fields,
         )
         daemon._flush_novel(novel)
         logger.warning("[%s] StoryPipeline 因规范记忆未提交而暂停: %s", novel_id, error)
@@ -346,6 +453,11 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
             last_chapter_tension=result.tension,
             audit_aftermath_reused=False,
             audit_aftermath_rebuilt=False,
+            **_canonical_ready_publication(
+                daemon,
+                novel_id,
+                chapter_number=chapter_num,
+            ),
         )
         daemon._flush_novel(novel)
         logger.info(
