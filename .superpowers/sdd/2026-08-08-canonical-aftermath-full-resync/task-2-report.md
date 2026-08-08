@@ -74,3 +74,25 @@ Regression output:
 ```
 
 The fix adds atomic pause persistence before the service worker, bounded preflight/pause executor timeouts using runtime DB settings, active-lease guards for start and resume, an ASGI route/content-type test, and a real `DatabaseConnection` persisted-state assertion.
+
+## Fix Round 2
+
+RED command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\unit\interfaces\test_autopilot_full_resync.py
+```
+
+RED output: the direct-write regression raised `LookupError('novel_not_found')` because a collecting transaction was used for the read, and the route race test showed no HTTP 409/no worker guard when the marker changed after preflight.
+
+GREEN command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\unit\interfaces\test_autopilot_full_resync.py
+```
+
+GREEN output: `11 passed in 2.30s`.
+
+Regression output: `23 passed in 3.54s` across full-resync, canonical-status, and resume-persistence tests. `py_compile` and `git diff --check` also pass.
+
+The pause write now reads through `database.fetch_one`, performs a short CAS update under `sqlite_writes_bypass_queue()`, preserves a marker written by another `DatabaseConnection`, and returns HTTP 409 before creating the worker. The route no longer invokes the non-CAS manual-stop DB update for this entrypoint; shared pause state and the stop signal are still published.

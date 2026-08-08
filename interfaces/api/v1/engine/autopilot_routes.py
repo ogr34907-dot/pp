@@ -2013,25 +2013,34 @@ def _full_resync_marker_is_active(marker: str, *, now: Optional[float] = None) -
     return (time.time() if now is None else now) - started < 600.0
 
 
-def _persist_full_resync_pause_sync(novel_id: str) -> None:
+def _persist_full_resync_pause_sync(novel_id: str) -> str:
     """Atomically persist the legal pause state before claiming a run lease."""
     database = get_database(get_db_path())
+    current_row = database.fetch_one(
+        "SELECT id, autopilot_recovery_reason FROM novels WHERE id = ?", (novel_id,)
+    )
+    if current_row is None:
+        raise LookupError("novel_not_found")
+    current_marker = str(current_row.get("autopilot_recovery_reason") or "")
+    if _full_resync_marker_is_active(current_marker):
+        return "conflict"
     update = (
         "UPDATE novels SET autopilot_status = 'stopped', current_stage = 'paused_for_review', "
         "autopilot_recovery_reason = 'paused_for_review_preserved', updated_at = CURRENT_TIMESTAMP "
-        "WHERE id = ?"
+        "WHERE id = ? AND autopilot_recovery_reason = ?"
     )
-    if hasattr(database, "transaction"):
-        with database.transaction() as conn:
-            row = conn.execute("SELECT id FROM novels WHERE id = ?", (novel_id,)).fetchone()
-            if row is None:
-                raise LookupError("novel_not_found")
-            conn.execute(update, (novel_id,))
-    else:
-        if database.fetch_one("SELECT id FROM novels WHERE id = ?", (novel_id,)) is None:
-            raise LookupError("novel_not_found")
-        database.execute(update, (novel_id,))
-        database.commit()
+    from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
+
+    with sqlite_writes_bypass_queue():
+        if hasattr(database, "transaction"):
+            with database.transaction() as conn:
+                cursor = conn.execute(update, (novel_id, current_marker))
+                if cursor.rowcount != 1:
+                    return "conflict"
+        else:
+            database.execute(update, (novel_id, current_marker))
+            database.commit()
+    return "ok"
 
 
 async def _guard_active_full_resync(novel_id: str) -> None:
@@ -2100,24 +2109,29 @@ async def resync_all_canonical_aftermath(novel_id: str):
     if preflight_error == "unavailable":
         raise HTTPException(503, "规范记忆全章重同步暂不可用")
 
-    # Establish the legal durable pause before starting any asynchronous work.
+    # Publish the legal pause in shared state and stop signal without using the
+    # non-CAS manual-stop DB update; the durable write below owns the race.
     try:
-        await asyncio.wait_for(
-            _request_manual_stop(
-                novel_id,
-                recovery_reason="paused_for_review_preserved",
-                cleanup_transient=False,
-                message="规范记忆全章重同步已暂停自动驾驶",
-            ),
-            timeout=runtime_settings.db_persist_timeout_seconds,
+        from interfaces.runtime_state import update_shared_novel_state
+
+        update_shared_novel_state(
+            novel_id,
+            autopilot_status="stopped",
+            current_stage="paused_for_review",
+            autopilot_pause_reason="paused_for_review_preserved",
+            autopilot_recovery_reason="paused_for_review_preserved",
         )
-    except asyncio.TimeoutError as exc:
-        raise HTTPException(503, "数据库繁忙，无法暂停自动驾驶") from exc
     except Exception as exc:
-        raise HTTPException(503, f"无法暂停自动驾驶：{exc}") from exc
+        logger.debug("更新全章重同步共享暂停状态失败（可忽略）: %s", exc)
+    try:
+        from application.engine.services.novel_stop_signal import publish_stop_signal
+
+        publish_stop_signal(novel_id)
+    except Exception as exc:
+        logger.debug("发布全章重同步停止信号失败（可忽略）: %s", exc)
 
     try:
-        await asyncio.wait_for(
+        pause_result = await asyncio.wait_for(
             loop.run_in_executor(_SSE_THREAD_POOL, _persist_full_resync_pause_sync, novel_id),
             timeout=runtime_settings.db_persist_timeout_seconds,
         )
@@ -2125,6 +2139,8 @@ async def resync_all_canonical_aftermath(novel_id: str):
         raise HTTPException(503, "数据库繁忙，无法持久化暂停状态") from exc
     except Exception as exc:
         raise HTTPException(503, f"无法持久化暂停状态：{exc}") from exc
+    if pause_result == "conflict":
+        raise HTTPException(409, "该小说已有全章规范记忆重同步任务正在运行")
 
     import queue
 
