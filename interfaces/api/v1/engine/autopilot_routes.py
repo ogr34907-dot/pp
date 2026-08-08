@@ -1654,6 +1654,8 @@ async def start_autopilot(novel_id: str, body: StartRequest = StartRequest()):
     runtime_settings = get_autopilot_runtime_settings()
     loop = asyncio.get_running_loop()
 
+    await _guard_active_full_resync(novel_id)
+
     # ── 第一步：从共享内存快速校验小说是否存在（优先）──
     next_stage = None
     current_act = 0
@@ -2011,10 +2013,57 @@ def _full_resync_marker_is_active(marker: str, *, now: Optional[float] = None) -
     return (time.time() if now is None else now) - started < 600.0
 
 
+def _persist_full_resync_pause_sync(novel_id: str) -> None:
+    """Atomically persist the legal pause state before claiming a run lease."""
+    database = get_database(get_db_path())
+    update = (
+        "UPDATE novels SET autopilot_status = 'stopped', current_stage = 'paused_for_review', "
+        "autopilot_recovery_reason = 'paused_for_review_preserved', updated_at = CURRENT_TIMESTAMP "
+        "WHERE id = ?"
+    )
+    if hasattr(database, "transaction"):
+        with database.transaction() as conn:
+            row = conn.execute("SELECT id FROM novels WHERE id = ?", (novel_id,)).fetchone()
+            if row is None:
+                raise LookupError("novel_not_found")
+            conn.execute(update, (novel_id,))
+    else:
+        if database.fetch_one("SELECT id FROM novels WHERE id = ?", (novel_id,)) is None:
+            raise LookupError("novel_not_found")
+        database.execute(update, (novel_id,))
+        database.commit()
+
+
+async def _guard_active_full_resync(novel_id: str) -> None:
+    """Reject start/resume while another full-resync lease is active."""
+    runtime_settings = get_autopilot_runtime_settings()
+    loop = asyncio.get_running_loop()
+    def _read_marker_sync():
+        database = get_database(get_db_path())
+        row = database.fetch_one(
+            "SELECT id, autopilot_recovery_reason FROM novels WHERE id = ?",
+            (novel_id,),
+        )
+        return str((row or {}).get("autopilot_recovery_reason") or "") if row else None
+
+    try:
+        marker = await asyncio.wait_for(
+            loop.run_in_executor(_SSE_THREAD_POOL, _read_marker_sync),
+            timeout=runtime_settings.db_read_timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(503, "数据库繁忙，请稍后重试") from exc
+    except Exception as exc:
+        raise HTTPException(503, f"数据库不可用：{exc}") from exc
+    if marker is not None and _full_resync_marker_is_active(marker):
+        raise HTTPException(409, "该小说已有全章规范记忆重同步任务正在运行")
+
+
 @router.post("/{novel_id}/canonical-aftermath/resync-all")
 async def resync_all_canonical_aftermath(novel_id: str):
     """Stream an ordered full canonical-aftermath resynchronization run."""
     loop = asyncio.get_running_loop()
+    runtime_settings = get_autopilot_runtime_settings()
 
     def _preflight_sync():
         database = get_database(get_db_path())
@@ -2036,9 +2085,12 @@ async def resync_all_canonical_aftermath(novel_id: str):
         return database, pipeline, None
 
     try:
-        database, aftermath_pipeline, preflight_error = await loop.run_in_executor(
-            _SSE_THREAD_POOL, _preflight_sync
+        database, aftermath_pipeline, preflight_error = await asyncio.wait_for(
+            loop.run_in_executor(_SSE_THREAD_POOL, _preflight_sync),
+            timeout=runtime_settings.db_read_timeout_seconds,
         )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(503, "数据库繁忙，请稍后重试") from exc
     except Exception as exc:
         raise HTTPException(503, f"规范记忆全章重同步暂不可用：{exc}") from exc
     if preflight_error == "missing":
@@ -2050,14 +2102,29 @@ async def resync_all_canonical_aftermath(novel_id: str):
 
     # Establish the legal durable pause before starting any asynchronous work.
     try:
-        await _request_manual_stop(
-            novel_id,
-            recovery_reason="paused_for_review_preserved",
-            cleanup_transient=False,
-            message="规范记忆全章重同步已暂停自动驾驶",
+        await asyncio.wait_for(
+            _request_manual_stop(
+                novel_id,
+                recovery_reason="paused_for_review_preserved",
+                cleanup_transient=False,
+                message="规范记忆全章重同步已暂停自动驾驶",
+            ),
+            timeout=runtime_settings.db_persist_timeout_seconds,
         )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(503, "数据库繁忙，无法暂停自动驾驶") from exc
     except Exception as exc:
         raise HTTPException(503, f"无法暂停自动驾驶：{exc}") from exc
+
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(_SSE_THREAD_POOL, _persist_full_resync_pause_sync, novel_id),
+            timeout=runtime_settings.db_persist_timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(503, "数据库繁忙，无法持久化暂停状态") from exc
+    except Exception as exc:
+        raise HTTPException(503, f"无法持久化暂停状态：{exc}") from exc
 
     import queue
 
@@ -2161,6 +2228,7 @@ async def resume_from_review(novel_id: str):
     """
     runtime_settings = get_autopilot_runtime_settings()
     loop = asyncio.get_running_loop()
+    await _guard_active_full_resync(novel_id)
 
     # ── 第一步：从共享内存校验当前状态 ──
     current_act = 0

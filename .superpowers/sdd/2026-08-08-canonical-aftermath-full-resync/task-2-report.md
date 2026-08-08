@@ -48,3 +48,29 @@ Implementation commit SHA: `082f9a05`.
 
 - The worker thread remains responsible for finishing a started service run after an SSE client disconnects; the endpoint does not clear the durable marker or resume the novel on cancellation.
 - A race after preflight can still produce a service-level conflict; that outcome is represented as a terminal SSE failure event because HTTP headers have already been sent.
+
+## Fix Round 1
+
+RED command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\unit\interfaces\test_autopilot_full_resync.py
+```
+
+RED output: 2 new tests failed as expected. The route started the worker without a persisted `paused_for_review` stage, and `resume_from_review`/`start_autopilot` did not reject an active full-resync marker.
+
+GREEN command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\unit\interfaces\test_autopilot_full_resync.py
+```
+
+GREEN output: `8 passed in 1.64s` (one existing Starlette/httpx deprecation warning from the TestClient dependency).
+
+Regression output:
+
+```text
+20 passed in 2.67s
+```
+
+The fix adds atomic pause persistence before the service worker, bounded preflight/pause executor timeouts using runtime DB settings, active-lease guards for start and resume, an ASGI route/content-type test, and a real `DatabaseConnection` persisted-state assertion.
