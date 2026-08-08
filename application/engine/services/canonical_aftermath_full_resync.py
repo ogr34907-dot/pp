@@ -94,7 +94,7 @@ async def resync_all_completed_chapters(
             ready = revision > 0 and str(raw.get("content_sha256") or "") == digest and commit_repository.is_current_version_ready(
                 novel_id=novel_id, chapter_number=int(raw["number"]),
                 pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION, require_memory_sync=True)
-            commit = database.fetch_one("SELECT vector_status FROM chapter_narrative_commits WHERE novel_id=? AND chapter_number=? AND content_sha256=? AND content_revision=?", (novel_id, int(raw["number"]), digest, revision))
+            commit = database.fetch_one("SELECT vector_status FROM chapter_narrative_commits WHERE novel_id=? AND chapter_number=? AND content_sha256=? AND content_revision=? AND pipeline_version=?", (novel_id, int(raw["number"]), digest, revision, CHAPTER_NARRATIVE_PIPELINE_VERSION))
             if not ready or str((commit or {}).get("vector_status") or "not_started") != "stored":
                 pending += 1
         result.remains_paused = True
@@ -184,8 +184,8 @@ async def resync_all_completed_chapters(
             )
             latest = database.fetch_one(
                 "SELECT vector_status FROM chapter_narrative_commits WHERE novel_id = ? AND chapter_number = ? "
-                "AND content_sha256 = ? AND content_revision = ?",
-                (novel_id, number, expected_hash, revision),
+                "AND content_sha256 = ? AND content_revision = ? AND pipeline_version = ?",
+                (novel_id, number, expected_hash, revision, CHAPTER_NARRATIVE_PIPELINE_VERSION),
             )
             latest_vector = str((latest or {}).get("vector_status") or "not_started")
             if not isinstance(outcome, dict):
@@ -250,7 +250,7 @@ def _fail(result: FullResyncResult, chapter: int, reason: str) -> FullResyncResu
 
 
 async def _pause(database: Any, novel_id: str) -> None:
-    database.execute("UPDATE novels SET current_stage='paused_for_review', autopilot_status='paused' WHERE id=?", (novel_id,))
+    database.execute("UPDATE novels SET current_stage='paused_for_review', autopilot_status='stopped' WHERE id=?", (novel_id,))
     database.commit()
 
 

@@ -100,7 +100,7 @@ class SqliteChapterNarrativeCommitRepository:
                     return False
                 cursor = conn.execute(
                     "UPDATE novels SET autopilot_recovery_reason = ?, "
-                    "current_stage = 'paused_for_review', autopilot_status = 'paused', "
+                    "current_stage = 'paused_for_review', autopilot_status = 'stopped', "
                     "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND autopilot_recovery_reason = ?",
                     (marker, novel_id, current),
                 )
@@ -121,7 +121,7 @@ class SqliteChapterNarrativeCommitRepository:
                 marker = f"{current}|{status}:{reason[:240]}"
                 cursor = conn.execute(
                     "UPDATE novels SET autopilot_recovery_reason = ?, current_stage='paused_for_review', "
-                    "autopilot_status='paused', updated_at=CURRENT_TIMESTAMP WHERE id=? AND autopilot_recovery_reason=?",
+                    "autopilot_status='stopped', updated_at=CURRENT_TIMESTAMP WHERE id=? AND autopilot_recovery_reason=?",
                     (marker, novel_id, current),
                 )
                 return cursor.rowcount == 1

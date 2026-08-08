@@ -86,6 +86,8 @@ async def test_order_skip_sync_stop_and_pause(tmp_path):
     assert result.failed_chapter == 3
     assert result.failure_reason == "API returned empty content"
     assert result.remains_paused is True
+    novel_state = db.fetch_one("SELECT autopilot_status, current_stage FROM novels WHERE id='novel-1'")
+    assert novel_state == {"autopilot_status": "stopped", "current_stage": "paused_for_review"}
     assert pipeline.calls == [(2, values[2][2], values[2][1]), (3, values[3][2], values[3][1])]
     assert result.skipped_count == 1
     assert result.synced_count == 1

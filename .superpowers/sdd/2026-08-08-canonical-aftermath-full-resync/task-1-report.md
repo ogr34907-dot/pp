@@ -73,3 +73,19 @@ Regression command and output: the canonical history/idempotency/auto-recovery c
 Fix commit: `d169a7e92d061a696fa505ca2e10d67f72326388`.
 
 Post-review hardening additionally treats an explicitly missing `_memory_engine` dependency as `unavailable`, marks the result paused immediately after a successful durable claim, and emits a diagnostic failure event for unexpected infrastructure exceptions. Focused verification remains `7 passed in 1.62s`; latest fix commit follows in Git history.
+
+## Scoped Fix Round 2
+
+RED added a pause-state assertion and exposed `autopilot_status='paused'`, which is not a legal existing runtime value. The service and lease helpers now persist `autopilot_status='stopped'` with `current_stage='paused_for_review'`. Both preflight and post-pipeline vector reads are constrained by the canonical `pipeline_version`.
+
+RED command: focused single pause test failed with persisted `autopilot_status='paused'` instead of `stopped`.
+
+GREEN command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\unit\engine\test_canonical_aftermath_full_resync.py
+```
+
+GREEN output: `7 passed in 1.63s`.
+
+Regression output: canonical history/idempotency/auto-recovery suite `48 passed in 48.77s`.
