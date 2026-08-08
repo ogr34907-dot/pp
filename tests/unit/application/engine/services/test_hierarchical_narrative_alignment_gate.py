@@ -1,4 +1,6 @@
 from unittest.mock import AsyncMock
+import json
+import math
 
 import pytest
 
@@ -129,3 +131,106 @@ def test_override_requires_reason_and_exact_digest(chain):
     )
     assert overridden.decision == "pass"
     assert overridden.overridden is True
+
+
+def test_repair_plan_is_derived_from_violations(chain):
+    snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain)
+    report = HierarchicalNarrativeAlignmentGate().check(
+        snapshot, candidate() | {"serves_volume_commitments": ["无关目标"]}
+    )
+
+    assert report.repair_plan
+    assert any("具体服务动作" in repair for repair in report.repair_plan)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [{"decision": "wat"}, {"decision": "pass", "confidence": "bad"}, {"decision": "pass", "confidence": math.nan}])
+async def test_malformed_or_unknown_llm_result_requires_review(chain, result):
+    snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain)
+    gate = HierarchicalNarrativeAlignmentGate(llm_evaluator=AsyncMock(return_value=result))
+
+    report = await gate.evaluate(snapshot, candidate())
+
+    assert report.decision == "review"
+
+
+def test_sync_vector_retriever_is_invoked_when_evidence_absent(chain):
+    calls = []
+
+    def retriever(*args):
+        calls.append(args)
+        return [{"id": "memory-1"}]
+
+    snapshot = HierarchicalNarrativeAlignmentGate(vector_retriever=retriever).build_snapshot("chapter-1", chain)
+
+    assert calls
+    assert snapshot.vector_evidence == ({"id": "memory-1"},)
+    assert snapshot.evidence_degraded is False
+
+
+@pytest.mark.asyncio
+async def test_async_vector_retriever_is_awaited_during_evaluation(chain):
+    calls = []
+
+    async def retriever(*args):
+        calls.append(args)
+        return [{"id": "memory-async"}]
+
+    gate = HierarchicalNarrativeAlignmentGate(vector_retriever=retriever)
+    snapshot = gate.build_snapshot("chapter-1", chain)
+
+    report = await gate.evaluate(snapshot, candidate())
+
+    assert report.decision == "pass"
+    assert calls
+
+
+def test_unknown_candidate_reference_blocks_even_without_known_references(chain):
+    chain[-1].metadata = {"contract_digest": "chapter-d"}
+    snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain)
+
+    report = HierarchicalNarrativeAlignmentGate().check(snapshot, candidate() | {"references": ["new-place"]})
+
+    assert report.decision == "block"
+    assert any(v.actual == "new-place" for v in report.violations)
+
+
+def test_snapshot_and_report_serialization_accept_arbitrary_values(chain):
+    class Odd:
+        def __str__(self):
+            return "odd-value"
+
+    odd = Odd()
+    cycle = []
+    cycle.append(cycle)
+    chain[-1].metadata = {"contract_digest": "chapter-d", "arbitrary": odd, "cycle": cycle}
+    snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain, memory_state={"odd": odd})
+    report = HierarchicalNarrativeAlignmentGate().check(snapshot, candidate())
+
+    json.dumps(snapshot.to_dict(), ensure_ascii=False)
+    json.dumps(report.to_dict(), ensure_ascii=False)
+
+
+def test_snapshot_preserves_story_node_planning_and_chapter_fields(chain):
+    chapter = chain[-1]
+    chapter.planning_status = "confirmed"
+    chapter.planning_source = "ai_act"
+    chapter.status = "ready"
+    chapter.chapter_count = 3
+    chapter.pov_character_id = "hero"
+    snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain)
+
+    record = snapshot.ancestry["chapter"]
+    assert record["planning_status"] == "confirmed"
+    assert record["planning_source"] == "ai_act"
+    assert record["status"] == "ready"
+    assert record["chapter_count"] == 3
+    assert record["pov_character_id"] == "hero"
+
+
+def test_cross_novel_ancestor_is_blocking(chain):
+    chain[2].novel_id = "other-novel"
+    snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain)
+
+    assert any(v.scope == "act" and v.actual == "other-novel" for v in snapshot.structural_violations)
+    assert snapshot.ancestry["act"] is None

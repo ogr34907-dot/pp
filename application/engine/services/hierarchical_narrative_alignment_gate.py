@@ -10,8 +10,56 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import asyncio
+import math
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
+
+
+def _json_safe(value: Any, _seen: Optional[set[int]] = None) -> Any:
+    """Convert arbitrary application values into JSON-compatible values."""
+    seen = _seen if _seen is not None else set()
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in seen:
+            return "<cycle>"
+        seen.add(marker)
+        try:
+            return {str(_json_safe(key, seen)): _json_safe(item, seen) for key, item in value.items()}
+        finally:
+            seen.discard(marker)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        marker = id(value)
+        if marker in seen:
+            return "<cycle>"
+        seen.add(marker)
+        try:
+            return [_json_safe(item, seen) for item in value]
+        finally:
+            seen.discard(marker)
+    if hasattr(value, "value") and not isinstance(value, type):
+        return _json_safe(getattr(value, "value"), seen)
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    marker = id(value)
+    if marker in seen:
+        return "<cycle>"
+    seen.add(marker)
+    try:
+        if hasattr(value, "__dict__"):
+            return {str(key): _json_safe(item, seen) for key, item in vars(value).items()}
+        return str(value)
+    finally:
+        seen.discard(marker)
 
 
 @dataclass(frozen=True)
@@ -53,7 +101,7 @@ class HierarchySnapshot:
     structural_violations: tuple[AlignmentViolation, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return _json_safe({
             "novel_id": self.novel_id,
             "chapter_id": self.chapter_id,
             "chapter_number": self.chapter_number,
@@ -63,9 +111,10 @@ class HierarchySnapshot:
             },
             "digest": self.digest,
             "memory_state": dict(self.memory_state),
-            "vector_evidence": [dict(item) for item in self.vector_evidence],
+            "vector_evidence": list(self.vector_evidence),
             "evidence_degraded": self.evidence_degraded,
-        }
+            "structural_violations": [asdict(item) for item in self.structural_violations],
+        })
 
 
 @dataclass(frozen=True)
@@ -84,10 +133,7 @@ class AlignmentReport:
     override_reason: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        data["violations"] = [asdict(item) for item in self.violations]
-        data["character_agency"] = [asdict(item) for item in self.character_agency]
-        return data
+        return _json_safe(asdict(self))
 
 
 class HierarchicalNarrativeAlignmentGate:
@@ -142,9 +188,22 @@ class HierarchicalNarrativeAlignmentGate:
             "number": cls._node_value(node, "number"),
             "title": cls._node_value(node, "title", ""),
             "parent_id": cls._node_value(node, "parent_id"),
+            "order_index": cls._node_value(node, "order_index"),
+            "planning_status": getattr(cls._node_value(node, "planning_status", "draft"), "value", cls._node_value(node, "planning_status", "draft")),
+            "planning_source": getattr(cls._node_value(node, "planning_source", "manual"), "value", cls._node_value(node, "planning_source", "manual")),
             "chapter_start": cls._node_value(node, "chapter_start"),
             "chapter_end": cls._node_value(node, "chapter_end"),
+            "chapter_count": cls._node_value(node, "chapter_count", 0),
+            "suggested_chapter_count": cls._node_value(node, "suggested_chapter_count"),
             "description": cls._node_value(node, "description") or summary,
+            "content": cls._node_value(node, "content"),
+            "word_count": cls._node_value(node, "word_count", 0),
+            "status": cls._node_value(node, "status", "draft"),
+            "pov_character_id": cls._node_value(node, "pov_character_id"),
+            "timeline_start": cls._node_value(node, "timeline_start"),
+            "timeline_end": cls._node_value(node, "timeline_end"),
+            "created_at": cls._node_value(node, "created_at"),
+            "updated_at": cls._node_value(node, "updated_at"),
             "themes": cls._node_value(node, "themes", None) or metadata.get("themes", []),
             "key_events": cls._node_value(node, "key_events", None) or metadata.get("key_events", []),
             "narrative_arc": cls._node_value(node, "narrative_arc", None) or metadata.get("narrative_arc", ""),
@@ -166,6 +225,52 @@ class HierarchicalNarrativeAlignmentGate:
                 record[key] = value
         return record
 
+    @staticmethod
+    def _repair_plan(violations: Iterable[AlignmentViolation]) -> tuple[str, ...]:
+        repairs: list[str] = []
+        for violation in violations:
+            repair = str(violation.repair or f"{violation.scope}: satisfy {violation.expected}")
+            if repair and repair not in repairs:
+                repairs.append(repair)
+        return tuple(repairs)
+
+    @classmethod
+    def _report(cls, *, violations: Iterable[AlignmentViolation], **kwargs: Any) -> AlignmentReport:
+        violations_tuple = tuple(violations)
+        kwargs.setdefault("repair_plan", cls._repair_plan(violations_tuple))
+        return AlignmentReport(violations=violations_tuple, **kwargs)
+
+    def _retrieve_vectors(self, novel_id: str, chapter_id: str) -> tuple[list[Any], bool]:
+        retriever = self.vector_retriever
+        if retriever is None:
+            return [], False
+        operation = retriever
+        for name in ("retrieve", "search", "get_evidence"):
+            if hasattr(retriever, name):
+                operation = getattr(retriever, name)
+                break
+        if inspect.iscoroutinefunction(operation):
+            return [{"degraded": True, "error": "async vector retriever requires async evaluation"}], True
+        try:
+            try:
+                result = operation(novel_id, chapter_id)
+            except TypeError:
+                result = operation(chapter_id)
+            if inspect.isawaitable(result):
+                try:
+                    result = asyncio.run(result)
+                except RuntimeError:
+                    if hasattr(result, "close"):
+                        result.close()
+                    return [{"degraded": True, "error": "async vector retriever requires async evaluation"}], True
+            if isinstance(result, Mapping):
+                degraded = bool(result.get("degraded") or result.get("error"))
+                result = result.get("items") or result.get("evidence") or []
+                return list(result), degraded
+            return list(result or []), False
+        except Exception as exc:
+            return [{"degraded": True, "error": str(exc)}], True
+
     def build_snapshot(
         self,
         chapter_id: str,
@@ -184,9 +289,23 @@ class HierarchicalNarrativeAlignmentGate:
 
         ancestry: dict[str, Optional[Mapping[str, Any]]] = {name: None for name in self._EXPECTED}
         current: Optional[Mapping[str, Any]] = chapter
+        chapter_novel_id = str(chapter.get("novel_id") or novel_id or "")
         expected_parent = {"chapter": "act", "act": "volume", "volume": "part"}
         for level in self._EXPECTED:
             if current is None:
+                break
+            current_novel_id = str(current.get("novel_id") or "")
+            if chapter_novel_id and current_novel_id and current_novel_id != chapter_novel_id:
+                structural.append(
+                    AlignmentViolation(
+                        level,
+                        "blocking",
+                        f"novel {chapter_novel_id}",
+                        current_novel_id,
+                        (str(current.get("id", "")),),
+                        "将祖先节点限制在当前小说内",
+                    )
+                )
                 break
             current_type = str(current.get("node_type", ""))
             if current_type != level:
@@ -226,19 +345,19 @@ class HierarchicalNarrativeAlignmentGate:
             degraded = bool(vector_evidence.get("degraded") or vector_evidence.get("error"))
             vectors = (vector_evidence.get("items") or vector_evidence.get("evidence") or [])
         elif vector_evidence is None:
-            vectors = []
+            vectors, degraded = self._retrieve_vectors(novel_id or str(chapter.get("novel_id") or ""), str(chapter_id))
         else:
             vectors = list(vector_evidence)
         try:
-            serial = {"novel_id": novel, "chapter_id": chapter_id, "ancestry": ancestry}
-            digest = hashlib.sha256(json.dumps(serial, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+            serial = _json_safe({"novel_id": novel, "chapter_id": chapter_id, "ancestry": ancestry})
+            digest = hashlib.sha256(json.dumps(serial, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         except Exception:
             digest = hashlib.sha256(str(serial).encode()).hexdigest()
         return HierarchySnapshot(novel, str(chapter_id), chapter_number, ancestry, digest, mem, tuple(vectors), degraded, tuple(structural))
 
     @staticmethod
     def _candidate_digest(candidate: Mapping[str, Any]) -> str:
-        payload = json.dumps(candidate, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+        payload = json.dumps(_json_safe(candidate), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -286,10 +405,10 @@ class HierarchicalNarrativeAlignmentGate:
                 meta = ancestor.get("metadata", {})
                 for key in ("known_references", "key_characters", "key_locations", "storylines"):
                     known.update(map(str, self._as_list(meta.get(key))))
-        if known:
+        if references:
             for ref in references:
                 if str(ref) not in known:
-                    violations.append(AlignmentViolation("chapter", "blocking", "known candidate reference", str(ref), (snapshot.chapter_id,)))
+                    violations.append(AlignmentViolation("chapter", "blocking", "known candidate reference", str(ref), (snapshot.chapter_id,), "将候选引用绑定到已知角色、地点或故事线"))
 
         active = self._as_list((snapshot.ancestry.get("chapter") or {}).get("metadata", {}).get("key_characters"))
         agency_input = self._as_list(candidate.get("character_agency"))
@@ -309,9 +428,18 @@ class HierarchicalNarrativeAlignmentGate:
         decision = "block" if any(v.severity == "blocking" for v in violations) else "pass"
         if snapshot.evidence_degraded and decision == "pass":
             decision = "review"
-        return AlignmentReport(decision, 1.0 if decision == "pass" else 0.0, self._candidate_digest(candidate), snapshot.digest, tuple(served), tuple(missing), tuple(violations), tuple(agency), evidence_degraded=snapshot.evidence_degraded)
+        return self._report(violations=violations, decision=decision, confidence=1.0 if decision == "pass" else 0.0, candidate_digest=self._candidate_digest(candidate), snapshot_digest=snapshot.digest, served_commitments=tuple(served), missing_commitments=tuple(missing), character_agency=tuple(agency), evidence_degraded=snapshot.evidence_degraded)
 
     async def evaluate(self, snapshot: HierarchySnapshot, candidate: Mapping[str, Any]) -> AlignmentReport:
+        retry_async_vectors = any(
+            isinstance(item, Mapping)
+            and item.get("error") == "async vector retriever requires async evaluation"
+            for item in snapshot.vector_evidence
+        )
+        if (not snapshot.vector_evidence or retry_async_vectors) and self.vector_retriever is not None:
+            vectors, degraded = await self._retrieve_vectors_async(snapshot.novel_id, snapshot.chapter_id)
+            evidence_degraded = degraded if retry_async_vectors else snapshot.evidence_degraded or degraded
+            snapshot = replace(snapshot, vector_evidence=tuple(vectors), evidence_degraded=evidence_degraded)
         report = self.check(snapshot, candidate)
         if report.decision == "block" or self.llm_evaluator is None:
             return report
@@ -321,14 +449,44 @@ class HierarchicalNarrativeAlignmentGate:
                 result = await result
         except Exception as exc:
             violation = AlignmentViolation("chapter", "warning", "LLM alignment evidence", str(exc), (snapshot.chapter_id,))
-            return replace(report, decision="review", confidence=0.0, violations=report.violations + (violation,))
+            violations = report.violations + (violation,)
+            return replace(report, decision="review", confidence=0.0, violations=violations, repair_plan=self._repair_plan(violations))
         if not isinstance(result, Mapping):
             return replace(report, decision="review", confidence=0.0)
-        llm_decision = str(result.get("decision", "review")).lower()
-        confidence = float(result.get("confidence", 0.0) or 0.0)
+        llm_decision = str(result.get("decision", "review")).lower().strip()
+        try:
+            confidence = float(result.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if not math.isfinite(confidence):
+            confidence = 0.0
+        if llm_decision not in {"pass", "review", "block"}:
+            return replace(report, decision="review", confidence=confidence)
         if llm_decision in {"block", "review"} or confidence < self.min_confidence:
             return replace(report, decision="review" if llm_decision != "block" else "block", confidence=confidence)
         return replace(report, confidence=confidence)
+
+    async def _retrieve_vectors_async(self, novel_id: str, chapter_id: str) -> tuple[list[Any], bool]:
+        retriever = self.vector_retriever
+        operation = retriever
+        for name in ("retrieve", "search", "get_evidence"):
+            if hasattr(retriever, name):
+                operation = getattr(retriever, name)
+                break
+        try:
+            try:
+                result = operation(novel_id, chapter_id)
+            except TypeError:
+                result = operation(chapter_id)
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, Mapping):
+                degraded = bool(result.get("degraded") or result.get("error"))
+                result = result.get("items") or result.get("evidence") or []
+                return list(result), degraded
+            return list(result or []), False
+        except Exception as exc:
+            return [{"degraded": True, "error": str(exc)}], True
 
     async def acheck(self, snapshot: HierarchySnapshot, candidate: Mapping[str, Any]) -> AlignmentReport:
         return await self.evaluate(snapshot, candidate)
