@@ -35,7 +35,7 @@ Result: 4 passed.
 
 ## Commit
 
-`f9eda690` (`feat: integrate hierarchy gate with act planning`)
+`26e6615f36ca70cb8be09e51a100fe467beb99bd` (`feat: integrate hierarchy gate with act planning`)
 
 ## Concerns
 
