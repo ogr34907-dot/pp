@@ -30,6 +30,37 @@ export interface CanonicalAftermathRetryResponse {
   [key: string]: unknown
 }
 
+export type CanonicalAftermathFullResyncEventType =
+  | 'started' | 'chapter' | 'vector' | 'failed' | 'completed' | 'cancelled'
+
+export interface CanonicalAftermathFullResyncEvent {
+  type: CanonicalAftermathFullResyncEventType
+  run_id?: string
+  chapter_number?: number
+  total?: number
+  processed?: number
+  synced?: number
+  skipped?: number
+  action?: string
+  status?: string
+  reason?: string
+  message?: string
+  remains_paused?: boolean
+  vector_failed?: number[]
+  [key: string]: unknown
+}
+
+export interface CanonicalAftermathFullResyncHandlers {
+  onEvent?: (event: CanonicalAftermathFullResyncEvent) => void
+  onStarted?: (event: CanonicalAftermathFullResyncEvent) => void
+  onChapter?: (event: CanonicalAftermathFullResyncEvent) => void
+  onVector?: (event: CanonicalAftermathFullResyncEvent) => void
+  onFailed?: (event: CanonicalAftermathFullResyncEvent) => void
+  onCompleted?: (event: CanonicalAftermathFullResyncEvent) => void
+  onCancelled?: (event: CanonicalAftermathFullResyncEvent) => void
+  signal?: AbortSignal
+}
+
 export interface AutopilotErrorRecord {
   message: string
   timestamp: string
@@ -105,6 +136,65 @@ export const autopilotApi = {
     return fetchJson<CanonicalAftermathRetryResponse>(apiRoutes.autopilot.canonicalAftermathRetry(novelId), {
       method: 'POST',
     })
+  },
+
+  async consumeCanonicalAftermathFullResync(
+    novelId: string,
+    handlers: CanonicalAftermathFullResyncHandlers = {},
+  ): Promise<void> {
+    const response = await fetch(fetchUrl(apiRoutes.autopilot.canonicalAftermathResyncAll(novelId)), {
+      method: 'POST',
+      headers: { Accept: 'text/event-stream', 'Cache-Control': 'no-cache' },
+      signal: handlers.signal,
+    })
+    if (!response.ok || !response.body) {
+      const text = await response.text().catch(() => '')
+      let body: unknown = text
+      try { body = text ? JSON.parse(text) : undefined } catch { /* preserve text body */ }
+      if (!response.ok) throw new HttpError(response, body)
+      return
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    const dispatch = (raw: string) => {
+      const dataLines: string[] = []
+      for (const line of raw.split(/\r?\n/)) {
+        if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^\s/, ''))
+      }
+      if (!dataLines.length) return false
+      let parsed: unknown
+      try { parsed = JSON.parse(dataLines.join('\n')) } catch { return false }
+      if (!parsed || typeof parsed !== 'object') return false
+      const event = parsed as CanonicalAftermathFullResyncEvent
+      const type = event.type
+      handlers.onEvent?.(event)
+      if (type === 'started') handlers.onStarted?.(event)
+      else if (type === 'chapter') handlers.onChapter?.(event)
+      else if (type === 'vector') handlers.onVector?.(event)
+      else if (type === 'failed') handlers.onFailed?.(event)
+      else if (type === 'completed') handlers.onCompleted?.(event)
+      else if (type === 'cancelled') handlers.onCancelled?.(event)
+      return type === 'completed' || type === 'failed' || type === 'cancelled'
+    }
+    try {
+      let terminal = false
+      while (!terminal) {
+        const chunk = await reader.read()
+        buffer += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done })
+        let match: RegExpMatchArray | null
+        while ((match = buffer.match(/^(.*?)(?:\r?\n){2}/s))) {
+          buffer = buffer.slice(match[0].length)
+          terminal = dispatch(match[1]) || terminal
+          if (terminal) break
+        }
+        if (chunk.done) break
+      }
+      if (!terminal && buffer.trim()) dispatch(buffer)
+    } finally {
+      reader.releaseLock()
+    }
   },
 
   logStreamUrl(novelId: string): string {

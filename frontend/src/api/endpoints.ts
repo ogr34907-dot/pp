@@ -64,6 +64,8 @@ export const apiRoutes = {
     resume: (novelId: string) => apiRootPath('autopilot', novelId, 'resume'),
     canonicalAftermathRetry: (novelId: string) =>
       apiRootPath('autopilot', novelId, 'canonical-aftermath', 'retry'),
+    canonicalAftermathResyncAll: (novelId: string) =>
+      apiRootPath('autopilot', novelId, 'canonical-aftermath', 'resync-all'),
     stream: (novelId: string, params?: QueryParams) =>
       withQuery(apiRootPath('autopilot', novelId, 'stream'), params),
     logStream: (novelId: string) => apiRootPath('autopilot', novelId, 'log-stream'),

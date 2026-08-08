@@ -210,9 +210,21 @@
           type="warning"
           size="small"
           :loading="toggling"
+          :disabled="fullResyncActive"
           @click="retryCanonicalAftermath"
         >
           {{ reviewGateActionLabel }}
+        </n-button>
+        <n-button
+          v-if="canStartFullResync && !fullResyncActive"
+          type="warning"
+          ghost
+          size="small"
+          :loading="toggling"
+          @click="startCanonicalAftermathFullResync"
+        >
+          <template #icon><n-icon size="14"><RefreshOutline /></n-icon></template>
+          全章重同步
         </n-button>
         <n-button
           v-else-if="canResumeReview && !canonicalAftermathFailure"
@@ -223,6 +235,40 @@
         >
           {{ reviewGateActionLabel }}
         </n-button>
+      </div>
+    </n-alert>
+
+    <n-alert
+      v-if="canonicalAftermathFailure && (fullResyncActive || fullResyncFirstFailureReason)"
+      :type="fullResyncFirstFailureReason ? 'error' : 'info'"
+      :show-icon="true"
+      class="ap-inline-alert"
+    >
+      <div class="full-resync-progress">
+        <div class="full-resync-progress__head">
+          <span v-if="fullResyncFirstFailureReason">
+            全章重同步首个失败：第 {{ fullResyncFailureChapter || '—' }} 章，{{ fullResyncFirstFailureReason }}
+          </span>
+          <span v-else>
+            全章重同步 · {{ fullResyncProcessed }} / {{ fullResyncTotal }}
+            <template v-if="fullResyncCurrentChapter"> · 当前第 {{ fullResyncCurrentChapter }} 章</template>
+          </span>
+          <strong>{{ fullResyncPercent }}%</strong>
+        </div>
+        <n-progress
+          type="line"
+          :percentage="fullResyncPercent"
+          :status="fullResyncFirstFailureReason ? 'error' : 'default'"
+          :show-indicator="false"
+          :height="7"
+          :border-radius="4"
+        />
+        <div class="full-resync-progress__stats">
+          <span>已处理 {{ fullResyncProcessed }}/{{ fullResyncTotal }}</span>
+          <span>已同步 {{ fullResyncSynced }}</span>
+          <span>已跳过 {{ fullResyncSkipped }}</span>
+          <span>向量失败 {{ fullResyncVectorFailed }}</span>
+        </div>
       </div>
     </n-alert>
 
@@ -244,13 +290,13 @@
 
     <!-- 操作按钮 -->
     <n-space justify="end" size="small">
-      <n-button v-if="canResumeReview && !canonicalAftermathFailure" type="warning" ghost size="small" :loading="toggling" @click="resume">
+      <n-button v-if="canResumeReview && !canonicalAftermathFailure" type="warning" ghost size="small" :loading="toggling" :disabled="fullResyncActive" @click="resume">
         再次确认 · 继续
       </n-button>
-      <n-button v-else-if="isManualPause" type="primary" size="small" :loading="toggling" @click="resume">
+      <n-button v-else-if="isManualPause" type="primary" size="small" :loading="toggling" :disabled="fullResyncActive" @click="resume">
         恢复
       </n-button>
-      <n-button v-if="!isRunning && !needsReview && !needsRecovery && !isManualPause" type="primary" size="small" :loading="toggling" @click="openStartModal">
+      <n-button v-if="!isRunning && !needsReview && !needsRecovery && !isManualPause" type="primary" size="small" :loading="toggling" :disabled="fullResyncActive" @click="openStartModal">
         🚀 启动全托管
       </n-button>
       <n-button v-if="isRunning && !needsReview" type="warning" ghost size="small" :loading="toggling" @click="pause">
@@ -362,7 +408,8 @@ import { useAIInvocationStore } from '../../stores/aiInvocationStore'
 import { featureFlags } from '../../config/features'
 import { runtimePerformance } from '../../config/performance'
 import { normalizeAutopilotStartConfig } from './autopilotStartConfig'
-import { getCanonicalAftermathPresentation } from './canonicalAftermathGate'
+import { createCanonicalAftermathFullResyncState, getCanonicalAftermathPresentation } from './canonicalAftermathGate'
+import { RefreshOutline } from '@vicons/ionicons5'
 
 const props = defineProps({
   novelId: String,
@@ -492,6 +539,10 @@ const reviewGateNeedsAIPanel = computed(() =>
 )
 const canonicalAftermathPresentation = computed(() => getCanonicalAftermathPresentation(status.value))
 const canonicalAftermathFailure = computed(() => canonicalAftermathPresentation.value.isFailure)
+const canStartFullResync = computed(() => (
+  canonicalAftermathFailure.value &&
+  ['stopped', 'paused'].includes(String(status.value?.autopilot_status || ''))
+))
 const showReviewGate = computed(() => needsReview.value || reviewGateNeedsAIPanel.value)
 const canResumeReview = computed(() => (
   needsReview.value &&
@@ -523,6 +574,20 @@ const reviewGateMessage = computed(() => {
   }
   return '请在侧栏核对刚生成的结构或审阅结果，核对无误后继续。'
 })
+const fullResyncState = createCanonicalAftermathFullResyncState()
+const fullResyncActive = fullResyncState.active
+const fullResyncProcessed = fullResyncState.processed
+const fullResyncTotal = fullResyncState.total
+const fullResyncSynced = fullResyncState.synced
+const fullResyncSkipped = fullResyncState.skipped
+const fullResyncVectorFailed = fullResyncState.vectorFailed
+const fullResyncCurrentChapter = fullResyncState.currentChapter
+const fullResyncFirstFailureReason = fullResyncState.firstFailureReason
+const fullResyncPercent = computed(() => fullResyncTotal.value > 0
+  ? Math.min(100, Math.round((fullResyncProcessed.value / fullResyncTotal.value) * 100))
+  : 0)
+const fullResyncFailureChapter = ref(null)
+let fullResyncCtrl = null
 const reviewGateActionLabel = computed(() => (
   canonicalAftermathFailure.value
     ? canonicalAftermathPresentation.value.actionLabel
@@ -1452,6 +1517,43 @@ async function retryCanonicalAftermath() {
   }
 }
 
+async function startCanonicalAftermathFullResync() {
+  if (isToggleThrottled() || !canonicalAftermathFailure.value || fullResyncActive.value) return
+  fullResyncState.reset()
+  fullResyncFailureChapter.value = null
+  fullResyncCtrl?.abort()
+  const controller = new AbortController()
+  fullResyncCtrl = controller
+  fullResyncActive.value = true
+  try {
+    await autopilotApi.consumeCanonicalAftermathFullResync(props.novelId, {
+      signal: controller.signal,
+      onStarted: event => fullResyncState.started(event),
+      onChapter: event => fullResyncState.chapter(event),
+      onVector: event => fullResyncState.vector(event),
+      onFailed: event => {
+        fullResyncFailureChapter.value = event.chapter_number ?? null
+        fullResyncState.failed(event)
+      },
+      onCompleted: event => {
+        fullResyncState.completed(event)
+        message.success('全章重同步已完成，仍保持暂停状态')
+        void fetchStatus()
+      },
+      onCancelled: event => fullResyncState.cancelled(event),
+    })
+  } catch (err) {
+    if (!(err instanceof Error && err.name === 'AbortError')) {
+      fullResyncState.failed({ type: 'failed', reason: getAutopilotErrorDetail(err) || '全章重同步请求失败' })
+      message.error(getAutopilotErrorDetail(err) || '全章重同步请求失败，请重试')
+    }
+    void fetchStatus()
+  } finally {
+    if (fullResyncCtrl === controller) fullResyncCtrl = null
+    if (fullResyncActive.value) fullResyncActive.value = false
+  }
+}
+
 async function retry() {
   if (isToggleThrottled() || !needsRecovery.value) return
   const prevStatus = status.value
@@ -1556,6 +1658,7 @@ onUnmounted(() => {
   }
   clearStatusPoll()
   stopChapterStream()
+  fullResyncCtrl?.abort()
 })
 </script>
 
@@ -2159,6 +2262,39 @@ onUnmounted(() => {
 
 .ap-review-alert .n-button {
   flex: 0 0 auto;
+}
+
+.full-resync-progress {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.full-resync-progress__head,
+.full-resync-progress__stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.full-resync-progress__head span {
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.full-resync-progress__head strong {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.full-resync-progress__stats {
+  justify-content: flex-start;
+  color: var(--app-text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .recovery-hint p { margin: 0 0 6px; line-height: 1.5; }
