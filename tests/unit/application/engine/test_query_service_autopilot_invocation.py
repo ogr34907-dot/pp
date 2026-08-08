@@ -2,6 +2,7 @@ import json
 
 from application.engine.services.query_service import QueryService
 from application.engine.services.shared_state_repository import NovelState, SharedStateRepository
+from infrastructure.persistence.database import connection as database_connection
 
 
 def test_query_service_exposes_configured_protection_limit_from_shared_state():
@@ -34,7 +35,14 @@ def test_query_service_exposes_configured_protection_limit_from_shared_state():
     assert status["max_auto_chapters"] == 1
 
 
-def test_query_service_exposes_canonical_failure_details_to_the_review_gate():
+def test_query_service_exposes_canonical_failure_details_to_the_review_gate_when_durable_state_is_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        database_connection,
+        "get_database",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
     repo = SharedStateRepository(shared_dict={})
     repo.set_novel_state(
         "novel-1",

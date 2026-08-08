@@ -210,7 +210,7 @@ def _merge_runtime_fields_from_raw(
             pass
     if raw.get("last_chapter_audit") is not None:
         payload["last_chapter_audit"] = raw.get("last_chapter_audit")
-    return _augment_review_fields(payload)
+    return payload
 
 
 @dataclass
@@ -546,11 +546,16 @@ class QueryService:
 
     def get_novel_status_dict(self, novel_id: str) -> Optional[Dict[str, Any]]:
         """获取小说状态（字典形式，含 planned_micro_beats 等运行时字段）"""
+        from application.engine.services.canonical_aftermath_recovery import (
+            reconcile_canonical_aftermath_status,
+        )
+
         response = self.get_novel_status(novel_id)
         if response is None:
             return None
         raw = self._shared.get_raw_state(novel_id)
-        return _merge_runtime_fields_from_raw(response.to_dict(), raw)
+        payload = _merge_runtime_fields_from_raw(response.to_dict(), raw)
+        return _augment_review_fields(reconcile_canonical_aftermath_status(payload))
 
     # ==================== 工作台上下文 ====================
 
