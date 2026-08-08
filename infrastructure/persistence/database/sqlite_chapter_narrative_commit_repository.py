@@ -88,7 +88,7 @@ class SqliteChapterNarrativeCommitRepository:
                         started = None
                     try:
                         if started is None:
-                            started = float(current.split(":")[-1].split("|", 1)[0])
+                            started = float(current.split("|", 1)[0].rsplit(":", 1)[-1])
                     except (TypeError, ValueError):
                         started = now.timestamp()
                     if started > now.timestamp() - max(1, int(lease_seconds)):
@@ -118,7 +118,7 @@ class SqliteChapterNarrativeCommitRepository:
                 current = str(row[0] or "") if row else ""
                 if not current.startswith(prefix):
                     return False
-                marker = f"{current.split('|', 1)[0]}|{status}:{reason[:240]}"
+                marker = f"{current}|{status}:{reason[:240]}"
                 cursor = conn.execute(
                     "UPDATE novels SET autopilot_recovery_reason = ?, current_stage='paused_for_review', "
                     "autopilot_status='paused', updated_at=CURRENT_TIMESTAMP WHERE id=? AND autopilot_recovery_reason=?",
@@ -126,11 +126,20 @@ class SqliteChapterNarrativeCommitRepository:
                 )
                 return cursor.rowcount == 1
 
-    def renew_full_resync(self, *, novel_id: str, run_id: str) -> bool:
+    def renew_full_resync(self, *, novel_id: str, run_id: str, chapter_number: int | None = None, processed_count: int | None = None, total_chapters: int | None = None) -> bool:
         """Refresh a run marker while retaining ownership."""
         prefix = f"canonical_aftermath_full_resync:{run_id}:"
         now = datetime.now(timezone.utc)
         marker = f"{prefix}{now.timestamp():.6f}"
+        progress = []
+        if chapter_number is not None:
+            progress.append(f"chapter={int(chapter_number)}")
+        if processed_count is not None:
+            progress.append(f"processed={int(processed_count)}")
+        if total_chapters is not None:
+            progress.append(f"total={int(total_chapters)}")
+        if progress:
+            marker += "|" + ";".join(progress)
         with sqlite_writes_bypass_queue():
             with self._db.transaction() as conn:
                 row = conn.execute(

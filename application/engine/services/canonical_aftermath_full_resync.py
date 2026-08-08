@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import inspect
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -28,7 +29,7 @@ class FullResyncResult:
     failed_chapter: int | None = None
     failure_reason: str = ""
     status: str = "completed"
-    remains_paused: bool = True
+    remains_paused: bool = False
 
 
 async def resync_all_completed_chapters(
@@ -79,11 +80,25 @@ async def resync_all_completed_chapters(
         if not claimed:
             result.status = "conflict"
             return result
+        pending = 0
+        for raw in rows:
+            content = str(raw.get("content") or "")
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            revision = int(raw.get("content_revision") or 0)
+            ready = revision > 0 and str(raw.get("content_sha256") or "") == digest and commit_repository.is_current_version_ready(
+                novel_id=novel_id, chapter_number=int(raw["number"]),
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION, require_memory_sync=True)
+            commit = database.fetch_one("SELECT vector_status FROM chapter_narrative_commits WHERE novel_id=? AND chapter_number=? AND content_sha256=? AND content_revision=?", (novel_id, int(raw["number"]), digest, revision))
+            if not ready or str((commit or {}).get("vector_status") or "not_started") != "stored":
+                pending += 1
+        result.remains_paused = True
         await _emit(emit, {"type": "started", "run_id": run_id, "total": result.total_chapters,
-                           "pending_chapters": result.total_chapters})
+                           "pending_chapters": pending})
 
+        current_number: int | None = None
         for raw in rows:
             number = int(raw["number"])
+            current_number = number
             content = str(raw.get("content") or "")
             expected_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
             stored_hash = str(raw.get("content_sha256") or "")
@@ -94,6 +109,7 @@ async def resync_all_completed_chapters(
                 await _emit_failure(emit, result)
                 break
 
+            commit_repository.renew_full_resync(novel_id=novel_id, run_id=run_id, chapter_number=number, processed_count=result.processed_count, total_chapters=result.total_chapters)
             await _pause(database, novel_id)
             ready = commit_repository.is_current_version_ready(
                 novel_id=novel_id,
@@ -112,7 +128,7 @@ async def resync_all_completed_chapters(
                 result.skipped_count += 1
                 result.processed_count += 1
                 await _emit_chapter(emit, result, number, "skipped")
-                commit_repository.renew_full_resync(novel_id=novel_id, run_id=run_id)
+                commit_repository.renew_full_resync(novel_id=novel_id, run_id=run_id, chapter_number=number, processed_count=result.processed_count, total_chapters=result.total_chapters)
                 continue
 
             if commit:
@@ -135,7 +151,14 @@ async def resync_all_completed_chapters(
                 )
             except asyncio.CancelledError:
                 result.status = "cancelled"
-                raise
+                result.failed_chapter = current_number
+                result.failure_reason = "cancelled"
+                try:
+                    commit_repository.mark_full_resync_failure(novel_id=novel_id, run_id=run_id, reason="cancelled", status="cancelled")
+                except Exception:
+                    pass
+                await _emit(emit, {"type": "cancelled", "run_id": run_id, "chapter_number": current_number, "processed": result.processed_count, "synced": result.synced_count, "skipped": result.skipped_count, "total": result.total_chapters})
+                return result
             except Exception as exc:
                 outcome = {"narrative_sync_ok": False, "failure_reason": str(exc)}
 
@@ -159,7 +182,14 @@ async def resync_all_completed_chapters(
                 (novel_id, number, expected_hash, revision),
             )
             latest_vector = str((latest or {}).get("vector_status") or "not_started")
-            if not bool(outcome.get("narrative_sync_ok")) or not ready_after:
+            if not isinstance(outcome, dict):
+                result.status = "unavailable"
+                result.failure_reason = "pipeline_invalid_result"
+                commit_repository.mark_full_resync_failure(novel_id=novel_id, run_id=run_id, reason=result.failure_reason, status="unavailable")
+                await _emit_failure(emit, result)
+                return result
+            vector_only = ready_after and latest_vector in {"failed", "not_started"}
+            if (not bool(outcome.get("narrative_sync_ok")) and not vector_only) or not ready_after:
                 reason = str(outcome.get("failure_reason") or "canonical_aftermath_not_ready")
                 result = _fail(result, number, reason)
                 commit_repository.mark_full_resync_failure(novel_id=novel_id, run_id=run_id, reason=result.failure_reason)
@@ -172,7 +202,7 @@ async def resync_all_completed_chapters(
                 await _emit(emit, {"type": "vector", "run_id": run_id, "chapter_number": number,
                                    "status": latest_vector, "processed": result.processed_count, "total": result.total_chapters})
             await _emit_chapter(emit, result, number, "synced")
-            commit_repository.renew_full_resync(novel_id=novel_id, run_id=run_id)
+            commit_repository.renew_full_resync(novel_id=novel_id, run_id=run_id, chapter_number=number, processed_count=result.processed_count, total_chapters=result.total_chapters)
 
         if result.status == "completed":
             commit_repository.finish_full_resync(novel_id=novel_id, run_id=run_id)
@@ -180,6 +210,22 @@ async def resync_all_completed_chapters(
                                "synced": result.synced_count, "skipped": result.skipped_count,
                                "vector_failed": result.vector_failed_chapters, "total": result.total_chapters,
                                "remains_paused": True})
+        return result
+    except asyncio.CancelledError:
+        result.status = "cancelled"
+        result.failure_reason = "cancelled"
+        try:
+            commit_repository.mark_full_resync_failure(novel_id=novel_id, run_id=run_id, reason="cancelled", status="cancelled")
+        except Exception:
+            pass
+        return result
+    except Exception as exc:
+        result.status = "unavailable"
+        result.failure_reason = str(exc) or "database_unavailable"
+        try:
+            commit_repository.mark_full_resync_failure(novel_id=novel_id, run_id=run_id, reason=result.failure_reason, status="unavailable")
+        except Exception:
+            pass
         return result
     finally:
         with _RUN_LOCK:
@@ -200,7 +246,9 @@ async def _pause(database: Any, novel_id: str) -> None:
 
 async def _emit(emit: Any, event: dict[str, Any]) -> None:
     if emit is not None:
-        await emit(event)
+        outcome = emit(event)
+        if inspect.isawaitable(outcome):
+            await outcome
 
 
 async def _emit_chapter(emit: Any, result: FullResyncResult, number: int, action: str) -> None:

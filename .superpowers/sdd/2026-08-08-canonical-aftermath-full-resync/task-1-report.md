@@ -46,4 +46,28 @@ Implementation commit SHA: `3a0bb5b5666c8533287942a728013a6ebcae8630`.
 ## Concerns
 
 - The durable marker uses the existing `novels.autopilot_recovery_reason` column, as required; failure markers remain diagnosable and are explicitly reclaimable by a later user-triggered run.
-- Cancellation leaves the active marker in place until its normal lease expiry, preventing an immediate concurrent duplicate and preserving pause state. An API/SSE adapter is outside Task 1.
+- Cancellation records a `|cancelled` marker and emits a cancellation event; the marker is immediately reclaimable by a later explicit run while preserving pause state. An API/SSE adapter is outside Task 1.
+
+## Fix Round 1
+
+Review-driven regressions were added for cancellation/restart, unavailable dependencies and invalid pipeline results, durable chapter/processed/total marker progress, event ordering and fields, vector-only retry, and cross-`DatabaseConnection` lease CAS.
+
+RED command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\unit\engine\test_canonical_aftermath_full_resync.py
+```
+
+RED output: 3 new tests failed as expected: cancellation propagated `CancelledError`, invalid pipeline output raised `AttributeError`, and synchronous event collection raised `TypeError`.
+
+GREEN command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\unit\engine\test_canonical_aftermath_full_resync.py
+```
+
+GREEN output: `7 passed in 1.47s`.
+
+Regression command and output: the canonical history/idempotency/auto-recovery command above completed with `48 passed in 48.32s`.
+
+Fix commit: `d169a7e92d061a696fa505ca2e10d67f72326388`.

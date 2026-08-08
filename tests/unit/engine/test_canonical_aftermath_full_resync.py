@@ -148,3 +148,88 @@ async def test_source_version_mutation_stops_without_stale_write(tmp_path):
     assert result.failed_chapter == 2
     assert result.failure_reason == "source_version_mismatch"
     assert db.fetch_one("SELECT 1 FROM chapter_narrative_commits WHERE chapter_number=2") is None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_marks_marker_and_can_resume_immediately(tmp_path):
+    from application.engine.services.canonical_aftermath_full_resync import resync_all_completed_chapters
+
+    db = DatabaseConnection(str(tmp_path / "cancel.db"))
+    values = _seed(db)
+    entered = asyncio.Event()
+
+    class Cancellable(FakePipeline):
+        async def run_after_chapter_saved(self, *args, **kwargs):
+            entered.set()
+            await asyncio.sleep(10)
+
+    task = asyncio.create_task(resync_all_completed_chapters(novel_id="novel-1", database=db, aftermath_pipeline=Cancellable(db, values)))
+    await entered.wait()
+    task.cancel()
+    cancelled = await task
+    assert cancelled.status == "cancelled"
+    marker = db.fetch_one("SELECT autopilot_recovery_reason FROM novels WHERE id='novel-1'")["autopilot_recovery_reason"]
+    assert "|cancelled" in marker
+
+    resumed = await resync_all_completed_chapters(novel_id="novel-1", database=db, aftermath_pipeline=FakePipeline(db, values))
+    assert resumed.status == "failed"  # chapter 3 remains the first hard failure
+
+
+@pytest.mark.asyncio
+async def test_unavailable_dependency_and_pipeline_shape_are_reported(tmp_path):
+    from application.engine.services.canonical_aftermath_full_resync import resync_all_completed_chapters
+
+    unavailable = await resync_all_completed_chapters(novel_id="novel-1", database=None, aftermath_pipeline=None)
+    assert unavailable.status == "unavailable"
+
+    db = DatabaseConnection(str(tmp_path / "unavailable.db"))
+    _seed(db)
+    class BrokenPipeline(FakePipeline):
+        async def run_after_chapter_saved(self, *args, **kwargs):
+            return None
+    result = await resync_all_completed_chapters(novel_id="novel-1", database=db, aftermath_pipeline=BrokenPipeline(db, {}))
+    assert result.status == "unavailable"
+    assert result.failure_reason == "pipeline_invalid_result"
+
+
+@pytest.mark.asyncio
+async def test_progress_and_event_fields_are_durable(tmp_path):
+    from application.engine.services.canonical_aftermath_full_resync import resync_all_completed_chapters
+
+    db = DatabaseConnection(str(tmp_path / "events.db"))
+    values = _seed(db)
+    events = []
+    class VectorFailure(FakePipeline):
+        async def run_after_chapter_saved(self, novel_id, chapter_number, content, **kwargs):
+            if chapter_number == 2:
+                self.db.execute("INSERT OR REPLACE INTO chapter_narrative_commits (novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status, attempt_count, vector_status, memory_status) VALUES (?, ?, ?, ?, ?, 'committed', 1, 'failed', 'committed')", (novel_id, chapter_number, kwargs['expected_content_sha256'], CHAPTER_NARRATIVE_PIPELINE_VERSION, kwargs['expected_content_revision']))
+                self.db.commit()
+                return {"narrative_sync_ok": True, "vector_stored": False}
+            return await super().run_after_chapter_saved(novel_id, chapter_number, content, **kwargs)
+    db.execute("INSERT INTO chapter_narrative_commits (novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status, attempt_count, vector_status, memory_status) VALUES ('novel-1', 2, ?, ?, ?, 'committed', 1, 'failed', 'committed')", (values[2][2], CHAPTER_NARRATIVE_PIPELINE_VERSION, values[2][1]))
+    db.execute("INSERT INTO chapter_summaries (id, knowledge_id, chapter_number, summary, source_content_sha256, source_content_revision, pipeline_version, sync_status, sync_attempts) VALUES ('summary-2', 'knowledge-1', 2, 'ready', ?, ?, ?, 'committed', 1)", (values[2][2], values[2][1], CHAPTER_NARRATIVE_PIPELINE_VERSION))
+    db.commit()
+    result = await resync_all_completed_chapters(novel_id="novel-1", database=db, aftermath_pipeline=VectorFailure(db, values), emit=events.append)
+    assert result.vector_failed_chapters == [2]
+    assert events[0]["type"] == "started"
+    assert events[0]["pending_chapters"] == 2
+    assert events[-1]["type"] == "failed"
+    assert {"processed", "synced", "skipped", "total"} <= events[1].keys()
+    marker = db.fetch_one("SELECT autopilot_recovery_reason FROM novels")["autopilot_recovery_reason"]
+    assert "chapter=3" in marker and "processed=2" in marker and "total=3" in marker
+
+
+def test_full_resync_marker_cas_across_database_connections(tmp_path):
+    from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import SqliteChapterNarrativeCommitRepository
+
+    path = str(tmp_path / "lease.db")
+    first = DatabaseConnection(path)
+    _seed(first)
+    second = DatabaseConnection(path)
+    repo_one = SqliteChapterNarrativeCommitRepository(first)
+    repo_two = SqliteChapterNarrativeCommitRepository(second)
+    assert repo_one.claim_full_resync(novel_id="novel-1", run_id="run-one")
+    assert not repo_two.claim_full_resync(novel_id="novel-1", run_id="run-two")
+    assert repo_two.renew_full_resync(novel_id="novel-1", run_id="run-one", chapter_number=2, processed_count=1, total_chapters=3)
+    marker = second.fetch_one("SELECT autopilot_recovery_reason FROM novels WHERE id='novel-1'")["autopilot_recovery_reason"]
+    assert "chapter=2" in marker and "processed=1" in marker and "total=3" in marker
