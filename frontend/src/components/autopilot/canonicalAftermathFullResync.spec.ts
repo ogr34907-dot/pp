@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  canOfferReviewResume,
   createCanonicalAftermathFullResyncState,
   shouldShowCanonicalAftermathFullResyncProgress,
 } from './canonicalAftermathGate'
@@ -31,6 +32,16 @@ describe('canonical aftermath full resync presentation state', () => {
     expect(shouldShowCanonicalAftermathFullResyncProgress(true, '')).toBe(true)
     expect(shouldShowCanonicalAftermathFullResyncProgress(false, '持久化向量失败')).toBe(true)
     expect(shouldShowCanonicalAftermathFullResyncProgress(false, '')).toBe(false)
+  })
+
+  it('withholds review resume controls while the local full-resync stream is active', () => {
+    const state = createCanonicalAftermathFullResyncState()
+    state.started({ type: 'started', total: 4, processed: 0 })
+
+    expect(canOfferReviewResume(true, state.active.value)).toBe(false)
+
+    state.completed({ type: 'completed', total: 4, processed: 4 })
+    expect(canOfferReviewResume(true, state.active.value)).toBe(true)
   })
 
   it('marks completion without requesting a resume', () => {

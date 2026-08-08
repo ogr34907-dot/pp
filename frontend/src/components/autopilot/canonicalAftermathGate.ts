@@ -89,6 +89,13 @@ export function shouldShowCanonicalAftermathFullResyncProgress(
   return active || Boolean(firstFailureReason)
 }
 
+export function canOfferReviewResume(
+  baselineCanResume: boolean,
+  fullResyncActive: boolean,
+): boolean {
+  return baselineCanResume && !fullResyncActive
+}
+
 export function getCanonicalAftermathPresentation(
   status: Record<string, any> | null | undefined,
 ): CanonicalAftermathPresentation {

@@ -227,7 +227,7 @@
           全章重同步
         </n-button>
         <n-button
-          v-else-if="canResumeReview && !canonicalAftermathFailure"
+          v-else-if="canResumeReview && !canonicalAftermathFailure && !fullResyncActive"
           type="warning"
           size="small"
           :loading="toggling"
@@ -290,13 +290,13 @@
 
     <!-- 操作按钮 -->
     <n-space justify="end" size="small">
-      <n-button v-if="canResumeReview && !canonicalAftermathFailure" type="warning" ghost size="small" :loading="toggling" :disabled="fullResyncActive" @click="resume">
+      <n-button v-if="canResumeReview && !canonicalAftermathFailure && !fullResyncActive" type="warning" ghost size="small" :loading="toggling" @click="resume">
         再次确认 · 继续
       </n-button>
-      <n-button v-else-if="isManualPause" type="primary" size="small" :loading="toggling" :disabled="fullResyncActive" @click="resume">
+      <n-button v-else-if="isManualPause && !fullResyncActive" type="primary" size="small" :loading="toggling" @click="resume">
         恢复
       </n-button>
-      <n-button v-if="!isRunning && !needsReview && !needsRecovery && !isManualPause" type="primary" size="small" :loading="toggling" :disabled="fullResyncActive" @click="openStartModal">
+      <n-button v-if="!isRunning && !needsReview && !needsRecovery && !isManualPause && !fullResyncActive" type="primary" size="small" :loading="toggling" @click="openStartModal">
         🚀 启动全托管
       </n-button>
       <n-button v-if="isRunning && !needsReview" type="warning" ghost size="small" :loading="toggling" @click="pause">
@@ -325,7 +325,7 @@
     </n-space>
 
     <!-- 启动配置弹窗 -->
-    <n-modal v-model:show="showStartModal" title="启动全托管" preset="dialog" positive-text="启动" @positive-click="start">
+    <n-modal v-model:show="showStartModal" title="启动全托管" preset="dialog" positive-text="启动" :positive-button-props="{ disabled: fullResyncActive }" @positive-click="start">
       <n-space vertical :size="12" style="width: 100%">
         <n-alert type="success" :show-icon="true" style="font-size: 12px">
           <strong>自动托管</strong>：守护进程已在后端自动启动，配置好参数后点击"启动"即可开始自动写作。
@@ -409,6 +409,7 @@ import { featureFlags } from '../../config/features'
 import { runtimePerformance } from '../../config/performance'
 import { normalizeAutopilotStartConfig } from './autopilotStartConfig'
 import {
+  canOfferReviewResume,
   createCanonicalAftermathFullResyncState,
   getCanonicalAftermathPresentation,
   shouldShowCanonicalAftermathFullResyncProgress,
@@ -512,6 +513,8 @@ let statusLastAbort = null
 /** 连续无法拉取 /status（网络拒绝/超时）时倍增轮询间隔 */
 const statusConnectivityFailures = ref(0)
 let lastStatusPollIntervalMs = -1
+const fullResyncState = createCanonicalAftermathFullResyncState()
+const fullResyncActive = fullResyncState.active
 
 // 计算属性
 const isRunning = computed(() => status.value?.autopilot_status === 'running')
@@ -545,14 +548,16 @@ const canonicalAftermathPresentation = computed(() => getCanonicalAftermathPrese
 const canonicalAftermathFailure = computed(() => canonicalAftermathPresentation.value.isFailure)
 const canStartFullResync = computed(() => (
   canonicalAftermathFailure.value &&
+  !fullResyncActive.value &&
   ['stopped', 'paused'].includes(String(status.value?.autopilot_status || ''))
 ))
 const showReviewGate = computed(() => needsReview.value || reviewGateNeedsAIPanel.value)
-const canResumeReview = computed(() => (
+const canResumeReview = computed(() => canOfferReviewResume(
   needsReview.value &&
-  !requiresAIReview.value &&
-  (!reviewGate.value || reviewGateStatus.value === 'ready') &&
-  reviewGate.value?.can_resume !== false
+    !requiresAIReview.value &&
+    (!reviewGate.value || reviewGateStatus.value === 'ready') &&
+    reviewGate.value?.can_resume !== false,
+  fullResyncActive.value,
 ))
 const reviewGateAlertType = computed(() => (
   reviewGateStatus.value === 'failed' ? 'error' : 'warning'
@@ -578,8 +583,6 @@ const reviewGateMessage = computed(() => {
   }
   return '请在侧栏核对刚生成的结构或审阅结果，核对无误后继续。'
 })
-const fullResyncState = createCanonicalAftermathFullResyncState()
-const fullResyncActive = fullResyncState.active
 const fullResyncProcessed = fullResyncState.processed
 const fullResyncTotal = fullResyncState.total
 const fullResyncSynced = fullResyncState.synced
@@ -1310,6 +1313,7 @@ watch(
 )
 
 function openStartModal() {
+  if (fullResyncActive.value) return
   const target = status.value?.target_chapters || 100
   const wpc = status.value?.target_words_per_chapter ?? 2500
   const autoApprove = status.value?.auto_approve_mode ?? false
@@ -1327,7 +1331,7 @@ function updateProtectionLimit() {
 }
 
 async function start() {
-  if (isToggleThrottled()) return
+  if (fullResyncActive.value || isToggleThrottled()) return
   toggling.value = true
   try {
     const normalizedStartConfig = normalizeAutopilotStartConfig(startConfig.value)
@@ -1467,7 +1471,7 @@ async function terminate() {
 }
 
 async function resume() {
-  if (isToggleThrottled()) return
+  if (fullResyncActive.value || isToggleThrottled()) return
   const resumeManualPause = isManualPause.value
   if (!canResumeReview.value && !resumeManualPause) {
     message.warning(reviewGateMessage.value || '当前还没有可确认的产物')
