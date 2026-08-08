@@ -4,6 +4,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from application.engine.services.canonical_aftermath_recovery import (
+    attempt_automatic_canonical_aftermath_recovery,
+)
 from domain.novel.entities.novel import Novel, NovelStage, AutopilotStatus
 
 from engine.runtime.act_planning_delegate import run_act_planning
@@ -112,6 +115,44 @@ async def process_novel(host: Any, novel: Novel) -> None:
                     completed_chapter,
                 )
             ):
+                if getattr(novel, "auto_approve_mode", False):
+                    recovery = await attempt_automatic_canonical_aftermath_recovery(
+                        novel_id=novel.novel_id.value,
+                        database=getattr(
+                            getattr(host, "chapter_repository", None),
+                            "db",
+                            None,
+                        ),
+                        aftermath_pipeline=getattr(host, "aftermath_pipeline", None),
+                    )
+                    if recovery.disposition in {"ready", "recovered"}:
+                        novel.current_stage = NovelStage.WRITING
+                        novel.autopilot_recovery_reason = ""
+                        host._update_shared_state(
+                            novel.novel_id.value,
+                            current_stage=NovelStage.WRITING.value,
+                            autopilot_pause_reason="",
+                            autopilot_recovery_reason="",
+                            canonical_aftermath_chapter_number=None,
+                            canonical_aftermath_failure_reason="",
+                        )
+                        host._save_novel_state(novel)
+                        logger.info(
+                            "[%s] 规范章后自动恢复成功，转回写作阶段应用待推进 CAS",
+                            novel.novel_id,
+                        )
+                        return
+                    if recovery.recovery_marker and recovery.disposition in {
+                        "failed",
+                        "exhausted",
+                    }:
+                        novel.autopilot_recovery_reason = recovery.recovery_marker
+                        host._update_shared_state(
+                            novel.novel_id.value,
+                            autopilot_recovery_reason=recovery.recovery_marker,
+                            canonical_aftermath_chapter_number=recovery.chapter_number,
+                            canonical_aftermath_failure_reason=recovery.failure_reason,
+                        )
                 novel.last_audit_narrative_ok = False
                 host._update_shared_state(
                     novel.novel_id.value,

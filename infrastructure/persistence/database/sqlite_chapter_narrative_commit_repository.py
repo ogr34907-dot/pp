@@ -11,6 +11,7 @@ from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
 
 
+MAX_NARRATIVE_SYNC_ATTEMPTS = 3
 MAX_MEMORY_SYNC_ATTEMPTS = 3
 # The daemon allows five minutes for the complete aftermath stage.  Keep the
 # lease longer so a live writer cannot be reclaimed by a concurrent process.
@@ -493,6 +494,147 @@ class SqliteChapterNarrativeCommitRepository:
                     ),
                 )
                 return True
+
+    def claim_bounded_automatic_recovery(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        pipeline_version: str,
+        content_revision: int,
+        expected_failure_reason: str,
+        recovery_marker: str,
+    ) -> str:
+        """Atomically consume one automatic recovery cycle for an exact version."""
+        if not recovery_marker:
+            raise ValueError("recovery_marker_required")
+
+        now = datetime.now(timezone.utc).isoformat()
+        allowed_reasons = {
+            "",
+            "canonical_aftermath_not_ready",
+            "paused_for_review_preserved",
+        }
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                source = conn.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (novel_id, chapter_number),
+                ).fetchone()
+                actual_sha256 = (
+                    hashlib.sha256((source[0] or "").encode("utf-8")).hexdigest()
+                    if source is not None
+                    else ""
+                )
+                if (
+                    source is None
+                    or actual_sha256 != content_sha256
+                    or (source[1] or "") != content_sha256
+                    or int(source[2] or 0) != int(content_revision)
+                ):
+                    return "source_version_mismatch"
+
+                novel = conn.execute(
+                    "SELECT autopilot_recovery_reason FROM novels WHERE id = ?",
+                    (novel_id,),
+                ).fetchone()
+                if novel is None:
+                    return "novel_not_found"
+                current_marker = str(novel[0] or "")
+                if current_marker == recovery_marker:
+                    return "exhausted"
+                if (
+                    current_marker not in allowed_reasons
+                    and not current_marker.startswith(
+                        "canonical_aftermath_auto_recovery:v1:"
+                    )
+                ):
+                    return "blocked"
+
+                claim = conn.execute(
+                    """
+                    SELECT status, attempt_count, failure_reason, updated_at
+                    FROM chapter_narrative_commits
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ?
+                    """,
+                    (
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                    ),
+                ).fetchone()
+                if claim is None:
+                    return "not_terminal"
+                if (
+                    str(claim[0] or "") != "failed"
+                    or int(claim[1] or 0) < MAX_NARRATIVE_SYNC_ATTEMPTS
+                    or str(claim[2] or "") != str(expected_failure_reason or "")
+                ):
+                    return "not_terminal"
+
+                claim_cursor = conn.execute(
+                    """
+                    UPDATE chapter_narrative_commits
+                    SET status = 'stale', updated_at = ?
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ? AND status = 'failed'
+                      AND attempt_count >= ? AND failure_reason = ?
+                      AND updated_at IS ?
+                    """,
+                    (
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                        MAX_NARRATIVE_SYNC_ATTEMPTS,
+                        str(expected_failure_reason or ""),
+                        claim[3],
+                    ),
+                )
+                if claim_cursor.rowcount != 1:
+                    return "conflict"
+
+                marker_cursor = conn.execute(
+                    """
+                    UPDATE novels
+                    SET autopilot_recovery_reason = ?, updated_at = ?
+                    WHERE id = ? AND autopilot_recovery_reason IS ?
+                    """,
+                    (recovery_marker, now, novel_id, novel[0]),
+                )
+                if marker_cursor.rowcount != 1:
+                    raise RuntimeError("automatic_recovery_marker_conflict")
+
+                conn.execute(
+                    """
+                    UPDATE chapter_summaries
+                    SET sync_status = 'stale', updated_at = ?
+                    WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?)
+                      AND chapter_number = ?
+                      AND source_content_sha256 = ?
+                      AND source_content_revision = ?
+                      AND pipeline_version = ?
+                      AND sync_status = 'failed'
+                    """,
+                    (
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        int(content_revision),
+                        pipeline_version,
+                    ),
+                )
+                return "claimed"
 
     def restore_terminal_failure(
         self,

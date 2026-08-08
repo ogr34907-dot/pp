@@ -1,8 +1,11 @@
 """Read the durable canonical aftermath state used by autopilot status."""
+import asyncio
 from dataclasses import dataclass
+import hashlib
 import logging
 from typing import Any, Dict, Optional
 
+from application.ai.llm_retry_policy import is_retryable_llm_error
 from application.world.services.chapter_narrative_sync import (
     CHAPTER_NARRATIVE_PIPELINE_VERSION,
 )
@@ -25,6 +28,254 @@ _MAX_CANONICAL_ATTEMPTS = 3
 class CanonicalAftermathStatus:
     chapter_number: Optional[int] = None
     failure_reason: str = ""
+
+
+@dataclass(frozen=True)
+class CanonicalAftermathRecoveryResult:
+    disposition: str
+    chapter_number: Optional[int] = None
+    content_sha256: str = ""
+    content_revision: int = 0
+    failure_reason: str = ""
+    recovery_marker: str = ""
+
+
+@dataclass(frozen=True)
+class _CanonicalRecoverySource:
+    chapter_number: int
+    content: str
+    content_sha256: str
+    content_revision: int
+    status: str
+    attempt_count: int
+    failure_reason: str
+
+
+def _automatic_recovery_marker(source: _CanonicalRecoverySource) -> str:
+    return (
+        "canonical_aftermath_auto_recovery:v1:"
+        f"{source.chapter_number}:{source.content_revision}:"
+        f"{source.content_sha256}:{CHAPTER_NARRATIVE_PIPELINE_VERSION}"
+    )
+
+
+def _latest_recovery_source(
+    novel_id: str,
+    *,
+    database: Any,
+) -> Optional[_CanonicalRecoverySource]:
+    row = database.fetch_one(
+        """
+        SELECT chapters.number, chapters.content, chapters.content_sha256,
+               chapters.content_revision, commits.status, commits.attempt_count,
+               commits.failure_reason
+        FROM chapters
+        LEFT JOIN chapter_narrative_commits AS commits
+          ON commits.novel_id = chapters.novel_id
+         AND commits.chapter_number = chapters.number
+         AND commits.content_sha256 = chapters.content_sha256
+         AND commits.content_revision = chapters.content_revision
+         AND commits.pipeline_version = ?
+        WHERE chapters.novel_id = ? AND chapters.status = 'completed'
+        ORDER BY chapters.number DESC
+        LIMIT 1
+        """,
+        (CHAPTER_NARRATIVE_PIPELINE_VERSION, novel_id),
+    )
+    if row is None:
+        return None
+
+    content = str(row["content"] or "")
+    content_sha256 = str(row["content_sha256"] or "")
+    actual_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    content_revision = int(row["content_revision"] or 0)
+    if not content.strip() or content_sha256 != actual_sha256 or content_revision < 1:
+        return _CanonicalRecoverySource(
+            chapter_number=int(row["number"]),
+            content=content,
+            content_sha256=content_sha256,
+            content_revision=content_revision,
+            status="source_version_mismatch",
+            attempt_count=0,
+            failure_reason="source_version_mismatch",
+        )
+    return _CanonicalRecoverySource(
+        chapter_number=int(row["number"]),
+        content=content,
+        content_sha256=content_sha256,
+        content_revision=content_revision,
+        status=str(row["status"] or ""),
+        attempt_count=int(row["attempt_count"] or 0),
+        failure_reason=str(row["failure_reason"] or ""),
+    )
+
+
+def _restore_terminal_failure_safely(
+    commits: SqliteChapterNarrativeCommitRepository,
+    *,
+    novel_id: str,
+    source: _CanonicalRecoverySource,
+    failure_reason: str,
+) -> None:
+    try:
+        commits.restore_terminal_failure(
+            novel_id=novel_id,
+            chapter_number=source.chapter_number,
+            content_sha256=source.content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision=source.content_revision,
+            failure_reason=failure_reason,
+        )
+    except Exception as exc:
+        logger.warning(
+            "恢复规范终态失败记录失败 novel=%s ch=%s: %s",
+            novel_id,
+            source.chapter_number,
+            exc,
+        )
+
+
+async def attempt_automatic_canonical_aftermath_recovery(
+    *,
+    novel_id: str,
+    database: Any,
+    aftermath_pipeline: Any,
+) -> CanonicalAftermathRecoveryResult:
+    """Run at most one extra three-attempt cycle for a transient exact version."""
+    if database is None or aftermath_pipeline is None:
+        return CanonicalAftermathRecoveryResult("unavailable")
+
+    try:
+        source = _latest_recovery_source(novel_id, database=database)
+    except Exception as exc:
+        logger.debug("读取自动规范恢复源失败 novel=%s: %s", novel_id, exc)
+        return CanonicalAftermathRecoveryResult(
+            "unavailable",
+            failure_reason=str(exc),
+        )
+    if source is None:
+        return CanonicalAftermathRecoveryResult("no_completed_chapter")
+
+    marker = _automatic_recovery_marker(source)
+    base = dict(
+        chapter_number=source.chapter_number,
+        content_sha256=source.content_sha256,
+        content_revision=source.content_revision,
+        failure_reason=source.failure_reason,
+        recovery_marker=marker,
+    )
+    commits = SqliteChapterNarrativeCommitRepository(database)
+    try:
+        already_ready = commits.is_current_version_ready(
+            novel_id=novel_id,
+            chapter_number=source.chapter_number,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            require_memory_sync=True,
+        )
+    except Exception as exc:
+        logger.debug("核验自动规范恢复状态失败 novel=%s: %s", novel_id, exc)
+        return CanonicalAftermathRecoveryResult(
+            "unavailable",
+            **{**base, "failure_reason": str(exc)},
+        )
+    if already_ready:
+        return CanonicalAftermathRecoveryResult("ready", **base)
+    if source.status != "failed" or source.attempt_count < _MAX_CANONICAL_ATTEMPTS:
+        return CanonicalAftermathRecoveryResult("not_terminal", **base)
+    if not is_retryable_llm_error(source.failure_reason):
+        return CanonicalAftermathRecoveryResult("not_retryable", **base)
+
+    try:
+        claim = commits.claim_bounded_automatic_recovery(
+            novel_id=novel_id,
+            chapter_number=source.chapter_number,
+            content_sha256=source.content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision=source.content_revision,
+            expected_failure_reason=source.failure_reason,
+            recovery_marker=marker,
+        )
+    except Exception as exc:
+        logger.warning("领取自动规范恢复失败 novel=%s ch=%s: %s", novel_id, source.chapter_number, exc)
+        return CanonicalAftermathRecoveryResult(
+            "conflict",
+            **{**base, "failure_reason": str(exc)},
+        )
+    if claim != "claimed":
+        disposition = "exhausted" if claim == "exhausted" else claim
+        return CanonicalAftermathRecoveryResult(disposition, **base)
+
+    try:
+        result = await aftermath_pipeline.run_after_chapter_saved(
+            novel_id,
+            source.chapter_number,
+            source.content,
+            expected_content_sha256=source.content_sha256,
+            expected_content_revision=source.content_revision,
+        )
+    except asyncio.CancelledError:
+        _restore_terminal_failure_safely(
+            commits,
+            novel_id=novel_id,
+            source=source,
+            failure_reason="canonical_aftermath_auto_recovery_cancelled",
+        )
+        raise
+    except Exception as exc:
+        failure_reason = f"canonical_aftermath_auto_recovery_failed:{exc}"
+        _restore_terminal_failure_safely(
+            commits,
+            novel_id=novel_id,
+            source=source,
+            failure_reason=failure_reason,
+        )
+        return CanonicalAftermathRecoveryResult(
+            "failed",
+            **{**base, "failure_reason": failure_reason},
+        )
+
+    try:
+        recovered = commits.is_current_version_ready(
+            novel_id=novel_id,
+            chapter_number=source.chapter_number,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            require_memory_sync=True,
+        )
+    except Exception as exc:
+        failure_reason = f"canonical_aftermath_auto_recovery_failed:{exc}"
+        _restore_terminal_failure_safely(
+            commits,
+            novel_id=novel_id,
+            source=source,
+            failure_reason=failure_reason,
+        )
+        return CanonicalAftermathRecoveryResult(
+            "failed",
+            **{**base, "failure_reason": failure_reason},
+        )
+    if recovered:
+        return CanonicalAftermathRecoveryResult(
+            "recovered",
+            **{**base, "failure_reason": ""},
+        )
+
+    failure_reason = "canonical_aftermath_auto_recovery_failed"
+    if isinstance(result, dict):
+        failure_reason = str(
+            result.get("failure_reason")
+            or result.get("memory_failure_reason")
+            or failure_reason
+        )
+    _restore_terminal_failure_safely(
+        commits,
+        novel_id=novel_id,
+        source=source,
+        failure_reason=failure_reason,
+    )
+    return CanonicalAftermathRecoveryResult(
+        "failed",
+        **{**base, "failure_reason": failure_reason},
+    )
 
 
 def resolve_canonical_aftermath_status(
