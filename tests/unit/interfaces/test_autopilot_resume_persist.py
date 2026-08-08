@@ -98,6 +98,44 @@ def test_manual_resume_blocks_terminal_canonical_failure(tmp_path, monkeypatch):
     )
 
 
+def test_manual_resume_blocks_committed_summary_with_failed_memory_sync(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "resume-memory.db"))
+    content = "completed prose"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    )
+    db.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, content, content_sha256, content_revision, status) "
+        "VALUES ('chapter-1', 'novel-1', 1, ?, ?, 1, 'completed')",
+        (content, content_sha256),
+    )
+    db.execute("INSERT INTO knowledge (id, novel_id) VALUES ('k1', 'novel-1')")
+    db.execute(
+        "INSERT INTO chapter_summaries "
+        "(id, knowledge_id, chapter_number, summary, source_content_sha256, "
+        "source_content_revision, pipeline_version, sync_status) "
+        "VALUES ('s1', 'k1', 1, 'summary', ?, 1, 'chapter-narrative-sync:v1', "
+        "'committed')",
+        (content_sha256,),
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status, memory_status) "
+        "VALUES ('novel-1', 1, ?, 'chapter-narrative-sync:v1', "
+        "1, 'committed', 'failed')",
+        (content_sha256,),
+    )
+    db.commit()
+
+    assert (
+        autopilot_routes._canonical_resume_block_reason("novel-1", db=db)
+        == "canonical_aftermath_not_ready"
+    )
+
+
 @pytest.mark.asyncio
 async def test_canonical_retry_route_preserves_resume_guard(monkeypatch):
     """Retry completion does not auto-resume; normal resume remains explicit."""

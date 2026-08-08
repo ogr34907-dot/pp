@@ -40,7 +40,22 @@ class _Db:
                 failure_reason TEXT NOT NULL DEFAULT '',
                 attempt_count INTEGER NOT NULL DEFAULT 1,
                 vector_status TEXT NOT NULL DEFAULT 'not_started',
+                memory_status TEXT NOT NULL DEFAULT 'not_required',
                 PRIMARY KEY (novel_id, chapter_number, content_sha256, pipeline_version)
+            );
+            CREATE TABLE knowledge (
+                id TEXT PRIMARY KEY,
+                novel_id TEXT NOT NULL
+            );
+            CREATE TABLE chapter_summaries (
+                id TEXT PRIMARY KEY,
+                knowledge_id TEXT NOT NULL,
+                chapter_number INTEGER NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                source_content_sha256 TEXT NOT NULL DEFAULT '',
+                source_content_revision INTEGER NOT NULL DEFAULT 0,
+                pipeline_version TEXT NOT NULL DEFAULT '',
+                sync_status TEXT NOT NULL DEFAULT 'legacy'
             );
             CREATE TABLE story_nodes (
                 id TEXT PRIMARY KEY,
@@ -192,6 +207,45 @@ def test_recovery_policy_preserves_terminal_canonical_failure_gate():
     assert decision.next_stage == "paused_for_review"
     assert decision.preserve_review_gate is True
     assert decision.clear_pending_invocation is False
+    assert decision.reason == "canonical_aftermath_not_ready"
+
+
+def test_recovery_policy_preserves_gate_when_memory_sync_failed():
+    db = _Db()
+    content = "completed prose"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO novels (id, current_stage, autopilot_status) "
+        "VALUES ('novel-1', 'paused_for_review', 'stopped')"
+    )
+    db.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, status, content, content_sha256, content_revision) "
+        "VALUES ('c1', 'novel-1', 1, 'completed', ?, ?, 1)",
+        (content, content_sha256),
+    )
+    db.execute("INSERT INTO knowledge (id, novel_id) VALUES ('k1', 'novel-1')")
+    db.execute(
+        "INSERT INTO chapter_summaries "
+        "(id, knowledge_id, chapter_number, summary, source_content_sha256, "
+        "source_content_revision, pipeline_version, sync_status) "
+        "VALUES ('s1', 'k1', 1, 'summary', ?, 1, 'chapter-narrative-sync:v1', "
+        "'committed')",
+        (content_sha256,),
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status, memory_status) "
+        "VALUES ('novel-1', 1, ?, 'chapter-narrative-sync:v1', "
+        "1, 'committed', 'failed')",
+        (content_sha256,),
+    )
+
+    decision = AutopilotRecoveryPolicy(db).decide_on_start("novel-1")
+
+    assert decision.next_stage == "paused_for_review"
+    assert decision.preserve_review_gate is True
     assert decision.reason == "canonical_aftermath_not_ready"
 
 

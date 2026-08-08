@@ -493,6 +493,7 @@ def _canonical_resume_block_reason(
             novel_id=novel_id,
             chapter_number=int(chapter_number),
             pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            require_memory_sync=True,
         )
         return None if ready else "canonical_aftermath_not_ready"
     except Exception:

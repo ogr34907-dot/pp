@@ -1050,6 +1050,7 @@ class DaemonHostMixin:
                 novel_id=novel_id,
                 chapter_number=chapter_number,
                 pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                require_memory_sync=True,
             )
         except Exception:
             return False

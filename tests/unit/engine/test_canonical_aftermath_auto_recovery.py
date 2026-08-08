@@ -10,6 +10,7 @@ from application.world.services.chapter_narrative_sync import (
 )
 from domain.novel.entities.novel import AutopilotStatus, NovelStage
 from engine.runtime.novel_lifecycle import process_novel
+from engine.runtime.daemon_host import DaemonHostMixin
 from infrastructure.persistence.database.connection import DatabaseConnection
 
 
@@ -173,6 +174,45 @@ async def test_manual_recovery_allows_explicit_retry_of_hard_failure(tmp_path):
         "SELECT autopilot_recovery_reason FROM novels WHERE id = 'novel-1'"
     )["autopilot_recovery_reason"]
     assert marker == ""
+
+
+def test_daemon_canonical_ready_gate_requires_committed_memory_sync(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "memory-gate.db"))
+    content_sha256, content_revision = _seed_terminal_failure(
+        database,
+        failure_reason="API returned empty content",
+    )
+    database.execute(
+        "INSERT INTO knowledge (id, novel_id) VALUES ('knowledge-1', 'novel-1')"
+    )
+    database.execute(
+        "INSERT INTO chapter_summaries "
+        "(id, knowledge_id, chapter_number, summary, source_content_sha256, "
+        "source_content_revision, pipeline_version, sync_status, sync_attempts) "
+        "VALUES ('summary-63', 'knowledge-1', 63, 'summary', ?, ?, ?, "
+        "'committed', 3)",
+        (
+            content_sha256,
+            content_revision,
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        ),
+    )
+    database.execute(
+        "UPDATE chapter_narrative_commits "
+        "SET status = 'committed', memory_status = 'failed', "
+        "memory_failure_reason = 'memory write failed', memory_attempt_count = 3 "
+        "WHERE novel_id = 'novel-1' AND chapter_number = 63"
+    )
+    database.commit()
+    host = SimpleNamespace(chapter_repository=SimpleNamespace(db=database))
+
+    ready = DaemonHostMixin._is_chapter_narrative_ready(
+        host,
+        "novel-1",
+        63,
+    )
+
+    assert ready is False
 
 
 @pytest.mark.asyncio
