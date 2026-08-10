@@ -16,61 +16,6 @@ const naiveTheme = computed(() =>
   themeStore.isDark ? darkTheme : undefined
 )
 
-// ─── 静态调色板（不随主题变化，提升出来避免 computed 重建字符串）─────────────
-const LIGHT_PALETTE = {
-  primary:        '#4f46e5',
-  primaryHover:   '#6366f1',
-  primaryPressed: '#4338ca',
-  primarySuppl:   '#818cf8',
-  text1:          '#0f172a',
-  text2:          '#475569',
-  text3:          '#64748b',
-  border:         'rgba(15, 23, 42, 0.09)',
-  divider:        'rgba(15, 23, 42, 0.06)',
-  surface:        '#ffffff',
-  tableStriped:   '#f8fafc',
-  tableHover:     '#f8fafc',
-  inputBg:        '#ffffff',
-  drawerBg:       '#eef1f6',
-  selectBorder:   '#4f46e5',
-} as const
-
-const DARK_PALETTE = {
-  primary:        '#818cf8',
-  primaryHover:   '#a5b4fc',
-  primaryPressed: '#6366f1',
-  primarySuppl:   '#c7d2fe',
-  text1:          '#e2e8f0',
-  text2:          '#94a3b8',
-  text3:          '#64748b',
-  border:         'rgba(148, 163, 184, 0.12)',
-  divider:        'rgba(148, 163, 184, 0.08)',
-  surface:        '#1a2235',
-  tableStriped:   '#161d2e',
-  tableHover:     '#232d42',
-  inputBg:        '#161d2e',
-  drawerBg:       '#121826',
-  selectBorder:   '#818cf8',
-} as const
-
-const ANCHOR_PALETTE = {
-  primary:        '#c9a227',
-  primaryHover:   '#ddb930',
-  primaryPressed: '#a88a1f',
-  primarySuppl:   '#e8c84a',
-  text1:          '#f0ead6',
-  text2:          '#c4b99a',
-  text3:          '#8a8070',
-  border:         'rgba(201, 162, 39, 0.14)',
-  divider:        'rgba(201, 162, 39, 0.06)',
-  surface:        '#111620',
-  tableStriped:   '#0d1018',
-  tableHover:     '#181f2e',
-  inputBg:        '#0d1018',
-  drawerBg:       '#0a0c10',
-  selectBorder:   '#c9a227',
-} as const
-
 /** Naive UI 形体：随字体档位缩放，基准见 design/layoutDensity */
 function naiveShapeOverrides(fz: FontSizePreset): GlobalThemeOverrides {
   const r = scaledUiPx(NAIVE_DENSITY_BASE.borderRadius, fz)
@@ -106,9 +51,6 @@ function naiveShapeOverrides(fz: FontSizePreset): GlobalThemeOverrides {
 
 // ─── 颜色 + 字号档位是动态的，量少性能好 ─────────────────────────────────────
 const themeOverrides = computed<GlobalThemeOverrides>(() => {
-  const p = themeStore.isAnchor ? ANCHOR_PALETTE
-          : themeStore.isDark   ? DARK_PALETTE
-          :                       LIGHT_PALETTE
   const fz = fontSizeStore.preset
 
   const shape = naiveShapeOverrides(fz)
@@ -116,42 +58,44 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => {
     ...shape,
     common: {
       ...shape.common,
-      primaryColor:        p.primary,
-      primaryColorHover:   p.primaryHover,
-      primaryColorPressed: p.primaryPressed,
-      primaryColorSuppl:   p.primarySuppl,
-      bodyColor:           p.text1,
-      textColor1:          p.text1,
-      textColor2:          p.text2,
-      textColor3:          p.text3,
-      borderColor:         p.border,
-      dividerColor:        p.divider,
-      cardColor:           p.surface,
-      modalColor:          p.surface,
-      popoverColor:        p.surface,
-      tableColor:          p.surface,
-      tableColorStriped:   p.tableStriped,
-      tableColorHover:     p.tableHover,
-      tableHeaderColor:    p.surface,
+      primaryColor:        'var(--color-brand)',
+      primaryColorHover:   'var(--color-brand-hover)',
+      primaryColorPressed: 'var(--color-brand-pressed)',
+      primaryColorSuppl:   'var(--color-brand-suppl)',
+      bodyColor:           'var(--app-page-bg)',
+      textColor1:          'var(--app-text-primary)',
+      textColor2:          'var(--app-text-secondary)',
+      textColor3:          'var(--app-text-muted)',
+      borderColor:         'var(--app-border)',
+      dividerColor:        'var(--app-divider)',
+      cardColor:           'var(--app-surface)',
+      modalColor:          'var(--app-surface)',
+      popoverColor:        'var(--app-surface-raised)',
+      tableColor:          'var(--app-surface)',
+      tableColorStriped:   'var(--app-surface-subtle)',
+      tableColorHover:     'var(--app-surface-raised)',
+      tableHeaderColor:    'var(--app-surface)',
+      inputColor:          'var(--app-input-bg)',
+      focusColor:          'var(--color-focus-soft)',
     },
     Select: {
       peers: {
         InternalSelection: {
-          color:       p.inputBg,
-          borderActive: p.selectBorder,
-          borderFocus:  p.selectBorder,
+          color:        'var(--app-input-bg)',
+          borderActive: 'var(--color-focus)',
+          borderFocus:  'var(--color-focus)',
         },
       },
     },
-    Drawer: { ...shape.Drawer, color: p.drawerBg },
+    Drawer: { ...shape.Drawer, color: 'var(--app-surface-subtle)' },
     Tabs: {
-      tabTextColorActiveLine: p.primary,
-      tabTextColorHoverLine:  p.text2,
-      barColor:               p.primary,
+      tabTextColorActiveLine: 'var(--color-brand)',
+      tabTextColorHoverLine:  'var(--app-text-secondary)',
+      barColor:               'var(--color-brand)',
     },
-    Switch: { railColorActive: p.primary },
-    Alert:  { ...shape.Alert, color: p.surface },
-    Form:   { labelTextColorTop: p.text2 },
+    Switch: { railColorActive: 'var(--color-brand)' },
+    Alert:  { ...shape.Alert, color: 'var(--app-surface)' },
+    Form:   { labelTextColorTop: 'var(--app-text-secondary)' },
   }
 })
 </script>

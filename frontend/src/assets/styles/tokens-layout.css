@@ -5,12 +5,13 @@
  */
 
 :root {
-  --plotpilot-space-2: 6px;
-  --plotpilot-space-3: 8px;
-  --plotpilot-space-4: 10px;
-  --plotpilot-space-5: 12px;
-  --plotpilot-space-6: 14px;
-  --plotpilot-space-7: 16px;
+  --plotpilot-space-1: 4px;
+  --plotpilot-space-2: 8px;
+  --plotpilot-space-3: 12px;
+  --plotpilot-space-4: 16px;
+  --plotpilot-space-5: 20px;
+  --plotpilot-space-6: 24px;
+  --plotpilot-space-7: 28px;
 
   --plotpilot-topbar-height: 52px;
   --plotpilot-topbar-padding-x: 20px;

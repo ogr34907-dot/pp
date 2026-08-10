@@ -3,7 +3,7 @@
     <!-- Brand Header -->
     <header class="sidebar-brand">
       <div class="brand-logo">
-        <span class="logo-icon">✦</span>
+        <PlotPilotMark class="logo-icon" :size="collapsed ? 'compact' : 'regular'" :label="false" />
         <div class="brand-text">
           <h1 class="brand-name">PlotPilot</h1>
           <p class="brand-slogan">墨枢 · 作者的领航员</p>
@@ -170,6 +170,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { NSkeleton } from 'naive-ui'
 import StatCard from './StatCard.vue'
+import PlotPilotMark from '@/components/brand/PlotPilotMark.vue'
 import { useStatsStore } from '@/stores/statsStore'
 import GlobalLLMEntryButton from '@/components/global/GlobalLLMEntryButton.vue'
 import PromptPlazaEntryButton from '@/components/global/PromptPlazaEntryButton.vue'
@@ -372,7 +373,6 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 22px;
   color: var(--app-text-inverse, #fff);
   backdrop-filter: blur(8px);
   border: 1px solid var(--app-text-inverse, rgba(255, 255, 255, 0.2));
@@ -630,11 +630,6 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .action-icon svg {
   width: 16px;
   height: 16px;
-}
-
-[data-theme='anchor'] .action-btn:hover {
-  transform: none;
-  box-shadow: none;
 }
 
 /* Footer */
