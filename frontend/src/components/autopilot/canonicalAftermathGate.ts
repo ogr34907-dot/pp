@@ -9,7 +9,7 @@ export interface CanonicalAftermathPresentation {
     label: string
     scope: string
   }
-  resumeAction: CanonicalAftermathRecoveryAction
+  resumeAction: AutopilotResumeAction
   afterFullResyncCompleted: () => void | Promise<void>
   asyncStatus: {
     status: 'waiting' | 'running' | 'failed'
@@ -25,6 +25,17 @@ export interface CanonicalAftermathRecoveryAction {
   label: string
   disabled: boolean
   invoke: () => void | Promise<void>
+}
+
+export interface AutopilotResumeAction extends CanonicalAftermathRecoveryAction {
+  intent: 'resume'
+  mode: 'review' | 'manual-pause' | null
+  visible: boolean
+}
+
+export interface AutopilotResumeEligibility {
+  canResumeReview: boolean
+  isManualPause: boolean
 }
 
 export interface CanonicalAftermathRecoveryHandlers {
@@ -143,6 +154,7 @@ export function getCanonicalAftermathPresentation(
   status: Record<string, any> | null | undefined,
   fullResync?: CanonicalAftermathFullResyncSnapshot,
   handlers?: CanonicalAftermathRecoveryHandlers,
+  resumeEligibility?: AutopilotResumeEligibility,
 ): CanonicalAftermathPresentation {
   const gate = status?.review_gate
   const isFailure = String(status?.autopilot_pause_reason || '') === 'canonical_aftermath_not_ready'
@@ -172,10 +184,16 @@ export function getCanonicalAftermathPresentation(
     disabled: fullResyncDisabled,
     invoke: guardedInvoke(fullResyncDisabled, handlers?.resyncFullBook),
   }
-  const resumeDisabled = isFailure || fullResyncActive
-  const resumeAction: CanonicalAftermathRecoveryAction = {
+  const resumeMode: AutopilotResumeAction['mode'] = !isFailure && resumeEligibility?.canResumeReview
+    ? 'review'
+    : (resumeEligibility?.isManualPause ? 'manual-pause' : null)
+  const resumeVisible = resumeMode !== null && !fullResyncActive
+  const resumeDisabled = !resumeVisible
+  const resumeAction: AutopilotResumeAction = {
     intent: 'resume',
-    label: '继续自动驾驶',
+    label: resumeMode === 'review' ? String(gate?.action_label || '确认后继续') : '恢复',
+    mode: resumeMode,
+    visible: resumeVisible,
     disabled: resumeDisabled,
     invoke: guardedInvoke(resumeDisabled, handlers?.resume),
   }

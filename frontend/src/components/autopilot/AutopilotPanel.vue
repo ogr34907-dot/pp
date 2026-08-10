@@ -208,10 +208,10 @@
       :message="reviewGateMessage"
       :recovery-label="reviewRecoveryLabel"
       :recovery-intent="reviewRecoveryIntent"
-      :recovery-disabled="canonicalAftermathFailure ? canonicalAftermathPresentation.currentChapterAction.disabled : fullResyncActive"
+      :recovery-disabled="canonicalAftermathFailure ? canonicalAftermathPresentation.currentChapterAction.disabled : canonicalAftermathPresentation.resumeAction.disabled"
       :recovery-loading="reviewRecoveryLoading"
       @retry="handleReviewRetry"
-      @resume="resume"
+      @resume="canonicalAftermathPresentation.resumeAction.invoke"
     >
       <template v-if="canonicalAftermathFailure && !canonicalAftermathPresentation.fullResyncAction.disabled" #actions>
         <n-button
@@ -261,10 +261,25 @@
 
     <!-- 操作按钮 -->
     <n-space justify="end" size="small">
-      <n-button v-if="canResumeReview && !canonicalAftermathFailure && !fullResyncActive" type="warning" ghost size="small" :loading="toggling" @click="resume">
+      <n-button
+        v-if="canonicalAftermathPresentation.resumeAction.visible && canonicalAftermathPresentation.resumeAction.mode === 'review'"
+        type="warning"
+        ghost
+        size="small"
+        :disabled="canonicalAftermathPresentation.resumeAction.disabled"
+        :loading="toggling"
+        @click="canonicalAftermathPresentation.resumeAction.invoke"
+      >
         再次确认 · 继续
       </n-button>
-      <n-button v-else-if="isManualPause && !fullResyncActive" type="primary" size="small" :loading="toggling" @click="resume">
+      <n-button
+        v-else-if="canonicalAftermathPresentation.resumeAction.visible && canonicalAftermathPresentation.resumeAction.mode === 'manual-pause'"
+        type="primary"
+        size="small"
+        :disabled="canonicalAftermathPresentation.resumeAction.disabled"
+        :loading="toggling"
+        @click="canonicalAftermathPresentation.resumeAction.invoke"
+      >
         恢复
       </n-button>
       <n-button v-if="!isRunning && !needsReview && !needsRecovery && !isManualPause && !fullResyncActive" type="primary" size="small" :loading="toggling" @click="openStartModal">
@@ -519,6 +534,17 @@ const reviewGateStatus = computed(() => String(reviewGate.value?.status || 'read
 const reviewGateNeedsAIPanel = computed(() =>
   !isTerminalStopped.value && (reviewGate.value?.primary_action === 'open_ai_panel' || requiresAIReview.value)
 )
+const isManualPause = computed(() => (
+  status.value?.autopilot_status === 'stopped' &&
+  status.value?.autopilot_recovery_reason === 'manual_pause'
+))
+const canResumeReview = computed(() => canOfferReviewResume(
+  needsReview.value &&
+    !requiresAIReview.value &&
+    (!reviewGate.value || reviewGateStatus.value === 'ready') &&
+    reviewGate.value?.can_resume !== false,
+  fullResyncActive.value,
+))
 const canonicalAftermathPresentation = computed(() => getCanonicalAftermathPresentation(status.value, {
   active: fullResyncActive.value,
   processed: fullResyncState.processed.value,
@@ -530,16 +556,12 @@ const canonicalAftermathPresentation = computed(() => getCanonicalAftermathPrese
   resyncFullBook: startCanonicalAftermathFullResync,
   resume,
   refresh: () => fetchStatus(),
+}, {
+  canResumeReview: canResumeReview.value,
+  isManualPause: isManualPause.value,
 }))
 const canonicalAftermathFailure = computed(() => canonicalAftermathPresentation.value.isFailure)
 const showReviewGate = computed(() => needsReview.value || reviewGateNeedsAIPanel.value)
-const canResumeReview = computed(() => canOfferReviewResume(
-  needsReview.value &&
-    !requiresAIReview.value &&
-    (!reviewGate.value || reviewGateStatus.value === 'ready') &&
-    reviewGate.value?.can_resume !== false,
-  fullResyncActive.value,
-))
 const reviewGateTitle = computed(() => {
   if (canonicalAftermathFailure.value) return canonicalAftermathPresentation.value.title
   if (reviewGateStatus.value === 'failed') {
@@ -585,13 +607,16 @@ const reviewTaskStatus = computed(() => (
 const reviewRecoveryLabel = computed(() => {
   if (reviewGateNeedsAIPanel.value && featureFlags.aiInvocationDebug) return '打开 AI 面板'
   if (canonicalAftermathFailure.value) return reviewGateActionLabel.value
-  if (canResumeReview.value && !fullResyncActive.value) return reviewGateActionLabel.value
+  if (
+    canonicalAftermathPresentation.value.resumeAction.visible &&
+    canonicalAftermathPresentation.value.resumeAction.mode === 'review'
+  ) return canonicalAftermathPresentation.value.resumeAction.label
   return ''
 })
 const reviewRecoveryIntent = computed(() => (
   canonicalAftermathFailure.value
     ? canonicalAftermathPresentation.value.currentChapterAction.intent
-    : (reviewGateNeedsAIPanel.value ? 'retry' : 'resume')
+    : (reviewGateNeedsAIPanel.value ? 'retry' : canonicalAftermathPresentation.value.resumeAction.intent)
 ))
 const reviewRecoveryLoading = computed(() => (
   reviewGateNeedsAIPanel.value ? aiPanelOpening.value : toggling.value
@@ -684,10 +709,6 @@ const needsRecovery = computed(
     status.value?.autopilot_status === 'error' ||
     (status.value?.consecutive_error_count || 0) >= 3
 )
-const isManualPause = computed(() => (
-  status.value?.autopilot_status === 'stopped' &&
-  status.value?.autopilot_recovery_reason === 'manual_pause'
-))
 const canTerminate = computed(() => (
   (isRunning.value && !needsReview.value) || isManualPause.value
 ))

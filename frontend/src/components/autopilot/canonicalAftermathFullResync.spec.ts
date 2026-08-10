@@ -97,6 +97,85 @@ describe('canonical aftermath full resync presentation state', () => {
     expect(resumeCalls).toBe(0)
   })
 
+  it('invokes resume only for an eligible visible entry and blocks every entry while full sync is active', () => {
+    let resumeCalls = 0
+    let refreshCalls = 0
+    const handlers = {
+      retryCurrentChapter: () => {},
+      resyncFullBook: () => {},
+      resume: () => { resumeCalls += 1 },
+      refresh: () => { refreshCalls += 1 },
+    }
+    const inactiveFullSync = {
+      active: false,
+      processed: 0,
+      total: 0,
+      currentChapter: null,
+      firstFailureReason: '',
+    }
+    const eligibleReview = {
+      canResumeReview: true,
+      isManualPause: false,
+    }
+    const ineligible = {
+      ...eligibleReview,
+      canResumeReview: false,
+    }
+    const eligibleManualPause = {
+      ...ineligible,
+      isManualPause: true,
+    }
+    const activeFullSync = {
+      ...inactiveFullSync,
+      active: true,
+    }
+    const status = {
+      autopilot_status: 'running',
+      current_stage: 'paused_for_review',
+      review_gate: { action_label: '确认后继续' },
+    }
+
+    const eligiblePresentation = getCanonicalAftermathPresentation(status, inactiveFullSync, handlers, eligibleReview)
+    eligiblePresentation.resumeAction.invoke()
+    expect(resumeCalls).toBe(1)
+
+    const manualPresentation = getCanonicalAftermathPresentation(status, inactiveFullSync, handlers, eligibleManualPause)
+    manualPresentation.resumeAction.invoke()
+    expect(resumeCalls).toBe(2)
+
+    const ineligiblePresentation = getCanonicalAftermathPresentation(status, inactiveFullSync, handlers, ineligible)
+    ineligiblePresentation.resumeAction.invoke()
+    expect(resumeCalls).toBe(2)
+
+    const activePresentation = getCanonicalAftermathPresentation(status, activeFullSync, handlers, eligibleReview)
+    activePresentation.resumeAction.invoke()
+    activePresentation.resumeAction.invoke()
+    activePresentation.afterFullResyncCompleted()
+    expect(resumeCalls).toBe(2)
+    expect(refreshCalls).toBe(1)
+
+    expect(eligiblePresentation.resumeAction).toMatchObject({
+      mode: 'review',
+      visible: true,
+      disabled: false,
+    })
+    expect(ineligiblePresentation.resumeAction).toMatchObject({
+      mode: null,
+      visible: false,
+      disabled: true,
+    })
+    expect(manualPresentation.resumeAction).toMatchObject({
+      mode: 'manual-pause',
+      visible: true,
+      disabled: false,
+    })
+    expect(activePresentation.resumeAction).toMatchObject({
+      mode: 'review',
+      visible: false,
+      disabled: true,
+    })
+  })
+
   it('blocks every canonical recovery handler while full-book synchronization is active', () => {
     let currentChapterCalls = 0
     let fullBookCalls = 0
