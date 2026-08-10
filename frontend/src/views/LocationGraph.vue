@@ -1,18 +1,26 @@
 <template>
   <div class="location-graph-page">
-    <n-page-header @back="handleBack" title="地点关系图">
-      <template #extra>
-        <n-space>
-          <n-button type="primary" @click="openTriplesDrawer()">三元组表格</n-button>
-          <n-button @click="handleRefresh" :loading="loading">
-            <template #icon>
-              <n-icon><RefreshOutline /></n-icon>
-            </template>
-            刷新
-          </n-button>
-        </n-space>
-      </template>
-    </n-page-header>
+    <header class="graph-header">
+      <div class="graph-heading-group">
+        <n-button quaternary circle aria-label="返回工作台" @click="handleBack">
+          <template #icon><n-icon><ArrowBackOutline /></n-icon></template>
+        </n-button>
+        <div>
+          <p class="graph-eyebrow">空间视图 · {{ novelId }}</p>
+          <h1>地点关系图</h1>
+        </div>
+      </div>
+      <n-space>
+        <n-button type="primary" @click="openTriplesDrawer()">
+          <template #icon><n-icon><GridOutline /></n-icon></template>
+          三元组表格
+        </n-button>
+        <n-button secondary @click="handleRefresh" :loading="loading">
+          <template #icon><n-icon><RefreshOutline /></n-icon></template>
+          刷新
+        </n-button>
+      </n-space>
+    </header>
 
     <div class="graph-body">
       <div class="graph-main">
@@ -102,7 +110,6 @@
 import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  NPageHeader,
   NButton,
   NSpace,
   NIcon,
@@ -115,7 +122,7 @@ import {
   NDrawer,
   NDrawerContent,
 } from 'naive-ui'
-import { RefreshOutline } from '@vicons/ionicons5'
+import { ArrowBackOutline, GridOutline, RefreshOutline } from '@vicons/ionicons5'
 import LocationRelationGraph from '../components/graphs/LocationRelationGraph.vue'
 import KnowledgeTriplesTableEditor from '../components/knowledge/KnowledgeTriplesTableEditor.vue'
 import type { EChartsNode } from '../utils/visToEcharts'
@@ -194,6 +201,40 @@ const importanceTagType = (importance: string) => {
   background: var(--app-page-bg);
 }
 
+.graph-header {
+  min-height: 72px;
+  padding: 12px clamp(14px, 2vw, 28px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--app-surface);
+  border-bottom: 1px solid var(--app-border);
+  box-shadow: var(--app-shadow-sm);
+  z-index: 2;
+}
+
+.graph-heading-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.graph-eyebrow {
+  margin: 0 0 2px;
+  color: var(--app-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.graph-header h1 {
+  margin: 0;
+  color: var(--app-text-primary);
+  font-family: var(--font-serif);
+  font-size: 19px;
+  font-weight: 600;
+}
+
 .graph-body {
   flex: 1;
   min-height: 0;
@@ -204,17 +245,21 @@ const importanceTagType = (importance: string) => {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  padding: 16px;
-  background: #f5f5f5;
+  margin: 14px 0 14px 14px;
+  overflow: hidden;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-md);
+  box-shadow: var(--app-shadow-sm);
 }
 
 .graph-side {
   width: min(400px, 42vw);
   flex-shrink: 0;
-  padding: 12px;
+  padding: 14px;
   overflow: auto;
   background: var(--app-surface);
-  border-left: 1px solid #e5e7eb;
+  border-left: 1px solid var(--app-border);
 }
 
 .side-form {
@@ -235,10 +280,53 @@ const importanceTagType = (importance: string) => {
 
 .attr-key {
   font-weight: 500;
-  color: #64748b;
+  color: var(--app-text-secondary);
 }
 
 .attr-value {
-  color: #0f172a;
+  color: var(--app-text-primary);
+}
+
+@media (max-width: 1024px) {
+  .graph-body {
+    flex-direction: column;
+    overflow: auto;
+  }
+
+  .graph-main {
+    flex: none;
+    min-height: 58vh;
+    margin: 12px;
+  }
+
+  .graph-side {
+    width: auto;
+    overflow: visible;
+    border-left: 0;
+    border-top: 1px solid var(--app-border);
+  }
+}
+
+@media (max-width: 640px) {
+  .graph-header {
+    min-height: 64px;
+    padding: 10px 12px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .graph-header > :deep(.n-space) {
+    width: 100%;
+    flex-wrap: wrap !important;
+  }
+
+  .graph-main {
+    min-height: 52vh;
+    margin: 8px;
+  }
+
+  .graph-side {
+    padding: 12px;
+  }
 }
 </style>

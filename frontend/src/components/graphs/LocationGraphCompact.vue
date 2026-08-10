@@ -12,6 +12,9 @@
     <div v-if="emptyHint" class="lgc-empty">
       <n-empty description="尚无地点相关三元组，请在「叙事与知识」中添加" size="small" />
     </div>
+    <div v-else-if="loading && !nodes.length" class="lgc-empty" aria-live="polite">
+      <n-spin size="small" description="正在整理地点关系…" />
+    </div>
     <div v-else class="lgc-canvas">
       <GraphChart :nodes="nodes" :links="links" height="100%" @node-click="handleNodeClick" />
     </div>
@@ -30,9 +33,12 @@ import {
   locationImportanceZh,
   locationTypeZh,
 } from '../../utils/knowledgeFactDisplay'
+import { useThemeStore } from '../../stores/themeStore'
+import { getEditorialGraphPalette } from '../../utils/graphThemePalette'
 
 const props = defineProps<{ slug: string }>()
 const router = useRouter()
+const themeStore = useThemeStore()
 
 interface KnowledgeTriple {
   id: string
@@ -115,15 +121,16 @@ const emptyHint = computed(() => graph.value.locations.length === 0 && !loading.
 
 // 根据重要程度返回颜色
 const getNodeColor = (importance?: string) => {
+  const palette = getEditorialGraphPalette(themeStore.effectiveTheme)
   switch (importance) {
     case 'core':
-      return { background: '#a7f3d0', border: '#059669' } // 核心地点-深绿
+      return palette.primary
     case 'important':
-      return { background: '#d1fae5', border: '#10b981' } // 重要地点-浅绿
+      return palette.secondary
     case 'normal':
-      return { background: '#e5e7eb', border: '#6b7280' } // 一般地点-灰色
+      return palette.minor
     default:
-      return { background: '#f3f4f6', border: '#9ca3af' } // 未分类-浅灰
+      return palette.neutral
   }
 }
 
@@ -262,8 +269,8 @@ onMounted(async () => {
   font-size: 10px;
   padding: 0 4px;
   border-radius: 4px;
-  background: rgba(79, 70, 229, 0.08);
-  color: #4338ca;
+  background: var(--color-brand-light);
+  color: var(--color-brand);
 }
 
 .lgc-empty {
