@@ -8,6 +8,7 @@ import type { GlobalThemeOverrides } from 'naive-ui'
 import { useThemeStore } from './stores/themeStore'
 import { useFontSizeStore, scaledUiPx, type FontSizePreset } from './stores/fontSizeStore'
 import { NAIVE_DENSITY_BASE } from './design/layoutDensity'
+import { getNaiveThemeColorPalette } from './utils/naiveThemePalette'
 
 const themeStore = useThemeStore()
 const fontSizeStore = useFontSizeStore()
@@ -52,50 +53,51 @@ function naiveShapeOverrides(fz: FontSizePreset): GlobalThemeOverrides {
 // ─── 颜色 + 字号档位是动态的，量少性能好 ─────────────────────────────────────
 const themeOverrides = computed<GlobalThemeOverrides>(() => {
   const fz = fontSizeStore.preset
+  const palette = getNaiveThemeColorPalette(themeStore.effectiveTheme)
 
   const shape = naiveShapeOverrides(fz)
   return {
     ...shape,
     common: {
       ...shape.common,
-      primaryColor:        'var(--color-brand)',
-      primaryColorHover:   'var(--color-brand-hover)',
-      primaryColorPressed: 'var(--color-brand-pressed)',
-      primaryColorSuppl:   'var(--color-brand-suppl)',
-      bodyColor:           'var(--app-page-bg)',
-      textColor1:          'var(--app-text-primary)',
-      textColor2:          'var(--app-text-secondary)',
-      textColor3:          'var(--app-text-muted)',
-      borderColor:         'var(--app-border)',
-      dividerColor:        'var(--app-divider)',
-      cardColor:           'var(--app-surface)',
-      modalColor:          'var(--app-surface)',
-      popoverColor:        'var(--app-surface-raised)',
-      tableColor:          'var(--app-surface)',
-      tableColorStriped:   'var(--app-surface-subtle)',
-      tableColorHover:     'var(--app-surface-raised)',
-      tableHeaderColor:    'var(--app-surface)',
-      inputColor:          'var(--app-input-bg)',
-      focusColor:          'var(--color-focus-soft)',
+      primaryColor:        palette.primary,
+      primaryColorHover:   palette.primaryHover,
+      primaryColorPressed: palette.primaryPressed,
+      primaryColorSuppl:   palette.primarySuppl,
+      bodyColor:           palette.canvas,
+      textColor1:          palette.ink,
+      textColor2:          palette.textSecondary,
+      textColor3:          palette.textMuted,
+      borderColor:         palette.border,
+      dividerColor:        palette.divider,
+      cardColor:           palette.surface,
+      modalColor:          palette.surface,
+      popoverColor:        palette.surfaceRaised,
+      tableColor:          palette.surface,
+      tableColorStriped:   palette.surfaceSubtle,
+      tableColorHover:     palette.surfaceRaised,
+      tableHeaderColor:    palette.surface,
+      inputColor:          palette.input,
+      focusColor:          palette.focusSoft,
     },
     Select: {
       peers: {
         InternalSelection: {
-          color:        'var(--app-input-bg)',
-          borderActive: 'var(--color-focus)',
-          borderFocus:  'var(--color-focus)',
+          color:        palette.input,
+          borderActive: palette.focus,
+          borderFocus:  palette.focus,
         },
       },
     },
-    Drawer: { ...shape.Drawer, color: 'var(--app-surface-subtle)' },
+    Drawer: { ...shape.Drawer, color: palette.surfaceSubtle },
     Tabs: {
-      tabTextColorActiveLine: 'var(--color-brand)',
-      tabTextColorHoverLine:  'var(--app-text-secondary)',
-      barColor:               'var(--color-brand)',
+      tabTextColorActiveLine: palette.primary,
+      tabTextColorHoverLine:  palette.textSecondary,
+      barColor:               palette.primary,
     },
-    Switch: { railColorActive: 'var(--color-brand)' },
-    Alert:  { ...shape.Alert, color: 'var(--app-surface)' },
-    Form:   { labelTextColorTop: 'var(--app-text-secondary)' },
+    Switch: { railColorActive: palette.primary },
+    Alert:  { ...shape.Alert, color: palette.surface },
+    Form:   { labelTextColorTop: palette.textSecondary },
   }
 })
 </script>

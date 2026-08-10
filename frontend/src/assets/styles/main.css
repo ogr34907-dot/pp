@@ -51,17 +51,17 @@ body {
   --app-font-scale: 1;
 
   /* ── 品牌色 ── */
-  --color-brand: #2B6C69;
-  --color-brand-hover: #347d78;
-  --color-brand-pressed: #215754;
-  --color-brand-suppl: #4d8f89;
-  --color-brand-light: rgba(43, 108, 105, 0.1);
-  --color-brand-border: rgba(43, 108, 105, 0.28);
+  --color-brand: #A64B2A;
+  --color-brand-hover: #8D3D21;
+  --color-brand-pressed: #76311A;
+  --color-brand-suppl: #BE6A49;
+  --color-brand-light: rgba(166, 75, 42, 0.1);
+  --color-brand-border: rgba(166, 75, 42, 0.28);
 
   /* ── 编辑强调色；旧变量仅作组件兼容别名 ── */
-  --color-accent: #9b6a32;
-  --color-accent-soft: rgba(155, 106, 50, 0.12);
-  --color-accent-border: rgba(155, 106, 50, 0.28);
+  --color-accent: #9A7134;
+  --color-accent-soft: rgba(154, 113, 52, 0.12);
+  --color-accent-border: rgba(154, 113, 52, 0.28);
   --color-gold: var(--color-accent);
   --color-gold-light: var(--color-accent-soft);
   --color-gold-dim: var(--color-accent-soft);
@@ -85,8 +85,8 @@ body {
   --color-purple-dim: var(--color-info-dim);
 
   /* ── 焦点与动效 ── */
-  --color-focus: #2B6C69;
-  --color-focus-soft: rgba(43, 108, 105, 0.18);
+  --color-focus: #A64B2A;
+  --color-focus-soft: rgba(166, 75, 42, 0.18);
   --focus-ring: 0 0 0 3px var(--color-focus-soft);
   --motion-duration-fast: 160ms;
   --motion-duration-standard: 180ms;
@@ -94,10 +94,10 @@ body {
   --motion-ease-standard: cubic-bezier(0.2, 0, 0, 1);
 
   /* ── 文字色（全部使用变量，禁止硬编码）── */
-  --app-text-primary: #1E2925;
-  --app-text-secondary: #42524c;
-  --app-text-muted: #66756f;
-  --app-text-inverse: #fffefa;
+  --app-text-primary: #2C2520;
+  --app-text-secondary: #665B52;
+  --app-text-muted: #8B7F75;
+  --app-text-inverse: #FFFCF6;
 
   /* 与 Naive UI n-text depth、旧组件对齐：统一走 app 文字色，避免暗色下仍落回 #0f172a */
   --text-color-1: var(--app-text-primary);
@@ -105,22 +105,22 @@ body {
   --text-color-3: var(--app-text-muted);
 
   /* ── 背景色 ── */
-  --app-page-bg: #F7F5EF;
-  --app-surface: #FFFEFA;
-  --app-surface-raised: #ffffff;
-  --app-surface-subtle: #f0f2ed;
-  --app-input-bg: #FFFEFA;
+  --app-page-bg: #F4EFE6;
+  --app-surface: #FFFCF6;
+  --app-surface-raised: #FFFCF6;
+  --app-surface-subtle: #EEE6DA;
+  --app-input-bg: #FFFCF6;
 
   /* ── 边框 ── */
-  --app-border: #D7DDD6;
-  --app-border-strong: #bac5bd;
-  --app-divider: rgba(30, 41, 37, 0.1);
+  --app-border: #E2D8CA;
+  --app-border-strong: #C9BBAA;
+  --app-divider: rgba(44, 37, 32, 0.12);
 
   /* ── 阴影 ── */
-  --app-shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.06);
-  --app-shadow-md: 0 4px 16px rgba(15, 23, 42, 0.06);
-  --app-shadow-lg: 0 8px 28px rgba(15, 23, 42, 0.08);
-  --app-shadow-hover: 0 8px 24px rgba(15, 23, 42, 0.12);
+  --app-shadow-sm: 0 1px 3px rgba(44, 37, 32, 0.06);
+  --app-shadow-md: 0 4px 16px rgba(44, 37, 32, 0.06);
+  --app-shadow-lg: 0 8px 28px rgba(44, 37, 32, 0.08);
+  --app-shadow-hover: 0 8px 24px rgba(44, 37, 32, 0.12);
 
   /* ── 布局 ── */
   --app-radius-sm: 8px;
@@ -196,23 +196,23 @@ body {
    暗色模式
    ═══════════════════════════════════════════════════ */
 [data-theme='dark'] {
-  --color-brand: #75B6A9;
-  --color-brand-hover: #8bc7bb;
-  --color-brand-pressed: #5b9b8f;
-  --color-brand-suppl: #a6d5cc;
-  --color-brand-light: rgba(117, 182, 169, 0.14);
-  --color-brand-border: rgba(117, 182, 169, 0.3);
-  --color-accent: #d2a96c;
-  --color-accent-soft: rgba(210, 169, 108, 0.14);
-  --color-accent-border: rgba(210, 169, 108, 0.3);
-  --color-focus: #75B6A9;
-  --color-focus-soft: rgba(117, 182, 169, 0.22);
+  --color-brand: #E28B62;
+  --color-brand-hover: #EDA17C;
+  --color-brand-pressed: #C9704B;
+  --color-brand-suppl: #F2B496;
+  --color-brand-light: rgba(226, 139, 98, 0.14);
+  --color-brand-border: rgba(226, 139, 98, 0.3);
+  --color-accent: #D7B26A;
+  --color-accent-soft: rgba(215, 178, 106, 0.14);
+  --color-accent-border: rgba(215, 178, 106, 0.3);
+  --color-focus: #E28B62;
+  --color-focus-soft: rgba(226, 139, 98, 0.22);
 
   /* ── 文字色 ── */
-  --app-text-primary: #E9F0EB;
-  --app-text-secondary: #bdc9c1;
-  --app-text-muted: #93a29a;
-  --app-text-inverse: #141a18;
+  --app-text-primary: #F6EEDF;
+  --app-text-secondary: #D3C5B6;
+  --app-text-muted: #AA9C90;
+  --app-text-inverse: #221C19;
 
   /* ── 组件交互态（Tab / 档案 / 运行时栏）── */
   --tab-track-bg: linear-gradient(135deg, var(--color-brand), var(--color-brand-hover));
@@ -221,16 +221,16 @@ body {
   --tab-inactive-color: var(--app-text-secondary, #94a3b8);
   --tab-inactive-hover-color: var(--app-text-primary, #e2e8f0);
 
-  --app-page-bg: #141A18;
-  --app-surface: #1C2522;
-  --app-surface-raised: #25312d;
-  --app-surface-subtle: #18201e;
-  --app-input-bg: #18201e;
+  --app-page-bg: #221C19;
+  --app-surface: #2B2420;
+  --app-surface-raised: #2B2420;
+  --app-surface-subtle: #251F1C;
+  --app-input-bg: #2B2420;
 
   /* ── 边框 ── */
-  --app-border: #33413C;
-  --app-border-strong: #52635d;
-  --app-divider: rgba(233, 240, 235, 0.1);
+  --app-border: #4A3E37;
+  --app-border-strong: #66554A;
+  --app-divider: rgba(246, 238, 223, 0.12);
 
   /* ── 阴影 ── */
   --app-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.25);
