@@ -330,20 +330,14 @@ watch(
 }
 
 .wc-preset-btn:hover {
-  border-color: var(--color-brand-hover, #3b82f6);
-  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.08);
+  border-color: var(--color-brand-hover);
+  box-shadow: none;
 }
 
 .wc-preset-btn.active {
-  border-color: var(--color-brand, #2563eb);
-  background: rgba(37, 99, 235, 0.06);
-  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.1);
-}
-
-[data-theme='anchor'] .wc-preset-btn.active {
-  border-color: var(--color-gold, #d4a843);
-  background: rgba(212, 168, 67, 0.07);
-  box-shadow: 0 0 0 2px rgba(212, 168, 67, 0.1);
+  border-color: var(--color-brand);
+  background: var(--color-brand-light);
+  box-shadow: 0 0 0 2px var(--color-brand-border);
 }
 
 .wc-value {

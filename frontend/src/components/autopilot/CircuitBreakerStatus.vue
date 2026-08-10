@@ -1,7 +1,7 @@
 <template>
   <div class="circuit-breaker-status">
     <div class="breaker-header">
-      <span class="breaker-title">🔌 熔断保护</span>
+      <span class="breaker-title"><n-icon :component="PowerOutline" />熔断保护</span>
       <n-tag
         :type="statusTagType"
         :bordered="false"
@@ -19,7 +19,7 @@
       <div class="status-indicator">
         <div class="indicator-ring" :class="statusClass">
           <div class="indicator-core">
-            <div class="status-icon">{{ statusIcon }}</div>
+            <n-icon class="status-icon" :component="statusIcon" :aria-label="statusLabel" />
           </div>
         </div>
         <div class="status-text">
@@ -71,7 +71,8 @@
       <!-- 操作按钮 -->
       <n-space v-if="isOpen" :size="8" style="margin-top: 8px">
         <n-button size="small" type="primary" @click="handleReset">
-          🔄 重置熔断器
+          <template #icon><n-icon :component="RefreshOutline" /></template>
+          重置熔断器
         </n-button>
         <n-button size="small" quaternary @click="showErrorHistory">
           查看错误历史
@@ -127,10 +128,11 @@ import {
 } from '@/api/autopilot'
 import { usePolling } from '@/composables/usePolling'
 import { runtimePerformance } from '@/config/performance'
+import { AlertCircleOutline, CheckmarkCircleOutline, PowerOutline, RefreshOutline, SyncOutline } from '@vicons/ionicons5'
 
 const props = defineProps<{
   novelId: string
-  refreshKey?: number  // 🔥 刷新信号，变化时重新拉数据
+  refreshKey?: number  // 刷新信号，变化时重新拉数据
 }>()
 
 const emit = defineEmits<{
@@ -181,9 +183,9 @@ const statusClass = computed(() => {
 })
 
 const statusIcon = computed(() => {
-  if (isOpen.value) return '⚠️'
-  if (isHalfOpen.value) return '🔄'
-  return '✓'
+  if (isOpen.value) return AlertCircleOutline
+  if (isHalfOpen.value) return SyncOutline
+  return CheckmarkCircleOutline
 })
 
 const statusLabel = computed(() => {
@@ -290,7 +292,7 @@ watch(() => props.novelId, () => {
   void startPolling()
 })
 
-// 🔥 刷新信号变化时重新加载（由 Dashboard 的 SSE 事件驱动）
+// 刷新信号变化时重新加载（由 Dashboard 的 SSE 事件驱动）
 watch(() => props.refreshKey, (newKey) => {
   if (newKey && newKey > 0) void loadBreakerData()
 })
@@ -317,6 +319,9 @@ onMounted(() => {
 }
 
 .breaker-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   font-weight: 600;
   color: var(--text-color-1);
@@ -362,15 +367,15 @@ onMounted(() => {
 }
 
 .indicator-ring.status-closed::before {
-  border-color: #18a058;
+  border-color: var(--color-success);
 }
 
 .indicator-ring.status-half-open::before {
-  border-color: #f0a020;
+  border-color: var(--color-warning);
 }
 
 .indicator-ring.status-open::before {
-  border-color: #d03050;
+  border-color: var(--color-danger);
   animation: pulse-error 2s infinite;
 }
 

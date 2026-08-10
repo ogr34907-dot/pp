@@ -12,7 +12,7 @@
         <n-card size="small" :bordered="true" class="ce-card-elements">
           <template #header>
             <div class="ce-card-header-row">
-              <span class="card-title">👥 人物 / 地点 / 道具</span>
+              <span class="card-title"><n-icon :component="PeopleOutline" />人物 / 地点 / 道具</span>
               <n-space :size="6">
                 <n-select
                   v-model:value="filterType"
@@ -34,7 +34,7 @@
           <n-spin :show="loading">
             <n-space vertical :size="8">
               <n-space v-if="groupedCharacters.length" vertical :size="6">
-                <n-text strong class="ce-group-label">👤 人物</n-text>
+                <n-text strong class="ce-group-label"><n-icon :component="PersonOutline" />人物</n-text>
                 <n-space vertical :size="4">
                   <div v-for="elem in groupedCharacters" :key="elem.id" class="ce-item-readonly">
                     <n-text class="ce-element-name">{{ getElementDisplayName(elem.element_id, 'character') }}</n-text>
@@ -50,7 +50,7 @@
               </n-space>
 
               <n-space v-if="groupedLocations.length" vertical :size="6">
-                <n-text strong class="ce-group-label">📍 地点</n-text>
+                <n-text strong class="ce-group-label"><n-icon :component="LocationOutline" />地点</n-text>
                 <n-space vertical :size="4">
                   <div v-for="elem in groupedLocations" :key="elem.id" class="ce-item-readonly">
                     <n-text class="ce-element-name">{{ getElementDisplayName(elem.element_id, 'location') }}</n-text>
@@ -66,7 +66,7 @@
               </n-space>
 
               <n-space v-if="groupedOther.length" vertical :size="6">
-                <n-text strong class="ce-group-label">📦 其他</n-text>
+                <n-text strong class="ce-group-label"><n-icon :component="CubeOutline" />其他</n-text>
                 <n-space vertical :size="4">
                   <div v-for="elem in groupedOther" :key="elem.id" class="ce-item-readonly">
                     <n-tag :type="elemTypeColor(elem.element_type)" size="tiny" round>
@@ -92,7 +92,7 @@
         <!-- 伏笔回收建议 -->
         <n-card size="small" :bordered="true">
           <template #header>
-            <span class="card-title">🔗 伏笔回收建议</span>
+            <span class="card-title"><n-icon :component="LinkOutline" />伏笔回收建议</span>
           </template>
           <ForeshadowChapterSuggestionsPanel
             :slug="slug"
@@ -111,7 +111,7 @@
           :bordered="true"
         >
           <template #header>
-            <span class="card-title">✨ AI 生成质检</span>
+            <span class="card-title"><n-icon :component="SparklesOutline" />AI 生成质检</span>
           </template>
           <n-space vertical :size="10">
             <n-alert
@@ -184,6 +184,14 @@ import type { GenerateChapterWorkflowResponse } from '../../api/workflow'
 import type { AutopilotChapterAudit } from './ChapterStatusPanel.vue'
 import ForeshadowChapterSuggestionsPanel from './ForeshadowChapterSuggestionsPanel.vue'
 import ConsistencyReportPanel from './ConsistencyReportPanel.vue'
+import {
+  CubeOutline,
+  LinkOutline,
+  LocationOutline,
+  PeopleOutline,
+  PersonOutline,
+  SparklesOutline,
+} from '@vicons/ionicons5'
 import {
   CHAPTER_ELEMENT_IMPORTANCE_OPTIONS,
   CHAPTER_ELEMENT_RELATION_TYPE_OPTIONS,
@@ -396,12 +404,18 @@ onMounted(async () => {
 }
 
 .card-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   font-weight: 600;
 }
 
 /* 元素分组标签 */
 .ce-group-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 12px;
   font-weight: 600;
   color: var(--n-text-color-1);
@@ -428,7 +442,7 @@ onMounted(async () => {
 
 .ce-item-readonly:hover {
   border-color: var(--n-primary-color);
-  background: rgba(99, 102, 241, 0.02);
+  background: var(--color-brand-light);
 }
 
 .ce-element-name {

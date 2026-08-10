@@ -33,7 +33,7 @@
       <!-- 1. 本章实体索引（仅有 currentChapter 时显示） -->
       <div v-if="currentChapterNumber != null" class="pp-section mpp-section">
         <div class="pp-section-header">
-          <div class="wb-icon-badge" style="background:#6366f1">
+          <div class="wb-icon-badge">
             <n-icon size="14"><BookmarkOutline /></n-icon>
           </div>
           <span class="pp-section-label">本章实体索引</span>
@@ -72,7 +72,7 @@
       <!-- 2. 道具库 -->
       <div class="pp-section mpp-section">
         <div class="pp-section-header">
-          <div class="wb-icon-badge" style="background:#f59e0b">
+          <div class="wb-icon-badge">
             <n-icon size="14"><BriefcaseOutline /></n-icon>
           </div>
           <span class="pp-section-label">道具库</span>
@@ -86,7 +86,7 @@
           </div>
           <n-spin v-else :show="propsLoading && propsDataLoaded">
             <div v-if="!propsRows.length && !propsLoading" class="pp-empty" style="padding:20px 16px">
-              <span class="pp-empty-icon">📦</span>
+              <n-icon class="pp-empty-icon" :component="BriefcaseOutline" :size="28" aria-hidden="true" />
               <span class="pp-empty-text">暂无道具</span>
               <n-button size="small" secondary @click="openCreate">+ 新建道具</n-button>
             </div>
@@ -481,6 +481,12 @@ watch(() => props.slug, () => void loadCharOptions())
 
 <style scoped>
 .mpp-panel { /* pp-panel base */ }
+
+.wb-icon-badge {
+  color: var(--color-brand);
+  background: var(--color-brand-light);
+  border: 1px solid var(--color-brand-border);
+}
 
 /* Hint collapsible strip */
 .mpp-hint-wrap {

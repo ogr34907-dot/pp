@@ -1,5 +1,11 @@
 <template>
-  <aside class="stats-sidebar" :class="{ 'is-collapsed': collapsed }">
+  <aside
+    id="home-stats-sidebar"
+    class="stats-sidebar"
+    :class="{ 'is-collapsed': collapsed, 'is-compact-open': compactOpen }"
+    aria-label="数据概览与快捷操作"
+    @keydown.esc.stop="$emit('close-compact')"
+  >
     <!-- Brand Header -->
     <header class="sidebar-brand">
       <div class="brand-logo">
@@ -13,15 +19,16 @@
         :aria-label="collapsed ? '展开侧边栏' : '收起侧边栏'"
         @click="toggleCollapse"
       >
-        <svg viewBox="0 0 24 24" fill="none" width="16" height="16">
-          <path
-            :d="collapsed ? 'M9 18l6-6-6-6' : 'M15 18l-6-6 6-6'"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
-        </svg>
+        <n-icon :component="collapsed ? ChevronForwardOutline : ChevronBackOutline" :size="16" />
+      </button>
+      <button
+        ref="mobileCloseRef"
+        type="button"
+        class="mobile-close"
+        aria-label="关闭数据概览面板"
+        @click="$emit('close-compact')"
+      >
+        <n-icon :component="CloseOutline" :size="18" />
       </button>
     </header>
 
@@ -46,7 +53,7 @@
           :class="{ loading: loading }"
           aria-label="刷新数据"
         >
-          <span class="refresh-icon">↻</span>
+          <n-icon class="refresh-icon" :component="RefreshOutline" :size="16" />
         </button>
       </div>
 
@@ -165,9 +172,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { NSkeleton } from 'naive-ui'
+import { NIcon, NSkeleton } from 'naive-ui'
+import { ChevronBackOutline, ChevronForwardOutline, CloseOutline, RefreshOutline } from '@vicons/ionicons5'
 import StatCard from './StatCard.vue'
 import PlotPilotMark from '@/components/brand/PlotPilotMark.vue'
 import { useStatsStore } from '@/stores/statsStore'
@@ -177,11 +185,24 @@ import { storageKeys } from '@/config/storageKeys'
 import { runtimePerformance } from '@/config/performance'
 import { readStorageBoolean, writeStorageBoolean } from '@/utils/storage'
 import { getNovelStageLabel } from '@/domain/novel'
+const props = withDefaults(defineProps<{
+  compactOpen?: boolean
+}>(), {
+  compactOpen: false,
+})
+
 const emit = defineEmits<{
   (e: 'create-book'): void
   (e: 'refresh-list'): void
   (e: 'collapsed-change', collapsed: boolean): void
+  (e: 'close-compact'): void
 }>()
+
+const mobileCloseRef = ref<HTMLButtonElement | null>(null)
+
+watch(() => props.compactOpen, (isOpen) => {
+  if (isOpen) nextTick(() => mobileCloseRef.value?.focus())
+})
 
 const collapsed = ref(readStorageBoolean(storageKeys.statsSidebarCollapsed))
 
@@ -593,6 +614,10 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   color: var(--app-text-inverse);
 }
 
+.mobile-close {
+  display: none;
+}
+
 .action-btn.action-refresh {
   background: var(--app-surface);
   border-color: var(--app-border-strong);
@@ -706,5 +731,79 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   .footer-link { transition: none; }
 
   .refresh-btn.loading .refresh-icon { animation: none; }
+}
+
+@media (max-width: 768px) {
+  .stats-sidebar,
+  .stats-sidebar.is-collapsed {
+    width: min(320px, calc(100vw - 32px));
+    height: 100dvh;
+    z-index: 200;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateX(-100%);
+    transition:
+      transform var(--motion-duration-base) var(--motion-ease-standard),
+      visibility 0s linear var(--motion-duration-base);
+    box-shadow: var(--app-shadow-lg);
+  }
+
+  .stats-sidebar.is-compact-open {
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateX(0);
+    transition-delay: 0s;
+  }
+
+  .stats-sidebar.is-collapsed .brand-text {
+    display: flex;
+  }
+
+  .stats-sidebar.is-collapsed .stats-section,
+  .stats-sidebar.is-collapsed .quick-actions,
+  .stats-sidebar.is-collapsed .sidebar-footer {
+    display: block;
+  }
+
+  .stats-sidebar.is-collapsed .sidebar-brand {
+    min-height: 84px;
+    padding: 16px;
+    justify-content: space-between;
+  }
+
+  .stats-sidebar.is-collapsed .logo-icon {
+    width: 40px;
+    height: 40px;
+  }
+
+  .collapse-toggle {
+    display: none;
+  }
+
+  .mobile-close {
+    width: 44px;
+    height: 44px;
+    display: inline-grid;
+    place-items: center;
+    flex: 0 0 auto;
+    padding: 0;
+    border: 1px solid var(--app-border);
+    border-radius: var(--app-radius-md);
+    color: var(--app-text-secondary);
+    background: var(--app-surface);
+    cursor: pointer;
+  }
+
+  .mobile-close:focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+}
+
+@media (max-width: 768px) and (prefers-reduced-motion: reduce) {
+  .stats-sidebar,
+  .stats-sidebar.is-collapsed {
+    transition: none;
+  }
 }
 </style>

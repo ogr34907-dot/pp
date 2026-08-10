@@ -146,7 +146,7 @@ function emitRecovery() {
 
 .async-task-status--running { border-inline-start-color: var(--color-brand); }
 .async-task-status--paused { border-inline-start-color: var(--color-warning); }
-.async-task-status--failed { border-inline-start-color: var(--color-error); }
+.async-task-status--failed { border-inline-start-color: var(--color-danger); }
 .async-task-status--completed { border-inline-start-color: var(--color-success); }
 
 .async-task-status__marker {
@@ -162,7 +162,7 @@ function emitRecovery() {
 
 .async-task-status--running .async-task-status__marker { color: var(--color-brand); }
 .async-task-status--paused .async-task-status__marker { color: var(--color-warning); }
-.async-task-status--failed .async-task-status__marker { color: var(--color-error); }
+.async-task-status--failed .async-task-status__marker { color: var(--color-danger); }
 .async-task-status--completed .async-task-status__marker { color: var(--color-success); }
 
 .async-task-status__body { min-width: 0; }

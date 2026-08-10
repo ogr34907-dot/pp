@@ -201,12 +201,14 @@
                             :loading="generating"
                             :disabled="isAutopilotRunning || isAssistedReadOnly"
                           >
-                            🔄 重新生成
+                            <template #icon><n-icon :component="RefreshOutline" /></template>
+                            重新生成
                           </n-button>
                         </template>
                       </n-tooltip>
                       <n-button v-if="!proseOnlyWorkbench" size="small" secondary :disabled="isAssistedReadOnly" @click="openTensionModal" title="诊断当前章节张力缺口">
-                        🔍 张力诊断
+                        <template #icon><n-icon :component="PulseOutline" /></template>
+                        张力诊断
                       </n-button>
                     </n-space>
                   </n-space>
@@ -336,7 +338,7 @@
       v-if="!proseOnlyWorkbench"
       v-model:show="showGenerateModal"
       preset="card"
-      :title="isRegenerationMode ? '🔄 重新生成本章' : 'AI 生成本章（含一致性检查）'"
+      :title="isRegenerationMode ? '重新生成本章' : 'AI 生成本章（含一致性检查）'"
       style="width: min(820px, 96vw); max-height: min(92vh, 900px)"
       :segmented="{ content: true, footer: 'soft' }"
       :mask-closable="!generateInProgress"
@@ -517,7 +519,7 @@
                         ? '分析场景中...'
                         : '生成中...'
                       : isRegenerationMode
-                        ? '🔄 开始重新生成'
+                        ? '开始重新生成'
                         : '开始生成'
                 }}
               </n-button>
@@ -706,7 +708,7 @@
     <n-modal
       v-model:show="showTensionModal"
       preset="card"
-      title="🔍 张力诊断"
+      title="张力诊断"
       style="width: min(560px, 96vw)"
     >
       <n-space vertical :size="16">
@@ -736,7 +738,7 @@
                 :type="tensionResult.tension_level === 'high' ? 'success' : tensionResult.tension_level === 'medium' ? 'warning' : 'error'"
                 round
               >
-                {{ tensionResult.tension_level === 'high' ? '高张力' : tensionResult.tension_level === 'medium' ? '中等' : '低张力 ⚠' }}
+                {{ tensionResult.tension_level === 'high' ? '高张力' : tensionResult.tension_level === 'medium' ? '中等' : '低张力 · 需关注' }}
               </n-tag>
             </n-space>
 
@@ -869,7 +871,7 @@ import {
 import { narrativeOrdinalLabel } from '@/utils/narrativeUnitLabel'
 import { loadAssistBeatSession, persistAssistBeatSession } from '@/utils/assistBeatSession'
 import { formatApiError, getHttpStatus } from '@/utils/apiError'
-import { AppsOutline, ChevronForwardOutline } from '@vicons/ionicons5'
+import { AppsOutline, ChevronForwardOutline, PulseOutline, RefreshOutline } from '@vicons/ionicons5'
 
 const ChapterContentPanel = defineAsyncComponent(() => import('./ChapterContentPanel.vue'))
 const ChapterElementPanel = defineAsyncComponent(() => import('./ChapterElementPanel.vue'))
@@ -1519,7 +1521,7 @@ const hasChanges = computed(() => {
 })
 
 const wordCount = computed(() => {
-  // 🔥 流式写作时取流式内容长度，否则取编辑框内容长度
+  // 流式写作时取流式内容长度，否则取编辑框内容长度
   if (isAutopilotRunning.value && streamingChapterNumber.value === currentChapter.value?.number && streamingContent.value) {
     return streamingContent.value.length
   }
@@ -1546,7 +1548,7 @@ const streamingWordCountHint = computed((): string | null => {
   return `已定 ${live}/${tgt}`
 })
 
-/** 🔥 编辑框显示内容：流式时显示流式内容，否则显示普通内容 */
+/** 编辑框显示内容：流式时显示流式内容，否则显示普通内容 */
 const editorDisplayContent = computed({
   get: () => {
     if (isAutopilotRunning.value && streamingChapterNumber.value === currentChapter.value?.number && streamingContent.value) {
@@ -2404,7 +2406,7 @@ defineExpose({ ensureAssistedMode, streamingChapterNumber, writingPipelineStep }
   border-top: 1px solid var(--border-color);
 }
 
-/* 🔥 流式编辑框：编辑框本身就是流式显示 */
+/* 流式编辑框：编辑框本身就是流式显示 */
 .editor-input-wrapper {
   position: relative;
   flex: 1;
@@ -2451,7 +2453,7 @@ defineExpose({ ensureAssistedMode, streamingChapterNumber, writingPipelineStep }
   50% { opacity: 0; }
 }
 
-/* 🔥 流式字数动画 */
+/* 流式字数动画 */
 .streaming-word-count {
   color: #18a058;
   font-variant-numeric: tabular-nums;

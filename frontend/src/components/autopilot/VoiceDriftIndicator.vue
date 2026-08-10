@@ -1,7 +1,7 @@
 <template>
   <div class="voice-drift-indicator">
     <div class="indicator-header">
-      <span class="indicator-title">🎭 文风警报器</span>
+      <span class="indicator-title"><n-icon :component="PulseOutline" />文风警报器</span>
       <n-button v-if="isDanger" size="tiny" type="error" @click="showDetail">
         查看详情
       </n-button>
@@ -20,7 +20,7 @@
           :style="{ width: '76px', height: '76px' }"
         />
         <div class="progress-center">
-          <div class="drift-icon">{{ driftIcon }}</div>
+          <n-icon class="drift-icon" :component="driftIcon" :aria-label="driftLabel" />
           <div class="drift-score">{{ driftScore.toFixed(1) }}</div>
         </div>
       </div>
@@ -91,6 +91,7 @@ import { ref, computed, watch, onMounted } from 'vue'
 import { monitorApi } from '@/api/monitor'
 import { usePolling } from '@/composables/usePolling'
 import { runtimePerformance } from '@/config/performance'
+import { AlertCircleOutline, CheckmarkCircleOutline, FlashOutline, PulseOutline } from '@vicons/ionicons5'
 
 interface VoiceDriftData {
   drift_score: number
@@ -108,7 +109,7 @@ const props = defineProps<{
   novelId: string
   safeThreshold?: number  // 安全阈值，默认 3.0
   dangerThreshold?: number  // 危险阈值，默认 6.0
-  refreshKey?: number  // 🔥 刷新信号，变化时重新拉数据
+  refreshKey?: number  // 刷新信号，变化时重新拉数据
 }>()
 
 const emit = defineEmits<{
@@ -142,20 +143,20 @@ const isSafe = computed(() => driftStatus.value === 'safe')
 
 // 颜色
 const driftColor = computed(() => {
-  if (isDanger.value) return '#d03050'
-  if (isWarning.value) return '#f0a020'
-  return '#18a058'
+  if (isDanger.value) return 'var(--color-danger)'
+  if (isWarning.value) return 'var(--color-warning)'
+  return 'var(--color-success)'
 })
 
 const railColor = computed(() => {
-  return 'rgba(255, 255, 255, 0.1)'
+  return 'var(--app-border)'
 })
 
 // 图标
 const driftIcon = computed(() => {
-  if (isDanger.value) return '⚠️'
-  if (isWarning.value) return '⚡'
-  return '✓'
+  if (isDanger.value) return AlertCircleOutline
+  if (isWarning.value) return FlashOutline
+  return CheckmarkCircleOutline
 })
 
 // 标签
@@ -244,7 +245,7 @@ watch(() => props.novelId, () => {
   polling.restart({ immediate: true })
 })
 
-// 🔥 刷新信号变化时重新加载（由 Dashboard 的 SSE 事件驱动）
+// 刷新信号变化时重新加载（由 Dashboard 的 SSE 事件驱动）
 watch(() => props.refreshKey, (newKey) => {
   if (newKey && newKey > 0) void loadDriftData()
 })
@@ -271,6 +272,9 @@ onMounted(() => {
 }
 
 .indicator-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   font-weight: 600;
   color: var(--text-color-1);

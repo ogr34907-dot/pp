@@ -1,9 +1,18 @@
 <template>
-  <div class="home">
+  <div class="home" @keydown.esc="mobileSidebarOpen && closeCompactSidebar()">
     <StatsSidebar
+      :compact-open="mobileSidebarOpen"
       @create-book="focusCreateInput"
       @refresh-list="handleRefreshList"
       @collapsed-change="handleSidebarCollapsedChange"
+      @close-compact="closeCompactSidebar"
+    />
+    <button
+      v-if="mobileSidebarOpen"
+      type="button"
+      class="compact-sidebar-backdrop"
+      aria-label="关闭数据概览面板"
+      @click="closeCompactSidebar"
     />
     <main class="home-content" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
       <div class="home-bg" aria-hidden="true" />
@@ -28,6 +37,21 @@
             <template #icon>
               <n-icon :component="SettingsOutline" :size="21" />
             </template>
+          </n-button>
+          <n-button
+            ref="statsTriggerRef"
+            quaternary
+            size="large"
+            class="mobile-stats-trigger"
+            aria-controls="home-stats-sidebar"
+            :aria-expanded="mobileSidebarOpen"
+            aria-label="打开数据概览与快捷操作"
+            @click="mobileSidebarOpen = true"
+          >
+            <template #icon>
+              <n-icon :component="MenuOutline" />
+            </template>
+            概览
           </n-button>
         </header>
 
@@ -441,6 +465,7 @@ import {
   ChevronUpOutline,
   CreateOutline,
   LibraryOutline,
+  MenuOutline,
   SearchOutline,
   SettingsOutline,
   SparklesOutline,
@@ -492,9 +517,16 @@ const creating = ref(false)
 const loading = ref(false)
 
 const sidebarCollapsed = ref(readStorageBoolean(storageKeys.statsSidebarCollapsed))
+const mobileSidebarOpen = ref(false)
+const statsTriggerRef = ref<{ $el?: HTMLElement } | null>(null)
 
 function handleSidebarCollapsedChange(isCollapsed: boolean) {
   sidebarCollapsed.value = isCollapsed
+}
+
+function closeCompactSidebar() {
+  mobileSidebarOpen.value = false
+  nextTick(() => statsTriggerRef.value?.$el?.focus())
 }
 const books = ref<BookListItem[]>([])
 const searchQuery = ref('')
@@ -807,6 +839,11 @@ onMounted(() => {
   inset: 0;
   background: var(--app-page-bg);
   z-index: 0;
+}
+
+.compact-sidebar-backdrop,
+.mobile-stats-trigger {
+  display: none;
 }
 
 .container {
@@ -1317,6 +1354,24 @@ onMounted(() => {
 }
 
 @media (max-width: 768px) {
+  .compact-sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 190;
+    display: block;
+    width: 100%;
+    height: 100%;
+    padding: 0;
+    border: 0;
+    background: color-mix(in srgb, var(--app-text-primary) 46%, transparent);
+    cursor: pointer;
+  }
+
+  .mobile-stats-trigger {
+    display: inline-flex;
+    min-height: 44px;
+  }
+
   .home-content {
     margin-left: 0;
     padding: 0 16px 24px;
@@ -1360,6 +1415,11 @@ onMounted(() => {
 
   .product-header {
     min-height: 62px;
+  }
+
+  .mobile-stats-trigger {
+    min-width: 44px;
+    padding-inline: 10px;
   }
 
   .product-descriptor {

@@ -31,7 +31,7 @@
     <!-- 选中角色详情 -->
     <n-card v-if="detail" size="small" :bordered="true" class="psyche-detail-card">
       <template #header>
-        <span class="card-title">🧠 {{ detail.name }} — 心理画像</span>
+        <span class="card-title"><n-icon :component="PersonCircleOutline" />{{ detail.name }} — 心理画像</span>
       </template>
       <n-space vertical :size="10">
         <!-- 4D 模型 -->
@@ -61,7 +61,10 @@
 
         <!-- 行为验证 -->
         <n-collapse class="validate-collapse">
-          <n-collapse-item title="🧪 行为验证" name="validate">
+          <n-collapse-item name="validate">
+            <template #header>
+              <span class="section-title"><n-icon :component="FlaskOutline" />行为验证</span>
+            </template>
             <n-space vertical :size="8">
               <n-text depth="3" style="font-size: 12px">
                 输入一段行为描写，检验是否符合该角色心理画像设定。
@@ -92,13 +95,13 @@
                   {{ validateResult.valid ? '行为符合设定' : '行为可能不符合设定' }}
                 </n-alert>
                 <div v-if="validateResult.warnings.length > 0">
-                  <n-text depth="3" style="font-size: 12px; display: block; margin-bottom: 4px">⚠️ 警告：</n-text>
+                  <n-text depth="3" class="validation-label"><n-icon :component="AlertCircleOutline" />警告：</n-text>
                   <ul class="validate-list">
                     <li v-for="(w, i) in validateResult.warnings" :key="i">{{ w }}</li>
                   </ul>
                 </div>
                 <div v-if="validateResult.suggestions.length > 0">
-                  <n-text depth="3" style="font-size: 12px; display: block; margin-bottom: 4px">💡 建议：</n-text>
+                  <n-text depth="3" class="validation-label"><n-icon :component="BulbOutline" />建议：</n-text>
                   <ul class="validate-list">
                     <li v-for="(s, i) in validateResult.suggestions" :key="i">{{ s }}</li>
                   </ul>
@@ -115,6 +118,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useMessage } from 'naive-ui'
+import { AlertCircleOutline, BulbOutline, FlaskOutline, PersonCircleOutline } from '@vicons/ionicons5'
 import {
   characterPsycheApi,
   type CharacterPsycheDTO,
@@ -189,6 +193,19 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.card-title,
+.section-title,
+.validation-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.validation-label {
+  margin-bottom: 4px;
+  font-size: 12px;
 }
 
 .psyche-header {

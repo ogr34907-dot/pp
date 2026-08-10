@@ -2,7 +2,7 @@
   <div class="foreshadow-ledger">
     <div class="ledger-header">
       <div class="ledger-title-block">
-        <span class="ledger-title">📖 伏笔雷达</span>
+        <span class="ledger-title"><n-icon :component="BookOutline" />伏笔雷达</span>
         <n-text depth="3" class="ledger-sub">
           只读摘要 · 编辑见侧栏伏笔账本
         </n-text>
@@ -75,7 +75,10 @@
                   {{ importanceLabel(item.importance) }}
                 </n-tag>
                 <n-text depth="3" style="font-size: 12px">
-                  {{ item.is_collected ? '✓ 已回收' : '⏳ 待回收' }}
+                  <span class="ledger-state">
+                    <n-icon :component="item.is_collected ? CheckmarkCircleOutline : TimeOutline" />
+                    {{ item.is_collected ? '已回收' : '待回收' }}
+                  </span>
                 </n-text>
               </div>
               <div class="full-item-text">{{ item.description }}</div>
@@ -107,7 +110,7 @@
                 >
                   {{ importanceLabel(item.importance) }}
                 </n-tag>
-                <n-text depth="3" style="font-size: 12px">⏳ 待回收</n-text>
+                <n-text depth="3" style="font-size: 12px"><span class="ledger-state"><n-icon :component="TimeOutline" />待回收</span></n-text>
               </div>
               <div class="full-item-text">{{ item.description }}</div>
               <div class="full-item-meta">
@@ -135,7 +138,7 @@
                 >
                   {{ importanceLabel(item.importance) }}
                 </n-tag>
-                <n-text depth="3" style="font-size: 12px">✓ 已回收</n-text>
+                <n-text depth="3" style="font-size: 12px"><span class="ledger-state"><n-icon :component="CheckmarkCircleOutline" />已回收</span></n-text>
               </div>
               <div class="full-item-text">{{ item.description }}</div>
               <div class="full-item-meta">
@@ -157,6 +160,7 @@ import { foreshadowApi } from '../../api/foreshadow'
 import { isRequestCanceled } from '../../utils/requestCancel'
 import { runtimePerformance } from '../../config/performance'
 import { usePolling } from '../../composables/usePolling'
+import { BookOutline, CheckmarkCircleOutline, TimeOutline } from '@vicons/ionicons5'
 import {
   getForeshadowImportanceLabel,
   getForeshadowImportanceTagType,
@@ -175,14 +179,14 @@ interface Foreshadow {
 const props = defineProps<{
   novelId: string
   maxRecent?: number  // 最多显示几条最近伏笔，默认 5
-  refreshKey?: number  // 🔥 刷新信号，变化时重新拉数据
+  refreshKey?: number  // 刷新信号，变化时重新拉数据
 }>()
 
 const foreshadows = ref<Foreshadow[]>([])
 const showLedgerModal = ref(false)
 const loading = ref(false)
 
-// 🔥 请求取消控制器：新请求发出前取消上一个未完成的请求
+// 请求取消控制器：新请求发出前取消上一个未完成的请求
 let loadAbortController: AbortController | null = null
 
 // 统计
@@ -222,7 +226,7 @@ const importanceTagType = getForeshadowImportanceTagType
 
 // 与片场「伏笔账本」共用 foreshadow-ledger，经 foreshadowApi 与监控统计对齐
 async function loadForeshadows() {
-  // 🔥 取消上一个未完成的请求，防止并发堆积
+  // 取消上一个未完成的请求，防止并发堆积
   if (loadAbortController) {
     loadAbortController.abort()
   }
@@ -237,7 +241,7 @@ async function loadForeshadows() {
       signal: ac.signal,
       timeout: fetchTimeoutMs,
     })
-    // 🔥 仅在请求未被取消时更新（避免过期响应覆盖新数据）
+    // 仅在请求未被取消时更新（避免过期响应覆盖新数据）
     if (!ac.signal.aborted) {
       foreshadows.value = entries.map((entry) => ({
         id: entry.id,
@@ -279,7 +283,7 @@ function startPolling() {
 
 function stopPolling() {
   polling.stop()
-  // 🔥 停止轮询时取消进行中的请求
+  // 停止轮询时取消进行中的请求
   if (loadAbortController) {
     loadAbortController.abort()
     loadAbortController = null
@@ -292,7 +296,7 @@ watch(() => props.novelId, () => {
   startPolling()
 })
 
-// 🔥 刷新信号变化时重新加载（由 Dashboard 的 SSE 事件驱动）
+// 刷新信号变化时重新加载（由 Dashboard 的 SSE 事件驱动）
 watch(() => props.refreshKey, (newKey) => {
   if (newKey && newKey > 0) void polling.execute()
 })
@@ -338,9 +342,18 @@ onUnmounted(() => {
 }
 
 .ledger-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   font-weight: 600;
   color: var(--text-color-1);
+}
+
+.ledger-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .ledger-sub {
