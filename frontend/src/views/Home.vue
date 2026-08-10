@@ -245,8 +245,8 @@
                   tabindex="0"
                   :aria-label="`打开书目 ${book.title}`"
                   @click="navigateToBook(book.slug)"
-                  @keydown.enter="navigateToBook(book.slug)"
-                  @keydown.space.prevent="navigateToBook(book.slug)"
+                  @keydown.enter.self="navigateToBook(book.slug)"
+                  @keydown.space.self.prevent="navigateToBook(book.slug)"
                 >
                   <div class="card-top">
                     <span class="book-dot" :class="`dot-${book.stage}`"></span>
@@ -380,8 +380,8 @@
             tabindex="0"
             :aria-label="`打开书目 ${book.title}`"
             @click="navigateToBook(book.slug); showAllModal = false"
-            @keydown.enter="navigateToBook(book.slug); showAllModal = false"
-            @keydown.space.prevent="navigateToBook(book.slug); showAllModal = false"
+            @keydown.enter.self="navigateToBook(book.slug); showAllModal = false"
+            @keydown.space.self.prevent="navigateToBook(book.slug); showAllModal = false"
           >
             <div class="card-top">
               <span class="book-dot" :class="`dot-${book.stage}`"></span>
