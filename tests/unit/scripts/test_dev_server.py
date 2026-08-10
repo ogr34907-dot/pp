@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -9,7 +10,9 @@ import pytest
 
 from scripts.dev_server import (
     start_development_servers,
+    start_frontend_development_server,
     stop_development_servers,
+    stop_frontend_development_server,
     wait_for_http_ready,
 )
 
@@ -64,7 +67,67 @@ def test_wait_for_http_ready_times_out_when_no_server_is_available() -> None:
         )
 
 
-def test_start_development_servers_waits_for_backend_before_starting_vite(tmp_path) -> None:
+def test_start_development_servers_starts_only_the_hidden_local_workbench(tmp_path) -> None:
+    (tmp_path / "frontend").mkdir()
+    python_executable = tmp_path / "python.exe"
+    python_windowless_executable = tmp_path / "pythonw.exe"
+    python_executable.touch()
+    python_windowless_executable.touch()
+    calls: list[tuple[str, str]] = []
+    popen_arguments: list[dict[str, object]] = []
+
+    def fake_popen(command, **kwargs):
+        calls.append(("spawn", " ".join(map(str, command))))
+        popen_arguments.append(kwargs)
+        return object()
+
+    def fake_wait(url: str, **_kwargs) -> None:
+        calls.append(("wait", url))
+
+    def fake_browser(url: str) -> None:
+        calls.append(("browser", url))
+
+    start_development_servers(
+        tmp_path,
+        python_executable=str(python_executable),
+        npm_command="npm.cmd",
+        is_ready=lambda _url: False,
+        port_in_use=lambda _port: False,
+        popen=fake_popen,
+        wait_for_ready=fake_wait,
+        browser_opener=fake_browser,
+    )
+
+    assert calls == [
+        (
+            "spawn",
+            f"{python_windowless_executable} -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005",
+        ),
+        ("wait", "http://127.0.0.1:8005/"),
+        ("browser", "http://127.0.0.1:8005/"),
+    ]
+    assert popen_arguments[0]["creationflags"] & subprocess.CREATE_NO_WINDOW
+
+
+def test_stop_development_servers_stops_only_the_local_workbench_listener() -> None:
+    queried_ports: list[int] = []
+    stopped: list[int] = []
+
+    def listening_pids(port: int) -> list[int]:
+        queried_ports.append(port)
+        return {8005: [101, 202], 3000: [202, 303]}[port]
+
+    stopped_processes = stop_development_servers(
+        listening_pids=listening_pids,
+        terminate_process_tree=stopped.append,
+    )
+
+    assert queried_ports == [8005]
+    assert stopped_processes == [101, 202]
+    assert stopped == [101, 202]
+
+
+def test_start_frontend_development_server_is_an_explicit_vite_only_entrypoint(tmp_path) -> None:
     (tmp_path / "frontend").mkdir()
     calls: list[tuple[str, str]] = []
 
@@ -78,9 +141,8 @@ def test_start_development_servers_waits_for_backend_before_starting_vite(tmp_pa
     def fake_browser(url: str) -> None:
         calls.append(("browser", url))
 
-    start_development_servers(
+    start_frontend_development_server(
         tmp_path,
-        python_executable="python.exe",
         npm_command="npm.cmd",
         is_ready=lambda _url: False,
         port_in_use=lambda _port: False,
@@ -90,21 +152,25 @@ def test_start_development_servers_waits_for_backend_before_starting_vite(tmp_pa
     )
 
     assert calls == [
-        ("spawn", "python.exe -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005"),
-        ("wait", "http://127.0.0.1:8005/docs"),
         ("spawn", "npm.cmd run dev -- --host 127.0.0.1 --port 3000"),
         ("wait", "http://127.0.0.1:3000/"),
         ("browser", "http://127.0.0.1:3000/"),
     ]
 
 
-def test_stop_development_servers_stops_unique_listener_processes() -> None:
+def test_stop_frontend_development_server_only_queries_vite_port() -> None:
+    queried_ports: list[int] = []
     stopped: list[int] = []
 
-    stopped_processes = stop_development_servers(
-        listening_pids=lambda port: {8005: [101, 202], 3000: [202, 303]}[port],
+    def listening_pids(port: int) -> list[int]:
+        queried_ports.append(port)
+        return [303] if port == 3000 else [101]
+
+    stopped_processes = stop_frontend_development_server(
+        listening_pids=listening_pids,
         terminate_process_tree=stopped.append,
     )
 
-    assert stopped_processes == [101, 202, 303]
-    assert stopped == [101, 202, 303]
+    assert queried_ports == [3000]
+    assert stopped_processes == [303]
+    assert stopped == [303]

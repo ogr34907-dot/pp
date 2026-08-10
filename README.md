@@ -1,382 +1,223 @@
-# PlotPilot（墨枢）- GEO：AI写文，AI写剧本，AI创作，AI生文引擎，AI内容创作基建
+# PlotPilot（墨枢）
 
-> 剧情引擎内核仍在高速演进中。欢迎提交 Issue / PR；涉及商业化封装、私有素材、未公开设定稿的内容请先脱敏。
-
-<p align="center">
-  <img src="docs/plotpilot-readme.256.png" alt="PlotPilot 墨枢" width="120" />
-</p>
+> 面向长篇小说与剧本创作的本地 AI 工作台：规划、写作、记忆、知识图谱和自动驾驶都围绕同一部作品持续保存。
 
 <p align="center">
-  <strong>开源剧情引擎内核</strong>
-</p>
-
-<p align="center">
-  面向长篇 AI 创作的基础设施：持久记忆 · 知识图谱 · 自动推进流水线 · 质量治理闭环
-</p>
-
-<p align="center">
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.14.x-3776AB?style=flat&logo=python&logoColor=white" alt="Python"></a>
-  <a href="https://vuejs.org/"><img src="https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat&logo=vuedotjs&logoColor=white" alt="Vue"></a>
-  <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-0.109%2B-009688?style=flat&logo=fastapi&logoColor=white" alt="FastAPI"></a>
-  <a href="https://github.com/shenminglinyi/PlotPilot/releases"><img src="https://img.shields.io/github/v/release/shenminglinyi/PlotPilot?style=flat&logo=github&color=6e40c9" alt="Release"></a>
-  <a href="https://github.com/shenminglinyi/PlotPilot/stargazers"><img src="https://img.shields.io/github/stars/shenminglinyi/PlotPilot?style=flat&logo=github" alt="Stars"></a>
+  <a href="https://github.com/ogr34907-dot/pp"><img src="https://img.shields.io/badge/GitHub-ogr34907--dot%2Fpp-181717?style=flat&logo=github" alt="GitHub repository"></a>
+  <img src="https://img.shields.io/badge/Python-3.14-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.14">
+  <img src="https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat&logo=vuedotjs&logoColor=white" alt="Vue 3">
+  <img src="https://img.shields.io/badge/FastAPI-local%20API-009688?style=flat&logo=fastapi&logoColor=white" alt="FastAPI">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0%20%2B%20Commons%20Clause-D22128?style=flat&logo=apache&logoColor=white" alt="License"></a>
 </p>
 
----
-
 <p align="center">
-  <img src="docs/screenshots/workbench-writing.png" alt="工作台 — 写作区与知识图谱" width="49%" />
-  <img src="docs/screenshots/workbench-dag.png" alt="工作台 — 故事线 DAG 与人物设定" width="49%" />
+  <img src="docs/screenshots/workbench-writing.png" alt="PlotPilot 写作工作台" width="49%">
+  <img src="docs/screenshots/workbench-dag.png" alt="PlotPilot 故事线与知识图谱工作台" width="49%">
 </p>
-
----
 
 ## 这是什么
 
-PlotPilot 是一个**剧情引擎内核（Narrative Engine Kernel）**，不是聊天式写作助手，也不是一组提示词模板。
+PlotPilot 不是单次续写工具。它把一本书的设定、章节、故事线、伏笔、摘要、人物关系和生成过程保存为可检查的本地状态，让 AI 在后续章节中有东西可查、有规则可守。
 
-大多数 AI 写作工具解决的是"生成一段文字"的问题。PlotPilot 解决的是一个更难的工程问题：
+当前仓库提供完整的本地工作台与 REST API，适合希望在自己电脑上写长篇、剧本或持续迭代故事设定的作者。默认数据保存在本地，不需要把作品正文或 API Key 交给本仓库。
 
-> **如何让 AI 系统在数十万字的叙事跨度里，维持人物一致性、因果链完整性、伏笔闭合率，并在无人值守的条件下持续推进？**
+## 当前可用能力
 
-这不是提示词优化问题，而是**系统工程问题**。PlotPilot 的答案是：构建一套完整的剧情状态管理基础设施，让 LLM 只做它最擅长的事——在结构化上下文中生成高质量叙事片段。
-
-本仓库是这套基础设施的**开源内核**。上层生态（垂直应用、编辑器插件、云服务）均以此为基石构建。
-
-项目边界很明确：
-
-- **不是** 单轮续写器：核心目标是长篇连续生产，而不是回答一次写作请求。
-- **不是** 大上下文堆料：世界观、人物、伏笔、故事线会被结构化为可追踪状态。
-- **不是** 单一前端产品：官方工作台只是内核的一个使用界面，核心能力通过 REST API 暴露。
-
----
-
-## 内核架构
-
-PlotPilot 内核由五个相互协作的子系统构成：
-
-### 1. 叙事状态机（Narrative State Machine）
-
-引擎在任意时刻都持有完整的叙事快照，包含：
-
-- **Story Bible**：人物档案（含 POV 防火墙、登场频率调度）、地点图、世界设定三元组
-- **章级摘要链**：每章生成后自动提炼的压缩摘要，构成跨章上下文骨架
-- **叙事事件流**：关键事件的时序登记表，支持因果链追溯
-- **故事线 DAG**：多故事线的有向无环图，可视化分支与汇合点
-- **伏笔注册表**：钩子（Hook）的开启、悬置、消费状态完整追踪
-
-任何一次章节生成，引擎都会从上述快照中动态装配上下文窗口，而非依赖模型自身的"记忆"。
-
-### 2. 向量语义检索层（Vector Retrieval Layer）
-
-引擎维护两条并行索引：
-
-- **章内容索引**：基于 FAISS / ChromaDB 的本地向量库，对所有已写章节做语义切片索引
-- **三元组索引**：从正文中自动抽取的 `(主体, 关系, 客体)` 三元组，支持结构化与语义混合查询
-
-生成时，引擎通过当前场景语义自动召回相关历史内容，注入上下文，消除"模型失忆"问题。嵌入服务支持 OpenAI 兼容 API（轻量）和本地 `sentence-transformers` 模型（离线高性能）。
-
-### 3. 剧情引擎运行时（Engine Runtime）
-
-这是引擎最核心的系统组件。当前生产入口收敛在 `engine/runtime/engine_daemon.py`：由 `EngineDaemon` 承接守护进程生命周期，委托 `StoryPipelineRunner` 运行章节规划、写作、审计与状态推进；章节写作默认走 `BaseStoryPipeline` 十步管线。
-
-```
-宏观规划（部 / 卷 / 幕结构）
-    └─▶ 幕级节拍规划（Beat Sheet 生成）
-            └─▶ 章节生成循环
-                    ├─▶ 叙事治理预算
-                    ├─▶ 章节执行剧本准备
-                    ├─▶ 上下文装配（人物 / 世界观 / 记忆 / 伏笔）
-                    ├─▶ LLM 调用
-                    ├─▶ 内容策略验证
-                    ├─▶ 文风漂移检测
-                    ├─▶ 章末管线（摘要 / 事件 / 三元组 / 伏笔）
-                    ├─▶ 向量索引更新
-                    ├─▶ 张力评分
-                    └─▶ 状态落库 → 继续 / 重写 / 暂停
-```
-
-关键工程特性：
-- **单一生产入口**：`scripts/start_daemon.py` 构造依赖并启动 `EngineDaemon`
-- **可回退写作路径**：默认 `StoryPipeline` 写作，`PLOTPILOT_USE_STORY_PIPELINE=off/legacy` 可临时回退
-- **熔断保护**：连续失败超过阈值自动暂停，附带诊断信息
-- **单写者路由（Write Dispatch）**：所有 SQLite 写操作经由统一调度器串行执行，消除并发写冲突
-- **SSE 实时推流**：生成进度、Token 消耗、当前阶段、错误信息全部通过 Server-Sent Events 实时推送到前端
-- **检查点快照**：阶段推进前自动存档，支持从任意检查点恢复
-
-### 4. 提示词策略层（Prompt Strategy Layer）
-
-引擎暴露 **20+ 独立提示接点**，每个接点均可通过 `prompt_packages/` 下的 YAML 配置文件独立覆写：
-
-| 接点类型 | 包含接点 |
-|----------|----------|
-| 规划类 | `planning-main-plot-suggest` · `planning-quick-macro` |
-| 生成类 | `scene-director` · `chapter-narrative-sync` |
-| 知识类 | `bible-all` · `bible-characters` · `bible-locations` · `bible-worldbuilding` |
-| 分析类 | `style-analysis` · `tension-analysis-diagnosis` |
-
-每个提示包支持独立配置：系统提示、声线锚点、节拍约束、字数层级、记忆铁律、模型参数（temperature / top_p / max_tokens）。切换任务类型（短篇 / 长篇 / 游戏剧本）不需要修改代码，只需切换提示包目录。
-
-### 5. 质量监控子系统（Quality Monitor）
-
-引擎内置叙事质量的量化监控，不依赖人工逐章审阅：
-
-- **张力心电图**：每章生成后计算张力评分（0–10），历史曲线持久化，低谷自动触发诊断
-- **文风相似度检测**：基于向量余弦相似度计算当前章节与风格基准的偏离程度
-- **漂移告警 + 定向修写**：偏离超过阈值时，引擎不回滚章节，而是触发定向修写任务，保留已有进度
-- **陈词滥调扫描**：规则库 + 语义相似度双重检测，标记高频套路表达
-
----
-
-## 内核与生态
-
-```
-PlotPilot 内核（本仓库）
-        │
-        ├── 叙事状态机
-        ├── 向量语义检索层
-        ├── 剧情引擎运行时
-        ├── 提示词策略层（20+ 接点）
-        └── 质量监控子系统
-                │
-                ▼
-        REST API（FastAPI · v1 · 版本化）
-                │
-        ┌───────┴──────────────────────┐
-        │                              │
-  官方工作台前端               生态扩展层（基于内核）
-  Vue 3 · TypeScript           ├── 垂直领域工具
-  Naive UI · ECharts            │   （剧本/游戏剧情/IP 衍生……）
-  Tauri 桌面客户端              ├── 第三方前端 / 编辑器插件
-                                ├── 自定义提示词包
-                                └── 云服务 / SaaS（需遵守许可证）
-```
-
-内核提供稳定的 REST API 边界；所有生态扩展均通过提示词包、工作流插件或上层应用的方式叠加能力，内核本身不感知。如果你在用内核做二创，建议从提示词包和工作流层开始，而非修改内核代码。
-
----
-
-## 技术选型说明
-
-| 层 | 技术 | 选型理由 |
-|----|------|----------|
-| 后端框架 | FastAPI + uvicorn | 原生异步 + 自动 OpenAPI 文档，SSE 支持开箱即用 |
-| 架构范式 | DDD 分层 + 独立 `engine/` 运行内核 | 领域逻辑、用例编排、生产写作管线与技术实现分离，生态扩展不污染内核 |
-| AI 接入 | OpenAI 兼容协议 / Anthropic Claude / 火山方舟 Doubao | 统一接口抽象，模型切换不改业务代码 |
-| 向量存储 | ChromaDB（默认）/ FAISS | 本地部署，零外部依赖，冷启动快 |
-| 嵌入模型 | OpenAI 兼容 API / 本地 `bge-small-zh-v1.5` | 在线轻量与离线高性能双模式 |
-| 主数据库 | SQLite + Write Dispatch 单写者路由 | 嵌入式零依赖，并发写冲突由调度层解决 |
-| 前端 | Vue 3 + TypeScript + Vite + Naive UI + ECharts | 组件类型安全，知识图谱与 DAG 可视化由 ECharts 驱动 |
-| 桌面客户端 | Tauri（Rust） | 比 Electron 内存占用低 80%+，原生系统集成 |
-
----
+- **作者工作台**：暖纸主题、响应式布局，覆盖新书设定、写作、章节浏览、人物与地点关系图。
+- **结构化创作**：宏观结构、章节节拍、人物设定、世界观、故事线和伏笔都可以围绕同一作品维护。
+- **持续记忆**：章节完成后沉淀摘要、事件、三元组、伏笔和向量索引，为后续生成提供可追溯的上下文。
+- **知识图谱**：从作品设定和章节事实中维护实体关系，支持人物、地点和故事关系的可视化查看。
+- **自动驾驶**：按章节规划、生成、审阅和提交流程推进；进度、暂停原因和恢复状态会实时显示在工作台中。
+- **恢复保护**：章节的规范章后记忆未提交时，自动驾驶会暂停，而不是带着不完整记忆继续写。
+- **本地优先**：FastAPI、SQLite、向量索引和前端工作台均可在本机运行；LLM 与嵌入模型使用你自己的服务凭证。
 
 ## 快速开始
 
-### 方式一：一键启动（Windows，无需安装 Python）
+以下是 Windows 源码本地部署的推荐方式。首次准备一次，之后使用启动器即可。
 
-1. 将 `python-3.14.5-embed-amd64.zip` 放入 `tools/` 目录（仅首次）
-2. 双击 `tools/plotpilot.bat`
+### 1. 准备环境
 
-启动器自动完成：环境自检 → 创建虚拟环境 → 安装依赖（自动切换国内镜像源）→ 启动服务 → 打开浏览器。后续启动直接双击。
+| 项目 | 要求 |
+| --- | --- |
+| 操作系统 | Windows 10 / 11（启动器为 Windows 批处理脚本） |
+| Python | `3.14.x`，推荐 `3.14.5` |
+| Node.js | `20.19+` 或 `22.12+` |
+| Git | 用于克隆和同步仓库 |
+| LLM 凭证 | 至少准备一个可用的模型服务凭证 |
 
-> 支持 `tools\plotpilot.bat pack` 打包整个项目分享给他人，对方双击即用。当前启动器固定使用 Python 3.14 系列；如需使用系统 Python，可设置 `PLOTPILOT_PYTHON_EXE` 指向 Python 3.14 的 `python.exe`。
+### 2. 克隆并安装依赖
 
-### 方式二：桌面安装版（Windows · Tauri）
+在 PowerShell 中执行：
 
-前往 [GitHub Releases](https://github.com/shenminglinyi/PlotPilot/releases) 下载最新安装包，内含冻结后端，无需单独安装 Python。
+```powershell
+git clone https://github.com/ogr34907-dot/pp.git
+Set-Location pp
 
-构建流程见 [docs/BUILD_INSTALLER.md](docs/BUILD_INSTALLER.md)。
-
----
-
-## 开发者文档
-
-**环境要求**：Python 3.14.x、Node.js 18+
-
-```bash
-# 后端 — Windows
+Copy-Item .env.example .env
 py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-# 使用本地向量模型时再安装：
+
+Push-Location frontend
+npm install
+npm run build
+Pop-Location
+```
+
+需要使用本地嵌入模型时，再执行：
+
+```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-local.txt
-copy .env.example .env    # 填写 LLM 凭证
-.\.venv\Scripts\python.exe -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
 ```
 
-```bash
-# 后端 — Linux / macOS
-python3.14 -m venv .venv
-./.venv/bin/python -m pip install --upgrade pip
-./.venv/bin/python -m pip install -r requirements.txt
-# 使用本地向量模型时再安装：
-./.venv/bin/python -m pip install -r requirements-local.txt
-cp .env.example .env
-./.venv/bin/python -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
+### 3. 配置模型服务
+
+编辑根目录的 `.env`，填入自己可用的模型服务配置。`.env.example` 提供了方舟与 Anthropic 的示例；项目也支持 OpenAI 与 Gemini 兼容配置。
+
+至少完成一组 LLM 配置，例如：
+
+```dotenv
+ARK_API_KEY=your-key
+ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3/chat/completions
+ARK_MODEL=your-model
 ```
 
-```bash
-# 前端（另开终端）
-cd frontend && npm install && npm run dev
+默认语义检索使用云端嵌入服务。可填写 `EMBEDDING_API_KEY`，或复用 `OPENAI_API_KEY`；若改为本地模型，请设置 `EMBEDDING_SERVICE=local` 并安装 `requirements-local.txt`。
+
+不要提交 `.env`、作品数据、日志或向量索引。它们都属于本地私有内容。
+
+### 4. 启动工作台
+
+日常本机写小说时，双击 `tools\start-local.vbs`。它会隐藏命令行窗口和后台服务进程，等待 FastAPI 就绪后打开浏览器。
+
+需要从终端观察真实启动错误时，运行诊断入口 `tools\start-dev.bat`：
+
+```powershell
+.\tools\start-dev.bat
 ```
 
-| 地址 | 说明 |
-|------|------|
-| `http://127.0.0.1:8005` | 后端 API |
-| `http://127.0.0.1:8005/docs` | OpenAPI 交互文档 |
-| `http://localhost:3000` | 前端开发服务器 |
+日常启动只拉起 `8005` 上的 FastAPI；FastAPI 直接托管已构建的 `frontend\dist`，不会默认启动 Vite 或 `3000`。
 
-生产构建后前端由 FastAPI 静态托管（`frontend/dist`），也可独立部署。
+服务地址如下：
 
----
+| 地址 | 用途 |
+| --- | --- |
+| [http://127.0.0.1:8005/](http://127.0.0.1:8005/) | PlotPilot 作者工作台 |
+| [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs) | FastAPI OpenAPI 文档 |
 
-## 环境变量
+结束日常服务时双击 `tools\stop-local.vbs`，或从终端运行 `tools\stop-dev.bat`。两者只处理 `8005`，不会误杀 `3000` 上的其他项目。
 
-| 变量 | 说明 |
-|------|------|
-| `LLM_PROVIDER` | 可选；指定默认 LLM 提供方 |
-| `ANTHROPIC_API_KEY` / `ARK_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` | 至少配置一个 LLM 凭证 |
-| `ARK_BASE_URL` / `ARK_MODEL`、`ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL`、`OPENAI_BASE_URL` / `OPENAI_MODEL`、`GEMINI_BASE_URL` / `GEMINI_MODEL` | 对应提供方的接口地址与模型名 |
-| `EMBEDDING_SERVICE` | `openai`（`.env.example` 默认）或 `local`（需额外安装模型，见 `requirements-local.txt`） |
-| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` | 云端嵌入服务配置；`EMBEDDING_API_KEY` 为空时可回退读取 `OPENAI_API_KEY` |
-| `EMBEDDING_MODEL_PATH` / `EMBEDDING_USE_GPU` | 本地嵌入模型路径与 GPU 开关 |
-| `VECTOR_STORE_ENABLED` / `VECTOR_STORE_TYPE` / `VECTOR_STORE_PATH` | 向量索引开关、类型与持久化目录 |
-| `CORS_ORIGINS` | 生产环境前端域名，逗号分隔 |
-| `DISABLE_AUTO_DAEMON` | 设为 `1` 禁止启动时自动拉起守护进程 |
-| `DISABLE_ORPHAN_CLEANUP` | 设为 `1` 跳过 Windows 启动时的残留后端进程清理；仅用于受控多进程启动 |
-| `LOG_LEVEL` / `LOG_FILE` | 日志级别与路径 |
+### 启动器说明
 
-完整说明见 [`.env.example`](.env.example)。
+| 文件 | 适用场景 |
+| --- | --- |
+| `tools\start-local.vbs` | 日常本机写作入口；无终端启动 `8005`，并打开 `http://127.0.0.1:8005/`。 |
+| `tools\stop-local.vbs` | 日常本机写作的无终端停止入口；只处理 `8005`。 |
+| `tools\start-dev.bat` | 从终端运行的诊断入口；行为与日常启动相同，但保留真实失败退出码。 |
+| `tools\stop-dev.bat` | 从终端停止日常服务；只处理 `8005`。 |
+| `tools\start-frontend-dev.bat` | 显式启动 Vue/Vite 源码开发服务器 `3000`，不会替代日常启动。 |
+| `tools\stop-frontend-dev.bat` | 停止显式启动的 Vite `3000` 开发服务器。 |
+| `tools\plotpilot.bat` | 便携式 GUI 启动器。它要求 Python `3.14.x`，并在没有系统 Python 时查找 `tools\python-3.14.5-embed-amd64.zip`；适合准备好该运行时的分发环境，不是源码开发的推荐入口。 |
 
----
+## 第一次写一本书
 
-## 架构目录
+1. 打开工作台，创建或选择一本作品。
+2. 在新书设定中补全题材、核心设定、人物、世界观和写作目标。
+3. 生成并确认宏观结构与章节规划。结构未确认前，自动驾驶不会把它当作可执行写作计划。
+4. 在工作台生成、编辑并保存章节；侧边栏可检查人物、地点、伏笔、关系和章节状态。
+5. 准备好连续产出后启动自动驾驶。它会在需要审阅、生成失败或状态不完整时暂停，等待你决定下一步。
 
-```
-（项目根目录）/
-├── domain/                 # 领域层 — 纯业务模型和值对象
-│   ├── novel/             # 小说、章节、故事线、伏笔、因果、张力
-│   ├── bible/             # 设定库、人物档案、地点、时间线
-│   ├── character/         # 人物实体、人物状态、关系能力
-│   ├── cast/              # 卡司与人物关系图
-│   ├── knowledge/         # 知识三元组、故事知识图
-│   ├── memory/            # 长期记忆与上下文状态
-│   ├── prop/              # 道具生命周期与道具事件
-│   ├── worldbuilding/     # 世界观领域模型
-│   ├── structure/         # 故事结构节点
-│   ├── evolution/         # 世界线 / 演化相关模型
-│   ├── ai/                # AI 领域契约与值对象
-│   └── shared/            # 共享基类、异常、事件、ID
-│
-├── application/           # 应用层 — 用例编排，协调领域、引擎与基础设施
-│   ├── core/              # 小说 / 章节 / 导出等基础用例
-│   ├── onboarding/        # 新书向导、前置设定生成
-│   ├── blueprint/         # 宏观规划、连续规划、Beat Sheet、故事结构
-│   ├── engine/            # 上下文构建、章后管线、治理预算、AI 调用编排
-│   ├── governance/        # 叙事治理、质量约束、章节预算
-│   ├── audit/             # 章节审阅、宏观重构、章节元素分析
-│   ├── analyst/           # 文风、张力、伏笔账本、叙事状态分析
-│   ├── world/             # Bible、知识图谱、世界观与人物关系服务
-│   ├── ai/                # LLM / embedding 应用服务
-│   ├── ai_invocation/     # AI 调用记录与审阅
-│   ├── checkpoint/        # 检查点与快照用例
-│   ├── memory/            # 记忆编排用例
-│   ├── narrative/         # 叙事投影与状态同步
-│   ├── narrative_engine/  # 叙事引擎应用服务
-│   ├── manuscript/        # 正文实体索引与手稿服务
-│   ├── prop/              # 道具应用服务
-│   ├── reader/            # 读者模拟 / 阅读侧能力
-│   ├── snapshot/          # 快照应用服务
-│   ├── workbench/         # 工作台编排
-│   └── workflows/         # 自动生成工作流、兼容编排与后台任务
-│
-├── engine/                # 剧情引擎内核 — 生产运行时、章节写作管线与题材扩展
-│   ├── runtime/           # EngineDaemon、StoryPipelineRunner、守护进程委托、质量守门
-│   ├── pipeline/          # BaseStoryPipeline 十步章节生成管线
-│   ├── pipelines/         # 题材 Pipeline 注册与扩展（如武侠、通用题材桥接）
-│   ├── core/              # 引擎侧实体、端口、服务契约
-│   └── infrastructure/    # 引擎事件、记忆编排、checkpoint 适配
-│
-├── infrastructure/        # 基础设施层 — 技术实现，可替换
-│   ├── ai/                # LLM Provider、Prompt Packages、向量存储、嵌入服务
-│   ├── persistence/       # SQLite 仓储、迁移、Write Dispatch 单写者调度器
-│   ├── export/            # DOCX / EPUB / PDF 导出
-│   └── runtime/           # 数据目录、日志环境与进程级运行配置
-│
-├── interfaces/            # 接口层 — FastAPI、依赖注入、运行状态与外部边界
-│   ├── main.py            # FastAPI 应用入口
-│   ├── daemon_manager.py  # 后端内自动驾驶进程管理
-│   └── api/v1/            # REST API（core / world / blueprint / engine / audit / analyst 等）
-│
-├── frontend/              # 官方工作台 — Vue 3 + TypeScript + Tauri 桌面壳
-│   ├── src/               # 工作台、自动驾驶、知识图谱、设置、API client
-│   └── src-tauri/         # Tauri 桌面客户端与后端 sidecar
-│
-├── shared/                # 跨端共享配置与分类体系资源
-├── config/                # 本地配置与默认配置
-├── scripts/               # 启动、安装、迁移、评估与维护脚本
-├── tests/                 # 单元、集成、E2E 与 DAG 测试
-└── tools/                 # Windows 启动器与内嵌 Python 包
+建议先以少量章节验证模型、篇幅、文风和嵌入服务，再增加自动驾驶的目标章节数。这样可以在较小范围内发现提示词、模型或设定问题。
+
+## 自动驾驶与规范记忆恢复
+
+每个章节被确认后，PlotPilot 需要把正文转换为后续写作依赖的规范资产，例如章节摘要、叙事事件、知识图谱候选、伏笔状态和向量索引。自动驾驶只会在这些资产提交完成后继续下一章。
+
+如果工作台显示 **“规范章后同步失败”** 或错误码 `canonical_aftermath_not_ready`：
+
+1. 先确认当前章节正文与必要的审阅结果已经保存。
+2. 对单章问题，使用工作台中的 **“重新同步本章”**，完成后再核对状态。
+3. 如果多个章节的历史记忆都需要重建，使用 **“从第 1 章开始全流程同步”**。该任务会从第 1 章处理到当前章，并显示当前进度与失败原因。
+4. 全章重同步完成后，自动驾驶会保持暂停状态。请在工作台检查结果，然后由作者手动继续或重新启动自动驾驶。
+
+不要通过强行刷新、跳过审阅或直接修改数据库来绕过这个暂停。它的作用正是避免下一章在缺失前文规范记忆的情况下继续生成。
+
+## 手动启动与本地部署
+
+不使用 Windows 启动器时，日常本机模式只需启动 FastAPI。运行前请确认已经在 `frontend` 目录执行过 `npm run build`，因为 `8005` 会直接托管构建产物：
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005
 ```
 
-完整设计与分层说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+然后访问 [http://127.0.0.1:8005/](http://127.0.0.1:8005/)；OpenAPI 文档仍在 [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs)。
 
----
+### Vue 源码开发（可选）
 
-## 测试
+只有需要修改 Vue 源码时才使用 `3000`。先让 `8005` 后端保持运行，再双击 `tools\start-frontend-dev.bat`，或在 `frontend` 目录执行：
 
-```bash
-pytest tests/ -v
-# 含覆盖率报告
-pytest tests/ --cov=. --cov-report=term-missing
+```powershell
+Set-Location frontend
+npm run dev -- --host 127.0.0.1 --port 3000
 ```
 
----
+此时工作台地址才是 [http://127.0.0.1:3000/](http://127.0.0.1:3000/)。Vite 的 API 代理仍指向已运行的 `8005`；停止时使用 `tools\stop-frontend-dev.bat`，不要用日常的 `stop-dev.bat` 代替。
 
-## 贡献指南
+Linux 或 macOS 可以使用同样的后端命令流程，将 Windows 虚拟环境路径替换为 `.venv/bin/python`，并使用 `source .venv/bin/activate`。生产构建、Tauri 桌面安装包与维护者打包说明见 [docs/BUILD_INSTALLER.md](docs/BUILD_INSTALLER.md)。
 
-1. Fork 本仓库
-2. 新建分支：`git checkout -b feat/your-feature`
-3. 提交信息建议遵循 [Conventional Commits](https://www.conventionalcommits.org/)
-4. 推送并发起 Pull Request
+## 常见问题
 
-架构与分层说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)；其余文档索引见 [docs/README.md](docs/README.md)。
+### `py -3.14` 找不到 Python
 
----
+安装 Python `3.14.x`，并确认 `py -3.14 --version` 能返回版本号。项目的 Python 版本约束是 `>=3.14,<3.15`，不要用 `3.11` 或 `3.12` 替代。
 
-## 提交安全边界
+### 启动器打开后无法访问工作台
 
-请不要提交以下内容：
+先检查 [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs)。如果后端未就绪，检查 `.env` 中的配置和 `8005` 端口占用；日常模式不启动 `3000`。只有 Vue 源码开发时才需要检查 `3000`，此时在 `frontend` 目录确认已执行 `npm install`。
 
-- `.env`、API Key、模型网关地址中的私有凭证
-- `data/`、`logs/`、SQLite 数据库、向量库、运行时缓存
-- Word / PPT / Excel 等办公文档（如 `.docx`、`.pptx`、`.xlsx`），尤其是未公开设定、商业计划、合同、客户资料
-- 打包产物、安装包、Tauri / PyInstaller 输出目录
+### 生成时报 API Key 或模型错误
 
-如果必须提交示例资料，请放入脱敏后的 Markdown / JSON / YAML，并确认不包含真实密钥、真实用户数据或未公开作品内容。
+确认 `.env` 内配置了对应提供方的 API Key、Base URL 和模型名。修改 `.env` 后重启后端。模型服务、网关地址和可用模型由你的服务商账户决定。
 
----
+### 向量检索或知识图谱初始化失败
 
-## 生态共建 (Community & Contribution)
+检查嵌入服务配置：云端模式需要有效的 `EMBEDDING_API_KEY` 或 `OPENAI_API_KEY`；本地模式需要安装 `requirements-local.txt`，并能访问 `EMBEDDING_MODEL_PATH` 指向的模型目录。
 
-PlotPilot 引擎仍在持续演进中，我们始终致力于用工程化手段解决复杂的创作状态管理问题。我们正在寻找对“叙事工程”与“大模型复杂系统架构”感兴趣的极客同行。
+### 如何备份作品
 
-**当前生态演进方向**：内核引擎研发、生态应用构建、提示词工程、前端工作台。如果你有志于共建，欢迎通过以下方式参与：
+在停止服务后备份本地 `data/` 目录，并妥善保管 `.env`。作品正文、SQLite 数据库和向量索引都可能位于本地数据目录，不应提交到 Git。
 
-*   **核心代码与架构共建：** 请直接在 GitHub 提交 Issue 或 PR，引擎核心维护组会定期 Review。
-*   **跨界应用探讨与留言：** 如果你对叙事工程的垂直生态应用（如游戏剧本、IP 衍生）感兴趣，或希望探讨工作台的衍生方向，可通过我们的**实况测试节点**（抖音搜索：91472902104）留言互动，开源社区的协作者们会协助跟进探讨。
+## 技术概览
 
----
+| 层 | 组成 |
+| --- | --- |
+| 作者界面 | Vue 3、TypeScript、Vite、Naive UI、ECharts |
+| 本地 API | FastAPI、Uvicorn、SSE 实时进度推送 |
+| 创作运行时 | 章节规划、上下文装配、生成、审阅、章后资产提交与恢复保护 |
+| 持久化 | SQLite、单写者调度、ChromaDB / FAISS 向量检索 |
+| 模型接入 | Anthropic、方舟、OpenAI、Gemini 与本地嵌入模型配置 |
+
+面向开发者的分层说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，文档索引见 [docs/README.md](docs/README.md)。
+
+## 验证与贡献
+
+后端测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/ -v
+```
+
+前端检查：
+
+```powershell
+Set-Location frontend
+npm run lint
+npm run test:unit
+npm run build
+```
+
+欢迎通过 Issue 或 Pull Request 改进项目。提交前请确保不包含 API Key、`.env`、`data/`、日志、数据库、向量索引、未公开作品内容或办公文档。
 
 ## 许可证
 
-本项目采用 **Apache License 2.0**，并附加 **Commons Clause** 条件限制。
-
-- **允许**：学习、修改、非商业内部部署、基于内核的生态扩展（非营利）
-- **禁止**：将本项目（含修改版）封装为收费 SaaS、打包售卖源码或作为收费产品的增值服务
-
-详见 [LICENSE](LICENSE)。
-
----
+本项目使用 [Apache License 2.0](LICENSE)，并附加 Commons Clause 条件限制。详细权利和限制以 [LICENSE](LICENSE) 为准。

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import sys
@@ -16,8 +17,8 @@ from urllib.request import urlopen
 
 BACKEND_PORT = 8005
 FRONTEND_PORT = 3000
-BACKEND_HEALTH_URL = f"http://127.0.0.1:{BACKEND_PORT}/docs"
 FRONTEND_HEALTH_URL = f"http://127.0.0.1:{FRONTEND_PORT}/"
+WORKBENCH_URL = f"http://127.0.0.1:{BACKEND_PORT}/"
 
 
 def wait_for_http_ready(
@@ -71,6 +72,17 @@ def _default_python_executable(project_root: Path) -> str:
     return sys.executable
 
 
+def _windowless_python_executable(python_executable: str) -> str:
+    """Use the Windows GUI interpreter so the service cannot create a console."""
+
+    executable = Path(python_executable)
+    if executable.name.lower() == "python.exe":
+        windowless = executable.with_name("pythonw.exe")
+        if windowless.exists():
+            return str(windowless)
+    return python_executable
+
+
 def _start_process(
     command: list[str],
     *,
@@ -79,18 +91,23 @@ def _start_process(
 ) -> object:
     creationflags = (
         getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        | getattr(subprocess, "DETACHED_PROCESS", 0)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
     )
-    return popen(
-        command,
-        cwd=str(cwd),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-        creationflags=creationflags,
-    )
+    options: dict[str, object] = {
+        "cwd": str(cwd),
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.STDOUT,
+        "creationflags": creationflags,
+    }
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        options["startupinfo"] = startupinfo
+    return popen(command, **options)
 
 
-def start_development_servers(
+def start_local_workbench(
     project_root: Path,
     *,
     python_executable: str | None = None,
@@ -101,12 +118,13 @@ def start_development_servers(
     wait_for_ready: Callable[..., None] = wait_for_http_ready,
     browser_opener: Callable[[str], object] = webbrowser.open,
 ) -> None:
-    """Start the API and Vite workbench in dependency order."""
+    """Start the local FastAPI workbench that serves the built frontend."""
 
     project_root = Path(project_root).resolve()
     python_executable = python_executable or _default_python_executable(project_root)
+    python_executable = _windowless_python_executable(python_executable)
 
-    if not is_ready(BACKEND_HEALTH_URL):
+    if not is_ready(WORKBENCH_URL):
         if not port_in_use(BACKEND_PORT):
             _start_process(
                 [
@@ -122,8 +140,24 @@ def start_development_servers(
                 cwd=project_root,
                 popen=popen,
             )
-        wait_for_ready(BACKEND_HEALTH_URL, timeout_seconds=60, poll_interval=0.25)
+        wait_for_ready(WORKBENCH_URL, timeout_seconds=60, poll_interval=0.25)
 
+    browser_opener(WORKBENCH_URL)
+
+
+def start_frontend_development_server(
+    project_root: Path,
+    *,
+    npm_command: str = "npm.cmd",
+    is_ready: Callable[[str], bool] = _is_http_ready,
+    port_in_use: Callable[[int], bool] = _port_is_in_use,
+    popen: Callable[..., object] = subprocess.Popen,
+    wait_for_ready: Callable[..., None] = wait_for_http_ready,
+    browser_opener: Callable[[str], object] = webbrowser.open,
+) -> None:
+    """Start Vite only for explicit Vue source development."""
+
+    project_root = Path(project_root).resolve()
     if not is_ready(FRONTEND_HEALTH_URL):
         if not port_in_use(FRONTEND_PORT):
             _start_process(
@@ -178,17 +212,62 @@ def _terminate_process_tree(process_id: int) -> None:
     )
 
 
-def stop_development_servers(
+def _stop_servers_on_ports(
+    ports: tuple[int, ...],
     *,
     listening_pids: Callable[[int], list[int]] = _listening_pids,
     terminate_process_tree: Callable[[int], object] = _terminate_process_tree,
 ) -> list[int]:
-    """Stop the unique process trees currently listening on PlotPilot dev ports."""
-
-    process_ids = sorted({process_id for port in (BACKEND_PORT, FRONTEND_PORT) for process_id in listening_pids(port)})
+    process_ids = sorted(
+        {
+            process_id
+            for port in ports
+            for process_id in listening_pids(port)
+        }
+    )
     for process_id in process_ids:
         terminate_process_tree(process_id)
     return process_ids
+
+
+def stop_local_workbench(
+    *,
+    listening_pids: Callable[[int], list[int]] = _listening_pids,
+    terminate_process_tree: Callable[[int], object] = _terminate_process_tree,
+) -> list[int]:
+    """Stop only the local FastAPI workbench process tree."""
+
+    return _stop_servers_on_ports(
+        (BACKEND_PORT,),
+        listening_pids=listening_pids,
+        terminate_process_tree=terminate_process_tree,
+    )
+
+
+def stop_frontend_development_server(
+    *,
+    listening_pids: Callable[[int], list[int]] = _listening_pids,
+    terminate_process_tree: Callable[[int], object] = _terminate_process_tree,
+) -> list[int]:
+    """Stop only the explicitly launched Vite development process tree."""
+
+    return _stop_servers_on_ports(
+        (FRONTEND_PORT,),
+        listening_pids=listening_pids,
+        terminate_process_tree=terminate_process_tree,
+    )
+
+
+def start_development_servers(*args, **kwargs) -> None:
+    """Backward-compatible alias for the 8005-only local workbench launcher."""
+
+    return start_local_workbench(*args, **kwargs)
+
+
+def stop_development_servers(*args, **kwargs) -> list[int]:
+    """Backward-compatible alias for stopping the 8005-only local workbench."""
+
+    return stop_local_workbench(*args, **kwargs)
 
 
 def _project_root() -> Path:
@@ -197,19 +276,29 @@ def _project_root() -> Path:
 
 def main() -> int:
     parser = ArgumentParser(description="Start or stop the PlotPilot development servers.")
-    parser.add_argument("command", choices=("start", "stop"))
+    parser.add_argument("command", choices=("start", "stop", "frontend", "stop-frontend"))
     arguments = parser.parse_args()
 
     if arguments.command == "start":
-        start_development_servers(_project_root())
-        print(f"PlotPilot development workbench is ready at {FRONTEND_HEALTH_URL}")
+        start_local_workbench(_project_root())
+        print(f"PlotPilot local workbench is ready at {WORKBENCH_URL}")
         return 0
 
-    stopped_processes = stop_development_servers()
+    if arguments.command == "frontend":
+        start_frontend_development_server(_project_root())
+        print(f"PlotPilot Vite development server is ready at {FRONTEND_HEALTH_URL}")
+        return 0
+
+    stop_function = (
+        stop_local_workbench
+        if arguments.command == "stop"
+        else stop_frontend_development_server
+    )
+    stopped_processes = stop_function()
     if stopped_processes:
         print("Stopped PlotPilot development process trees: " + ", ".join(map(str, stopped_processes)))
     else:
-        print("No PlotPilot development process is listening on ports 8005 or 3000.")
+        print("No PlotPilot development process is listening on the requested port.")
     return 0
 
 

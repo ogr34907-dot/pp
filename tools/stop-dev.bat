@@ -8,5 +8,6 @@ if exist ".venv\Scripts\python.exe" (
     py -3.14 scripts\dev_server.py stop
 )
 
-pause
-exit /b %errorlevel%
+set "EXIT_CODE=%errorlevel%"
+if not "%EXIT_CODE%"=="0" pause
+exit /b %EXIT_CODE%
