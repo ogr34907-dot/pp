@@ -1,10 +1,18 @@
 <template>
-  <div class="workbench">
-    <StatsTopBar :slug="slug" @open-settings="appSettingsShell.open()" />
+  <div class="workbench" :class="{ 'is-focus-mode': focusMode }">
+    <StatsTopBar
+      :slug="slug"
+      :context-title="bookTitle || slug"
+      :chapter-label="currentChapter ? `第 ${currentChapter.number} 章 · ${currentChapter.title || '未命名章节'}` : '尚未选择章节'"
+      :focus-mode="focusMode"
+      @toggle-focus="focusMode = !focusMode"
+      @open-settings="appSettingsShell.open()"
+    />
 
     <n-spin :show="pageLoading" class="workbench-spin" description="加载工作台…">
       <div class="workbench-inner">
         <n-split
+          class="workbench-primary-split"
           direction="horizontal"
           :min="WORKBENCH_SPLIT.sidebarMin"
           :max="WORKBENCH_SPLIT.sidebarMax"
@@ -50,9 +58,15 @@
                 </template>
 
                 <template #2>
-                  <div v-if="rightCollapsed" class="wb-right-strip" @click="toggleRight">
-                    <span class="wb-strip-icon">◀</span>
-                  </div>
+                  <button
+                    v-if="rightCollapsed"
+                    type="button"
+                    class="wb-right-strip"
+                    aria-label="展开右侧检查器"
+                    @click="toggleRight"
+                  >
+                    <n-icon size="17"><ChevronBackOutline /></n-icon>
+                  </button>
                   <SettingsPanel
                     v-else
                     :slug="slug"
@@ -103,6 +117,7 @@ import { WORKBENCH_SPLIT } from '../design/layoutDensity'
 import { storageKeys } from '@/config/storageKeys'
 import { runtimePerformance } from '@/config/performance'
 import { readStorageBoolean, writeStorageBoolean } from '@/utils/storage'
+import { ChevronBackOutline } from '@vicons/ionicons5'
 
 const ActPlanningModal = defineAsyncComponent(() => import('../components/workbench/ActPlanningModal.vue'))
 
@@ -175,6 +190,7 @@ const handlePlanAct = (actId: string, actTitle: string) => {
 }
 
 const rightCollapsed = ref(readStorageBoolean(storageKeys.workbenchRightPanelCollapsed))
+const focusMode = ref(false)
 
 function toggleRight() {
   rightCollapsed.value = !rightCollapsed.value
@@ -281,7 +297,7 @@ watch(
   min-height: 0;
   max-height: 100vh;
   overflow: hidden;
-  background: var(--app-page-bg, #f0f2f8);
+  background: var(--app-page-bg);
   display: flex;
   flex-direction: column;
 }
@@ -309,6 +325,7 @@ watch(
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  padding: 6px;
 }
 
 .workbench-inner :deep(.n-split) {
@@ -329,6 +346,9 @@ watch(
   height: 100%;
   width: 100%;
   overflow: hidden;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-md);
 }
 
 .wb-right-collapsed :deep(.n-split-pane-1) {
@@ -363,10 +383,39 @@ watch(
   font-size: 12px;
   transition: background 0.15s, color 0.15s;
   user-select: none;
+  padding: 0;
 }
 
 .wb-right-strip:hover {
   background: var(--plotpilot-panel-muted);
   color: var(--app-text-primary);
+}
+
+.wb-right-strip:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -3px;
+}
+
+.is-focus-mode :deep(.workbench-primary-split > .n-split-pane-1),
+.is-focus-mode :deep(.workbench-primary-split > .n-split__gutter),
+.is-focus-mode .wb-main-split :deep(> .n-split > .n-split-pane-2),
+.is-focus-mode .wb-main-split :deep(> .n-split > .n-split__gutter) {
+  display: none !important;
+}
+
+.is-focus-mode :deep(.workbench-primary-split > .n-split-pane-2),
+.is-focus-mode .wb-main-split :deep(> .n-split > .n-split-pane-1) {
+  width: 100% !important;
+  max-width: none !important;
+  flex: 1 1 100% !important;
+}
+
+@media (max-width: 900px) {
+  .workbench-inner { padding: 0; }
+  .wb-main-split { border-radius: 0; border-block: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-right-strip { transition: none; }
 }
 </style>

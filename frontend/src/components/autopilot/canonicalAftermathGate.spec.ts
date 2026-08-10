@@ -13,7 +13,7 @@ describe('getCanonicalAftermathPresentation', () => {
       macro_structure_ready: true,
     })
 
-    expect(presentation).toEqual({
+    expect(presentation).toMatchObject({
       isFailure: true,
       title: '规范章后同步失败',
       actionLabel: '重新同步第 8 章',

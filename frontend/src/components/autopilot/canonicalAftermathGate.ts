@@ -6,6 +6,30 @@ export interface CanonicalAftermathPresentation {
   title: string
   actionLabel: string
   canResume: boolean
+  role: 'alert' | 'status'
+  ariaLive: 'assertive' | 'polite'
+  fullResyncAction: {
+    intent: 'resync-all'
+    label: string
+    scope: string
+    disabled: boolean
+  } | null
+  asyncStatus: {
+    status: 'waiting' | 'running' | 'failed'
+    stage: string
+    message: string
+    current?: number
+    total?: number
+    shouldAutoResume: false
+  } | null
+}
+
+export interface CanonicalAftermathFullResyncSnapshot {
+  active: boolean
+  processed: number
+  total: number
+  currentChapter: number | null
+  firstFailureReason: string
 }
 
 export function canStartCanonicalAftermathFullResync(
@@ -107,6 +131,7 @@ export function canOfferReviewResume(
 
 export function getCanonicalAftermathPresentation(
   status: Record<string, any> | null | undefined,
+  fullResync?: CanonicalAftermathFullResyncSnapshot,
 ): CanonicalAftermathPresentation {
   const gate = status?.review_gate
   const isFailure = String(status?.autopilot_pause_reason || '') === 'canonical_aftermath_not_ready'
@@ -118,13 +143,42 @@ export function getCanonicalAftermathPresentation(
       title: '',
       actionLabel: '',
       canResume: true,
+      role: 'status',
+      ariaLive: 'polite',
+      fullResyncAction: null,
+      asyncStatus: null,
     }
   }
+
+  const fullResyncActive = fullResync?.active === true
+  const firstFailureReason = String(fullResync?.firstFailureReason || '')
+  const currentChapter = Number(fullResync?.currentChapter || 0)
+  const asyncStatus = fullResync
+    ? {
+        status: fullResyncActive ? 'running' as const : (firstFailureReason ? 'failed' as const : 'waiting' as const),
+        stage: '第 1 章至当前章',
+        message: firstFailureReason
+          ? `同步中断：${firstFailureReason}`
+          : (currentChapter > 0 ? `正在同步第 ${currentChapter} 章` : '准备从第 1 章开始同步'),
+        current: Math.max(0, Number(fullResync.processed || 0)),
+        total: Math.max(0, Number(fullResync.total || 0)),
+        shouldAutoResume: false as const,
+      }
+    : null
 
   return {
     isFailure: true,
     title: '规范章后同步失败',
     actionLabel: String(gate?.action_label || '重新同步本章'),
     canResume: false,
+    role: 'alert',
+    ariaLive: 'assertive',
+    fullResyncAction: {
+      intent: 'resync-all',
+      label: '从第 1 章开始全流程同步',
+      scope: '第 1 章至当前章',
+      disabled: fullResyncActive || String(status?.current_stage || '') !== 'paused_for_review',
+    },
+    asyncStatus,
   }
 }

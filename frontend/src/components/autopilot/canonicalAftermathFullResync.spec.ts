@@ -3,6 +3,7 @@ import {
   canStartCanonicalAftermathFullResync,
   canOfferReviewResume,
   createCanonicalAftermathFullResyncState,
+  getCanonicalAftermathPresentation,
   shouldShowCanonicalAftermathFullResyncProgress,
 } from './canonicalAftermathGate'
 
@@ -51,6 +52,55 @@ describe('canonical aftermath full resync presentation state', () => {
       autopilot_status: 'running',
       current_stage: 'paused_for_review',
     }, false)).toBe(true)
+  })
+
+  it('exposes canonical failure as an assertive alert with an explicit full-book recovery intent', () => {
+    const presentation = getCanonicalAftermathPresentation({
+      autopilot_pause_reason: 'canonical_aftermath_not_ready',
+      autopilot_status: 'running',
+      current_stage: 'paused_for_review',
+      current_chapter_number: 64,
+      review_gate: {
+        type: 'canonical_aftermath',
+        message: '第 64 章的规范记忆同步尚未完成',
+      },
+    }) as any
+
+    expect(presentation).toMatchObject({
+      role: 'alert',
+      ariaLive: 'assertive',
+      fullResyncAction: {
+        intent: 'resync-all',
+        label: '从第 1 章开始全流程同步',
+        scope: '第 1 章至当前章',
+        disabled: false,
+      },
+    })
+  })
+
+  it('presents active full-book counters while disabling recovery and never auto-resuming', () => {
+    const presentation = getCanonicalAftermathPresentation({
+      autopilot_pause_reason: 'canonical_aftermath_not_ready',
+      current_stage: 'paused_for_review',
+      current_chapter_number: 64,
+    }, {
+      active: true,
+      processed: 18,
+      total: 64,
+      currentChapter: 19,
+      firstFailureReason: '',
+    }) as any
+
+    expect(presentation.fullResyncAction.disabled).toBe(true)
+    expect(presentation.asyncStatus).toMatchObject({
+      status: 'running',
+      stage: '第 1 章至当前章',
+      current: 18,
+      total: 64,
+      message: '正在同步第 19 章',
+      shouldAutoResume: false,
+    })
+    expect(presentation.canResume).toBe(false)
   })
 
   it('marks completion without requesting a resume', () => {

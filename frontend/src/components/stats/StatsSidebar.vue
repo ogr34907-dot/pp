@@ -274,7 +274,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   height: 100vh;
   box-sizing: border-box;
   padding-top: env(safe-area-inset-top);
-  background: var(--app-surface-subtle);
+  background: var(--app-page-bg);
   border-right: 1px solid var(--app-border);
   display: flex;
   flex-direction: column;
@@ -293,7 +293,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .sidebar-brand {
   min-height: 100px;
   padding: 20px 24px;
-  background: var(--app-surface);
+  background: var(--app-page-bg);
   border-bottom: 1px solid var(--app-border);
   position: relative;
   overflow: visible;
@@ -411,7 +411,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .title-icon {
   width: 16px;
   height: 16px;
-  color: var(--app-text-secondary, #64748b);
+  color: var(--app-text-secondary);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -432,14 +432,14 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--app-text-muted, #64748b);
+  color: var(--app-text-muted);
   transition: all 0.2s ease;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  box-shadow: none;
 }
 
 .refresh-btn:hover:not(:disabled) {
   background: var(--app-surface-subtle);
-  color: var(--color-brand, #4f46e5);
+  color: var(--color-brand);
 }
 
 .refresh-btn:disabled {
@@ -472,7 +472,8 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   background: var(--app-surface);
   border-radius: 12px;
   padding: 16px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--app-border);
+  box-shadow: none;
   min-height: 168px;
   box-sizing: border-box;
 }
@@ -482,7 +483,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 }
 
 .stage-dot--placeholder {
-  background: var(--app-border, rgba(148, 163, 184, 0.35));
+  background: var(--app-border);
   opacity: 0.9;
 }
 
@@ -494,13 +495,13 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 
 .stage-empty-hint {
   font-size: 12px;
-  color: var(--app-text-muted, #94a3b8);
+  color: var(--app-text-muted);
 }
 
 .stage-title {
   font-size: 13px;
   font-weight: 600;
-  color: var(--app-text-muted, #64748b);
+  color: var(--app-text-muted);
   margin: 0 0 12px;
 }
 
@@ -524,10 +525,10 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   flex-shrink: 0;
 }
 
-.stage-dot.stage-planning { background: #3b82f6; }
-.stage-dot.stage-writing { background: #f59e0b; }
-.stage-dot.stage-reviewing { background: #8b5cf6; }
-.stage-dot.stage-completed { background: #10b981; }
+.stage-dot.stage-planning { background: var(--color-info); }
+.stage-dot.stage-writing { background: var(--color-brand); }
+.stage-dot.stage-reviewing { background: var(--color-warning); }
+.stage-dot.stage-completed { background: var(--color-success); }
 
 .stage-name {
   flex: 1;
@@ -573,40 +574,52 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   gap: 8px;
   min-height: 58px;
   padding: 0 14px;
-  background: linear-gradient(135deg, var(--color-brand-hover, #6366f1) 0%, var(--color-brand, #4f46e5) 55%, var(--color-brand-pressed, #4338ca) 100%);
-  border: 1px solid color-mix(in srgb, var(--color-brand, #4f46e5) 52%, transparent);
-  border-radius: 16px;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border-strong);
+  border-radius: var(--app-radius-md);
   cursor: pointer;
   transition: all 0.2s ease;
   font-size: 15px;
   font-weight: 600;
   line-height: 1;
-  color: var(--app-text-inverse, #ffffff);
+  color: var(--app-text-primary);
   box-shadow: none;
   white-space: nowrap;
 }
 
 .action-btn.action-create {
-  background: linear-gradient(135deg, var(--color-brand-hover, #6366f1) 0%, var(--color-brand, #4f46e5) 55%, var(--color-brand-pressed, #4338ca) 100%);
-  border-color: color-mix(in srgb, var(--color-brand, #4f46e5) 52%, transparent);
+  background: var(--color-brand);
+  border-color: var(--color-brand);
+  color: var(--app-text-inverse);
 }
 
 .action-btn.action-refresh {
-  background: linear-gradient(135deg, var(--color-brand-hover, #6366f1) 0%, var(--color-brand, #4f46e5) 55%, var(--color-brand-pressed, #4338ca) 100%);
-  border-color: color-mix(in srgb, var(--color-brand, #4f46e5) 52%, transparent);
+  background: var(--app-surface);
+  border-color: var(--app-border-strong);
 }
 
 .action-btn:hover {
-  filter: none;
-  transform: none;
-  background: linear-gradient(135deg, var(--color-brand, #4f46e5) 0%, var(--color-brand-hover, #6366f1) 55%, var(--color-brand-pressed, #4338ca) 100%);
-  box-shadow: none;
+  background: var(--app-surface-subtle);
+  border-color: var(--color-brand-border);
+}
+
+.action-btn.action-create:hover {
+  background: var(--color-brand-hover);
+  border-color: var(--color-brand-hover);
+}
+
+.action-btn:focus-visible,
+.collapse-toggle:focus-visible,
+.refresh-btn:focus-visible,
+.footer-link:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
 }
 
 .action-icon {
   width: 16px;
   height: 16px;
-  color: var(--app-text-inverse, #ffffff);
+  color: currentColor;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -621,9 +634,9 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .sidebar-footer {
   margin-top: auto;
   padding: 10px 16px 12px;
-  border-top: 1px solid var(--app-divider, rgba(15, 23, 42, 0.06));
+  border-top: 1px solid var(--app-divider);
   display: block;
-  background: var(--app-surface-subtle, rgba(248, 250, 252, 0.8));
+  background: var(--app-page-bg);
 }
 
 .footer-info {
@@ -635,7 +648,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 
 .update-time {
   font-size: 12px;
-  color: var(--app-text-muted, #64748b);
+  color: var(--app-text-muted);
   display: flex;
   align-items: center;
   gap: 4px;
@@ -656,7 +669,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 
 .footer-link {
   font-size: 12px;
-  color: var(--app-text-muted, #64748b);
+  color: var(--app-text-muted);
   text-decoration: none;
   display: inline-flex;
   align-items: center;
@@ -668,7 +681,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 }
 
 .footer-link:hover {
-  color: var(--color-brand, #4f46e5);
+  color: var(--color-brand);
   background: var(--app-surface-subtle);
 }
 
@@ -683,5 +696,15 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .link-icon svg {
   width: 14px;
   height: 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stats-sidebar,
+  .collapse-toggle,
+  .refresh-btn,
+  .action-btn,
+  .footer-link { transition: none; }
+
+  .refresh-btn.loading .refresh-icon { animation: none; }
 }
 </style>

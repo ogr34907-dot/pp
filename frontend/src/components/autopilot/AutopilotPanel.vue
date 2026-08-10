@@ -62,13 +62,23 @@
     </section>
 
     <n-alert
-      v-if="statusConnectivityFailures >= 2 && !statusPollDisabled"
+      v-if="status && statusConnectivityFailures >= 2 && !statusPollDisabled"
       type="warning"
       :show-icon="true"
       class="ap-inline-alert"
     >
       无法连接写作后端。已自动拉长轮询间隔，请确认桌面后端或开发 API 已启动后再试。
     </n-alert>
+
+    <EmptyState
+      v-if="!status && statusConnectivityFailures >= 2 && !statusPollDisabled"
+      title="暂时无法读取托管状态"
+      description="写作内容不会受影响。请确认后端已启动，再重新获取当前进度。"
+    >
+      <template #actions>
+        <n-button size="small" secondary :loading="toggling" @click="fetchStatus">重新获取状态</n-button>
+      </template>
+    </EmptyState>
 
     <section v-if="status" class="ap-kpi-grid" aria-label="关键指标">
       <article class="ap-kpi">
@@ -190,87 +200,48 @@
       </div>
     </n-alert>
 
-    <!-- 审阅等待 -->
-    <n-alert v-if="showReviewGate" :type="reviewGateAlertType" :show-icon="true" class="ap-inline-alert">
-      <div class="ap-review-alert">
-        <span>
-          <strong>{{ reviewGateTitle }}</strong>：{{ reviewGateMessage }}
-        </span>
+    <!-- 审阅等待：共享状态组件负责读屏播报，动作仍调用原处理器。 -->
+    <AsyncTaskStatus
+      v-if="showReviewGate"
+      :status="reviewTaskStatus"
+      :stage="reviewGateTitle"
+      :message="reviewGateMessage"
+      :recovery-label="reviewRecoveryLabel"
+      :recovery-intent="reviewRecoveryIntent"
+      :recovery-disabled="fullResyncActive"
+      :recovery-loading="reviewRecoveryLoading"
+      @retry="handleReviewRetry"
+      @resume="resume"
+    >
+      <template v-if="canonicalAftermathFailure && canStartFullResync && !fullResyncActive" #actions>
         <n-button
-          v-if="reviewGateNeedsAIPanel && featureFlags.aiInvocationDebug"
           type="warning"
-          size="small"
-          :loading="aiPanelOpening"
-          @click="() => openActiveInvocation()"
-        >
-          打开 AI 面板
-        </n-button>
-        <n-button
-          v-else-if="canonicalAftermathFailure"
-          type="warning"
-          size="small"
-          :loading="toggling"
-          :disabled="fullResyncActive"
-          @click="retryCanonicalAftermath"
-        >
-          {{ reviewGateActionLabel }}
-        </n-button>
-        <n-button
-          v-if="canStartFullResync && !fullResyncActive"
-          type="warning"
-          ghost
+          secondary
           size="small"
           :loading="toggling"
           @click="startCanonicalAftermathFullResync"
         >
-          <template #icon><n-icon size="14"><RefreshOutline /></n-icon></template>
-          全章重同步
+          <template #icon><n-icon size="16"><RefreshOutline /></n-icon></template>
+          {{ canonicalAftermathPresentation.fullResyncAction?.label }}
         </n-button>
-        <n-button
-          v-else-if="canResumeReview && !canonicalAftermathFailure && !fullResyncActive"
-          type="warning"
-          size="small"
-          :loading="toggling"
-          @click="resume"
-        >
-          {{ reviewGateActionLabel }}
-        </n-button>
-      </div>
-    </n-alert>
+      </template>
+    </AsyncTaskStatus>
 
-    <n-alert
+    <AsyncTaskStatus
       v-if="showFullResyncProgress"
-      :type="fullResyncFirstFailureReason ? 'error' : 'info'"
-      :show-icon="true"
-      class="ap-inline-alert"
+      :status="fullResyncTaskStatus"
+      :stage="canonicalAftermathPresentation.asyncStatus?.stage || '第 1 章至当前章'"
+      :message="fullResyncStatusMessage"
+      :current="canonicalAftermathPresentation.asyncStatus?.current ?? fullResyncProcessed"
+      :total="canonicalAftermathPresentation.asyncStatus?.total ?? fullResyncTotal"
     >
-      <div class="full-resync-progress">
-        <div class="full-resync-progress__head">
-          <span v-if="fullResyncFirstFailureReason">
-            全章重同步首个失败：第 {{ fullResyncFailureChapter || '—' }} 章，{{ fullResyncFirstFailureReason }}
-          </span>
-          <span v-else>
-            全章重同步 · {{ fullResyncProcessed }} / {{ fullResyncTotal }}
-            <template v-if="fullResyncCurrentChapter"> · 当前第 {{ fullResyncCurrentChapter }} 章</template>
-          </span>
-          <strong>{{ fullResyncPercent }}%</strong>
-        </div>
-        <n-progress
-          type="line"
-          :percentage="fullResyncPercent"
-          :status="fullResyncFirstFailureReason ? 'error' : 'default'"
-          :show-indicator="false"
-          :height="7"
-          :border-radius="4"
-        />
-        <div class="full-resync-progress__stats">
-          <span>已处理 {{ fullResyncProcessed }}/{{ fullResyncTotal }}</span>
-          <span>已同步 {{ fullResyncSynced }}</span>
-          <span>已跳过 {{ fullResyncSkipped }}</span>
-          <span>向量失败 {{ fullResyncVectorFailed }}</span>
-        </div>
-      </div>
-    </n-alert>
+      <template #meta>
+        <span>已同步 {{ fullResyncSynced }}</span>
+        <span>已跳过 {{ fullResyncSkipped }}</span>
+        <span>向量失败 {{ fullResyncVectorFailed }}</span>
+        <span>完成后仍保持暂停，不会自动续写</span>
+      </template>
+    </AsyncTaskStatus>
 
     <!-- 仅写作阶段拉章节流；审计/规划时服务端会关流，避免无意义重连 -->
     <AutopilotWritingStream
@@ -297,7 +268,8 @@
         恢复
       </n-button>
       <n-button v-if="!isRunning && !needsReview && !needsRecovery && !isManualPause && !fullResyncActive" type="primary" size="small" :loading="toggling" @click="openStartModal">
-        🚀 启动全托管
+        <template #icon><n-icon><PlayOutline /></n-icon></template>
+        启动全托管
       </n-button>
       <n-button v-if="isRunning && !needsReview" type="warning" ghost size="small" :loading="toggling" @click="pause">
         暂停
@@ -320,7 +292,8 @@
       </n-button>
       <!-- 🔥 error 状态下显示强制停止按钮（解除挂起 + 停止） -->
       <n-button v-if="needsRecovery && !isRunning" type="error" size="small" :loading="toggling" @click="forceStopFromError">
-        ⏹ 强制停止
+        <template #icon><n-icon><StopOutline /></n-icon></template>
+        强制停止
       </n-button>
     </n-space>
 
@@ -395,6 +368,8 @@ import { useMessage } from 'naive-ui'
 import AutopilotWritingStream from './AutopilotWritingStream.vue'
 import StoryPipelineObservability from './StoryPipelineObservability.vue'
 import AuditPipelineObservability from './AuditPipelineObservability.vue'
+import AsyncTaskStatus from '../ui/AsyncTaskStatus.vue'
+import EmptyState from '../ui/EmptyState.vue'
 import { chapterApi } from '../../api/chapter'
 import {
   autopilotApi,
@@ -415,7 +390,7 @@ import {
   getCanonicalAftermathPresentation,
   shouldShowCanonicalAftermathFullResyncProgress,
 } from './canonicalAftermathGate'
-import { RefreshOutline } from '@vicons/ionicons5'
+import { PlayOutline, RefreshOutline, StopOutline } from '@vicons/ionicons5'
 
 const props = defineProps({
   novelId: String,
@@ -545,7 +520,13 @@ const reviewGateStatus = computed(() => String(reviewGate.value?.status || 'read
 const reviewGateNeedsAIPanel = computed(() =>
   !isTerminalStopped.value && (reviewGate.value?.primary_action === 'open_ai_panel' || requiresAIReview.value)
 )
-const canonicalAftermathPresentation = computed(() => getCanonicalAftermathPresentation(status.value))
+const canonicalAftermathPresentation = computed(() => getCanonicalAftermathPresentation(status.value, {
+  active: fullResyncActive.value,
+  processed: fullResyncState.processed.value,
+  total: fullResyncState.total.value,
+  currentChapter: fullResyncState.currentChapter.value,
+  firstFailureReason: fullResyncState.firstFailureReason.value,
+}))
 const canonicalAftermathFailure = computed(() => canonicalAftermathPresentation.value.isFailure)
 const canStartFullResync = computed(() => canStartCanonicalAftermathFullResync(
   status.value,
@@ -558,9 +539,6 @@ const canResumeReview = computed(() => canOfferReviewResume(
     (!reviewGate.value || reviewGateStatus.value === 'ready') &&
     reviewGate.value?.can_resume !== false,
   fullResyncActive.value,
-))
-const reviewGateAlertType = computed(() => (
-  reviewGateStatus.value === 'failed' ? 'error' : 'warning'
 ))
 const reviewGateTitle = computed(() => {
   if (canonicalAftermathFailure.value) return canonicalAftermathPresentation.value.title
@@ -590,9 +568,6 @@ const fullResyncSkipped = fullResyncState.skipped
 const fullResyncVectorFailed = fullResyncState.vectorFailed
 const fullResyncCurrentChapter = fullResyncState.currentChapter
 const fullResyncFirstFailureReason = fullResyncState.firstFailureReason
-const fullResyncPercent = computed(() => fullResyncTotal.value > 0
-  ? Math.min(100, Math.round((fullResyncProcessed.value / fullResyncTotal.value) * 100))
-  : 0)
 const fullResyncFailureChapter = ref(null)
 let fullResyncCtrl = null
 const showFullResyncProgress = computed(() => shouldShowCanonicalAftermathFullResyncProgress(
@@ -604,6 +579,39 @@ const reviewGateActionLabel = computed(() => (
     ? canonicalAftermathPresentation.value.actionLabel
     : (reviewGate.value?.action_label || '确认后继续')
 ))
+const reviewTaskStatus = computed(() => (
+  canonicalAftermathFailure.value || reviewGateStatus.value === 'failed' ? 'failed' : 'paused'
+))
+const reviewRecoveryLabel = computed(() => {
+  if (reviewGateNeedsAIPanel.value && featureFlags.aiInvocationDebug) return '打开 AI 面板'
+  if (canonicalAftermathFailure.value) return reviewGateActionLabel.value
+  if (canResumeReview.value && !fullResyncActive.value) return reviewGateActionLabel.value
+  return ''
+})
+const reviewRecoveryIntent = computed(() => (
+  reviewGateNeedsAIPanel.value || canonicalAftermathFailure.value ? 'retry' : 'resume'
+))
+const reviewRecoveryLoading = computed(() => (
+  reviewGateNeedsAIPanel.value ? aiPanelOpening.value : toggling.value
+))
+const fullResyncTaskStatus = computed(() => (
+  canonicalAftermathPresentation.value.asyncStatus?.status === 'failed' ? 'failed' : 'running'
+))
+const fullResyncStatusMessage = computed(() => {
+  if (fullResyncFirstFailureReason.value) {
+    return `同步中断于第 ${fullResyncFailureChapter.value || '—'} 章：${fullResyncFirstFailureReason.value}`
+  }
+  return canonicalAftermathPresentation.value.asyncStatus?.message
+    || '正在准备从第 1 章开始同步规范记忆'
+})
+
+function handleReviewRetry() {
+  if (reviewGateNeedsAIPanel.value && featureFlags.aiInvocationDebug) {
+    void openActiveInvocation()
+    return
+  }
+  void retryCanonicalAftermath()
+}
 function statusHasActiveInvocation(s) {
   return Boolean(s?.active_invocation_session_id && (s?.has_active_invocation || s?.requires_ai_review))
 }
@@ -1681,17 +1689,17 @@ onUnmounted(() => {
 
 <style scoped>
 .autopilot-panel {
-  --ap-accent: var(--color-success, #22c55e);
-  --ap-card-bg: var(--app-surface-raised, var(--app-surface));
+  --ap-accent: var(--color-brand);
+  --ap-card-bg: var(--app-surface-raised);
   --ap-card-border: var(--app-border);
   background: var(--ap-card-bg);
   border: 1px solid var(--ap-card-border);
-  border-radius: var(--app-radius-lg, 14px);
-  padding: 16px 18px 14px;
+  border-radius: var(--app-radius-lg);
+  padding: 18px;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  box-shadow: var(--app-shadow-md);
+  box-shadow: var(--app-shadow-sm);
 }
 
 .ap-hero {
@@ -1699,12 +1707,8 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 10px;
   padding: 14px 16px;
-  border-radius: var(--app-radius-md, 10px);
-  background: linear-gradient(
-    145deg,
-    color-mix(in srgb, var(--color-primary, #2563eb) 5%, var(--app-surface-subtle)) 0%,
-    var(--app-surface-subtle) 55%
-  );
+  border-radius: var(--app-radius-md);
+  background: var(--app-surface-subtle);
   border: 1px solid var(--app-border);
 }
 
@@ -1786,8 +1790,8 @@ onUnmounted(() => {
   line-height: 1.6;
   color: var(--app-text-muted);
   background: color-mix(in srgb, var(--app-text-primary) 3%, transparent);
-  border-radius: var(--app-radius-sm, 8px);
-  border-left: 3px solid var(--color-primary, #2563eb);
+  border-radius: var(--app-radius-sm);
+  border-left: 3px solid var(--color-brand);
 }
 
 .ap-inline-alert {
@@ -1821,20 +1825,20 @@ onUnmounted(() => {
 }
 
 .dot-running {
-  background: var(--color-success, #22c55e);
-  color: var(--color-success, #22c55e);
+  background: var(--color-success);
+  color: var(--color-success);
   animation: ap-dot-pulse 1.4s ease-in-out infinite;
 }
 
 .dot-review {
-  background: var(--color-warning, #f59e0b);
-  color: var(--color-warning, #f59e0b);
+  background: var(--color-warning);
+  color: var(--color-warning);
   animation: ap-dot-pulse 0.9s ease-in-out infinite;
 }
 
 .dot-error {
-  background: var(--color-danger, #ef4444);
-  color: var(--color-danger, #ef4444);
+  background: var(--color-danger);
+  color: var(--color-danger);
 }
 
 .dot-stopped {
@@ -1872,8 +1876,8 @@ onUnmounted(() => {
 .tag-sem-sync { background: var(--color-info-dim); color: var(--color-info); }
 .tag-sem-review { background: var(--color-warning-dim); color: var(--color-warning); }
 .tag-sem-idle {
-  background: var(--color-purple-light, rgba(139, 92, 246, 0.12));
-  color: var(--color-purple, #8b5cf6);
+  background: var(--color-info-dim);
+  color: var(--color-info);
 }
 .tag-sem-daemon_wait { background: var(--color-info-dim); color: var(--color-info); }
 
@@ -1964,7 +1968,7 @@ onUnmounted(() => {
   min-width: 0;
   background: var(--app-surface-subtle);
   border: 1px solid var(--app-border);
-  border-radius: var(--app-radius-md, 10px);
+  border-radius: var(--app-radius-md);
   transition: border-color var(--app-transition), box-shadow var(--app-transition);
 }
 
@@ -2031,8 +2035,8 @@ onUnmounted(() => {
   max-width: 100%;
   padding: 2px 7px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--color-primary, #2563eb) 18%, var(--app-border));
-  background: color-mix(in srgb, var(--color-primary, #2563eb) 7%, transparent);
+  border: 1px solid var(--app-border-strong);
+  background: var(--app-surface);
   color: var(--app-text-secondary);
   font-size: 10px;
   font-weight: 700;
@@ -2076,16 +2080,16 @@ onUnmounted(() => {
 }
 
 .ap-location__chip--strong {
-  background: var(--color-primary-light, color-mix(in srgb, var(--color-primary, #2563eb) 12%, transparent));
-  color: var(--color-primary, #2563eb);
+  background: var(--color-brand-light);
+  color: var(--color-brand);
 }
 
 .ap-narrative {
   padding: 12px 14px;
-  border-radius: var(--app-radius-md, 10px);
+  border-radius: var(--app-radius-md);
   background: var(--app-surface-subtle);
   border: 1px solid var(--app-border);
-  border-left: 3px solid var(--color-primary, #2563eb);
+  border-left: 3px solid var(--color-brand);
 }
 
 .ap-narrative__label {
@@ -2120,8 +2124,8 @@ onUnmounted(() => {
 .ap-telemetry {
   padding: 12px 14px;
   border-radius: var(--app-radius-md, 10px);
-  background: color-mix(in srgb, var(--color-primary) 4%, var(--app-surface-subtle));
-  border: 1px solid color-mix(in srgb, var(--color-primary) 18%, var(--app-border));
+  background: var(--app-surface-subtle);
+  border: 1px solid var(--app-border);
 }
 
 .ap-telemetry__head {
@@ -2194,13 +2198,9 @@ onUnmounted(() => {
   transition: width 0.45s ease;
 }
 
-.ap-meter__fill--beat {
-  background: linear-gradient(90deg, var(--color-primary), var(--color-brand-hover, #3b82f6));
-}
+.ap-meter__fill--beat { background: var(--color-brand); }
 
-.ap-meter__fill--word {
-  background: linear-gradient(90deg, var(--color-success), color-mix(in srgb, var(--color-success) 70%, #fff));
-}
+.ap-meter__fill--word { background: var(--color-success); }
 
 .substep-badge {
   display: inline-block;
@@ -2264,63 +2264,17 @@ onUnmounted(() => {
   }
 }
 
-.ap-review-alert {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  width: 100%;
-}
-
-.ap-review-alert span {
-  line-height: 1.55;
-  min-width: 0;
-}
-
-.ap-review-alert .n-button {
-  flex: 0 0 auto;
-}
-
-.full-resync-progress {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.full-resync-progress__head,
-.full-resync-progress__stats {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.full-resync-progress__head span {
-  min-width: 0;
-  line-height: 1.5;
-}
-
-.full-resync-progress__head strong {
-  flex: 0 0 auto;
-  font-variant-numeric: tabular-nums;
-}
-
-.full-resync-progress__stats {
-  justify-content: flex-start;
-  color: var(--app-text-muted);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-
 .recovery-hint p { margin: 0 0 6px; line-height: 1.5; }
 .recovery-sub { font-size: 11px; opacity: 0.95; margin-bottom: 8px !important; }
 
-@media (max-width: 640px) {
-  .ap-review-alert {
-    align-items: flex-start;
-    flex-direction: column;
-  }
+@media (prefers-reduced-motion: reduce) {
+  .ap-dot,
+  .ap-stage-live,
+  .skeleton-pulse,
+  .stage-transition-label,
+  .substep-badge.substep-active { animation: none; }
+
+  .ap-meter__fill,
+  .ap-kpi { transition: none; }
 }
 </style>
