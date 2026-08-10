@@ -3,37 +3,82 @@
   <div class="wizard-skeleton">
     <!-- 世界观维度骨架 -->
     <template v-if="type === 'worldbuilding'">
-      <div
-        v-for="dim in dimensions"
-        :key="dim.key"
-        class="skeleton-dimension"
-        :class="{
-          'skeleton-dimension--done': completedDimensions.has(dim.key),
-          'skeleton-dimension--active': activeDimension === dim.key && !completedDimensions.has(dim.key),
-        }"
-      >
-        <div class="skeleton-dimension__header">
-          <div class="skeleton-dot" :class="{ 'skeleton-dot--active': activeDimension === dim.key && !completedDimensions.has(dim.key), 'skeleton-dot--done': completedDimensions.has(dim.key) }">
-            <span v-if="completedDimensions.has(dim.key)" class="skeleton-dot__check">✓</span>
-            <span v-else-if="activeDimension === dim.key" class="skeleton-dot__pulse"></span>
+      <div class="worldbuilding-progress">
+        <aside class="worldbuilding-progress__rail" aria-label="世界观生成阶段">
+          <div class="worldbuilding-progress__rail-head">
+            <span class="worldbuilding-progress__eyebrow">生成阶段</span>
+            <span class="worldbuilding-progress__count">{{ completedCount }} / {{ dimensions.length }}</span>
           </div>
-          <span class="skeleton-dimension__title">{{ dim.label }}</span>
-          <n-tag v-if="completedDimensions.has(dim.key)" size="tiny" type="success">已生成</n-tag>
-          <n-tag v-else-if="activeDimension === dim.key" size="tiny" type="info">
-            <template #icon>
-              <span class="loading-dots">生成中</span>
-            </template>
-          </n-tag>
-          <n-tag v-else size="tiny" type="default">等待中</n-tag>
-        </div>
-        <!-- 生成中：显示 slot 内容（流式文本预览或字段卡片） -->
-        <div v-if="activeDimension === dim.key && !completedDimensions.has(dim.key)" class="skeleton-dimension__body">
-          <slot :name="dim.key" />
-        </div>
-        <!-- 已完成：显示完整字段数据 -->
-        <div v-else-if="completedDimensions.has(dim.key)" class="skeleton-dimension__content">
-          <slot :name="dim.key" />
-        </div>
+          <div class="worldbuilding-progress__list" role="list">
+            <button
+              v-for="dim in dimensions"
+              :key="dim.key"
+              type="button"
+              class="worldbuilding-progress__item"
+              :class="{
+                'worldbuilding-progress__item--active': activeDimension === dim.key && !completedDimensions.has(dim.key),
+                'worldbuilding-progress__item--done': completedDimensions.has(dim.key),
+                'worldbuilding-progress__item--selected': selectedDimension.key === dim.key,
+              }"
+              role="listitem"
+              @click="previewDimension = dim.key"
+            >
+              <span
+                class="skeleton-dot"
+                :class="{
+                  'skeleton-dot--active': activeDimension === dim.key && !completedDimensions.has(dim.key),
+                  'skeleton-dot--done': completedDimensions.has(dim.key),
+                }"
+                aria-hidden="true"
+              >
+                <span v-if="completedDimensions.has(dim.key)" class="skeleton-dot__check">✓</span>
+                <span v-else-if="activeDimension === dim.key" class="skeleton-dot__pulse"></span>
+              </span>
+              <span class="worldbuilding-progress__item-text">
+                <span class="worldbuilding-progress__item-title">{{ dim.label }}</span>
+                <span class="worldbuilding-progress__item-status">{{ dimensionStatus(dim.key) }}</span>
+              </span>
+              <span class="worldbuilding-progress__item-arrow" aria-hidden="true">›</span>
+            </button>
+          </div>
+          <div class="worldbuilding-progress__rail-foot">
+            <span class="worldbuilding-progress__legend-dot worldbuilding-progress__legend-dot--active" />
+            <span>当前生成项可实时查看</span>
+          </div>
+        </aside>
+
+        <section class="worldbuilding-progress__preview" aria-live="polite">
+          <header class="worldbuilding-progress__preview-head">
+            <div>
+              <span class="worldbuilding-progress__eyebrow">实时预览</span>
+              <h4>{{ selectedDimension.label }}</h4>
+            </div>
+            <n-tag :type="selectedStatus.type" size="small">{{ selectedStatus.label }}</n-tag>
+          </header>
+
+          <div
+            v-if="activeDimension === selectedDimension.key && !completedDimensions.has(selectedDimension.key)"
+            class="worldbuilding-progress__live-line"
+          >
+            <span class="worldbuilding-progress__live-dot" aria-hidden="true" />
+            <span>{{ phaseMessage || `正在生成${selectedDimension.label}` }}</span>
+          </div>
+
+          <div
+            v-if="activeDimension === selectedDimension.key || completedDimensions.has(selectedDimension.key)"
+            class="worldbuilding-progress__preview-body"
+          >
+            <slot :name="selectedDimension.key" />
+          </div>
+          <div v-else class="worldbuilding-progress__waiting">
+            <div class="worldbuilding-progress__waiting-lines" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+            <p>{{ phaseMessage || '等待前一阶段完成后开始生成' }}</p>
+          </div>
+        </section>
       </div>
     </template>
 
@@ -95,6 +140,8 @@
 </template>
 
 <script setup lang="ts">
+import { computed, ref, watch } from 'vue'
+
 const props = withDefaults(
   defineProps<{
     /** 骨架屏类型 */
@@ -105,11 +152,14 @@ const props = withDefaults(
     completedDimensions?: Set<string>
     /** 人物/地点：已完成的数量 */
     completedCount?: number
+    /** 世界观当前阶段的状态描述 */
+    phaseMessage?: string
   }>(),
   {
     activeDimension: '',
     completedDimensions: () => new Set<string>(),
     completedCount: 0,
+    phaseMessage: '',
   }
 )
 
@@ -120,12 +170,263 @@ const dimensions = [
   { key: 'culture', label: '历史文化' },
   { key: 'daily_life', label: '沉浸感细节' },
 ]
+
+const previewDimension = ref(props.activeDimension || dimensions[0].key)
+
+const selectedDimension = computed(() =>
+  dimensions.find(dim => dim.key === previewDimension.value) || dimensions[0],
+)
+
+const completedCount = computed(() => dimensions.filter(dim => props.completedDimensions.has(dim.key)).length)
+
+const selectedStatus = computed(() => {
+  if (props.completedDimensions.has(selectedDimension.value.key)) {
+    return { label: '已生成', type: 'success' as const }
+  }
+  if (props.activeDimension === selectedDimension.value.key) {
+    return { label: '生成中', type: 'info' as const }
+  }
+  return { label: '等待中', type: 'default' as const }
+})
+
+function dimensionStatus(key: string) {
+  if (props.completedDimensions.has(key)) return '已生成'
+  if (props.activeDimension === key) return '生成中'
+  return '等待中'
+}
+
+watch(
+  () => props.activeDimension,
+  (next) => {
+    if (next && dimensions.some(dim => dim.key === next)) {
+      previewDimension.value = next
+    }
+  },
+)
 </script>
 
 <style scoped>
 .wizard-skeleton {
   width: 100%;
 }
+
+.worldbuilding-progress {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.34fr) minmax(0, 1fr);
+  gap: 14px;
+  min-height: 264px;
+}
+
+.worldbuilding-progress__rail,
+.worldbuilding-progress__preview {
+  min-width: 0;
+  border: 1px solid var(--app-border, var(--n-border-color));
+  border-radius: 8px;
+  background: var(--app-surface, var(--n-color-modal));
+}
+
+.worldbuilding-progress__rail {
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+}
+
+.worldbuilding-progress__rail-head,
+.worldbuilding-progress__preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.worldbuilding-progress__rail-head {
+  padding: 0 2px 10px;
+  border-bottom: 1px solid var(--app-border, var(--n-border-color));
+}
+
+.worldbuilding-progress__eyebrow {
+  color: var(--app-text-muted, var(--n-text-color-3));
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.worldbuilding-progress__count {
+  color: var(--app-text-secondary, var(--n-text-color-2));
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.worldbuilding-progress__list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 8px;
+}
+
+.worldbuilding-progress__item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 44px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--app-text-primary, var(--n-text-color-1));
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.2s ease, background 0.2s ease, color 0.2s ease;
+}
+
+.worldbuilding-progress__item:hover,
+.worldbuilding-progress__item:focus-visible {
+  border-color: var(--app-border-strong, var(--n-border-color));
+  background: var(--app-surface-subtle, var(--n-color-modal));
+  outline: none;
+}
+
+.worldbuilding-progress__item--selected {
+  border-color: color-mix(in srgb, var(--color-brand, var(--n-primary-color)) 28%, var(--app-border));
+  background: color-mix(in srgb, var(--color-brand, var(--n-primary-color)) 7%, var(--app-surface));
+}
+
+.worldbuilding-progress__item--done {
+  color: var(--app-text-secondary, var(--n-text-color-2));
+}
+
+.worldbuilding-progress__item-text {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.worldbuilding-progress__item-title {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worldbuilding-progress__item-status {
+  color: var(--app-text-muted, var(--n-text-color-3));
+  font-size: 11px;
+}
+
+.worldbuilding-progress__item--active .worldbuilding-progress__item-status {
+  color: var(--color-brand, var(--n-primary-color));
+}
+
+.worldbuilding-progress__item--done .worldbuilding-progress__item-status {
+  color: var(--color-success, var(--n-success-color));
+}
+
+.worldbuilding-progress__item-arrow {
+  color: var(--app-text-muted, var(--n-text-color-3));
+  font-size: 18px;
+  line-height: 1;
+}
+
+.worldbuilding-progress__rail-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 2px 0;
+  border-top: 1px solid var(--app-border, var(--n-border-color));
+  color: var(--app-text-muted, var(--n-text-color-3));
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.worldbuilding-progress__legend-dot,
+.worldbuilding-progress__live-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--color-brand, var(--n-primary-color));
+}
+
+.worldbuilding-progress__legend-dot--active,
+.worldbuilding-progress__live-dot {
+  animation: pulse-glow 1.4s ease-in-out infinite;
+}
+
+.worldbuilding-progress__preview {
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+}
+
+.worldbuilding-progress__preview-head {
+  align-items: flex-start;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--app-border, var(--n-border-color));
+}
+
+.worldbuilding-progress__preview-head h4 {
+  margin: 5px 0 0;
+  color: var(--app-text-primary, var(--n-text-color-1));
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.worldbuilding-progress__live-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 2px;
+  color: var(--app-text-secondary, var(--n-text-color-2));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.worldbuilding-progress__preview-body {
+  min-height: 0;
+  padding-top: 12px;
+  overflow: auto;
+}
+
+.worldbuilding-progress__waiting {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 170px;
+  color: var(--app-text-muted, var(--n-text-color-3));
+  text-align: center;
+}
+
+.worldbuilding-progress__waiting p {
+  margin: 12px 0 0;
+  font-size: 12px;
+}
+
+.worldbuilding-progress__waiting-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  width: min(88%, 420px);
+  margin: 0 auto;
+}
+
+.worldbuilding-progress__waiting-lines span {
+  display: block;
+  height: 12px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--app-surface-subtle) 25%, var(--app-border) 50%, var(--app-surface-subtle) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+.worldbuilding-progress__waiting-lines span:nth-child(2) { width: 82%; }
+.worldbuilding-progress__waiting-lines span:nth-child(3) { width: 58%; }
 
 /* 世界观维度 */
 .skeleton-dimension {
@@ -361,5 +662,47 @@ const dimensions = [
   33% { content: '.'; }
   66% { content: '..'; }
   100% { content: '...'; }
+}
+
+@media (max-width: 720px) {
+  .worldbuilding-progress {
+    grid-template-columns: 1fr;
+  }
+
+  .worldbuilding-progress__rail {
+    padding: 10px;
+  }
+
+  .worldbuilding-progress__list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .worldbuilding-progress__rail-foot {
+    display: none;
+  }
+
+  .worldbuilding-progress__preview {
+    min-height: 250px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-dot__pulse,
+  .worldbuilding-progress__legend-dot--active,
+  .worldbuilding-progress__live-dot,
+  .skeleton-bar--shimmer,
+  .worldbuilding-progress__waiting-lines span,
+  .skeleton-storyline__card,
+  .loading-dots::after {
+    animation: none;
+  }
+
+  .worldbuilding-progress__item,
+  .skeleton-dimension,
+  .skeleton-character,
+  .skeleton-location {
+    transition: none;
+  }
 }
 </style>

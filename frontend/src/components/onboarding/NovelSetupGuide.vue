@@ -31,15 +31,35 @@
 
         <!-- 生成中：骨架屏 + 流式数据 -->
         <div v-if="generatingBible" class="step-generating">
-          <div class="generating-header">
+          <div class="generating-header" aria-live="polite">
             <div class="generating-icon">
               <n-icon size="36" color="var(--color-brand)">
                 <IconBook />
               </n-icon>
             </div>
             <div class="generating-text">
-              <h3>{{ phaseMessage || '正在生成文风公约与世界观...' }}</h3>
+              <div class="generating-title-row">
+                <h3>{{ phaseMessage || '正在生成文风公约与世界观...' }}</h3>
+                <span class="generation-progress-count">
+                  {{ worldbuildingCompletedCount }} / {{ WB_DIMS.length }} 个维度
+                </span>
+              </div>
               <p class="generating-sub">AI 会先定文风，再逐维度构建您的世界，出一个渲染一个</p>
+              <n-progress
+                class="generation-progress-bar"
+                type="line"
+                :percentage="worldbuildingProgressPercent"
+                :show-indicator="false"
+                :height="6"
+                :border-radius="3"
+                color="var(--color-brand)"
+              />
+            </div>
+            <div class="generation-metrics">
+              <span class="generation-metric">已解析 {{ worldbuildingFieldCount }} 个字段</span>
+              <n-tag size="tiny" :type="bibleError ? 'error' : 'success'">
+                {{ bibleError ? '连接异常' : worldbuildingStreamLabel }}
+              </n-tag>
             </div>
           </div>
 
@@ -47,6 +67,7 @@
             type="worldbuilding"
             :active-dimension="activeDimension"
             :completed-dimensions="completedDimensions"
+            :phase-message="phaseMessage"
           >
             <template #core_rules>
               <div class="dimension-fields" v-if="orderedWorldbuildingFields('core_rules').length">
@@ -109,6 +130,14 @@
               </div>
             </template>
           </WizardSkeleton>
+
+          <div class="generation-status-footer" aria-live="polite">
+            <span>
+              当前阶段：<strong>{{ activeWorldbuildingLabel }}</strong>
+            </span>
+            <span v-if="styleText">文风公约已开始产出</span>
+            <span v-if="worldbuildingRawStream">实时流已接收 {{ worldbuildingRawStream.length }} 字符</span>
+          </div>
 
           <!-- 文风公约实时预览（SSE 生成中即可见） -->
           <div v-if="styleText" class="style-preview-generating">
@@ -946,6 +975,29 @@ const worldbuildingRawStream = ref('')
 const styleConventionDisplay = computed(() => {
   if (styleText.value) return styleText.value
   return styleConventionFromBible(bibleData.value)
+})
+
+const worldbuildingCompletedCount = computed(() => (
+  WB_DIMS.filter(dim => completedDimensions.value.has(dim)).length
+))
+
+const worldbuildingFieldCount = computed(() => (
+  WB_DIMS.reduce((total, dim) => total + orderedWorldbuildingFields(dim).length, 0)
+))
+
+const worldbuildingProgressPercent = computed(() => (
+  Math.round((worldbuildingCompletedCount.value / WB_DIMS.length) * 100)
+))
+
+const activeWorldbuildingLabel = computed(() => {
+  if (activeDimension.value) return getWorldbuildingDimensionLabel(activeDimension.value)
+  if (styleText.value) return '文风公约'
+  return '准备阶段'
+})
+
+const worldbuildingStreamLabel = computed(() => {
+  if (activeDimension.value || worldbuildingRawStream.value || styleText.value) return '实时输出'
+  return '准备中'
 })
 
 /** 世界观维度卡片（用于生成完后的折叠面板） */
@@ -2206,6 +2258,60 @@ const handleComplete = () => {
   border: 1px solid var(--app-border);
 }
 
+.generating-text {
+  min-width: 0;
+  flex: 1;
+}
+
+.generating-title-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.generation-progress-count {
+  flex: 0 0 auto;
+  color: var(--app-text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.generation-progress-bar {
+  margin-top: 10px;
+}
+
+.generation-metrics {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.generation-metric {
+  color: var(--app-text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.generation-status-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 0 2px;
+  color: var(--app-text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.generation-status-footer strong {
+  color: var(--app-text-secondary);
+  font-weight: 650;
+}
+
 .generating-icon {
   flex-shrink: 0;
 }
@@ -2946,6 +3052,29 @@ const handleComplete = () => {
 }
 
 @media (max-width: 720px) {
+  .generating-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .generating-text {
+    flex-basis: calc(100% - 54px);
+  }
+
+  .generating-title-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .generation-metrics {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding-left: 52px;
+  }
+
   .character-editor-head {
     grid-template-columns: 1fr;
   }
@@ -2959,6 +3088,14 @@ const handleComplete = () => {
   .relationship-row,
   .wound-row {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .generation-progress-bar,
+  .generating-header,
+  .generation-status-footer {
+    transition: none;
   }
 }
 

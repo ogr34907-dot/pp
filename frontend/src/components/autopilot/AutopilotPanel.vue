@@ -61,6 +61,56 @@
       </p>
     </section>
 
+    <section v-if="status" class="ap-progress-overview" aria-label="写作进度分解">
+      <article class="ap-progress-lane ap-progress-lane--book">
+        <div class="ap-progress-lane__head">
+          <span class="ap-progress-lane__label">全书章节</span>
+          <strong>{{ bookProgressLabel }}</strong>
+        </div>
+        <n-progress
+          type="line"
+          :percentage="progressPct"
+          :show-indicator="false"
+          :height="5"
+          :border-radius="3"
+          color="var(--color-success)"
+        />
+        <p>{{ formatWords(status.total_words) }} 字已写入书稿</p>
+      </article>
+
+      <article class="ap-progress-lane ap-progress-lane--chapter" aria-live="polite">
+        <div class="ap-progress-lane__head">
+          <span class="ap-progress-lane__label">当前章节</span>
+          <strong>{{ currentChapterLabel }}</strong>
+        </div>
+        <n-progress
+          type="line"
+          :percentage="currentChapterProgress"
+          :show-indicator="false"
+          :height="5"
+          :border-radius="3"
+          color="var(--color-brand)"
+        />
+        <p>{{ formatWords(currentChapterWords) }} / {{ formatWords(currentChapterTarget) }} 字</p>
+      </article>
+
+      <article class="ap-progress-lane ap-progress-lane--pipeline" aria-live="polite">
+        <div class="ap-progress-lane__head">
+          <span class="ap-progress-lane__label">当前管线</span>
+          <strong>{{ pipelineProgressLabel }}</strong>
+        </div>
+        <n-progress
+          type="line"
+          :percentage="pipelineProgressPercent"
+          :show-indicator="false"
+          :height="5"
+          :border-radius="3"
+          color="var(--color-warning)"
+        />
+        <p>{{ pipelineProgressMessage }}</p>
+      </article>
+    </section>
+
     <n-alert
       v-if="status && statusConnectivityFailures >= 2 && !statusPollDisabled"
       type="warning"
@@ -748,14 +798,21 @@ const planTotalWordsHint = computed(() => {
   return (s.target_chapters ?? 0) * (s.target_words_per_chapter ?? 2500)
 })
 
+const bookCompletedChapterCount = computed(() => {
+  const s = status.value
+  if (!s) return 0
+  return Math.max(
+    Number(s.completed_chapters || 0),
+    Number(s.manuscript_chapters ?? s.completed_chapters ?? 0),
+    Number(s.current_auto_chapters || 0),
+  )
+})
+
 const progressPct = computed(() => {
   const s = status.value
   if (!s) return 0
   const target = Number(s.target_chapters || 0)
-  const completed = Number(s.completed_chapters || 0)
-  const manuscript = Number(s.manuscript_chapters ?? completed)
-  const currentAuto = Number(s.current_auto_chapters || 0)
-  const bestCount = Math.max(completed, manuscript, currentAuto)
+  const bestCount = bookCompletedChapterCount.value
   if (target > 0 && bestCount > 0) {
     return Math.min(100, Math.round((bestCount / target) * 1000) / 10)
   }
@@ -768,6 +825,58 @@ const progressPctDisplay = computed(() => {
   if (!Number.isFinite(n)) return '0%'
   return `${n < 10 ? n.toFixed(1) : Math.round(n * 10) / 10}%`
 })
+
+const bookProgressLabel = computed(() => {
+  const target = Number(status.value?.target_chapters || 0)
+  return `第 ${bookCompletedChapterCount.value} / ${target || '—'} 章`
+})
+
+const currentChapterWords = computed(() => Math.max(0, Number(status.value?.accumulated_words || 0)))
+const currentChapterTarget = computed(() => Math.max(0, Number(
+  status.value?.chapter_target_words ?? status.value?.target_words_per_chapter ?? 0,
+)))
+const currentChapterProgress = computed(() => {
+  const target = currentChapterTarget.value
+  if (target <= 0) return 0
+  return Math.min(100, Math.round((currentChapterWords.value / target) * 100))
+})
+const currentChapterLabel = computed(() => {
+  const chapter = Number(status.value?.current_chapter_number || 0)
+  return chapter > 0 ? `第 ${chapter} 章` : '等待章节'
+})
+
+const pipelineStepIndex = computed(() => {
+  const wave = storyPipelineWaveIndex.value
+  if (wave >= 1 && wave <= 10) return wave
+  const substep = String(status.value?.writing_substep || '')
+  const fallback = {
+    chapter_found: 1,
+    context_assembly: 2,
+    script_generation: 3,
+    prose_generation: 4,
+    continuity_check: 5,
+    chapter_persist: 6,
+    audit_voice_check: 7,
+    audit_aftermath: 8,
+    audit_tension: 9,
+    pipeline_done: 10,
+  }
+  return fallback[substep] || 0
+})
+
+const pipelineProgressPercent = computed(() => (
+  pipelineStepIndex.value > 0 ? Math.round((pipelineStepIndex.value / 10) * 100) : 0
+))
+
+const pipelineProgressLabel = computed(() => (
+  pipelineStepIndex.value > 0
+    ? `第 ${pipelineStepIndex.value} / 10 步`
+    : (stagePresentation.value.text || '等待管线')
+))
+
+const pipelineProgressMessage = computed(() => (
+  status.value?.writing_substep_label || stagePresentation.value.text || '等待下一步状态'
+))
 
 const progressColor = computed(() => {
   if (needsRecovery.value) return 'var(--color-danger, #ef4444)'
@@ -1737,6 +1846,65 @@ onUnmounted(() => {
   border: 1px solid var(--app-border);
 }
 
+.ap-progress-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.ap-progress-lane {
+  min-width: 0;
+  padding: 11px 12px 10px;
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-sm, 8px);
+  background: var(--app-surface-subtle);
+}
+
+.ap-progress-lane__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.ap-progress-lane__label {
+  color: var(--app-text-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.ap-progress-lane__head strong {
+  overflow: hidden;
+  color: var(--app-text-primary);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ap-progress-lane p {
+  margin: 7px 0 0;
+  overflow: hidden;
+  color: var(--app-text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ap-progress-lane--book {
+  border-inline-start: 3px solid var(--color-success);
+}
+
+.ap-progress-lane--chapter {
+  border-inline-start: 3px solid var(--color-brand);
+}
+
+.ap-progress-lane--pipeline {
+  border-inline-start: 3px solid var(--color-warning);
+}
+
 .ap-hero__top {
   display: flex;
   align-items: flex-start;
@@ -2275,6 +2443,10 @@ onUnmounted(() => {
 }
 
 @media (max-width: 900px) {
+  .ap-progress-overview {
+    grid-template-columns: 1fr;
+  }
+
   .ap-kpi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -2300,6 +2472,7 @@ onUnmounted(() => {
   .substep-badge.substep-active { animation: none; }
 
   .ap-meter__fill,
-  .ap-kpi { transition: none; }
+  .ap-kpi,
+  .ap-progress-lane { transition: none; }
 }
 </style>
