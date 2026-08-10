@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from pathlib import Path
 
 from interfaces.api.settings import BackendSettings
 from interfaces.daemon_manager import (
@@ -104,7 +105,7 @@ def test_daemon_manager_stop_signals_and_terminates_stuck_process(monkeypatch):
 
 def test_orphan_cleanup_does_not_kill_other_workspace_backend(monkeypatch):
     local_executable = sys.executable
-    foreign_executable = r"W:\novel\PlotPilot\.venv\Scripts\python.exe"
+    foreign_executable = str(Path(local_executable).with_name("foreign-python.exe"))
     listed_processes = "\n".join(
         [
             f'101\t"{local_executable}" -m uvicorn interfaces.main:app --port 8015',
