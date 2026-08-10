@@ -96,7 +96,9 @@ body {
   /* ── 文字色（全部使用变量，禁止硬编码）── */
   --app-text-primary: #2C2520;
   --app-text-secondary: #665B52;
-  --app-text-muted: #8B7F75;
+  /* Normal-size supporting copy stays AA-readable; faint is decorative/disabled only. */
+  --app-text-muted: #665B52;
+  --app-text-faint: #8B7F75;
   --app-text-inverse: #FFFCF6;
 
   /* 与 Naive UI n-text depth、旧组件对齐：统一走 app 文字色，避免暗色下仍落回 #0f172a */
@@ -168,9 +170,6 @@ body {
   --dag-menu-border: var(--app-border-strong);
   --dag-menu-hover: var(--color-brand-light);
 
-  /* ── StatsTopBar 渐变 ── */
-  --stats-bar-gradient: linear-gradient(135deg, var(--app-text-primary), var(--color-brand));
-
   /* 彩色顶栏上的文字与「药丸」图标底（与 --app-text-inverse 解耦：暗色主题里 inverse 是深色字，不能用在渐变条上） */
   --nav-hero-text: #ffffff;
   --nav-hero-text-muted: rgba(255, 255, 255, 0.86);
@@ -211,7 +210,9 @@ body {
   /* ── 文字色 ── */
   --app-text-primary: #F6EEDF;
   --app-text-secondary: #D3C5B6;
-  --app-text-muted: #AA9C90;
+  /* Match the light convention: normal muted copy is readable; faint is non-content only. */
+  --app-text-muted: #D3C5B6;
+  --app-text-faint: #AA9C90;
   --app-text-inverse: #221C19;
 
   /* ── 组件交互态（Tab / 档案 / 运行时栏）── */
@@ -241,9 +242,6 @@ body {
   /* ── 面板专用 ── */
   --plotpilot-split-border: var(--app-border);
   --plotpilot-panel-muted: var(--app-surface-subtle);
-
-  /* ── StatsTopBar 渐变（暗色版：深靛蓝+微光）── */
-  --stats-bar-gradient: linear-gradient(135deg, var(--app-page-bg), var(--color-brand-pressed));
 
   --nav-hero-text: #f8fafc;
   --nav-hero-text-muted: rgba(248, 250, 252, 0.82);
@@ -405,11 +403,11 @@ ruby { ruby-align: center; }
 rt { font-size: 0.6em; color: var(--app-text-muted); }
 
 /* ═══════════════════════════════════════════════════
-   StatsTopBar — 使用变量渐变 + 主题装饰边框
+   StatsTopBar — 安静的纸色导航表面
    ═══════════════════════════════════════════════════ */
 .stats-top-bar {
-  background: var(--stats-bar-gradient);
-  border-bottom: var(--stats-bar-border-bottom, 1px solid rgba(255, 255, 255, 0.08));
+  background: var(--app-surface);
+  border-bottom: 1px solid var(--app-border);
 }
 
 /* ═══════════════════════════════════════════════════

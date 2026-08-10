@@ -254,12 +254,27 @@ function handleThemeChange(newMode: ThemeMode) {
   transition: background var(--motion-duration-slow) var(--motion-ease-standard);
 }
 
-.prev-light { background: #F7F5EF; }
-.prev-dark { background: #141A18; }
+.prev-light {
+  --preview-surface: #FFFCF6;
+  --preview-ink: #2C2520;
+  --preview-border: #E2D8CA;
+  --preview-primary: #A64B2A;
+  background: #F4EFE6;
+}
+
+.prev-dark {
+  --preview-surface: #2B2420;
+  --preview-ink: #F6EEDF;
+  --preview-border: #4A3E37;
+  --preview-primary: #E28B62;
+  background: #221C19;
+}
 
 .tile-preview-bar {
   display: flex;
   gap: 0.25rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--preview-border);
 }
 
 .tile-dot {
@@ -268,8 +283,7 @@ function handleThemeChange(newMode: ThemeMode) {
   border-radius: 50%;
 }
 
-.prev-light .tile-dot { background: #D7DDD6; }
-.prev-dark .tile-dot { background: #33413C; }
+.tile-dot { background: var(--preview-primary); }
 
 .tile-preview-lines {
   display: flex;
@@ -280,14 +294,17 @@ function handleThemeChange(newMode: ThemeMode) {
 .tile-line {
   height: 0.3rem;
   border-radius: 0.2rem;
+  background: var(--preview-ink);
 }
 
 .w-full { width: 100%; }
 .w-3\/4  { width: 75%; }
 .w-1\/2  { width: 50%; }
 
-.prev-light .tile-line { background: #D7DDD6; }
-.prev-dark .tile-line { background: #25312D; }
+.tile-line:not(:first-child) {
+  background: var(--preview-surface);
+  box-shadow: inset 0 0 0 1px var(--preview-border);
+}
 
 /* 底部标签区 */
 .tile-meta {

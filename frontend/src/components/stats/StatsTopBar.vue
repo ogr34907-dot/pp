@@ -273,23 +273,21 @@ onMounted(loadStats)
    ═══════════════════════════════════════════════════ */
 .stats-top-bar {
   height: var(--plotpilot-topbar-height);
-  background: var(--stats-bar-gradient);
+  background: var(--app-surface);
   display: flex;
   flex-direction: row;
   flex-wrap: nowrap;
   align-items: center;
   justify-content: space-between;
   padding: 0 var(--plotpilot-topbar-padding-x);
-  color: var(--nav-hero-text, #ffffff);
+  color: var(--app-text-primary);
   position: relative;
   gap: var(--plotpilot-topbar-inner-gap);
   min-width: 0;
   /* 横向不允许出现滚动条：内容若溢出则靠中间 stat 区自然收窄 */
   overflow: hidden;
-  border-bottom: 1px solid var(--app-border, rgba(255, 255, 255, 0.08));
-  box-shadow:
-    var(--app-shadow-sm, 0 1px 3px rgba(0, 0, 0, 0.08)),
-    0 4px 16px var(--color-brand-border, rgba(79, 70, 229, 0.08));
+  border-bottom: 1px solid var(--app-border);
+  box-shadow: var(--app-shadow-sm);
 }
 
 /* 左侧：AI 控制台入口 */
@@ -322,17 +320,19 @@ onMounted(loadStats)
   padding: var(--plotpilot-ai-trigger-pad-y) var(--plotpilot-ai-trigger-pad-x);
   border-radius: var(--app-radius-md);
   cursor: pointer;
-  background: var(--nav-hero-pill-bg-top, rgba(255, 255, 255, 0.16));
-  border: 1px solid var(--nav-hero-pill-border, rgba(255, 255, 255, 0.28));
-  color: var(--nav-hero-text, #ffffff);
+  background: var(--app-surface-subtle);
+  border: 1px solid var(--app-border);
+  color: var(--app-text-secondary);
   transition: all var(--app-transition);
   white-space: nowrap;
-  box-shadow: var(--nav-hero-shadow);
+  box-shadow: none;
   user-select: none;
 }
 
 .ai-tools-trigger:hover {
-  background: rgba(255, 255, 255, 0.24);
+  background: var(--color-brand-light);
+  border-color: var(--color-brand-border);
+  color: var(--color-brand);
 }
 
 .ai-tools-label {
@@ -362,7 +362,7 @@ onMounted(loadStats)
 
 .stats-top-bar.error span {
   font-size: 14px;
-  opacity: 0.9;
+  color: var(--app-text-secondary);
 }
 
 .stat-item {
@@ -375,7 +375,7 @@ onMounted(loadStats)
 }
 
 .stat-item:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--app-surface-subtle);
 }
 
 .stat-content {
@@ -387,11 +387,11 @@ onMounted(loadStats)
 
 .stat-label {
   font-size: 12px;
-  opacity: 0.92;
+  opacity: 1;
   font-weight: 600;
   letter-spacing: 0.03em;
   white-space: nowrap;
-  color: var(--nav-hero-text-muted, rgba(255, 255, 255, 0.86));
+  color: var(--app-text-secondary);
 }
 
 .stat-value {
@@ -399,8 +399,8 @@ onMounted(loadStats)
   font-weight: 800;
   letter-spacing: -0.02em;
   line-height: 1.2;
-  color: var(--nav-hero-text, #ffffff);
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  color: var(--app-text-primary);
+  text-shadow: none;
 }
 
 .stat-item:hover .stat-value {
@@ -425,15 +425,15 @@ onMounted(loadStats)
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  opacity: 0.9;
+  opacity: 1;
   transition: all 0.18s ease;
   border-radius: var(--app-radius-sm);
-  color: inherit;
+  color: var(--app-text-secondary);
 }
 
 .action-trigger:hover {
-  opacity: 1;
-  background: rgba(255, 255, 255, 0.16);
+  background: var(--color-brand-light);
+  color: var(--color-brand);
   transform: rotate(45deg);
 }
 
@@ -446,15 +446,15 @@ onMounted(loadStats)
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  opacity: 0.9;
+  opacity: 1;
   transition: all 0.18s ease;
   border-radius: var(--app-radius-sm);
-  color: inherit;
+  color: var(--app-text-secondary);
 }
 
 .settings-trigger:hover {
-  opacity: 1;
-  background: rgba(255, 255, 255, 0.16);
+  background: var(--color-brand-light);
+  color: var(--color-brand);
   transform: rotate(45deg);
 }
 
@@ -465,13 +465,13 @@ onMounted(loadStats)
 
 /* Accessibility: Focus styles */
 .stat-item:focus-within {
-  outline: 2px solid rgba(255, 255, 255, 0.55);
+  outline: 2px solid var(--color-focus);
   outline-offset: 4px;
   border-radius: 4px;
 }
 
 .settings-trigger:focus-visible {
-  outline: 2px solid rgba(255, 255, 255, 0.55);
+  outline: 2px solid var(--color-focus);
   outline-offset: 2px;
 }
 

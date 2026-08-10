@@ -274,7 +274,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   height: 100vh;
   box-sizing: border-box;
   padding-top: env(safe-area-inset-top);
-  background: linear-gradient(180deg, var(--app-surface-subtle) 0%, var(--app-border) 100%);
+  background: var(--app-surface-subtle);
   border-right: 1px solid var(--app-border);
   display: flex;
   flex-direction: column;
@@ -293,7 +293,8 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .sidebar-brand {
   min-height: 100px;
   padding: 20px 24px;
-  background: linear-gradient(135deg, var(--color-brand, #4f46e5) 0%, var(--color-brand-pressed, #7c3aed) 100%);
+  background: var(--app-surface);
+  border-bottom: 1px solid var(--app-border);
   position: relative;
   overflow: visible;
   display: flex;
@@ -327,35 +328,29 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   flex-shrink: 0;
   width: 28px;
   height: 28px;
-  border: none;
-  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid var(--app-border);
+  background: var(--app-surface-subtle);
   border-radius: 8px;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
-  transition: background 0.18s ease;
+  color: var(--app-text-secondary);
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    color 0.18s ease;
   padding: 0;
 }
 
 .collapse-toggle:hover {
-  background: rgba(255, 255, 255, 0.32);
+  background: var(--color-brand-light);
+  border-color: var(--color-brand-border);
+  color: var(--color-brand);
 }
 
 .is-collapsed .collapse-toggle {
   margin: 0 auto;
-}
-
-.sidebar-brand::before {
-  content: '';
-  position: absolute;
-  top: -38%;
-  right: -46%;
-  width: 132px;
-  height: 132px;
-  background: radial-gradient(circle, var(--app-text-inverse, rgba(255,255,255,0.09)) 0%, transparent 72%);
-  pointer-events: none;
 }
 
 .brand-logo {
@@ -367,14 +362,13 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .logo-icon {
   width: 44px;
   height: 44px;
-  background: var(--color-brand-light, rgba(255, 255, 255, 0.2));
+  background: var(--color-brand-light);
   border-radius: 12px;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--app-text-inverse, #fff);
-  backdrop-filter: blur(8px);
-  border: 1px solid var(--app-text-inverse, rgba(255, 255, 255, 0.2));
+  color: var(--color-brand);
+  border: 1px solid var(--color-brand-border);
 }
 
 .brand-text {
@@ -386,7 +380,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .brand-name {
   font-size: 22px;
   font-weight: 700;
-  color: var(--app-text-inverse, #fff);
+  color: var(--app-text-primary);
   margin: 0;
   letter-spacing: -0.02em;
 }
