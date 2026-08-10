@@ -5,43 +5,61 @@
       @refresh-list="handleRefreshList"
       @collapsed-change="handleSidebarCollapsedChange"
     />
-    <div class="home-content" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
+    <main class="home-content" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
       <div class="home-bg" aria-hidden="true" />
 
       <div class="container">
-        <!-- Header -->
-        <header class="header">
+        <header class="product-header">
+          <div class="product-identity">
+            <PlotPilotMark size="compact" :label="false" />
+            <div>
+              <div class="product-name">{{ BRAND.productName }}</div>
+              <div class="product-descriptor">{{ BRAND.descriptor }}</div>
+            </div>
+          </div>
           <n-button
             quaternary
             circle
-            size="medium"
-            class="header-theme-btn"
-            aria-label="应用设置"
+            size="large"
+            class="icon-control"
+            aria-label="打开应用设置"
             @click="appSettingsShell.open()"
           >
             <template #icon>
-              <n-icon :component="IconThemeSettings" :size="22" />
+              <n-icon :component="SettingsOutline" :size="21" />
             </template>
           </n-button>
-          <div class="header-content">
-            <h1 class="title">墨枢 · 长篇叙事工作台</h1>
-            <p class="subtitle">
-              以梗概与类型开局，选定目标篇幅；宏观结构、幕次与节拍由后台自动编排，你专注把故事写下去即可。
-            </p>
-          </div>
         </header>
 
-        <!-- Create Card -->
-        <n-card class="create-card" :bordered="false">
+        <section class="library-heading" aria-labelledby="library-title">
+          <div class="library-copy">
+            <p class="library-kicker">{{ BRAND.tagline }}</p>
+            <h1 id="library-title" class="library-title">项目书库</h1>
+            <p class="library-subtitle">整理创作项目、查看当前进度，或从一个新梗概开始。</p>
+          </div>
+          <n-button quaternary size="large" class="library-create-control" @click="focusCreateInput">
+            <template #icon>
+              <n-icon :component="AddOutline" />
+            </template>
+            新建书目
+          </n-button>
+        </section>
+
+        <n-card class="create-card" :bordered="true">
           <n-space vertical :size="20">
             <div class="create-header">
               <div class="create-title-wrap">
-                <span class="create-icon">✨</span>
-                <h3 class="create-title">新建书目</h3>
+                <span class="section-icon" aria-hidden="true">
+                  <n-icon :component="CreateOutline" :size="19" />
+                </span>
+                <div>
+                  <h2 class="create-title">创建新书目</h2>
+                  <p class="create-hint">先记录故事核心，其余细节可以逐步完善。</p>
+                </div>
               </div>
               <n-button text type="primary" @click="showAdvanced = !showAdvanced">
                 <template #icon>
-                  <n-icon><component :is="showAdvanced ? IconChevronUp : IconChevronDown" /></n-icon>
+                  <n-icon :component="showAdvanced ? ChevronUpOutline : ChevronDownOutline" />
                 </template>
                 {{ showAdvanced ? '收起高级' : '高级（自定义章数/每章字数）' }}
               </n-button>
@@ -129,7 +147,7 @@
                 @click="handleCreate"
               >
                 <template #icon>
-                  <n-icon><IconSpark /></n-icon>
+                  <n-icon :component="SparklesOutline" />
                 </template>
                 建档并进入工作台
               </n-button>
@@ -137,11 +155,10 @@
           </n-space>
         </n-card>
 
-        <!-- Books Section -->
-        <section class="books-section">
+        <section class="books-section" aria-labelledby="book-list-title">
           <div class="section-header">
             <div class="section-left">
-              <h2 class="section-title">我的书目</h2>
+              <h2 id="book-list-title" class="section-title">书目列表</h2>
               <span class="book-count" v-if="!loading">{{ filteredBooks.length }} 本</span>
             </div>
             <div class="section-right">
@@ -151,9 +168,10 @@
                 clearable
                 round
                 class="search-input"
+                aria-label="搜索书名或类型"
               >
                 <template #prefix>
-                  <n-icon><IconSearch /></n-icon>
+                  <n-icon :component="SearchOutline" />
                 </template>
               </n-input>
               <n-button
@@ -163,7 +181,7 @@
                 @click="showBatchDeleteConfirm = true"
               >
                 <template #icon>
-                  <n-icon><IconTrash /></n-icon>
+                  <n-icon :component="TrashOutline" />
                 </template>
                 删除选中 ({{ selectedBooks.length }})
               </n-button>
@@ -179,13 +197,13 @@
           <!-- Empty State -->
           <div v-else-if="books.length === 0" class="empty-state">
             <div class="empty-illustration">
-              <span class="empty-icon">📚</span>
+              <n-icon :component="LibraryOutline" :size="44" aria-hidden="true" />
             </div>
             <h3 class="empty-title">还没有书目</h3>
             <p class="empty-desc">在上方输入你的故事创意，开启创作之旅</p>
             <n-button type="primary" size="large" round @click="focusCreateInput">
               <template #icon>
-                <n-icon><IconSpark /></n-icon>
+                <n-icon :component="AddOutline" />
               </template>
               创建第一本书
             </n-button>
@@ -193,7 +211,7 @@
 
           <!-- No Results State -->
           <div v-else-if="filteredBooks.length === 0" class="no-results-state">
-            <span class="no-results-icon">🔍</span>
+            <n-icon :component="SearchOutline" :size="36" aria-hidden="true" />
             <p>未找到匹配「{{ searchQuery }}」的书目</p>
             <n-button text type="primary" @click="searchQuery = ''">清除搜索</n-button>
           </div>
@@ -223,7 +241,12 @@
                   class="book-card"
                   :class="{ 'is-selected': selectedBooks.includes(book.slug) }"
                   :style="{ animationDelay: `${idx * 0.04}s` }"
+                  role="link"
+                  tabindex="0"
+                  :aria-label="`打开书目 ${book.title}`"
                   @click="navigateToBook(book.slug)"
+                  @keydown.enter="navigateToBook(book.slug)"
+                  @keydown.space.prevent="navigateToBook(book.slug)"
                 >
                   <div class="card-top">
                     <span class="book-dot" :class="`dot-${book.stage}`"></span>
@@ -263,7 +286,7 @@
                           aria-label="删除书目"
                         >
                           <template #icon>
-                            <n-icon><IconTrash /></n-icon>
+                            <n-icon :component="TrashOutline" />
                           </template>
                         </n-button>
                       </template>
@@ -284,19 +307,9 @@
           </template>
         </section>
 
-        <!-- 底部版权 -->
-        <footer class="home-footer">
-          <span class="footer-brand">PlotPilot</span>
-          <span class="footer-sep">·</span>
-          <span class="footer-sub">墨枢</span>
-          <span class="footer-text">由 PlotPilot（墨枢）团队倾力开发</span>
-          <a class="footer-link" href="https://www.douyin.com/user/MS4wLjABAAAA91472902104" target="_blank" rel="noopener noreferrer">
-            抖音：林亦 91472902104
-          </a>
-          <span class="footer-text">每晚 9 点随缘直播</span>
-        </footer>
+        <footer class="home-ending">书目与创作进度按项目整理。</footer>
       </div>
-    </div>
+    </main>
 
     <!-- Batch Delete Confirm Modal -->
     <n-modal v-model:show="showBatchDeleteConfirm" preset="confirm" type="error" title="确认批量删除">
@@ -351,10 +364,11 @@
           placeholder="搜索书目…"
           clearable
           size="small"
+          aria-label="搜索全部书目"
           style="max-width: 280px; margin-bottom: 16px"
         >
           <template #prefix>
-            <n-icon><IconSearch /></n-icon>
+            <n-icon :component="SearchOutline" />
           </template>
         </n-input>
         <div class="all-books-grid">
@@ -362,7 +376,12 @@
             v-for="book in modalFilteredBooks"
             :key="book.slug"
             class="book-card"
+            role="link"
+            tabindex="0"
+            :aria-label="`打开书目 ${book.title}`"
             @click="navigateToBook(book.slug); showAllModal = false"
+            @keydown.enter="navigateToBook(book.slug); showAllModal = false"
+            @keydown.space.prevent="navigateToBook(book.slug); showAllModal = false"
           >
             <div class="card-top">
               <span class="book-dot" :class="`dot-${book.stage}`"></span>
@@ -398,7 +417,7 @@
                     aria-label="删除书目"
                   >
                     <template #icon>
-                      <n-icon><IconTrash /></n-icon>
+                      <n-icon :component="TrashOutline" />
                     </template>
                   </n-button>
                 </template>
@@ -413,11 +432,24 @@
 </template>
 
 <script setup lang="ts">
-import { defineAsyncComponent, h, ref, onMounted, computed, nextTick } from 'vue'
+import { defineAsyncComponent, ref, onMounted, computed, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMessage, NIcon } from 'naive-ui'
+import {
+  AddOutline,
+  ChevronDownOutline,
+  ChevronUpOutline,
+  CreateOutline,
+  LibraryOutline,
+  SearchOutline,
+  SettingsOutline,
+  SparklesOutline,
+  TrashOutline,
+} from '@vicons/ionicons5'
 import { novelApi, type NovelDTO } from '../api/novel'
 import { isWizardCompleted } from '@/utils/wizardStageCache'
+import PlotPilotMark from '@/components/brand/PlotPilotMark.vue'
+import { BRAND } from '@/constants/brand'
 import StatsSidebar from '@/components/stats/StatsSidebar.vue'
 import { useAppSettingsShellStore } from '@/stores/appSettingsShellStore'
 import { parseGenreWorldFromPremise } from '@/utils/premisePresets'
@@ -438,35 +470,6 @@ const MarketTaxonomyPicker = defineAsyncComponent(
 const NovelSetupGuide = defineAsyncComponent(
   () => import('@/components/onboarding/NovelSetupGuide.vue'),
 )
-
-// Icons
-const IconSpark = () =>
-  h('svg', { xmlns: 'http://www.w3.org/2000/svg', viewBox: '0 0 24 24', width: '1em', height: '1em' },
-    h('path', { fill: 'currentColor', d: 'M13 2L3 14h8l-1 8 10-12h-8l1-8z' }))
-
-const IconSearch = () =>
-  h('svg', { xmlns: 'http://www.w3.org/2000/svg', viewBox: '0 0 24 24', width: '1em', height: '1em' },
-    h('path', { fill: 'currentColor', d: 'M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z' }))
-
-const IconTrash = () =>
-  h('svg', { xmlns: 'http://www.w3.org/2000/svg', viewBox: '0 0 24 24', width: '1em', height: '1em' },
-    h('path', { fill: 'currentColor', d: 'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z' }))
-
-const IconChevronDown = () =>
-  h('svg', { xmlns: 'http://www.w3.org/2000/svg', viewBox: '0 0 24 24', width: '1em', height: '1em' },
-    h('path', { fill: 'currentColor', d: 'M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6 1.41-1.41z' }))
-
-const IconChevronUp = () =>
-  h('svg', { xmlns: 'http://www.w3.org/2000/svg', viewBox: '0 0 24 24', width: '1em', height: '1em' },
-    h('path', { fill: 'currentColor', d: 'M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6 1.41 1.41z' }))
-
-/** 与工作台顶栏一致：打开应用设置（默认「外观与主题」分区） */
-const IconThemeSettings = () =>
-  h('svg', { xmlns: 'http://www.w3.org/2000/svg', viewBox: '0 0 24 24', width: '1em', height: '1em' },
-    h('path', {
-      fill: 'currentColor',
-      d: 'M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z',
-    }))
 
 interface BookListItem {
   slug: string
@@ -780,88 +783,133 @@ onMounted(() => {
   min-height: 100vh;
   height: 100vh;
   overflow: hidden;
+  background: var(--app-page-bg);
 }
 
 .home-content {
   flex: 1;
   min-height: 0;
   margin-left: 300px;
-  padding: 32px;
+  padding: 0 36px 32px;
   position: relative;
   overflow-x: hidden;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
-  transition: margin-left 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: margin-left var(--motion-duration-slow) var(--motion-ease-standard);
 }
 
 .home-content.sidebar-collapsed {
   margin-left: 52px;
 }
 
-/* 顶栏：与 StatsTopBar 同款渐变，AI 控制台 / 提示词广场 / 设置 */
-
 .home-bg {
   position: absolute;
   inset: 0;
-  background:
-    radial-gradient(ellipse 110% 80% at 50% -30%, var(--color-brand-light), transparent 55%),
-    radial-gradient(ellipse 60% 50% at 100% 20%, rgba(14, 165, 233, 0.12), transparent 45%),
-    radial-gradient(ellipse 50% 40% at 0% 60%, var(--color-gold-dim), transparent 50%),
-    linear-gradient(180deg, var(--app-page-bg) 0%, var(--app-surface-subtle) 45%, var(--app-page-bg) 100%);
+  background: var(--app-page-bg);
   z-index: 0;
 }
 
 .container {
   position: relative;
   z-index: 1;
-  max-width: 1200px;
+  max-width: 1120px;
   margin: 0 auto;
 }
 
-.header {
-  position: relative;
-  text-align: center;
-  margin-bottom: 40px;
-  animation: fade-up 0.55s ease both;
+.product-header {
+  min-height: 68px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border-bottom: 1px solid var(--app-divider);
 }
 
-.header-theme-btn {
-  position: absolute;
-  top: 0;
-  right: 0;
-  z-index: 2;
-  color: var(--app-text-secondary);
+.product-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--color-brand);
 }
 
-.header-theme-btn:hover {
-  color: var(--color-brand, #4f46e5);
-}
-
-.header-content {
-  padding: 0 44px;
-}
-
-.title {
-  font-size: clamp(2rem, 4vw, 2.5rem);
-  font-weight: 700;
-  margin: 0 0 12px;
-  letter-spacing: -0.03em;
+.product-name {
   color: var(--app-text-primary);
+  font-size: 15px;
+  font-weight: 750;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
 }
 
-.subtitle {
-  font-size: 1.05rem;
+.product-descriptor {
+  margin-top: 2px;
+  color: var(--app-text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.icon-control {
   color: var(--app-text-secondary);
-  margin: 0;
-  font-weight: 400;
 }
 
+.icon-control:hover {
+  color: var(--color-brand);
+  background: var(--color-brand-light);
+}
+
+.library-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 32px;
+  padding: 40px 0 28px;
+}
+
+.library-copy {
+  min-width: 0;
+}
+
+.library-kicker {
+  margin: 0 0 6px;
+  color: var(--color-brand);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+.library-title {
+  margin: 0;
+  color: var(--app-text-primary);
+  font-family: var(--font-serif);
+  font-size: clamp(2rem, 5vw, 3rem);
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.035em;
+}
+
+.library-subtitle {
+  margin: 10px 0 0;
+  max-width: 42rem;
+  color: var(--app-text-secondary);
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.library-create-control {
+  min-height: 44px;
+  color: var(--color-brand);
+  font-weight: 650;
+}
+
+.library-create-control:hover {
+  background: var(--color-brand-light);
+}
 
 .create-card {
-  margin-bottom: 32px;
-  border-radius: 16px;
-  box-shadow: 0 4px 20px rgba(15, 23, 42, 0.06);
-  animation: fade-up 0.55s ease 0.08s both;
+  margin-bottom: 24px;
+  border-radius: var(--app-radius-lg);
+  background: var(--app-surface);
+  box-shadow: var(--app-shadow-sm);
 }
 
 .create-header {
@@ -873,17 +921,32 @@ onMounted(() => {
 .create-title-wrap {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
 }
 
-.create-icon {
-  font-size: 20px;
+.section-icon {
+  width: 36px;
+  height: 36px;
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: var(--app-radius-sm);
+  background: var(--color-brand-light);
+  color: var(--color-brand);
 }
 
 .create-title {
   margin: 0;
-  font-size: 17px;
-  font-weight: 600;
+  color: var(--app-text-primary);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.create-hint {
+  margin: 3px 0 0;
+  color: var(--app-text-muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .premise-input :deep(textarea) {
@@ -894,8 +957,8 @@ onMounted(() => {
 .taxonomy-block {
   margin-top: 4px;
   padding: 14px 16px;
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.02);
+  border-radius: var(--app-radius-md);
+  background: var(--app-surface-subtle);
   border: 1px solid var(--app-border);
 }
 .taxonomy-block-head {
@@ -961,9 +1024,9 @@ onMounted(() => {
 
 .advanced-settings {
   padding: 16px;
-  background: rgba(79, 70, 229, 0.04);
-  border-radius: 12px;
-  border: 1px solid rgba(79, 70, 229, 0.1);
+  background: var(--color-brand-light);
+  border-radius: var(--app-radius-md);
+  border: 1px solid var(--color-brand-border);
 }
 
 .w-full {
@@ -972,10 +1035,10 @@ onMounted(() => {
 
 .books-section {
   background: var(--app-surface);
-  border-radius: 16px;
-  padding: 28px;
-  box-shadow: 0 4px 20px rgba(15, 23, 42, 0.04);
-  animation: fade-up 0.55s ease 0.14s both;
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-lg);
+  padding: 24px;
+  box-shadow: var(--app-shadow-sm);
 }
 
 .section-header {
@@ -995,17 +1058,17 @@ onMounted(() => {
 
 .section-title {
   margin: 0;
-  font-size: 18px;
-  font-weight: 600;
+  font-size: 17px;
+  font-weight: 700;
   color: var(--app-text-primary);
 }
 
 .book-count {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--app-text-muted);
   background: var(--app-surface-subtle);
-  padding: 4px 10px;
-  border-radius: 12px;
+  padding: 3px 9px;
+  border-radius: 999px;
 }
 
 .section-right {
@@ -1015,7 +1078,7 @@ onMounted(() => {
 }
 
 .search-input {
-  width: 240px;
+  width: 248px;
 }
 
 .selection-bar {
@@ -1054,17 +1117,15 @@ onMounted(() => {
 }
 
 .empty-illustration {
-  width: 100px;
-  height: 100px;
-  background: linear-gradient(135deg, var(--app-surface-subtle) 0%, var(--app-border) 100%);
-  border-radius: 50%;
+  width: 88px;
+  height: 88px;
+  background: var(--app-surface-subtle);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-xl);
   display: flex;
   align-items: center;
   justify-content: center;
-}
-
-.empty-icon {
-  font-size: 48px;
+  color: var(--color-brand);
 }
 
 .empty-title {
@@ -1084,16 +1145,11 @@ onMounted(() => {
   gap: 12px;
 }
 
-.no-results-icon {
-  font-size: 40px;
-}
-
 .no-results-state p {
   margin: 0;
   font-size: 14px;
 }
 
-/* ── 书目：单行横排，多本时横向滚动 ── */
 .books-list-wrap {
   display: flex;
   flex-direction: column;
@@ -1101,44 +1157,45 @@ onMounted(() => {
 }
 
 .books-grid {
-  display: flex;
-  flex-direction: row;
-  flex-wrap: nowrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
   gap: 16px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding-bottom: 6px;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: thin;
 }
 
-/* 卡片（固定宽度，保证单行横滑） */
 .book-card {
   position: relative;
-  flex: 0 0 auto;
-  width: 260px;
-  max-width: min(260px, 82vw);
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  padding: 20px;
-  background: var(--app-surface);
+  padding: 18px;
+  background: var(--app-surface-raised);
   border: 1px solid var(--app-border);
-  border-radius: 14px;
+  border-radius: var(--app-radius-md);
   cursor: pointer;
-  transition: all 0.2s ease;
-  animation: fade-up 0.35s ease both;
+  transition:
+    border-color var(--app-transition),
+    background var(--app-transition),
+    box-shadow var(--app-transition),
+    transform var(--app-transition);
+  animation: fade-up var(--motion-duration-slow) var(--motion-ease-standard) both;
   overflow: hidden;
 }
 
 .book-card:hover {
-  border-color: var(--color-brand, #4f46e5);
-  box-shadow: 0 4px 16px rgba(79, 70, 229, 0.1);
+  border-color: var(--color-brand-border);
+  box-shadow: var(--app-shadow-hover);
   transform: translateY(-2px);
 }
 
+.book-card:focus-visible {
+  outline: none;
+  border-color: var(--color-focus);
+  box-shadow: var(--focus-ring), var(--app-shadow-md);
+}
+
 .book-card.is-selected {
-  border-color: var(--color-brand, #4f46e5);
-  background: var(--color-brand-light, rgba(79, 70, 229, 0.04));
+  border-color: var(--color-brand);
+  background: var(--color-brand-light);
 }
 
 /* 阶段状态小圆点 */
@@ -1150,10 +1207,10 @@ onMounted(() => {
   display: inline-block;
 }
 
-.book-dot.dot-planning { background: #3b82f6; }
-.book-dot.dot-writing { background: #f59e0b; }
-.book-dot.dot-reviewing { background: #8b5cf6; }
-.book-dot.dot-completed { background: #10b981; }
+.book-dot.dot-planning { background: var(--color-info); }
+.book-dot.dot-writing { background: var(--color-warning); }
+.book-dot.dot-reviewing { background: var(--color-brand); }
+.book-dot.dot-completed { background: var(--color-success); }
 
 /* 卡片顶部：标题 + 圆点 */
 .card-top {
@@ -1204,12 +1261,13 @@ onMounted(() => {
   justify-content: flex-end;
   gap: 6px;
   opacity: 0;
-  transition: opacity 0.18s ease;
+  transition: opacity var(--app-transition);
   padding-top: 4px;
   border-top: 1px solid transparent;
 }
 
-.book-card:hover .card-actions {
+.book-card:hover .card-actions,
+.book-card:focus-within .card-actions {
   opacity: 1;
 }
 
@@ -1220,9 +1278,9 @@ onMounted(() => {
   justify-content: space-between;
   margin-top: 12px;
   padding: 12px 16px;
-  background: var(--color-brand-light, rgba(79, 70, 229, 0.05));
-  border: 1px dashed var(--color-brand-border, rgba(79, 70, 229, 0.2));
-  border-radius: 10px;
+  background: var(--app-surface-subtle);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-sm);
 }
 
 .fold-hint {
@@ -1244,69 +1302,37 @@ onMounted(() => {
 /* Responsive */
 @media (max-width: 1200px) {
   .home-content {
-    padding: 24px;
+    padding: 0 24px 28px;
   }
-
-
 }
 
-/* ── 底部版权 ──────────────────────────────── */
-.home-footer {
-  position: relative;
-  z-index: 1;
+.home-ending {
   text-align: center;
-  padding: 28px 20px 32px;
-  margin-top: 40px;
+  padding: 24px 20px 8px;
+  margin-top: 24px;
   border-top: 1px solid var(--app-border);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  flex-wrap: wrap;
   font-size: 12px;
   color: var(--app-text-muted);
   line-height: 1.6;
 }
 
-.footer-brand {
-  font-weight: 700;
-  color: var(--color-gold);
-  letter-spacing: 0.03em;
-}
-
-.footer-sep {
-  opacity: 0.4;
-}
-
-.footer-sub {
-  font-weight: 600;
-  color: var(--color-gold-light);
-  opacity: 0.8;
-}
-
-.footer-text {
-  color: var(--app-text-muted);
-}
-
-.footer-link {
-  color: var(--color-gold);
-  text-decoration: none;
-  font-weight: 600;
-  border-bottom: 1px dashed var(--color-gold-border);
-  transition: all 0.2s ease;
-  white-space: nowrap;
-}
-
-.footer-link:hover {
-  color: var(--color-gold-light);
-  border-bottom-style: solid;
-  box-shadow: 0 0 8px var(--color-glow-gold);
-}
-
 @media (max-width: 768px) {
   .home-content {
     margin-left: 0;
-    padding: 16px;
+    padding: 0 16px 24px;
+  }
+
+  .library-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 20px;
+    padding: 32px 0 24px;
+  }
+
+  .create-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
   }
 
   .section-header {
@@ -1324,6 +1350,39 @@ onMounted(() => {
 
   .card-actions {
     opacity: 1; /* 移动端始终显示操作按钮 */
+  }
+}
+
+@media (max-width: 480px) {
+  .home-content {
+    padding-inline: 12px;
+  }
+
+  .product-header {
+    min-height: 62px;
+  }
+
+  .product-descriptor {
+    display: none;
+  }
+
+  .library-title {
+    font-size: 2rem;
+  }
+
+  .create-card :deep(.n-card__content),
+  .books-section {
+    padding: 16px;
+  }
+
+  .books-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .books-fold-bar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
   }
 }
 
@@ -1351,5 +1410,12 @@ onMounted(() => {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .book-card {
+    animation: none;
+    transition: none;
+  }
 }
 </style>

@@ -62,10 +62,10 @@
       }
     },
     "shortDescription": "AI 驱动的智能小说创作平台",
-    "longDescription": "PlotPilot（墨枢）是一款 AI 驱动的智能小说创作平台，提供剧情分析、角色管理、AI 续写等专业功能。",
+    "longDescription": "PlotPilot 是一款 AI 驱动的智能小说创作平台，提供剧情分析、角色管理与 AI 续写等专业功能。",
     "category": "Productivity",
-    "publisher": "PlotPilot Team",
-    "copyright": "© 2025 PlotPilot Team. All rights reserved."
+    "publisher": "PlotPilot",
+    "copyright": "© 2025 PlotPilot. All rights reserved."
   },
   "plugins": {}
 }

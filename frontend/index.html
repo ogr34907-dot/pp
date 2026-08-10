@@ -22,9 +22,28 @@
       href="https://fonts.loli.net/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <title>PlotPilot · 墨枢 | 作者的领航员</title>
+    <title>PlotPilot | AI 小说创作平台</title>
     <style>
       /* 首屏：在 JS/Vue 挂载前即可显示，避免桌面壳等后端时纯白窗口 */
+      :root {
+        --boot-page: #f7f5ef;
+        --boot-surface: #fffefa;
+        --boot-text: #1e2925;
+        --boot-muted: #66756f;
+        --boot-brand: #2b6c69;
+        --boot-brand-soft: rgba(43, 108, 105, 0.16);
+        color-scheme: light dark;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --boot-page: #141a18;
+          --boot-surface: #1c2522;
+          --boot-text: #e9f0eb;
+          --boot-muted: #93a29a;
+          --boot-brand: #75b6a9;
+          --boot-brand-soft: rgba(117, 182, 169, 0.2);
+        }
+      }
       #boot-splash {
         position: fixed;
         inset: 0;
@@ -33,8 +52,8 @@
         align-items: center;
         justify-content: center;
         gap: 1.25rem;
-        background: linear-gradient(160deg, #0f172a 0%, #1e293b 45%, #312e81 100%);
-        color: #e2e8f0;
+        background: var(--boot-page);
+        color: var(--boot-text);
         font-family: system-ui, 'Segoe UI', 'Noto Sans SC', sans-serif;
         z-index: 2147483647;
       }
@@ -45,13 +64,13 @@
       }
       #boot-splash .boot-hint {
         font-size: 0.875rem;
-        color: #94a3b8;
+        color: var(--boot-muted);
       }
       #boot-splash .boot-spinner {
         width: 2.5rem;
         height: 2.5rem;
-        border: 3px solid rgba(129, 140, 248, 0.25);
-        border-top-color: #818cf8;
+        border: 3px solid var(--boot-brand-soft);
+        border-top-color: var(--boot-brand);
         border-radius: 50%;
         animation: boot-spin 0.85s linear infinite;
       }
@@ -66,7 +85,7 @@
     <div id="app">
       <div id="boot-splash" aria-live="polite">
         <div class="boot-spinner" aria-hidden="true"></div>
-        <div class="boot-logo">PlotPilot · 墨枢</div>
+        <div class="boot-logo">PlotPilot</div>
         <div class="boot-hint">正在启动本地服务，请稍候…</div>
       </div>
     </div>

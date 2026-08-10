@@ -23,8 +23,7 @@ use std::time::Duration;
 use backend::BackendManager;
 use tauri::{Manager, WindowEvent};
 
-const BRAND_DISPLAY_NAME: &str = "PlotPilot · 墨枢";
-const BRAND_CREDIT: &str = "由 PlotPilot（墨枢）团队倾力开发";
+const BRAND_DISPLAY_NAME: &str = "PlotPilot";
 
 /// 防止重复 spawn 多条优雅退出线程（用户连点关闭）
 static GRACEFUL_SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
@@ -34,7 +33,7 @@ pub fn run() {
     // 初始化日志
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    log::info!("🚀 {} 启动中 - {}", BRAND_DISPLAY_NAME, BRAND_CREDIT);
+    log::info!("🚀 {} 启动中", BRAND_DISPLAY_NAME);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
