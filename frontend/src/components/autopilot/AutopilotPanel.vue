@@ -208,18 +208,18 @@
       :message="reviewGateMessage"
       :recovery-label="reviewRecoveryLabel"
       :recovery-intent="reviewRecoveryIntent"
-      :recovery-disabled="fullResyncActive"
+      :recovery-disabled="canonicalAftermathFailure ? canonicalAftermathPresentation.currentChapterAction.disabled : fullResyncActive"
       :recovery-loading="reviewRecoveryLoading"
       @retry="handleReviewRetry"
       @resume="resume"
     >
-      <template v-if="canonicalAftermathFailure && canStartFullResync && !fullResyncActive" #actions>
+      <template v-if="canonicalAftermathFailure && !canonicalAftermathPresentation.fullResyncAction.disabled" #actions>
         <n-button
           type="warning"
           secondary
           size="small"
           :loading="toggling"
-          @click="startCanonicalAftermathFullResync"
+          @click="canonicalAftermathPresentation.fullResyncAction.invoke"
         >
           <template #icon><n-icon size="16"><RefreshOutline /></n-icon></template>
           {{ canonicalAftermathPresentation.fullResyncAction?.label }}
@@ -384,7 +384,6 @@ import { featureFlags } from '../../config/features'
 import { runtimePerformance } from '../../config/performance'
 import { normalizeAutopilotStartConfig } from './autopilotStartConfig'
 import {
-  canStartCanonicalAftermathFullResync,
   canOfferReviewResume,
   createCanonicalAftermathFullResyncState,
   getCanonicalAftermathPresentation,
@@ -526,12 +525,13 @@ const canonicalAftermathPresentation = computed(() => getCanonicalAftermathPrese
   total: fullResyncState.total.value,
   currentChapter: fullResyncState.currentChapter.value,
   firstFailureReason: fullResyncState.firstFailureReason.value,
+}, {
+  retryCurrentChapter: retryCanonicalAftermath,
+  resyncFullBook: startCanonicalAftermathFullResync,
+  resume,
+  refresh: () => fetchStatus(),
 }))
 const canonicalAftermathFailure = computed(() => canonicalAftermathPresentation.value.isFailure)
-const canStartFullResync = computed(() => canStartCanonicalAftermathFullResync(
-  status.value,
-  fullResyncActive.value,
-))
 const showReviewGate = computed(() => needsReview.value || reviewGateNeedsAIPanel.value)
 const canResumeReview = computed(() => canOfferReviewResume(
   needsReview.value &&
@@ -576,7 +576,7 @@ const showFullResyncProgress = computed(() => shouldShowCanonicalAftermathFullRe
 ))
 const reviewGateActionLabel = computed(() => (
   canonicalAftermathFailure.value
-    ? canonicalAftermathPresentation.value.actionLabel
+    ? canonicalAftermathPresentation.value.currentChapterAction.label
     : (reviewGate.value?.action_label || '确认后继续')
 ))
 const reviewTaskStatus = computed(() => (
@@ -589,7 +589,9 @@ const reviewRecoveryLabel = computed(() => {
   return ''
 })
 const reviewRecoveryIntent = computed(() => (
-  reviewGateNeedsAIPanel.value || canonicalAftermathFailure.value ? 'retry' : 'resume'
+  canonicalAftermathFailure.value
+    ? canonicalAftermathPresentation.value.currentChapterAction.intent
+    : (reviewGateNeedsAIPanel.value ? 'retry' : 'resume')
 ))
 const reviewRecoveryLoading = computed(() => (
   reviewGateNeedsAIPanel.value ? aiPanelOpening.value : toggling.value
@@ -610,7 +612,9 @@ function handleReviewRetry() {
     void openActiveInvocation()
     return
   }
-  void retryCanonicalAftermath()
+  if (canonicalAftermathFailure.value) {
+    void canonicalAftermathPresentation.value.currentChapterAction.invoke()
+  }
 }
 function statusHasActiveInvocation(s) {
   return Boolean(s?.active_invocation_session_id && (s?.has_active_invocation || s?.requires_ai_review))
@@ -1560,7 +1564,7 @@ async function startCanonicalAftermathFullResync() {
       onCompleted: event => {
         fullResyncState.completed(event)
         message.success('全章重同步已完成，仍保持暂停状态')
-        void fetchStatus()
+        void canonicalAftermathPresentation.value.afterFullResyncCompleted()
       },
       onCancelled: event => fullResyncState.cancelled(event),
     })

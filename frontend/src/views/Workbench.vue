@@ -365,8 +365,9 @@ watch(
   overflow: hidden;
 }
 
-.wb-right-collapsed :deep(.n-split__gutter) {
+.wb-right-collapsed :deep(> .n-split > .n-split__resize-trigger-wrapper) {
   display: none !important;
+  pointer-events: none !important;
 }
 
 .wb-right-strip {
@@ -397,10 +398,11 @@ watch(
 }
 
 .is-focus-mode :deep(.workbench-primary-split > .n-split-pane-1),
-.is-focus-mode :deep(.workbench-primary-split > .n-split__gutter),
+.is-focus-mode :deep(.workbench-primary-split > .n-split__resize-trigger-wrapper),
 .is-focus-mode .wb-main-split :deep(> .n-split > .n-split-pane-2),
-.is-focus-mode .wb-main-split :deep(> .n-split > .n-split__gutter) {
+.is-focus-mode .wb-main-split :deep(> .n-split > .n-split__resize-trigger-wrapper) {
   display: none !important;
+  pointer-events: none !important;
 }
 
 .is-focus-mode :deep(.workbench-primary-split > .n-split-pane-2),

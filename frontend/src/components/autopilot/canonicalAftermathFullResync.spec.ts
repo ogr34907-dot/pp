@@ -54,7 +54,11 @@ describe('canonical aftermath full resync presentation state', () => {
     }, false)).toBe(true)
   })
 
-  it('exposes canonical failure as an assertive alert with an explicit full-book recovery intent', () => {
+  it('routes the consumed recovery actions to current-chapter/full-book handlers and never resumes on completion', () => {
+    let currentChapterCalls = 0
+    let fullBookCalls = 0
+    let resumeCalls = 0
+    let refreshCalls = 0
     const presentation = getCanonicalAftermathPresentation({
       autopilot_pause_reason: 'canonical_aftermath_not_ready',
       autopilot_status: 'running',
@@ -64,21 +68,39 @@ describe('canonical aftermath full resync presentation state', () => {
         type: 'canonical_aftermath',
         message: '第 64 章的规范记忆同步尚未完成',
       },
-    }) as any
-
-    expect(presentation).toMatchObject({
-      role: 'alert',
-      ariaLive: 'assertive',
-      fullResyncAction: {
-        intent: 'resync-all',
-        label: '从第 1 章开始全流程同步',
-        scope: '第 1 章至当前章',
-        disabled: false,
-      },
+    }, undefined, {
+      retryCurrentChapter: () => { currentChapterCalls += 1 },
+      resyncFullBook: () => { fullBookCalls += 1 },
+      resume: () => { resumeCalls += 1 },
+      refresh: () => { refreshCalls += 1 },
     })
+
+    expect(presentation.currentChapterAction).toMatchObject({
+      intent: 'retry',
+      disabled: false,
+    })
+    expect(presentation.fullResyncAction).toMatchObject({
+      intent: 'resync-all',
+      scope: '第 1 章至当前章',
+      disabled: false,
+    })
+    expect(presentation.resumeAction.disabled).toBe(true)
+
+    presentation.currentChapterAction.invoke()
+    presentation.fullResyncAction.invoke()
+    presentation.resumeAction.invoke()
+    presentation.afterFullResyncCompleted()
+
+    expect(currentChapterCalls).toBe(1)
+    expect(fullBookCalls).toBe(1)
+    expect(refreshCalls).toBe(1)
+    expect(resumeCalls).toBe(0)
   })
 
-  it('presents active full-book counters while disabling recovery and never auto-resuming', () => {
+  it('blocks every canonical recovery handler while full-book synchronization is active', () => {
+    let currentChapterCalls = 0
+    let fullBookCalls = 0
+    let resumeCalls = 0
     const presentation = getCanonicalAftermathPresentation({
       autopilot_pause_reason: 'canonical_aftermath_not_ready',
       current_stage: 'paused_for_review',
@@ -89,18 +111,31 @@ describe('canonical aftermath full resync presentation state', () => {
       total: 64,
       currentChapter: 19,
       firstFailureReason: '',
-    }) as any
+    }, {
+      retryCurrentChapter: () => { currentChapterCalls += 1 },
+      resyncFullBook: () => { fullBookCalls += 1 },
+      resume: () => { resumeCalls += 1 },
+      refresh: () => {},
+    })
 
+    expect(presentation.currentChapterAction.disabled).toBe(true)
     expect(presentation.fullResyncAction.disabled).toBe(true)
+    expect(presentation.resumeAction.disabled).toBe(true)
     expect(presentation.asyncStatus).toMatchObject({
       status: 'running',
       stage: '第 1 章至当前章',
       current: 18,
       total: 64,
       message: '正在同步第 19 章',
-      shouldAutoResume: false,
     })
-    expect(presentation.canResume).toBe(false)
+
+    presentation.currentChapterAction.invoke()
+    presentation.fullResyncAction.invoke()
+    presentation.resumeAction.invoke()
+
+    expect(currentChapterCalls).toBe(0)
+    expect(fullBookCalls).toBe(0)
+    expect(resumeCalls).toBe(0)
   })
 
   it('marks completion without requesting a resume', () => {
