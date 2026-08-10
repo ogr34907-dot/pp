@@ -815,17 +815,18 @@ onUnmounted(() => {
     overflow: auto;
   }
 
-  .chapter :deep(.n-split-pane) {
+  .chapter :deep(.n-split-pane-1),
+  .chapter :deep(.n-split-pane-2) {
     width: 100% !important;
     min-width: 0 !important;
     flex: none !important;
   }
 
-  .chapter :deep(.n-split-pane:first-child) {
+  .chapter :deep(.n-split-pane-1) {
     min-height: 66vh;
   }
 
-  .chapter :deep(.n-split-pane:last-child) {
+  .chapter :deep(.n-split-pane-2) {
     min-height: 420px;
   }
 

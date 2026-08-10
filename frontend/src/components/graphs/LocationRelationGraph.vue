@@ -9,11 +9,11 @@
         <n-button size="small" secondary @click="goToKnowledge">编辑三元组</n-button>
       </n-space>
     </div>
-    <div class="lrg-chart">
-      <div v-if="emptyHint" class="lrg-empty">
+    <div class="lrg-chart" :data-graph-surface="graphSurface">
+      <div v-if="graphSurface === 'empty'" class="lrg-empty" role="status" aria-live="polite">
         <n-empty description="尚无地点三元组，请在「叙事与知识」中添加" size="small" />
       </div>
-      <div v-else-if="loading && !graphData.nodes.length" class="lrg-empty" aria-live="polite">
+      <div v-else-if="graphSurface === 'loading'" class="lrg-empty" role="status" aria-live="polite">
         <n-spin size="small" description="正在整理地点关系…" />
       </div>
       <GraphChart v-else :nodes="graphData.nodes" :links="graphData.links" @node-click="handleNodeClick" />
@@ -34,6 +34,7 @@ import {
 } from '../../utils/knowledgeFactDisplay'
 import { useThemeStore } from '../../stores/themeStore'
 import { getEditorialGraphPalette } from '../../utils/graphThemePalette'
+import { resolveLocationGraphSurface } from '../../utils/locationGraphSurface'
 
 const props = defineProps<{ slug: string }>()
 const emit = defineEmits<{
@@ -64,7 +65,10 @@ const loading = ref(false)
 const facts = ref<Fact[]>([])
 const graphData = ref<EChartsGraphData>({ nodes: [], links: [] })
 
-const emptyHint = computed(() => facts.value.length === 0 && !loading.value)
+const graphSurface = computed(() => resolveLocationGraphSurface({
+  loading: loading.value,
+  nodeCount: graphData.value.nodes.length,
+}))
 
 // 根据重要程度返回颜色
 const getColorByImportance = (importance?: string) => {
@@ -210,7 +214,6 @@ const reload = async () => {
   try {
     const res = await knowledgeApi.getKnowledge(props.slug)
     facts.value = (res.facts || []) as Fact[]
-    const locationFacts = facts.value.filter(f => f.entity_type === 'location')
     await redraw()
   } catch (error) {
     console.error('Failed to load location graph:', error)
