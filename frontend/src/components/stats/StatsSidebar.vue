@@ -6,7 +6,6 @@
         <PlotPilotMark class="logo-icon" :size="collapsed ? 'compact' : 'regular'" :label="false" />
         <div class="brand-text">
           <h1 class="brand-name">PlotPilot</h1>
-          <p class="brand-slogan">墨枢 · 作者的领航员</p>
         </div>
       </div>
       <button
@@ -390,14 +389,6 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   color: var(--app-text-inverse, #fff);
   margin: 0;
   letter-spacing: -0.02em;
-}
-
-.brand-slogan {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.82);
-  margin: 0;
-  font-weight: 400;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
 }
 
 /* Stats Section */

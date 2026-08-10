@@ -557,6 +557,11 @@ rt { font-size: 0.6em; color: var(--app-text-muted); }
     scroll-behavior: auto;
   }
 
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none !important;
+  }
+
   *,
   *::before,
   *::after {

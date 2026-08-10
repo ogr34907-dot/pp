@@ -161,7 +161,10 @@ function handleThemeChange(newMode: ThemeMode) {
   const opt = themeOptions.find((o) => o.value === newMode)
   const label = opt?.label ?? newMode
   const applyTheme = () => { themeStore.setTheme(newMode) }
-  if ('startViewTransition' in document) {
+  const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
+  if (reduceMotion) {
+    applyTheme()
+  } else if ('startViewTransition' in document) {
     ;(document as Document & { startViewTransition: (cb: () => void) => void })
       .startViewTransition(applyTheme)
   } else {

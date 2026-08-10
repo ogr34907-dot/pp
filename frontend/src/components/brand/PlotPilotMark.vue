@@ -3,7 +3,7 @@
     class="plotpilot-mark"
     :class="`plotpilot-mark--${size}`"
     :role="label ? 'img' : undefined"
-    :aria-label="label ? 'PlotPilot 墨枢' : undefined"
+    :aria-label="label ? 'PlotPilot' : undefined"
     :aria-hidden="label ? undefined : 'true'"
   >
     <span class="plotpilot-mark__symbol" aria-hidden="true">
