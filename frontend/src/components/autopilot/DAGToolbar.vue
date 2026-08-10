@@ -1,7 +1,7 @@
 <template>
   <div class="dag-toolbar">
     <div class="toolbar-left">
-      <n-text strong class="toolbar-title-text">🧭 DAG 可视化</n-text>
+      <n-text strong class="toolbar-title-text"><n-icon :component="CompassOutline" />DAG 可视化</n-text>
 
       <!-- 节点统计（精简） -->
       <n-tag v-if="dagStats" size="small" round>
@@ -14,7 +14,7 @@
         </template>
       </n-tag>
 
-      <!-- ★ 托管模式状态指示 -->
+      <!-- 托管模式状态指示 -->
       <n-tag
         v-if="autopilotStatus === 'running'"
         size="small"
@@ -34,7 +34,8 @@
         round
         :bordered="false"
       >
-        ⏸️ 等待审阅
+        <template #icon><n-icon :component="PauseCircleOutline" /></template>
+        等待审阅
       </n-tag>
       <n-tag
         v-else-if="autopilotStatus === 'completed'"
@@ -43,7 +44,8 @@
         round
         :bordered="false"
       >
-        ✅ 全书完成
+        <template #icon><n-icon :component="CheckmarkCircleOutline" /></template>
+        全书完成
       </n-tag>
       <n-tag
         v-else-if="autopilotStatus === 'error'"
@@ -52,7 +54,8 @@
         round
         :bordered="false"
       >
-        ❌ 托管异常
+        <template #icon><n-icon :component="AlertCircleOutline" /></template>
+        托管异常
       </n-tag>
 
       <!-- SSE 连接状态 -->
@@ -89,6 +92,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useDAGStore } from '@/stores/dagStore'
+import { AlertCircleOutline, CheckmarkCircleOutline, CompassOutline, PauseCircleOutline } from '@vicons/ionicons5'
 
 const dagStore = useDAGStore()
 
@@ -106,7 +110,7 @@ const props = defineProps<{
     bypassed: number
     version?: number
   }
-  /** ★ 托管模式状态 */
+  /** 托管模式状态 */
   autopilotStatus: 'idle' | 'running' | 'paused' | 'completed' | 'error'
   sseConnected: boolean
 }>()
@@ -148,6 +152,9 @@ defineEmits<{
 }
 
 .toolbar-title-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 14px;
   color: var(--app-text-primary);
 }

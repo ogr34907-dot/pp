@@ -2,7 +2,7 @@
   <div class="character-scheduler-simulator">
     <div class="simulator-header">
       <h2 class="simulator-title">
-        <span class="title-icon">🎯</span>
+        <n-icon class="title-icon"><PulseOutline /></n-icon>
         角色上下文调度模拟器
       </h2>
       <p class="simulator-desc">
@@ -14,7 +14,7 @@
       <!-- 控制面板 -->
       <div class="control-panel">
         <h3 class="panel-title">
-          <span class="title-icon">⚙️</span>
+          <n-icon class="title-icon"><OptionsOutline /></n-icon>
           调度参数
         </h3>
 
@@ -22,16 +22,26 @@
         <div class="control-group">
           <div class="control-item">
             <label class="control-label">大纲中提及艾达</label>
-            <div class="toggle-switch" :class="{ active: mentionedAda }" @click="mentionedAda = !mentionedAda">
-              <div class="toggle-slider"></div>
-            </div>
+            <button
+              type="button"
+              class="toggle-switch"
+              :class="{ active: mentionedAda }"
+              :aria-pressed="mentionedAda"
+              aria-label="切换大纲中提及艾达"
+              @click="mentionedAda = !mentionedAda"
+            ><span class="toggle-slider"></span></button>
           </div>
 
           <div class="control-item">
             <label class="control-label">大纲中提及苏晴</label>
-            <div class="toggle-switch" :class="{ active: mentionedSuQing }" @click="mentionedSuQing = !mentionedSuQing">
-              <div class="toggle-slider"></div>
-            </div>
+            <button
+              type="button"
+              class="toggle-switch"
+              :class="{ active: mentionedSuQing }"
+              :aria-pressed="mentionedSuQing"
+              aria-label="切换大纲中提及苏晴"
+              @click="mentionedSuQing = !mentionedSuQing"
+            ><span class="toggle-slider"></span></button>
           </div>
         </div>
 
@@ -58,7 +68,7 @@
       <!-- 角色卡片 -->
       <div class="characters-panel">
         <h3 class="panel-title">
-          <span class="title-icon">👥</span>
+          <n-icon class="title-icon"><PeopleOutline /></n-icon>
           角色库
         </h3>
 
@@ -116,7 +126,7 @@
       <!-- 调度队列 -->
       <div class="queue-panel">
         <h3 class="panel-title">
-          <span class="title-icon">📋</span>
+          <n-icon class="title-icon"><ListOutline /></n-icon>
           调度队列
         </h3>
 
@@ -146,7 +156,7 @@
       <!-- 生成的上下文 -->
       <div class="context-panel">
         <h3 class="panel-title">
-          <span class="title-icon">📝</span>
+          <n-icon class="title-icon"><DocumentTextOutline /></n-icon>
           生成的上下文 Prompt
         </h3>
 
@@ -163,7 +173,7 @@
       <!-- 算法说明 -->
       <div class="algorithm-panel">
         <h3 class="panel-title">
-          <span class="title-icon">🧠</span>
+          <n-icon class="title-icon"><GitBranchOutline /></n-icon>
           排序算法逻辑
         </h3>
 
@@ -207,6 +217,14 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
+import {
+  DocumentTextOutline,
+  GitBranchOutline,
+  ListOutline,
+  OptionsOutline,
+  PeopleOutline,
+  PulseOutline,
+} from '@vicons/ionicons5'
 
 // 角色数据
 interface Character {
@@ -355,51 +373,54 @@ const estimatedTokens = computed(() => {
 
 <style scoped>
 .character-scheduler-simulator {
-  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-  border-radius: 16px;
-  padding: 24px;
-  color: #e0e0e0;
-  font-family: 'Courier New', monospace;
-  max-width: 1400px;
+  min-height: 100vh;
+  padding: clamp(16px, 3vw, 36px);
+  color: var(--app-text-primary);
+  background: var(--app-page-bg);
+  font-family: var(--font-sans);
   margin: 0 auto;
 }
 
 .simulator-header {
-  text-align: center;
-  margin-bottom: 32px;
-  padding-bottom: 20px;
-  border-bottom: 2px solid #2d3436;
+  max-width: 1400px;
+  margin: 0 auto 24px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--app-border);
 }
 
 .simulator-title {
-  font-size: 28px;
-  font-weight: 700;
-  margin: 0 0 12px 0;
+  font-size: clamp(22px, 3vw, 28px);
+  font-weight: 650;
+  font-family: var(--font-serif);
+  margin: 0 0 8px;
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 12px;
+  gap: 10px;
 }
 
 .title-icon {
-  font-size: 32px;
+  font-size: 1.1em;
+  color: var(--color-brand);
 }
 
 .simulator-desc {
-  color: #a0a0a0;
+  color: var(--app-text-secondary);
   font-size: 14px;
   margin: 0;
 }
 
 .simulator-desc code {
-  background: #2d3436;
+  background: var(--app-surface-subtle);
+  border: 1px solid var(--app-border);
   padding: 2px 8px;
-  border-radius: 4px;
-  color: #00cec9;
-  font-family: 'Courier New', monospace;
+  border-radius: var(--app-radius-sm);
+  color: var(--color-brand);
+  font-family: var(--font-mono);
 }
 
 .simulator-body {
+  max-width: 1400px;
+  margin: 0 auto;
   display: grid;
   grid-template-columns: 1fr 2fr;
   gap: 24px;
@@ -418,14 +439,19 @@ const estimatedTokens = computed(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  color: var(--app-text-inverse, #fff);
+  color: var(--app-text-primary);
 }
 
-/* 控制面板 */
-.control-panel {
-  background: #1e272e;
-  border-radius: 12px;
+.control-panel,
+.characters-panel,
+.queue-panel,
+.context-panel,
+.algorithm-panel {
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-md);
   padding: 20px;
+  box-shadow: var(--app-shadow-sm);
 }
 
 .control-group {
@@ -445,32 +471,42 @@ const estimatedTokens = computed(() => {
 
 .control-label {
   font-size: 14px;
-  color: #b0b0b0;
+  color: var(--app-text-secondary);
 }
 
 .toggle-switch {
   width: 56px;
   height: 28px;
-  background: #2d3436;
+  padding: 0;
+  border: 1px solid var(--app-border-strong);
+  background: var(--app-surface-subtle);
   border-radius: 14px;
   cursor: pointer;
   position: relative;
-  transition: background 0.3s;
+  transition: background var(--app-transition), border-color var(--app-transition);
 }
 
 .toggle-switch.active {
-  background: #00cec9;
+  background: var(--color-brand);
+  border-color: var(--color-brand);
+}
+
+.toggle-switch:focus-visible,
+.slider:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 3px;
 }
 
 .toggle-slider {
   width: 22px;
   height: 22px;
-  background: var(--app-text-inverse, #fff);
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
   border-radius: 50%;
   position: absolute;
   top: 3px;
   left: 3px;
-  transition: left 0.3s;
+  transition: left var(--app-transition);
 }
 
 .toggle-switch.active .toggle-slider {
@@ -481,7 +517,7 @@ const estimatedTokens = computed(() => {
   width: 100%;
   height: 8px;
   border-radius: 4px;
-  background: #2d3436;
+  background: var(--app-surface-subtle);
   outline: none;
   -webkit-appearance: none;
   margin: 12px 0;
@@ -492,24 +528,20 @@ const estimatedTokens = computed(() => {
   width: 20px;
   height: 20px;
   border-radius: 50%;
-  background: #00cec9;
+  background: var(--color-brand);
   cursor: pointer;
-  box-shadow: 0 2px 6px rgba(0, 206, 201, 0.3);
+  box-shadow: 0 0 0 3px var(--color-focus-soft);
 }
 
 .slider-labels {
   display: flex;
   justify-content: space-between;
   font-size: 12px;
-  color: #808080;
+  color: var(--app-text-secondary);
 }
 
-/* 角色卡片 */
 .characters-panel {
   grid-column: 1 / -1;
-  background: #1e272e;
-  border-radius: 12px;
-  padding: 20px;
 }
 
 .characters-grid {
@@ -519,21 +551,20 @@ const estimatedTokens = computed(() => {
 }
 
 .character-card {
-  background: #2d3436;
-  border-radius: 10px;
+  background: var(--app-surface-subtle);
+  border-radius: var(--app-radius-sm);
   padding: 16px;
-  border: 2px solid transparent;
-  transition: all 0.3s;
+  border: 1px solid var(--app-border);
+  transition: border-color var(--app-transition), box-shadow var(--app-transition), opacity var(--app-transition);
 }
 
 .character-card.mentioned {
-  border-color: #fdcb6e;
-  background: linear-gradient(135deg, #2d3436 0%, #3d4446 100%);
+  border-color: var(--color-accent);
 }
 
 .character-card.selected {
-  border-color: #00cec9;
-  box-shadow: 0 4px 12px rgba(0, 206, 201, 0.3);
+  border-color: var(--color-brand);
+  box-shadow: 0 0 0 2px var(--color-focus-soft);
 }
 
 .character-card.excluded {
@@ -550,7 +581,7 @@ const estimatedTokens = computed(() => {
 .char-name {
   font-size: 18px;
   font-weight: 600;
-  color: var(--app-text-inverse, #fff);
+  color: var(--app-text-primary);
 }
 
 .char-importance {
@@ -561,18 +592,20 @@ const estimatedTokens = computed(() => {
 }
 
 .importance-protagonist {
-  background: #e17055;
-  color: var(--app-text-inverse, #fff);
+  background: var(--color-brand);
+  color: var(--app-text-inverse);
 }
 
 .importance-major {
-  background: #fdcb6e;
-  color: #2d3436;
+  background: var(--color-accent-soft);
+  color: var(--app-text-primary);
+  border: 1px solid var(--color-accent-border);
 }
 
 .importance-minor {
-  background: #636e72;
-  color: var(--app-text-inverse, #fff);
+  background: var(--app-surface-subtle);
+  color: var(--app-text-secondary);
+  border: 1px solid var(--app-border);
 }
 
 .char-stats {
@@ -587,17 +620,17 @@ const estimatedTokens = computed(() => {
 }
 
 .stat-label {
-  color: #a0a0a0;
+  color: var(--app-text-secondary);
 }
 
 .stat-value {
-  color: #dfe6e9;
+  color: var(--app-text-primary);
   font-weight: 600;
 }
 
 .char-behaviors {
   padding-top: 8px;
-  border-top: 1px solid #3d4446;
+  border-top: 1px solid var(--app-divider);
 }
 
 .behavior-item {
@@ -605,11 +638,11 @@ const estimatedTokens = computed(() => {
 }
 
 .behavior-label {
-  color: #a0a0a0;
+  color: var(--app-text-secondary);
 }
 
 .behavior-value {
-  color: #74b9ff;
+  color: var(--color-brand);
   margin-left: 6px;
 }
 
@@ -628,25 +661,21 @@ const estimatedTokens = computed(() => {
 }
 
 .badge-mentioned {
-  background: #fdcb6e;
-  color: #2d3436;
+  background: var(--color-accent-soft);
+  color: var(--app-text-primary);
+  border: 1px solid var(--color-accent-border);
 }
 
 .badge-selected {
-  background: #00cec9;
-  color: var(--app-text-inverse, #fff);
+  background: var(--color-brand-light);
+  color: var(--color-brand);
+  border: 1px solid var(--color-brand-border);
 }
 
 .badge-excluded {
-  background: #636e72;
-  color: var(--app-text-inverse, #fff);
-}
-
-/* 调度队列 */
-.queue-panel {
-  background: #1e272e;
-  border-radius: 12px;
-  padding: 20px;
+  background: var(--app-surface-subtle);
+  color: var(--app-text-secondary);
+  border: 1px solid var(--app-border);
 }
 
 .queue-list {
@@ -660,15 +689,16 @@ const estimatedTokens = computed(() => {
   align-items: center;
   gap: 12px;
   padding: 12px;
-  background: #2d3436;
-  border-radius: 8px;
-  border-left: 4px solid #636e72;
-  transition: all 0.3s;
+  background: var(--app-surface-subtle);
+  border-radius: var(--app-radius-sm);
+  border: 1px solid var(--app-border);
+  border-left: 4px solid var(--app-border-strong);
+  transition: border-color var(--app-transition), background var(--app-transition), opacity var(--app-transition);
 }
 
 .queue-item.selected {
-  border-left-color: #00cec9;
-  background: linear-gradient(90deg, #2d3436 0%, #3d4446 100%);
+  border-left-color: var(--color-brand);
+  background: var(--color-brand-light);
 }
 
 .queue-item.excluded {
@@ -679,8 +709,8 @@ const estimatedTokens = computed(() => {
   width: 32px;
   height: 32px;
   border-radius: 50%;
-  background: #636e72;
-  color: var(--app-text-inverse, #fff);
+  background: var(--app-border-strong);
+  color: var(--app-text-primary);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -689,7 +719,8 @@ const estimatedTokens = computed(() => {
 }
 
 .queue-item.selected .queue-rank {
-  background: #00cec9;
+  background: var(--color-brand);
+  color: var(--app-text-inverse);
 }
 
 .queue-info {
@@ -700,13 +731,13 @@ const estimatedTokens = computed(() => {
   display: block;
   font-size: 15px;
   font-weight: 600;
-  color: var(--app-text-inverse, #fff);
+  color: var(--app-text-primary);
   margin-bottom: 4px;
 }
 
 .queue-reason {
   font-size: 12px;
-  color: #a0a0a0;
+  color: var(--app-text-secondary);
 }
 
 .queue-status {
@@ -715,33 +746,29 @@ const estimatedTokens = computed(() => {
 }
 
 .status-selected {
-  color: #00cec9;
+  color: var(--color-brand);
 }
 
 .status-excluded {
-  color: #636e72;
+  color: var(--app-text-secondary);
 }
 
-/* 上下文输出 */
 .context-panel {
   grid-column: 1 / -1;
-  background: #1e272e;
-  border-radius: 12px;
-  padding: 20px;
 }
 
 .context-output {
-  background: #0a0a0a;
-  border-radius: 8px;
+  background: var(--app-surface-subtle);
+  border-radius: var(--app-radius-sm);
   padding: 16px;
-  border: 1px solid #2d3436;
+  border: 1px solid var(--app-border);
   margin-bottom: 16px;
 }
 
 .context-output pre {
   margin: 0;
-  color: #dfe6e9;
-  font-family: 'Courier New', monospace;
+  color: var(--app-text-primary);
+  font-family: var(--font-mono);
   font-size: 14px;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -755,15 +782,11 @@ const estimatedTokens = computed(() => {
 
 .context-stats .stat {
   font-size: 13px;
-  color: #a0a0a0;
+  color: var(--app-text-secondary);
 }
 
-/* 算法说明 */
 .algorithm-panel {
   grid-column: 1 / -1;
-  background: #1e272e;
-  border-radius: 12px;
-  padding: 20px;
 }
 
 .algorithm-steps {
@@ -776,16 +799,17 @@ const estimatedTokens = computed(() => {
   display: flex;
   gap: 12px;
   padding: 16px;
-  background: #2d3436;
-  border-radius: 8px;
+  background: var(--app-surface-subtle);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-sm);
 }
 
 .step-number {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  background: #00cec9;
-  color: var(--app-text-inverse, #fff);
+  background: var(--color-brand);
+  color: var(--app-text-inverse);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -797,14 +821,54 @@ const estimatedTokens = computed(() => {
 .step-content strong {
   display: block;
   margin-bottom: 6px;
-  color: var(--app-text-inverse, #fff);
+  color: var(--app-text-primary);
   font-size: 14px;
 }
 
 .step-content p {
   margin: 0;
   font-size: 13px;
-  color: #a0a0a0;
+  color: var(--app-text-secondary);
   line-height: 1.5;
+}
+
+@media (max-width: 640px) {
+  .character-scheduler-simulator {
+    padding: 14px 10px 24px;
+  }
+
+  .simulator-body,
+  .characters-grid,
+  .algorithm-steps {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .control-panel,
+  .characters-panel,
+  .queue-panel,
+  .context-panel,
+  .algorithm-panel {
+    padding: 16px;
+  }
+
+  .queue-item {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .queue-status {
+    width: 100%;
+    padding-left: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toggle-switch,
+  .toggle-slider,
+  .character-card,
+  .queue-item {
+    transition: none;
+  }
 }
 </style>

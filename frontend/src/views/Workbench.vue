@@ -1,10 +1,42 @@
 <template>
-  <div class="workbench">
-    <StatsTopBar :slug="slug" @open-settings="appSettingsShell.open()" />
+  <div
+    class="workbench"
+    :class="{
+      'is-focus-mode': focusMode,
+      'is-compact-shell': compactShell,
+      'compact-pane--structure': compactShell && compactPane === 'structure',
+      'compact-pane--writing': compactShell && compactPane === 'writing',
+      'compact-pane--inspector': compactShell && compactPane === 'inspector',
+    }"
+  >
+    <StatsTopBar
+      :slug="slug"
+      :context-title="bookTitle || slug"
+      :chapter-label="currentChapter ? `第 ${currentChapter.number} 章 · ${currentChapter.title || '未命名章节'}` : '尚未选择章节'"
+      :focus-mode="focusMode"
+      @toggle-focus="focusMode = !focusMode"
+      @open-settings="appSettingsShell.open()"
+    />
+
+    <nav v-if="compactShell && !focusMode" class="workbench-compact-nav" aria-label="工作台面板">
+      <button
+        v-for="pane in compactPaneOptions"
+        :key="pane.value"
+        type="button"
+        class="workbench-compact-nav__button"
+        :class="{ 'is-active': compactPane === pane.value }"
+        :aria-pressed="compactPane === pane.value"
+        @click="selectCompactPane(pane.value)"
+      >
+        <n-icon :component="pane.icon" :size="18" aria-hidden="true" />
+        <span>{{ pane.label }}</span>
+      </button>
+    </nav>
 
     <n-spin :show="pageLoading" class="workbench-spin" description="加载工作台…">
       <div class="workbench-inner">
         <n-split
+          class="workbench-primary-split"
           direction="horizontal"
           :min="WORKBENCH_SPLIT.sidebarMin"
           :max="WORKBENCH_SPLIT.sidebarMax"
@@ -50,9 +82,15 @@
                 </template>
 
                 <template #2>
-                  <div v-if="rightCollapsed" class="wb-right-strip" @click="toggleRight">
-                    <span class="wb-strip-icon">◀</span>
-                  </div>
+                  <button
+                    v-if="rightCollapsed"
+                    type="button"
+                    class="wb-right-strip"
+                    aria-label="展开右侧检查器"
+                    @click="toggleRight"
+                  >
+                    <n-icon size="17"><ChevronBackOutline /></n-icon>
+                  </button>
                   <SettingsPanel
                     v-else
                     :slug="slug"
@@ -84,6 +122,8 @@
 import { onMounted, onUnmounted, computed, ref, watch, defineAsyncComponent, type ComponentPublicInstance } from 'vue'
 import { useRoute } from 'vue-router'
 import { useMessage } from 'naive-ui'
+import { useMediaQuery } from '@vueuse/core'
+import { CreateOutline, ListOutline, OptionsOutline } from '@vicons/ionicons5'
 import { useDebouncedTask } from '../composables/useDebouncedTask'
 import { useWorkbench } from '../composables/useWorkbench'
 import { useStatsStore } from '../stores/statsStore'
@@ -103,6 +143,7 @@ import { WORKBENCH_SPLIT } from '../design/layoutDensity'
 import { storageKeys } from '@/config/storageKeys'
 import { runtimePerformance } from '@/config/performance'
 import { readStorageBoolean, writeStorageBoolean } from '@/utils/storage'
+import { ChevronBackOutline } from '@vicons/ionicons5'
 
 const ActPlanningModal = defineAsyncComponent(() => import('../components/workbench/ActPlanningModal.vue'))
 
@@ -175,6 +216,24 @@ const handlePlanAct = (actId: string, actTitle: string) => {
 }
 
 const rightCollapsed = ref(readStorageBoolean(storageKeys.workbenchRightPanelCollapsed))
+const focusMode = ref(false)
+type CompactPane = 'structure' | 'writing' | 'inspector'
+const compactShell = useMediaQuery('(max-width: 900px)')
+const compactPane = ref<CompactPane>('writing')
+const compactPaneOptions = [
+  { value: 'structure' as const, label: '结构', icon: ListOutline },
+  { value: 'writing' as const, label: '写作', icon: CreateOutline },
+  { value: 'inspector' as const, label: '检查器', icon: OptionsOutline },
+]
+
+function selectCompactPane(pane: CompactPane) {
+  compactPane.value = pane
+  if (pane === 'inspector' && rightCollapsed.value) rightCollapsed.value = false
+}
+
+watch(focusMode, (enabled) => {
+  if (enabled) compactPane.value = 'writing'
+})
 
 function toggleRight() {
   rightCollapsed.value = !rightCollapsed.value
@@ -281,7 +340,7 @@ watch(
   min-height: 0;
   max-height: 100vh;
   overflow: hidden;
-  background: var(--app-page-bg, #f0f2f8);
+  background: var(--app-page-bg);
   display: flex;
   flex-direction: column;
 }
@@ -309,6 +368,7 @@ watch(
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  padding: 6px;
 }
 
 .workbench-inner :deep(.n-split) {
@@ -329,6 +389,9 @@ watch(
   height: 100%;
   width: 100%;
   overflow: hidden;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-md);
 }
 
 .wb-right-collapsed :deep(.n-split-pane-1) {
@@ -345,8 +408,9 @@ watch(
   overflow: hidden;
 }
 
-.wb-right-collapsed :deep(.n-split__gutter) {
+.wb-right-collapsed :deep(> .n-split > .n-split__resize-trigger-wrapper) {
   display: none !important;
+  pointer-events: none !important;
 }
 
 .wb-right-strip {
@@ -363,10 +427,117 @@ watch(
   font-size: 12px;
   transition: background 0.15s, color 0.15s;
   user-select: none;
+  padding: 0;
 }
 
 .wb-right-strip:hover {
   background: var(--plotpilot-panel-muted);
   color: var(--app-text-primary);
+}
+
+.workbench-compact-nav {
+  display: none;
+}
+
+.wb-right-strip:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -3px;
+}
+
+.is-focus-mode :deep(.workbench-primary-split > .n-split-pane-1),
+.is-focus-mode :deep(.workbench-primary-split > .n-split__resize-trigger-wrapper),
+.is-focus-mode .wb-main-split :deep(> .n-split > .n-split-pane-2),
+.is-focus-mode .wb-main-split :deep(> .n-split > .n-split__resize-trigger-wrapper) {
+  display: none !important;
+  pointer-events: none !important;
+}
+
+.is-focus-mode :deep(.workbench-primary-split > .n-split-pane-2),
+.is-focus-mode .wb-main-split :deep(> .n-split > .n-split-pane-1) {
+  width: 100% !important;
+  max-width: none !important;
+  flex: 1 1 100% !important;
+}
+
+@media (max-width: 900px) {
+  .workbench-compact-nav {
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--app-border);
+    background: var(--app-page-bg);
+  }
+
+  .workbench-compact-nav__button {
+    min-width: 0;
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border: 1px solid transparent;
+    border-radius: var(--app-radius-md);
+    color: var(--app-text-secondary);
+    background: transparent;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .workbench-compact-nav__button:hover {
+    color: var(--app-text-primary);
+    background: var(--app-surface-subtle);
+  }
+
+  .workbench-compact-nav__button.is-active {
+    color: var(--color-brand);
+    background: var(--color-brand-light);
+    border-color: var(--color-brand-border);
+  }
+
+  .workbench-compact-nav__button:focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+
+  .workbench-inner { padding: 0; }
+  .wb-main-split { border-radius: 0; border-block: 0; }
+
+  .is-compact-shell :deep(.workbench-primary-split > .n-split__resize-trigger-wrapper),
+  .is-compact-shell .wb-main-split :deep(> .n-split > .n-split__resize-trigger-wrapper) {
+    display: none !important;
+    pointer-events: none !important;
+  }
+
+  .is-compact-shell :deep(.workbench-primary-split > .n-split-pane-1),
+  .is-compact-shell :deep(.workbench-primary-split > .n-split-pane-2),
+  .is-compact-shell .wb-main-split :deep(> .n-split > .n-split-pane-1),
+  .is-compact-shell .wb-main-split :deep(> .n-split > .n-split-pane-2) {
+    display: none !important;
+    pointer-events: none !important;
+    width: 0 !important;
+    max-width: 0 !important;
+    flex: 0 0 0 !important;
+  }
+
+  .is-compact-shell.compact-pane--structure :deep(.workbench-primary-split > .n-split-pane-1),
+  .is-compact-shell.compact-pane--writing :deep(.workbench-primary-split > .n-split-pane-2),
+  .is-compact-shell.compact-pane--inspector :deep(.workbench-primary-split > .n-split-pane-2),
+  .is-compact-shell.compact-pane--writing .wb-main-split :deep(> .n-split > .n-split-pane-1),
+  .is-compact-shell.compact-pane--inspector .wb-main-split :deep(> .n-split > .n-split-pane-2) {
+    display: block !important;
+    pointer-events: auto !important;
+    width: 100% !important;
+    max-width: none !important;
+    flex: 1 1 100% !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-right-strip { transition: none; }
 }
 </style>

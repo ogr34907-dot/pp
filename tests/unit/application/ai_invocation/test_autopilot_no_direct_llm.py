@@ -48,7 +48,9 @@ def test_autopilot_panel_respects_ai_invocation_debug_flag():
     text = Path("frontend/src/components/autopilot/AutopilotPanel.vue").read_text(encoding="utf-8")
 
     assert "function statusHasActiveInvocation" in text
-    assert 'v-if="reviewGateNeedsAIPanel && featureFlags.aiInvocationDebug"' in text
+    assert '<AsyncTaskStatus' in text
+    assert ':recovery-label="reviewRecoveryLabel"' in text
+    assert "if (reviewGateNeedsAIPanel.value && featureFlags.aiInvocationDebug) return '打开 AI 面板'" in text
     assert "void openActiveInvocation(sessionId, { showPanel: featureFlags.aiInvocationDebug })" in text
     assert "if (!sessionId) return" in text
     assert "if (!statusHasActiveInvocation(s) || !sessionId) return" not in text

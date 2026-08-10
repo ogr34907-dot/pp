@@ -13,6 +13,7 @@ import { computed } from 'vue'
 import ChartWrapper from './ChartWrapper.vue'
 import type { EChartsOption } from 'echarts'
 import { useThemeStore } from '../../stores/themeStore'
+import { getEditorialGraphPalette } from '../../utils/graphThemePalette'
 
 const themeStore = useThemeStore()
 
@@ -59,25 +60,11 @@ const nodeCount = computed(() => props.nodes.length)
  * surface → --app-surface, border → --app-border-strong, text → --app-text-secondary
  */
 const tooltipColors = computed(() => {
-  const { isDark, isAnchor } = themeStore
-  if (isAnchor) {
-    return {
-      bg: '#111620',
-      border: 'rgba(201,162,39,0.14)',
-      text: '#c4b99a',
-    }
-  }
-    if (isDark) {
-      return {
-        bg: '#1a2235',
-        border: 'rgba(148,163,184,0.12)',
-        text: '#d1d5db',
-      }
-    }
+  const palette = getEditorialGraphPalette(themeStore.effectiveTheme)
   return {
-    bg: '#ffffff',
-    border: 'rgba(15,23,42,0.09)',
-    text: '#1f2937',
+    bg: palette.tooltipBackground,
+    border: palette.tooltipBorder,
+    text: palette.tooltipText,
   }
 })
 

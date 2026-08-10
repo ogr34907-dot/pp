@@ -27,7 +27,7 @@
       <n-spin :show="metaLoading">
         <n-card v-if="slug" size="small" :bordered="true" class="status-card">
           <template #header>
-            <span class="card-title">📊 正文结构</span>
+            <span class="card-title"><n-icon :component="BarChartOutline" />正文结构</span>
           </template>
           <n-empty v-if="!chapterStructure && !metaLoading" description="暂无结构分析" size="small" />
           <div v-else-if="chapterStructure" class="structure-grid">
@@ -56,7 +56,7 @@
       <!-- 自动审阅（AI 章末管线） -->
       <n-card v-if="autopilotChapterReview" size="small" :bordered="true" class="status-card">
         <template #header>
-          <span class="card-title">🤖 自动审阅</span>
+          <span class="card-title"><n-icon :component="ShieldCheckmarkOutline" />自动审阅</span>
         </template>
         <n-alert
           v-if="chapter && chapter.number !== autopilotChapterReview.chapter_number"
@@ -98,8 +98,8 @@
                 <div class="aftermath-step__body">
                   <div class="aftermath-step__label-row">
                     <span class="aftermath-step__label">{{ step.label }}</span>
-                    <span v-if="step.state === 'done'" class="aftermath-step__ok">✓</span>
-                    <span v-else-if="step.state === 'fail'" class="aftermath-step__fail">!</span>
+                    <n-icon v-if="step.state === 'done'" class="aftermath-step__ok" :component="CheckmarkCircleOutline" aria-label="完成" />
+                    <n-icon v-else-if="step.state === 'fail'" class="aftermath-step__fail" :component="AlertCircleOutline" aria-label="失败" />
                   </div>
                   <span class="aftermath-step__detail">{{ step.detail }}</span>
                 </div>
@@ -127,7 +127,10 @@
                 size="small"
                 round
               >
-                {{ autopilotChapterReview.drift_alert ? '⚠ 告警' : '✓ 正常' }}
+                <template #icon>
+                  <n-icon :component="autopilotChapterReview.drift_alert ? AlertCircleOutline : CheckmarkCircleOutline" />
+                </template>
+                {{ autopilotChapterReview.drift_alert ? '告警' : '正常' }}
               </n-tag>
               <n-tag v-else type="default" size="small" round>待采样</n-tag>
             </div>
@@ -180,7 +183,7 @@
       <!-- AI 生成质检 -->
       <n-card v-if="lastWorkflowResult && qcChapterNumber != null" size="small" :bordered="true" class="status-card">
         <template #header>
-          <span class="card-title">✨ 生成质检</span>
+          <span class="card-title"><n-icon :component="SparklesOutline" />生成质检</span>
         </template>
         <n-space vertical :size="10">
           <n-alert
@@ -248,6 +251,13 @@ import type { GenerateChapterWorkflowResponse } from '../../api/workflow'
 import ConsistencyReportPanel from './ConsistencyReportPanel.vue'
 import { chapterApi, type ChapterStructureDTO } from '../../api/chapter'
 import { getChapterPacingLabel, getChapterQualityLabel } from '@/domain/chapterWriting'
+import {
+  AlertCircleOutline,
+  BarChartOutline,
+  CheckmarkCircleOutline,
+  ShieldCheckmarkOutline,
+  SparklesOutline,
+} from '@vicons/ionicons5'
 
 interface Chapter {
   id: number | string
@@ -433,6 +443,9 @@ function onLocationClick(location: number) {
 }
 
 .card-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   font-weight: 600;
 }

@@ -201,8 +201,8 @@
 }
 
 .pp-chip--gold {
-  background: var(--color-gold-dim, rgba(212, 168, 83, 0.15));
-  color: var(--color-gold, #d4a853);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
 }
 
 /* ─── Info bar ───────────────────────────────────────── */
@@ -274,7 +274,7 @@
   justify-content: center;
   font-size: 10px;
   font-weight: 700;
-  color: #fff;
+  color: var(--app-text-inverse);
   background: var(--pp-avatar-bg, var(--color-brand));
   letter-spacing: 0;
   line-height: 1;
@@ -290,7 +290,7 @@
   color: var(--color-brand, #2563eb);
   cursor: pointer;
   opacity: 0.75;
-  transition: opacity 0.15s;
+  transition: opacity var(--motion-duration-fast) var(--motion-ease-standard);
   white-space: nowrap;
   text-decoration: none;
 }
@@ -340,7 +340,10 @@
   border: 1px solid var(--app-border);
   background: transparent;
   color: var(--app-text-muted);
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  transition:
+    background var(--motion-duration-fast) var(--motion-ease-standard),
+    color var(--motion-duration-fast) var(--motion-ease-standard),
+    border-color var(--motion-duration-fast) var(--motion-ease-standard);
   white-space: nowrap;
 }
 
@@ -399,7 +402,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
+  color: var(--app-text-inverse);
 }
 
 /* ─── Horizontal scroll rail ─────────────────────────── */

@@ -2,16 +2,19 @@
   <div class="lrg-root">
     <div class="lrg-toolbar">
       <n-text depth="3" class="lrg-hint">
-        地点关系图：从三元组自动生成，节点颜色表示重要程度（深绿=核心地点，浅绿=重要地点，灰=一般地点）
+        地点关系图：从三元组自动生成；节点的色阶与边框共同表示核心、重要和一般地点
       </n-text>
       <n-space :size="8">
         <n-button size="small" quaternary :loading="loading" @click="reload">刷新</n-button>
         <n-button size="small" secondary @click="goToKnowledge">编辑三元组</n-button>
       </n-space>
     </div>
-    <div class="lrg-chart">
-      <div v-if="emptyHint" class="lrg-empty">
+    <div class="lrg-chart" :data-graph-surface="graphSurface">
+      <div v-if="graphSurface === 'empty'" class="lrg-empty" role="status" aria-live="polite">
         <n-empty description="尚无地点三元组，请在「叙事与知识」中添加" size="small" />
+      </div>
+      <div v-else-if="graphSurface === 'loading'" class="lrg-empty" role="status" aria-live="polite">
+        <n-spin size="small" description="正在整理地点关系…" />
       </div>
       <GraphChart v-else :nodes="graphData.nodes" :links="graphData.links" @node-click="handleNodeClick" />
     </div>
@@ -29,6 +32,9 @@ import {
   locationImportanceZh,
   locationTypeZh,
 } from '../../utils/knowledgeFactDisplay'
+import { useThemeStore } from '../../stores/themeStore'
+import { getEditorialGraphPalette } from '../../utils/graphThemePalette'
+import { resolveLocationGraphSurface } from '../../utils/locationGraphSurface'
 
 const props = defineProps<{ slug: string }>()
 const emit = defineEmits<{
@@ -36,6 +42,7 @@ const emit = defineEmits<{
   nodeClick: [node: any]
 }>()
 const router = useRouter()
+const themeStore = useThemeStore()
 
 interface Fact {
   id: string
@@ -58,19 +65,23 @@ const loading = ref(false)
 const facts = ref<Fact[]>([])
 const graphData = ref<EChartsGraphData>({ nodes: [], links: [] })
 
-const emptyHint = computed(() => facts.value.length === 0 && !loading.value)
+const graphSurface = computed(() => resolveLocationGraphSurface({
+  loading: loading.value,
+  nodeCount: graphData.value.nodes.length,
+}))
 
 // 根据重要程度返回颜色
 const getColorByImportance = (importance?: string) => {
+  const palette = getEditorialGraphPalette(themeStore.effectiveTheme)
   switch (importance) {
     case 'core':
-      return { background: '#a7f3d0', border: '#10b981' } // 深绿 - 核心地点
+      return palette.primary
     case 'important':
-      return { background: '#d1fae5', border: '#6ee7b7' } // 浅绿 - 重要地点
+      return palette.secondary
     case 'normal':
-      return { background: '#e5e7eb', border: '#9ca3af' } // 灰色 - 一般地点
+      return palette.minor
     default:
-      return { background: '#e0e7ff', border: '#6366f1' } // 默认紫色
+      return palette.neutral
   }
 }
 
@@ -203,7 +214,6 @@ const reload = async () => {
   try {
     const res = await knowledgeApi.getKnowledge(props.slug)
     facts.value = (res.facts || []) as Fact[]
-    const locationFacts = facts.value.filter(f => f.entity_type === 'location')
     await redraw()
   } catch (error) {
     console.error('Failed to load location graph:', error)
@@ -227,6 +237,13 @@ watch(
   () => {
     void reload()
   }
+)
+
+watch(
+  () => themeStore.effectiveTheme,
+  () => {
+    void redraw()
+  },
 )
 
 onMounted(async () => {

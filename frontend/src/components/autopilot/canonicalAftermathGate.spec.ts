@@ -13,12 +13,19 @@ describe('getCanonicalAftermathPresentation', () => {
       macro_structure_ready: true,
     })
 
-    expect(presentation).toEqual({
+    expect(presentation).toMatchObject({
       isFailure: true,
       title: '规范章后同步失败',
-      actionLabel: '重新同步第 8 章',
-      canResume: false,
+      currentChapterAction: {
+        intent: 'retry',
+        label: '重新同步第 8 章',
+        disabled: false,
+      },
+      resumeAction: {
+        intent: 'resume',
+        disabled: true,
+      },
     })
-    expect(presentation.actionLabel).not.toContain('确认结构')
+    expect(presentation.currentChapterAction.label).not.toContain('确认结构')
   })
 })

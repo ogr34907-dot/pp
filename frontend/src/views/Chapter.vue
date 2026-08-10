@@ -5,7 +5,7 @@
       <n-space align="center" :wrap="false">
         <n-button quaternary round @click="goBack">
           <template #icon>
-            <span class="ico-back">←</span>
+            <n-icon><ArrowBackOutline /></n-icon>
           </template>
           工作台
         </n-button>
@@ -20,14 +20,14 @@
         <n-button-group>
           <n-button size="small" @click="prevChapter" :disabled="!canPrev">
             <template #icon>
-              <span class="ico-tiny">◀</span>
+              <n-icon><ChevronBackOutline /></n-icon>
             </template>
             上一章
           </n-button>
           <n-button size="small" @click="nextChapter" :disabled="!canNext">
             下一章
             <template #icon>
-              <span class="ico-tiny">▶</span>
+              <n-icon><ChevronForwardOutline /></n-icon>
             </template>
           </n-button>
         </n-button-group>
@@ -217,6 +217,7 @@
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMessage, useDialog } from 'naive-ui'
+import { ArrowBackOutline, ChevronBackOutline, ChevronForwardOutline } from '@vicons/ionicons5'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { chapterApi } from '../api/chapter'
@@ -670,7 +671,7 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--app-page-bg, #f0f2f8);
+  background: var(--app-page-bg);
 }
 
 .chapter :deep(.n-split) {
@@ -680,7 +681,7 @@ onUnmounted(() => {
 
 .chapter-header {
   flex-shrink: 0;
-  padding: 12px 18px;
+  padding: 12px clamp(14px, 2vw, 28px);
   border-bottom: 1px solid var(--app-border);
   display: flex;
   align-items: center;
@@ -688,21 +689,16 @@ onUnmounted(() => {
   gap: 12px;
   flex-wrap: wrap;
   background: var(--app-surface);
+  box-shadow: var(--app-shadow-sm);
+  z-index: 2;
 }
 
 .chapter-heading {
   margin: 0;
   font-size: 17px;
   font-weight: 600;
-}
-
-.ico-back {
-  font-size: 15px;
-}
-
-.ico-tiny {
-  font-size: 10px;
-  opacity: 0.8;
+  font-family: var(--font-serif);
+  color: var(--app-text-primary);
 }
 
 .editor-area {
@@ -710,8 +706,8 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 14px 16px;
-  background: var(--app-surface);
+  padding: clamp(14px, 2.5vw, 34px) clamp(16px, 4vw, 64px) 14px;
+  background: var(--app-page-bg);
 }
 
 .content-editor {
@@ -719,11 +715,21 @@ onUnmounted(() => {
   min-height: 0;
   font-size: 16px;
   line-height: 1.85;
+  width: min(100%, 920px);
+  margin: 0 auto;
+}
+
+.content-editor :deep(.n-input-wrapper) {
+  padding: clamp(20px, 3vw, 40px);
+  background: var(--app-surface);
+  border-radius: var(--app-radius-md);
+  box-shadow: var(--app-shadow-sm);
 }
 
 .content-editor :deep(textarea) {
-  font-family: 'Source Han Serif SC', 'Noto Serif SC', Georgia, serif;
-  line-height: 1.85;
+  font-family: var(--font-serif);
+  line-height: 1.9;
+  color: var(--app-text-primary);
 }
 
 .editor-footer {
@@ -733,6 +739,9 @@ onUnmounted(() => {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
+  width: min(100%, 920px);
+  margin: 0 auto;
+  color: var(--app-text-secondary);
 }
 
 .preview-slide-enter-active,
@@ -753,6 +762,8 @@ onUnmounted(() => {
   border: 1px solid var(--app-border);
   max-height: 42vh;
   overflow: auto;
+  width: min(100%, 920px);
+  margin-inline: auto;
 }
 
 .preview-content {
@@ -763,7 +774,7 @@ onUnmounted(() => {
   height: 100%;
   min-height: 0;
   padding: 12px 14px;
-  background: linear-gradient(180deg, var(--app-surface-subtle) 0%, rgba(99, 102, 241, 0.06) 100%);
+  background: var(--app-surface-subtle);
   border-left: 1px solid var(--app-border);
 }
 
@@ -788,8 +799,74 @@ onUnmounted(() => {
 }
 
 .meta-mono {
-  font-family: ui-monospace, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   word-break: break-all;
+}
+
+@media (max-width: 1024px) {
+  .chapter-header {
+    align-items: flex-start;
+  }
+
+  .chapter :deep(.n-split) {
+    display: flex;
+    flex-direction: column;
+    overflow: auto;
+  }
+
+  .chapter :deep(.n-split-pane-1),
+  .chapter :deep(.n-split-pane-2) {
+    width: 100% !important;
+    min-width: 0 !important;
+    flex: none !important;
+  }
+
+  .chapter :deep(.n-split-pane-1) {
+    min-height: 66vh;
+  }
+
+  .chapter :deep(.n-split-pane-2) {
+    min-height: 420px;
+  }
+
+  .chapter :deep(.n-split__resize-trigger-wrapper) {
+    display: none;
+  }
+
+  .review-panel {
+    border-left: 0;
+    border-top: 1px solid var(--app-border);
+  }
+}
+
+@media (max-width: 640px) {
+  .chapter-header {
+    padding: 10px 12px;
+  }
+
+  .chapter-header > :deep(.n-space) {
+    width: 100%;
+    flex-wrap: wrap !important;
+  }
+
+  .editor-area {
+    padding: 10px;
+  }
+
+  .content-editor :deep(.n-input-wrapper) {
+    padding: 18px 14px;
+  }
+
+  .review-panel {
+    padding: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .preview-slide-enter-active,
+  .preview-slide-leave-active {
+    transition: none;
+  }
 }
 </style>

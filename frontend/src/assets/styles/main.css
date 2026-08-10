@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════
-   PlotPilot 全局样式 — 颜色架构（亮色 / 暗色 / 黑金）
+   PlotPilot 全局样式 — 语义化纸色 / 墨色主题
    ═══════════════════════════════════════════════════ */
 
 @import './workbench-panels.css';
@@ -38,7 +38,9 @@ body {
   font-variant-ligatures: common-ligatures;
   text-size-adjust: 100%;
   line-height: 1.6;
-  transition: background-color 0.3s ease, color 0.3s ease;
+  transition:
+    background-color var(--motion-duration-standard) var(--motion-ease-standard),
+    color var(--motion-duration-standard) var(--motion-ease-standard);
 }
 
 /* ═══════════════════════════════════════════════════
@@ -49,21 +51,22 @@ body {
   --app-font-scale: 1;
 
   /* ── 品牌色 ── */
-  --color-brand: #2563eb;
-  --color-brand-hover: #3b82f6;
-  --color-brand-pressed: #1d4ed8;
-  --color-brand-suppl: #60a5fa;
-  --color-brand-light: rgba(37, 99, 235, 0.08);
-  --color-brand-border: rgba(37, 99, 235, 0.18);
+  --color-brand: #A64B2A;
+  --color-brand-hover: #8D3D21;
+  --color-brand-pressed: #76311A;
+  --color-brand-suppl: #BE6A49;
+  --color-brand-light: rgba(166, 75, 42, 0.1);
+  --color-brand-border: rgba(166, 75, 42, 0.28);
 
-  /* ── 黑金装饰色 ── */
-  --color-gold: #d4a853;
-  --color-gold-light: #f5deb3;
-  --color-gold-dim: rgba(212, 168, 83, 0.15);
-  --color-gold-border: rgba(212, 168, 83, 0.25);
-  --color-gold-glow: rgba(212, 168, 83, 0.35);
-
-  /* ── 黑金主播限定色（主播品牌标识）── */
+  /* ── 编辑强调色；旧变量仅作组件兼容别名 ── */
+  --color-accent: #9A7134;
+  --color-accent-soft: rgba(154, 113, 52, 0.12);
+  --color-accent-border: rgba(154, 113, 52, 0.28);
+  --color-gold: var(--color-accent);
+  --color-gold-light: var(--color-accent-soft);
+  --color-gold-dim: var(--color-accent-soft);
+  --color-gold-border: var(--color-accent-border);
+  --color-gold-glow: var(--color-accent-border);
 
   /* ── 语义色 ── */
   --color-success: #22c55e;
@@ -77,15 +80,26 @@ body {
   --color-danger-dim: rgba(239, 68, 68, 0.12);
   --color-info: #3b82f6;
   --color-info-dim: rgba(59, 130, 246, 0.12);
-  --color-purple: #8b5cf6;
-  --color-purple-light: #ede9fe;
-  --color-purple-dim: rgba(139, 92, 246, 0.12);
+  --color-purple: var(--color-info);
+  --color-purple-light: var(--color-info-dim);
+  --color-purple-dim: var(--color-info-dim);
+
+  /* ── 焦点与动效 ── */
+  --color-focus: #A64B2A;
+  --color-focus-soft: rgba(166, 75, 42, 0.18);
+  --focus-ring: 0 0 0 3px var(--color-focus-soft);
+  --motion-duration-fast: 160ms;
+  --motion-duration-standard: 180ms;
+  --motion-duration-slow: 220ms;
+  --motion-ease-standard: cubic-bezier(0.2, 0, 0, 1);
 
   /* ── 文字色（全部使用变量，禁止硬编码）── */
-  --app-text-primary: #111827;
-  --app-text-secondary: #1f2937;
-  --app-text-muted: #475569;
-  --app-text-inverse: #ffffff;
+  --app-text-primary: #2C2520;
+  --app-text-secondary: #665B52;
+  /* Normal-size supporting copy stays AA-readable; faint is decorative/disabled only. */
+  --app-text-muted: #665B52;
+  --app-text-faint: #8B7F75;
+  --app-text-inverse: #FFFCF6;
 
   /* 与 Naive UI n-text depth、旧组件对齐：统一走 app 文字色，避免暗色下仍落回 #0f172a */
   --text-color-1: var(--app-text-primary);
@@ -93,33 +107,34 @@ body {
   --text-color-3: var(--app-text-muted);
 
   /* ── 背景色 ── */
-  --app-page-bg: #eef1f6;
-  --app-surface: #ffffff;
-  --app-surface-raised: #ffffff;
-  --app-surface-subtle: #f8fafc;
-  --app-input-bg: #ffffff;
+  --app-page-bg: #F4EFE6;
+  --app-surface: #FFFCF6;
+  --app-surface-raised: #FFFCF6;
+  --app-surface-subtle: #EEE6DA;
+  --app-input-bg: #FFFCF6;
 
   /* ── 边框 ── */
-  --app-border: rgba(15, 23, 42, 0.09);
-  --app-border-strong: rgba(15, 23, 42, 0.15);
-  --app-divider: rgba(15, 23, 42, 0.06);
+  --app-border: #E2D8CA;
+  --app-border-strong: #C9BBAA;
+  --app-divider: rgba(44, 37, 32, 0.12);
 
   /* ── 阴影 ── */
-  --app-shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.06);
-  --app-shadow-md: 0 4px 16px rgba(15, 23, 42, 0.06);
-  --app-shadow-lg: 0 8px 28px rgba(15, 23, 42, 0.08);
-  --app-shadow-hover: 0 8px 24px rgba(15, 23, 42, 0.12);
+  --app-shadow-sm: 0 1px 3px rgba(44, 37, 32, 0.06);
+  --app-shadow-md: 0 4px 16px rgba(44, 37, 32, 0.06);
+  --app-shadow-lg: 0 8px 28px rgba(44, 37, 32, 0.08);
+  --app-shadow-hover: 0 8px 24px rgba(44, 37, 32, 0.12);
 
   /* ── 布局 ── */
   --app-radius-sm: 8px;
-  --app-radius-md: 10px;
-  --app-radius-lg: 14px;
+  --app-radius-md: 12px;
+  --app-radius-lg: 16px;
   --app-radius-xl: 20px;
-  --app-transition: 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+  --app-border-width: 1px;
+  --app-transition: var(--motion-duration-standard) var(--motion-ease-standard);
 
   /* ── 面板专用 ── */
-  --plotpilot-split-border: rgba(15, 23, 42, 0.07);
-  --plotpilot-panel-muted: #f8fafc;
+  --plotpilot-split-border: var(--app-border);
+  --plotpilot-panel-muted: var(--app-surface-subtle);
 
   /* ── 字体 ── */
   --font-sans: 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC', 'Inter', system-ui, sans-serif;
@@ -134,29 +149,26 @@ body {
   --font-size-xl:   1.125rem;   /* 18px @ scale=1 */
 
   /* ── DAG 画布专用 ── */
-  --dag-canvas-bg: #eef1f6;
-  --dag-canvas-grid: rgba(15, 23, 42, 0.06);
-  --dag-node-bg: #ffffff;
-  --dag-node-border: rgba(15, 23, 42, 0.12);
+  --dag-canvas-bg: var(--app-page-bg);
+  --dag-canvas-grid: color-mix(in srgb, var(--app-text-primary) 6%, transparent);
+  --dag-node-bg: var(--app-surface);
+  --dag-node-border: var(--app-border);
   --dag-node-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
   --dag-node-selected-ring: var(--color-brand);
   --dag-edge-default: rgba(15, 23, 42, 0.25);
   --dag-edge-active: var(--color-brand);
   --dag-edge-conditional: rgba(15, 23, 42, 0.35);
-  --dag-port-text: #3b82f6;
-  --dag-port-json: #8b5cf6;
-  --dag-port-score: #f59e0b;
-  --dag-port-boolean: #22c55e;
-  --dag-port-list: #ec4899;
-  --dag-port-prompt: #6366f1;
+  --dag-port-text: var(--color-info);
+  --dag-port-json: var(--color-brand);
+  --dag-port-score: var(--color-warning);
+  --dag-port-boolean: var(--color-success);
+  --dag-port-list: var(--color-danger);
+  --dag-port-prompt: var(--color-accent);
   --dag-toolbar-bg: var(--app-surface);
   --dag-toolbar-border: var(--app-border);
   --dag-menu-bg: var(--app-surface);
   --dag-menu-border: var(--app-border-strong);
   --dag-menu-hover: var(--color-brand-light);
-
-  /* ── StatsTopBar 渐变 ── */
-  --stats-bar-gradient: linear-gradient(135deg, #1f2937 0%, #334155 55%, #475569 100%);
 
   /* 彩色顶栏上的文字与「药丸」图标底（与 --app-text-inverse 解耦：暗色主题里 inverse 是深色字，不能用在渐变条上） */
   --nav-hero-text: #ffffff;
@@ -183,28 +195,25 @@ body {
    暗色模式
    ═══════════════════════════════════════════════════ */
 [data-theme='dark'] {
-  /* ── 品牌色（暗模式下略提亮）── */
-  --color-brand: #60a5fa;
-  --color-brand-hover: #93c5fd;
-  --color-brand-pressed: #3b82f6;
-  --color-brand-suppl: #bfdbfe;
-  --color-brand-light: rgba(96, 165, 250, 0.12);
-  --color-brand-border: rgba(96, 165, 250, 0.22);
-
-  /* ── 黑金装饰色（暗模式下更耀眼）── */
-  --color-gold: #e5b86e;
-  --color-gold-light: #f5ddb5;
-  --color-gold-dim: rgba(229, 184, 110, 0.12);
-  --color-gold-border: rgba(229, 184, 110, 0.2);
-  --color-gold-glow: rgba(229, 184, 110, 0.4);
-
-  /* ── 黑金主播限定色（暗模式：更温暖的金铜色调）── */
+  --color-brand: #E28B62;
+  --color-brand-hover: #EDA17C;
+  --color-brand-pressed: #C9704B;
+  --color-brand-suppl: #F2B496;
+  --color-brand-light: rgba(226, 139, 98, 0.14);
+  --color-brand-border: rgba(226, 139, 98, 0.3);
+  --color-accent: #D7B26A;
+  --color-accent-soft: rgba(215, 178, 106, 0.14);
+  --color-accent-border: rgba(215, 178, 106, 0.3);
+  --color-focus: #E28B62;
+  --color-focus-soft: rgba(226, 139, 98, 0.22);
 
   /* ── 文字色 ── */
-  --app-text-primary: #f3f4f6;
-  --app-text-secondary: #d1d5db;
-  --app-text-muted: #9ca3af;
-  --app-text-inverse: #0f172a;
+  --app-text-primary: #F6EEDF;
+  --app-text-secondary: #D3C5B6;
+  /* Match the light convention: normal muted copy is readable; faint is non-content only. */
+  --app-text-muted: #D3C5B6;
+  --app-text-faint: #AA9C90;
+  --app-text-inverse: #221C19;
 
   /* ── 组件交互态（Tab / 档案 / 运行时栏）── */
   --tab-track-bg: linear-gradient(135deg, var(--color-brand), var(--color-brand-hover));
@@ -213,17 +222,16 @@ body {
   --tab-inactive-color: var(--app-text-secondary, #94a3b8);
   --tab-inactive-hover-color: var(--app-text-primary, #e2e8f0);
 
-  /* ── 背景色（深色系，不要太深，符合美学）── */
-  --app-page-bg: #121826;
-  --app-surface: #1a2235;
-  --app-surface-raised: #232d42;
-  --app-surface-subtle: #161d2e;
-  --app-input-bg: #161d2e;
+  --app-page-bg: #221C19;
+  --app-surface: #2B2420;
+  --app-surface-raised: #2B2420;
+  --app-surface-subtle: #251F1C;
+  --app-input-bg: #2B2420;
 
   /* ── 边框 ── */
-  --app-border: rgba(148, 163, 184, 0.12);
-  --app-border-strong: rgba(148, 163, 184, 0.2);
-  --app-divider: rgba(148, 163, 184, 0.08);
+  --app-border: #4A3E37;
+  --app-border-strong: #66554A;
+  --app-divider: rgba(246, 238, 223, 0.12);
 
   /* ── 阴影 ── */
   --app-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.25);
@@ -232,11 +240,8 @@ body {
   --app-shadow-hover: 0 8px 24px rgba(0, 0, 0, 0.4);
 
   /* ── 面板专用 ── */
-  --plotpilot-split-border: rgba(148, 163, 184, 0.1);
-  --plotpilot-panel-muted: #161d2e;
-
-  /* ── StatsTopBar 渐变（暗色版：深靛蓝+微光）── */
-  --stats-bar-gradient: linear-gradient(135deg, #161d2e 0%, #1e293b 50%, #334155 100%);
+  --plotpilot-split-border: var(--app-border);
+  --plotpilot-panel-muted: var(--app-surface-subtle);
 
   --nav-hero-text: #f8fafc;
   --nav-hero-text-muted: rgba(248, 250, 252, 0.82);
@@ -246,21 +251,21 @@ body {
   --nav-hero-shadow: 0 1px 0 rgba(255, 255, 255, 0.08) inset;
 
   /* ── DAG 画布专用（暗色版）── */
-  --dag-canvas-bg: #0f1623;
-  --dag-canvas-grid: rgba(148, 163, 184, 0.06);
-  --dag-node-bg: #1a2235;
-  --dag-node-border: rgba(148, 163, 184, 0.15);
+  --dag-canvas-bg: var(--app-page-bg);
+  --dag-canvas-grid: color-mix(in srgb, var(--app-text-primary) 6%, transparent);
+  --dag-node-bg: var(--app-surface);
+  --dag-node-border: var(--app-border);
   --dag-node-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
   --dag-node-selected-ring: var(--color-brand);
   --dag-edge-default: rgba(148, 163, 184, 0.2);
   --dag-edge-active: var(--color-brand);
   --dag-edge-conditional: rgba(148, 163, 184, 0.3);
-  --dag-port-text: #60a5fa;
-  --dag-port-json: #a78bfa;
-  --dag-port-score: #fbbf24;
-  --dag-port-boolean: #4ade80;
-  --dag-port-list: #f472b6;
-  --dag-port-prompt: #818cf8;
+  --dag-port-text: var(--color-info);
+  --dag-port-json: var(--color-brand);
+  --dag-port-score: var(--color-warning);
+  --dag-port-boolean: var(--color-success);
+  --dag-port-list: var(--color-danger);
+  --dag-port-prompt: var(--color-accent);
   --dag-toolbar-bg: var(--app-surface);
   --dag-toolbar-border: var(--app-border);
   --dag-menu-bg: var(--app-surface);
@@ -279,103 +284,15 @@ body {
   --color-danger-dim: rgba(248, 113, 113, 0.08);
   --color-info: #60a5fa;
   --color-info-dim: rgba(96, 165, 250, 0.08);
-  --color-purple: #a78bfa;
-  --color-purple-light: rgba(167, 139, 250, 0.14);
-  --color-purple-dim: rgba(167, 139, 250, 0.08);
+  --color-purple: var(--color-info);
+  --color-purple-light: var(--color-info-dim);
+  --color-purple-dim: var(--color-info-dim);
 
   color-scheme: dark;
 }
 
 /* ═══════════════════════════════════════════════════
-   黑金模式（主播限定色）— 奢华暗金风格
-   基于 dark 深色基底 + 金铜色调强调
-   ═══════════════════════════════════════════════════ */
-[data-theme='anchor'] {
-  /* ── 品牌色：金紫融合 ── */
-  --color-brand: #c9a227;
-  --color-brand-hover: #ddb930;
-  --color-brand-pressed: #a88a1f;
-  --color-brand-suppl: #e8c84a;
-  --color-brand-light: rgba(201, 162, 39, 0.12);
-  --color-brand-border: rgba(201, 162, 39, 0.2);
-
-  /* ── 黑金装饰色（更浓郁）── */
-  --color-gold: #f0c866;
-  --color-gold-light: #f5ddb5;
-  --color-gold-dim: rgba(240, 200, 102, 0.1);
-  --color-gold-border: rgba(240, 200, 102, 0.18);
-  --color-gold-glow: rgba(240, 200, 102, 0.35);
-
-  /* ── DAG 画布专用（黑金版）── */
-  --dag-canvas-bg: #08090c;
-  --dag-canvas-grid: rgba(201, 162, 39, 0.04);
-  --dag-node-bg: #111620;
-  --dag-node-border: rgba(201, 162, 39, 0.12);
-  --dag-node-shadow: 0 2px 10px rgba(0, 0, 0, 0.3), 0 0 16px rgba(201, 162, 39, 0.04);
-  --dag-node-selected-ring: var(--color-gold);
-  --dag-edge-default: rgba(201, 162, 39, 0.18);
-  --dag-edge-active: var(--color-gold);
-  --dag-edge-conditional: rgba(201, 162, 39, 0.28);
-  --dag-port-text: #e8b84a;
-  --dag-port-json: #d4a843;
-  --dag-port-score: #f0c866;
-  --dag-port-boolean: #c9a227;
-  --dag-port-list: #e5b86e;
-  --dag-port-prompt: #ddb930;
-  --dag-toolbar-bg: var(--app-surface);
-  --dag-toolbar-border: var(--app-border);
-  --dag-menu-bg: var(--app-surface);
-  --dag-menu-border: var(--app-border-strong);
-  --dag-menu-hover: var(--color-gold-dim);
-
-  /* ── 主播限定色（核心品牌金）── */
-
-  /* ── 文字色（暖调暗色文字，更高对比度）── */
-  --app-text-primary: #f0ead6;
-  --app-text-secondary: #c4b99a;
-  --app-text-muted: #8a8070;
-  --app-text-inverse: #0a0c10;
-
-  /* ── 背景色（墨黑+微金底纹）── */
-  --app-page-bg: #0a0c10;
-  --app-surface: #111620;
-  --app-surface-raised: #181f2e;
-  --app-surface-subtle: #0d1018;
-  --app-input-bg: #0d1018;
-
-  /* ── 边框（金色调边框）── */
-  --app-border: rgba(201, 162, 39, 0.08);
-  --app-border-strong: rgba(201, 162, 39, 0.14);
-  --app-divider: rgba(201, 162, 39, 0.06);
-
-  /* ── 阴影（带金色光晕）── */
-  --app-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
-  --app-shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35), 0 0 20px rgba(201, 162, 39, 0.04);
-  --app-shadow-lg: 0 8px 28px rgba(0, 0, 0, 0.4), 0 0 40px rgba(201, 162, 39, 0.06);
-  --app-shadow-hover: 0 8px 24px rgba(0, 0, 0, 0.45), 0 0 30px rgba(201, 162, 39, 0.08);
-
-  /* ── 面板专用 ── */
-  --plotpilot-split-border: rgba(201, 162, 39, 0.1);
-  --plotpilot-panel-muted: #0d1018;
-
-  /* ── StatsTopBar 渐变（黑金版：墨黑金边）── */
-  --stats-bar-gradient: linear-gradient(135deg, #16130f 0%, #1f1a13 50%, #2a2318 100%);
-
-  /* 黑金模式顶部栏额外装饰：金色底边线 */
-  --stats-bar-border-bottom: 1px solid rgba(212, 168, 67, 0.18);
-
-  --nav-hero-text: #faf6ee;
-  --nav-hero-text-muted: rgba(250, 246, 238, 0.78);
-  --nav-hero-pill-bg-top: rgba(212, 168, 67, 0.22);
-  --nav-hero-pill-bg-bottom: rgba(10, 12, 16, 0.35);
-  --nav-hero-pill-border: rgba(212, 168, 67, 0.35);
-  --nav-hero-shadow: 0 1px 0 rgba(245, 215, 126, 0.12) inset;
-
-  color-scheme: dark;
-}
-
-/* ═══════════════════════════════════════════════════
-   通用组件样式（使用变量，自动适配亮/暗/黑金）
+   通用组件样式（使用变量，自动适配纸色/墨色）
    ═══════════════════════════════════════════════════ */
 
 /* 工作台 / 侧栏共用 */
@@ -469,6 +386,12 @@ h1, h2, h3, h4, h5, h6 {
 input, textarea, select { font-family: inherit; font-size: inherit; }
 button { font-family: inherit; }
 
+:where(a, button, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+  box-shadow: var(--focus-ring);
+}
+
 /* 数字/数据展示 */
 .numeric, .data-value {
   font-family: var(--font-mono);
@@ -480,11 +403,11 @@ ruby { ruby-align: center; }
 rt { font-size: 0.6em; color: var(--app-text-muted); }
 
 /* ═══════════════════════════════════════════════════
-   StatsTopBar — 使用变量渐变 + 主题装饰边框
+   StatsTopBar — 安静的纸色导航表面
    ═══════════════════════════════════════════════════ */
 .stats-top-bar {
-  background: var(--stats-bar-gradient);
-  border-bottom: var(--stats-bar-border-bottom, 1px solid rgba(255, 255, 255, 0.08));
+  background: var(--app-surface);
+  border-bottom: 1px solid var(--app-border);
 }
 
 /* ═══════════════════════════════════════════════════
@@ -583,8 +506,8 @@ rt { font-size: 0.6em; color: var(--app-text-muted); }
  */
 ::view-transition-old(root),
 ::view-transition-new(root) {
-  animation-duration: 0.32s;
-  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  animation-duration: var(--motion-duration-slow);
+  animation-timing-function: var(--motion-ease-standard);
 }
 
 ::view-transition-old(root) {
@@ -611,8 +534,8 @@ rt { font-size: 0.6em; color: var(--app-text-muted); }
  */
 .theme-transitioning {
   transition:
-    background-color 0.3s ease,
-    color 0.3s ease !important;
+    background-color var(--motion-duration-standard) var(--motion-ease-standard),
+    color var(--motion-duration-standard) var(--motion-ease-standard) !important;
 }
 
 .theme-transitioning [class*='n-'],
@@ -622,7 +545,27 @@ rt { font-size: 0.6em; color: var(--app-text-muted); }
 .theme-transitioning .right-panel,
 .theme-transitioning .sidebar {
   transition:
-    background-color 0.3s ease,
-    color 0.3s ease,
-    border-color 0.3s ease !important;
+    background-color var(--motion-duration-standard) var(--motion-ease-standard),
+    color var(--motion-duration-standard) var(--motion-ease-standard),
+    border-color var(--motion-duration-standard) var(--motion-ease-standard) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none !important;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }

@@ -3,7 +3,7 @@
     <header class="cast-header">
       <n-space align="center">
         <n-button quaternary round @click="goWorkbench">
-          <template #icon><span class="ico">←</span></template>
+          <template #icon><n-icon><ArrowBackOutline /></n-icon></template>
           工作台
         </n-button>
         <n-divider vertical />
@@ -18,9 +18,17 @@
           round
           style="width: 260px"
           @update:value="onSearch"
-        />
-        <n-button secondary @click="reload">刷新</n-button>
-        <n-button type="primary" @click="openTriplesDrawer()">三元组表格</n-button>
+        >
+          <template #prefix><n-icon><SearchOutline /></n-icon></template>
+        </n-input>
+        <n-button secondary @click="reload">
+          <template #icon><n-icon><RefreshOutline /></n-icon></template>
+          刷新
+        </n-button>
+        <n-button type="primary" @click="openTriplesDrawer()">
+          <template #icon><n-icon><GridOutline /></n-icon></template>
+          三元组表格
+        </n-button>
         <n-button quaternary @click="goKnowledge">工作台 · 知识库</n-button>
       </n-space>
     </header>
@@ -196,12 +204,15 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMessage } from 'naive-ui'
+import { ArrowBackOutline, GridOutline, RefreshOutline, SearchOutline } from '@vicons/ionicons5'
 import GraphChart from '../components/charts/GraphChart.vue'
 import KnowledgeTriplesTableEditor from '../components/knowledge/KnowledgeTriplesTableEditor.vue'
 import { convertGraph, type VisNode, type VisEdge, type EChartsNode, type EChartsLink } from '../utils/visToEcharts'
 import { castApi } from '../api/cast'
 import { runtimePerformance } from '../config/performance'
 import { useDebouncedTask } from '../composables/useDebouncedTask'
+import { useThemeStore } from '../stores/themeStore'
+import { getEditorialGraphPalette } from '../utils/graphThemePalette'
 
 interface CastCharacter {
   id: string
@@ -226,6 +237,7 @@ interface CastRelationship {
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const themeStore = useThemeStore()
 const slug = route.params.slug as string
 
 const graph = ref<{ characters: CastCharacter[]; relationships: CastRelationship[] }>({
@@ -295,6 +307,7 @@ const formRel = ref({
 
 const buildVisData = () => {
   const hi = highlightIds.value
+  const palette = getEditorialGraphPalette(themeStore.effectiveTheme)
   const nodes: VisNode[] = graph.value.characters.map(c => {
     const ne = (c.story_events || []).length
     const base = [c.name, ...(c.aliases || []), c.traits, c.note].filter(Boolean).join('\n')
@@ -303,7 +316,7 @@ const buildVisData = () => {
       id: c.id,
       label: c.name + (c.role ? `\n${c.role}` : '') + (ne ? `\n·${ne}事件` : ''),
       title,
-      color: hi.size && !hi.has(c.id) ? { background: '#e2e8f0', border: '#cbd5e1' } : { background: '#c7d2fe', border: '#6366f1' },
+      color: hi.size && !hi.has(c.id) ? palette.subdued : palette.primary,
       font: { size: 14 },
     }
   })
@@ -454,12 +467,12 @@ onMounted(async () => {
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--app-page-bg, #f0f2f8);
+  background: var(--app-page-bg);
 }
 
 .cast-header {
   flex-shrink: 0;
-  padding: 12px 18px;
+  padding: 12px clamp(14px, 2vw, 28px);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -467,16 +480,16 @@ onMounted(async () => {
   flex-wrap: wrap;
   border-bottom: 1px solid var(--app-border);
   background: var(--app-surface);
+  box-shadow: var(--app-shadow-sm);
+  z-index: 2;
 }
 
 .cast-title {
   margin: 0;
   font-size: 18px;
   font-weight: 600;
-}
-
-.ico {
-  font-size: 15px;
+  font-family: var(--font-serif);
+  color: var(--app-text-primary);
 }
 
 .cast-body {
@@ -489,14 +502,18 @@ onMounted(async () => {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  background: var(--app-surface-subtle);
-  border-right: 1px solid var(--app-border);
+  margin: 14px 0 14px 14px;
+  overflow: hidden;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius-md);
+  box-shadow: var(--app-shadow-sm);
 }
 
 .cast-side {
   width: min(400px, 42vw);
   flex-shrink: 0;
-  padding: 12px;
+  padding: 14px;
   overflow: auto;
   background: var(--app-surface);
 }
@@ -512,9 +529,9 @@ onMounted(async () => {
   align-items: flex-start;
   margin-bottom: 10px;
   padding: 8px;
-  border-radius: 8px;
-  background: rgba(79, 70, 229, 0.05);
-  border: 1px solid rgba(99, 102, 241, 0.12);
+  border-radius: var(--app-radius-sm);
+  background: var(--app-surface-subtle);
+  border: 1px solid var(--app-border);
 }
 
 .ev-id {
@@ -563,7 +580,7 @@ onMounted(async () => {
 .cov-block-title {
   font-size: 12px;
   font-weight: 600;
-  color: #64748b;
+  color: var(--app-text-secondary);
   margin-bottom: 6px;
 }
 
@@ -572,7 +589,7 @@ onMounted(async () => {
   flex-direction: column;
   gap: 4px;
   padding: 6px 0;
-  border-bottom: 1px solid rgba(15, 23, 42, 0.06);
+  border-bottom: 1px solid var(--app-divider);
   font-size: 13px;
 }
 
@@ -604,5 +621,56 @@ onMounted(async () => {
 
 .cov-count {
   font-size: 12px;
+}
+
+@media (max-width: 1024px) {
+  .cast-header {
+    align-items: flex-start;
+  }
+
+  .cast-header > :deep(.n-space:last-child) {
+    width: 100%;
+    flex-wrap: wrap !important;
+  }
+
+  .cast-body {
+    flex-direction: column;
+    overflow: auto;
+  }
+
+  .net-wrap {
+    min-height: 58vh;
+    margin: 12px;
+  }
+
+  .cast-side {
+    width: auto;
+    overflow: visible;
+    border-top: 1px solid var(--app-border);
+  }
+}
+
+@media (max-width: 640px) {
+  .cast-header {
+    padding: 10px 12px;
+  }
+
+  .cast-header > :deep(.n-space) {
+    width: 100%;
+    flex-wrap: wrap !important;
+  }
+
+  .cast-header :deep(.n-input) {
+    width: 100% !important;
+  }
+
+  .net-wrap {
+    min-height: 52vh;
+    margin: 8px;
+  }
+
+  .cast-side {
+    padding: 12px;
+  }
 }
 </style>

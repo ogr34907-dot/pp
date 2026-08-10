@@ -13,6 +13,9 @@
       <div v-if="emptyHint" class="crg-empty">
         <n-empty description="尚无可用人物关系（知识库人物三元组为空且 Bible 未配置关系）" size="small" />
       </div>
+      <div v-else-if="loading && !graphData.nodes.length" class="crg-empty" aria-live="polite">
+        <n-spin size="small" description="正在整理人物关系…" />
+      </div>
       <GraphChart v-else :nodes="graphData.nodes" :links="graphData.links" height="100%" @node-click="handleNodeClick" />
     </div>
   </div>
@@ -30,9 +33,12 @@ import {
   characterImportanceZh,
 } from '../../utils/knowledgeFactDisplay'
 import { mergeKnowledgeFactsWithBibleCharacters } from '../../utils/characterGraphMerge'
+import { useThemeStore } from '../../stores/themeStore'
+import { getEditorialGraphPalette } from '../../utils/graphThemePalette'
 
 const props = defineProps<{ slug: string }>()
 const router = useRouter()
+const themeStore = useThemeStore()
 
 interface Fact {
   id: string
@@ -55,15 +61,16 @@ const emptyHint = computed(() => facts.value.length === 0 && !loading.value)
 
 // 根据重要程度返回颜色
 const getColorByImportance = (importance?: string) => {
+  const palette = getEditorialGraphPalette(themeStore.effectiveTheme)
   switch (importance) {
     case 'primary':
-      return { background: '#fecaca', border: '#ef4444' } // 红色 - 主角
+      return palette.primary
     case 'secondary':
-      return { background: '#fed7aa', border: '#f97316' } // 橙色 - 重要配角
+      return palette.secondary
     case 'minor':
-      return { background: '#bfdbfe', border: '#3b82f6' } // 蓝色 - 次要人物
+      return palette.minor
     default:
-      return { background: '#e0e7ff', border: '#6366f1' } // 默认紫色
+      return palette.neutral
   }
 }
 
@@ -185,6 +192,13 @@ watch(
   () => {
     void reload()
   }
+)
+
+watch(
+  () => themeStore.effectiveTheme,
+  () => {
+    void redraw()
+  },
 )
 
 onMounted(async () => {

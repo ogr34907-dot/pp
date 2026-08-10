@@ -64,8 +64,8 @@
             <n-collapse-item name="core">
               <template #header>
                 <div class="wb-section-head">
-                  <div class="wb-icon-badge" style="background:#6366f1">
-                    <n-icon size="14" color="#fff"><FlashOutline /></n-icon>
+                  <div class="wb-icon-badge">
+                    <n-icon size="14"><FlashOutline /></n-icon>
                   </div>
                   <div class="wb-section-titles">
                     <span class="wb-section-title">核心法则与底层逻辑</span>
@@ -102,8 +102,8 @@
             <n-collapse-item name="geo">
               <template #header>
                 <div class="wb-section-head">
-                  <div class="wb-icon-badge" style="background:#10b981">
-                    <n-icon size="14" color="#fff"><EarthOutline /></n-icon>
+                  <div class="wb-icon-badge">
+                    <n-icon size="14"><EarthOutline /></n-icon>
                   </div>
                   <div class="wb-section-titles">
                     <span class="wb-section-title">地理与生态环境</span>
@@ -146,8 +146,8 @@
             <n-collapse-item name="society">
               <template #header>
                 <div class="wb-section-head">
-                  <div class="wb-icon-badge" style="background:#3b82f6">
-                    <n-icon size="14" color="#fff"><PeopleOutline /></n-icon>
+                  <div class="wb-icon-badge">
+                    <n-icon size="14"><PeopleOutline /></n-icon>
                   </div>
                   <div class="wb-section-titles">
                     <span class="wb-section-title">社会结构与权力分配</span>
@@ -184,8 +184,8 @@
             <n-collapse-item name="culture">
               <template #header>
                 <div class="wb-section-head">
-                  <div class="wb-icon-badge" style="background:#f59e0b">
-                    <n-icon size="14" color="#fff"><LibraryOutline /></n-icon>
+                  <div class="wb-icon-badge">
+                    <n-icon size="14"><LibraryOutline /></n-icon>
                   </div>
                   <div class="wb-section-titles">
                     <span class="wb-section-title">历史、信仰与文化</span>
@@ -222,8 +222,8 @@
             <n-collapse-item name="daily">
               <template #header>
                 <div class="wb-section-head">
-                  <div class="wb-icon-badge" style="background:#ec4899">
-                    <n-icon size="14" color="#fff"><LayersOutline /></n-icon>
+                  <div class="wb-icon-badge">
+                    <n-icon size="14"><LayersOutline /></n-icon>
                   </div>
                   <div class="wb-section-titles">
                     <span class="wb-section-title">沉浸感细节</span>
@@ -520,6 +520,9 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
+  color: var(--color-brand);
+  background: var(--color-brand-light);
+  border: 1px solid var(--color-brand-border);
 }
 
 .wb-section-titles {
@@ -569,7 +572,7 @@ onUnmounted(() => {
   padding: 10px 14px 12px;
   border-top: 1px solid var(--app-border);
   background: var(--app-surface);
-  border-left: 3px solid #0ea5e9;
+  border-left: 3px solid var(--color-brand);
 }
 
 .wb-ice-heading {
@@ -580,14 +583,14 @@ onUnmounted(() => {
 }
 
 .wb-ice-bulb {
-  color: #0ea5e9;
+  color: var(--color-brand);
   flex-shrink: 0;
 }
 
 .wb-ice-title {
   font-size: 11px;
   font-weight: 700;
-  color: #0ea5e9;
+  color: var(--color-brand);
   letter-spacing: 0.04em;
 }
 

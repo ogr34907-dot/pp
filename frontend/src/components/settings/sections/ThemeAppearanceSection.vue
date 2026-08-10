@@ -8,12 +8,15 @@
         <span class="group-hint">立即生效并自动保存</span>
       </div>
       <div class="theme-grid">
-        <div
+        <button
           v-for="option in themeOptions"
           :key="option.value"
+          type="button"
           class="theme-tile"
           :class="{ active: themeStore.mode === option.value }"
           :data-mode="option.value"
+          :aria-pressed="themeStore.mode === option.value"
+          :aria-label="`切换到${option.label}主题`"
           @click="handleThemeChange(option.value)"
         >
           <!-- 缩略预览 -->
@@ -30,13 +33,16 @@
             </div>
           </div>
           <div class="tile-meta">
-            <span class="tile-icon" v-html="option.icon"></span>
+            <n-icon class="tile-icon" :component="option.icon" aria-hidden="true" />
             <span class="tile-name">{{ option.label }}</span>
-            <svg v-if="themeStore.mode === option.value" class="tile-check" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="16" height="16">
-              <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clip-rule="evenodd"/>
-            </svg>
+            <n-icon
+              v-if="themeStore.mode === option.value"
+              class="tile-check"
+              :component="CheckmarkCircle"
+              aria-hidden="true"
+            />
           </div>
-        </div>
+        </button>
       </div>
     </div>
 
@@ -88,7 +94,8 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { useMessage } from 'naive-ui'
+import { NIcon, useMessage } from 'naive-ui'
+import { CheckmarkCircle, MoonOutline, SunnyOutline } from '@vicons/ionicons5'
 import { useThemeStore, type ThemeMode } from '@/stores/themeStore'
 import { useFontSizeStore, type FontSizePreset } from '@/stores/fontSizeStore'
 
@@ -128,32 +135,20 @@ const previewWordCountDone = computed(() => {
   return scale >= 1.2 ? '1,020' : scale >= 1.1 ? '1,224' : '1,360'
 })
 
-const themeOptions = computed(() => [
+const themeOptions = [
   {
     value: 'light' as ThemeMode,
     label: '浅色',
     previewClass: 'prev-light',
-    icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="#f59e0b" width="14" height="14"><circle cx="10" cy="10" r="4"/><path d="M10 2v1.5M10 16.5V18M3.22 3.22l1.06 1.06m11.44 11.44 1.06 1.06M2 10h1.5M16.5 10H18M4.28 15.72l1.06-1.06M14.66 5.34l1.06-1.06" stroke="#f59e0b" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>',
+    icon: SunnyOutline,
   },
   {
     value: 'dark' as ThemeMode,
     label: '深色',
     previewClass: 'prev-dark',
-    icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="#818cf8" width="14" height="14"><path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z"/></svg>',
+    icon: MoonOutline,
   },
-  {
-    value: 'anchor' as ThemeMode,
-    label: '黑金',
-    previewClass: 'prev-anchor',
-    icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" width="14" height="14"><defs><linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#d4a843"/><stop offset="100%" stop-color="#f5d485"/></linearGradient></defs><path d="M10 2l2.09 4.26L17 7.27l-3.5 3.41.83 4.82L10 13.27l-4.33 2.23.83-4.82L3 7.27l4.91-.71z" fill="url(#g1)"/></svg>',
-  },
-  {
-    value: 'auto' as ThemeMode,
-    label: '跟随系统',
-    previewClass: 'prev-auto',
-    icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" width="14" height="14"><rect x="2" y="3" width="16" height="12" rx="2" stroke="#94a3b8" stroke-width="1.5" fill="none"/><path d="M7 15v2m6-2v2M5 17h10" stroke="#94a3b8" stroke-width="1.5" stroke-linecap="round"/></svg>',
-  },
-])
+]
 
 function handleFontSizeChange(next: FontSizePreset) {
   if (fontSizeStore.preset === next) return
@@ -163,17 +158,20 @@ function handleFontSizeChange(next: FontSizePreset) {
 }
 
 function handleThemeChange(newMode: ThemeMode) {
-  const opt = themeOptions.value.find((o) => o.value === newMode)
+  const opt = themeOptions.find((o) => o.value === newMode)
   const label = opt?.label ?? newMode
   const applyTheme = () => { themeStore.setTheme(newMode) }
-  if ('startViewTransition' in document) {
+  const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
+  if (reduceMotion) {
+    applyTheme()
+  } else if ('startViewTransition' in document) {
     ;(document as Document & { startViewTransition: (cb: () => void) => void })
       .startViewTransition(applyTheme)
   } else {
     const root = (document as Document).documentElement as HTMLElement
     root.classList.add('theme-transitioning')
     applyTheme()
-    setTimeout(() => root.classList.remove('theme-transitioning'), 360)
+    setTimeout(() => root.classList.remove('theme-transitioning'), 220)
   }
   message.success(`已切换到${label}主题`)
 }
@@ -213,17 +211,11 @@ function handleThemeChange(newMode: ThemeMode) {
   opacity: 0.7;
 }
 
-/* ── 主题 2×2 网格 ── */
+/* ── 主题选择 ── */
 .theme-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 0.625rem;
-}
-
-@media (min-width: 500px) {
-  .theme-grid {
-    grid-template-columns: repeat(4, 1fr);
-  }
+  gap: var(--plotpilot-space-3, 12px);
 }
 
 .theme-tile {
@@ -231,24 +223,25 @@ function handleThemeChange(newMode: ThemeMode) {
   border: 1.5px solid var(--app-border, #e2e8f0);
   overflow: hidden;
   cursor: pointer;
-  transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+  color: inherit;
+  text-align: left;
+  appearance: none;
+  transition:
+    border-color var(--motion-duration-standard) var(--motion-ease-standard),
+    box-shadow var(--motion-duration-standard) var(--motion-ease-standard),
+    transform var(--motion-duration-standard) var(--motion-ease-standard);
   background: var(--app-surface);
 }
 
 .theme-tile:hover {
-  border-color: #a5b4fc;
-  box-shadow: 0 3px 12px rgba(79, 70, 229, 0.1);
+  border-color: var(--color-brand-border);
+  box-shadow: var(--app-shadow-md);
   transform: translateY(-1px);
 }
 
 .theme-tile.active {
-  border-color: var(--color-brand, #2563eb);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1), 0 3px 12px rgba(37, 99, 235, 0.12);
-}
-
-.theme-tile.active[data-mode='anchor'] {
-  border-color: var(--color-gold, #d4a843);
-  box-shadow: 0 0 0 3px rgba(212, 168, 67, 0.12), 0 3px 12px rgba(212, 168, 67, 0.15);
+  border-color: var(--color-brand);
+  box-shadow: var(--focus-ring), var(--app-shadow-sm);
 }
 
 /* 缩略预览 */
@@ -258,17 +251,30 @@ function handleThemeChange(newMode: ThemeMode) {
   display: flex;
   flex-direction: column;
   gap: 0.375rem;
-  transition: background 0.3s ease;
+  transition: background var(--motion-duration-slow) var(--motion-ease-standard);
 }
 
-.prev-light  { background: #f8fafc; }
-.prev-dark   { background: #0d1120; }
-.prev-anchor { background: linear-gradient(135deg, #0d0e14, #12141c); }
-.prev-auto   { background: linear-gradient(135deg, #f8fafc 50%, #0d1120 50%); }
+.prev-light {
+  --preview-surface: #FFFCF6;
+  --preview-ink: #2C2520;
+  --preview-border: #E2D8CA;
+  --preview-primary: #A64B2A;
+  background: #F4EFE6;
+}
+
+.prev-dark {
+  --preview-surface: #2B2420;
+  --preview-ink: #F6EEDF;
+  --preview-border: #4A3E37;
+  --preview-primary: #E28B62;
+  background: #221C19;
+}
 
 .tile-preview-bar {
   display: flex;
   gap: 0.25rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--preview-border);
 }
 
 .tile-dot {
@@ -277,10 +283,7 @@ function handleThemeChange(newMode: ThemeMode) {
   border-radius: 50%;
 }
 
-.prev-light  .tile-dot { background: #cbd5e1; }
-.prev-dark   .tile-dot { background: #334155; }
-.prev-anchor .tile-dot { background: rgba(212, 168, 67, 0.35); }
-.prev-auto   .tile-dot { background: #94a3b8; }
+.tile-dot { background: var(--preview-primary); }
 
 .tile-preview-lines {
   display: flex;
@@ -291,16 +294,17 @@ function handleThemeChange(newMode: ThemeMode) {
 .tile-line {
   height: 0.3rem;
   border-radius: 0.2rem;
+  background: var(--preview-ink);
 }
 
 .w-full { width: 100%; }
 .w-3\/4  { width: 75%; }
 .w-1\/2  { width: 50%; }
 
-.prev-light  .tile-line { background: #e2e8f0; }
-.prev-dark   .tile-line { background: #1e293b; }
-.prev-anchor .tile-line { background: rgba(212, 168, 67, 0.18); }
-.prev-auto   .tile-line { background: #cbd5e1; }
+.tile-line:not(:first-child) {
+  background: var(--preview-surface);
+  box-shadow: inset 0 0 0 1px var(--preview-border);
+}
 
 /* 底部标签区 */
 .tile-meta {
@@ -315,6 +319,7 @@ function handleThemeChange(newMode: ThemeMode) {
   display: flex;
   align-items: center;
   flex-shrink: 0;
+  color: var(--color-brand);
 }
 
 .tile-name {
@@ -330,10 +335,6 @@ function handleThemeChange(newMode: ThemeMode) {
 .tile-check {
   flex-shrink: 0;
   color: var(--color-brand, #2563eb);
-}
-
-.theme-tile.active[data-mode='anchor'] .tile-check {
-  color: var(--color-gold, #d4a843);
 }
 
 /* ── 字号卡 + 预览 ── */
@@ -360,31 +361,23 @@ function handleThemeChange(newMode: ThemeMode) {
   background: var(--app-surface);
   cursor: pointer;
   text-align: center;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  transition:
+    border-color var(--motion-duration-fast) var(--motion-ease-standard),
+    box-shadow var(--motion-duration-fast) var(--motion-ease-standard),
+    transform var(--motion-duration-fast) var(--motion-ease-standard);
 }
 
 .size-card:hover,
 .size-card.hovering {
-  border-color: #a5b4fc;
-  box-shadow: 0 2px 10px rgba(79, 70, 229, 0.1);
+  border-color: var(--color-brand-border);
+  box-shadow: var(--app-shadow-sm);
   transform: translateY(-1px);
 }
 
 .size-card.active {
   border-color: var(--color-brand, #2563eb);
-  background: rgba(37, 99, 235, 0.05);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.09), 0 2px 8px rgba(37, 99, 235, 0.1);
-}
-
-[data-theme='anchor'] .size-card.active {
-  border-color: var(--color-gold, #d4a843);
-  background: rgba(212, 168, 67, 0.07);
-  box-shadow: 0 0 0 3px rgba(212, 168, 67, 0.12), 0 2px 8px rgba(212, 168, 67, 0.1);
-}
-
-[data-theme='anchor'] .size-card:hover,
-[data-theme='anchor'] .size-card.hovering {
-  border-color: rgba(212, 168, 67, 0.5);
+  background: var(--color-brand-light);
+  box-shadow: var(--focus-ring), var(--app-shadow-sm);
 }
 
 .size-aa {
@@ -392,7 +385,7 @@ function handleThemeChange(newMode: ThemeMode) {
   line-height: 1;
   color: var(--app-text-primary);
   letter-spacing: -0.02em;
-  transition: font-size 0.1s ease;
+  transition: font-size var(--motion-duration-fast) var(--motion-ease-standard);
 }
 
 .size-name {
@@ -412,7 +405,7 @@ function handleThemeChange(newMode: ThemeMode) {
   border: 1px solid var(--app-border, #e2e8f0);
   background: var(--app-surface-subtle, #f8fafc);
   padding: 0.875rem 1rem;
-  transition: font-size 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: font-size var(--motion-duration-standard) var(--motion-ease-standard);
   user-select: none;
 }
 
@@ -450,11 +443,7 @@ function handleThemeChange(newMode: ThemeMode) {
   height: 100%;
   border-radius: 0.125rem;
   background: var(--color-brand, #2563eb);
-  transition: width 0.3s ease;
-}
-
-[data-theme='anchor'] .preview-progress-fill {
-  background: var(--color-gold, #d4a843);
+  transition: width var(--motion-duration-slow) var(--motion-ease-standard);
 }
 
 .preview-pct-label {

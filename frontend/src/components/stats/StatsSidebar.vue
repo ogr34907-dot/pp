@@ -1,12 +1,17 @@
 <template>
-  <aside class="stats-sidebar" :class="{ 'is-collapsed': collapsed }">
+  <aside
+    id="home-stats-sidebar"
+    class="stats-sidebar"
+    :class="{ 'is-collapsed': collapsed, 'is-compact-open': compactOpen }"
+    aria-label="数据概览与快捷操作"
+    @keydown.esc.stop="$emit('close-compact')"
+  >
     <!-- Brand Header -->
     <header class="sidebar-brand">
       <div class="brand-logo">
-        <span class="logo-icon">✦</span>
+        <PlotPilotMark class="logo-icon" :size="collapsed ? 'compact' : 'regular'" :label="false" />
         <div class="brand-text">
           <h1 class="brand-name">PlotPilot</h1>
-          <p class="brand-slogan">墨枢 · 作者的领航员</p>
         </div>
       </div>
       <button
@@ -14,15 +19,16 @@
         :aria-label="collapsed ? '展开侧边栏' : '收起侧边栏'"
         @click="toggleCollapse"
       >
-        <svg viewBox="0 0 24 24" fill="none" width="16" height="16">
-          <path
-            :d="collapsed ? 'M9 18l6-6-6-6' : 'M15 18l-6-6 6-6'"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
-        </svg>
+        <n-icon :component="collapsed ? ChevronForwardOutline : ChevronBackOutline" :size="16" />
+      </button>
+      <button
+        ref="mobileCloseRef"
+        type="button"
+        class="mobile-close"
+        aria-label="关闭数据概览面板"
+        @click="$emit('close-compact')"
+      >
+        <n-icon :component="CloseOutline" :size="18" />
       </button>
     </header>
 
@@ -47,7 +53,7 @@
           :class="{ loading: loading }"
           aria-label="刷新数据"
         >
-          <span class="refresh-icon">↻</span>
+          <n-icon class="refresh-icon" :component="RefreshOutline" :size="16" />
         </button>
       </div>
 
@@ -166,10 +172,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { NSkeleton } from 'naive-ui'
+import { NIcon, NSkeleton } from 'naive-ui'
+import { ChevronBackOutline, ChevronForwardOutline, CloseOutline, RefreshOutline } from '@vicons/ionicons5'
 import StatCard from './StatCard.vue'
+import PlotPilotMark from '@/components/brand/PlotPilotMark.vue'
 import { useStatsStore } from '@/stores/statsStore'
 import GlobalLLMEntryButton from '@/components/global/GlobalLLMEntryButton.vue'
 import PromptPlazaEntryButton from '@/components/global/PromptPlazaEntryButton.vue'
@@ -177,11 +185,24 @@ import { storageKeys } from '@/config/storageKeys'
 import { runtimePerformance } from '@/config/performance'
 import { readStorageBoolean, writeStorageBoolean } from '@/utils/storage'
 import { getNovelStageLabel } from '@/domain/novel'
+const props = withDefaults(defineProps<{
+  compactOpen?: boolean
+}>(), {
+  compactOpen: false,
+})
+
 const emit = defineEmits<{
   (e: 'create-book'): void
   (e: 'refresh-list'): void
   (e: 'collapsed-change', collapsed: boolean): void
+  (e: 'close-compact'): void
 }>()
+
+const mobileCloseRef = ref<HTMLButtonElement | null>(null)
+
+watch(() => props.compactOpen, (isOpen) => {
+  if (isOpen) nextTick(() => mobileCloseRef.value?.focus())
+})
 
 const collapsed = ref(readStorageBoolean(storageKeys.statsSidebarCollapsed))
 
@@ -274,7 +295,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   height: 100vh;
   box-sizing: border-box;
   padding-top: env(safe-area-inset-top);
-  background: linear-gradient(180deg, var(--app-surface-subtle) 0%, var(--app-border) 100%);
+  background: var(--app-page-bg);
   border-right: 1px solid var(--app-border);
   display: flex;
   flex-direction: column;
@@ -293,7 +314,8 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .sidebar-brand {
   min-height: 100px;
   padding: 20px 24px;
-  background: linear-gradient(135deg, var(--color-brand, #4f46e5) 0%, var(--color-brand-pressed, #7c3aed) 100%);
+  background: var(--app-page-bg);
+  border-bottom: 1px solid var(--app-border);
   position: relative;
   overflow: visible;
   display: flex;
@@ -327,35 +349,29 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   flex-shrink: 0;
   width: 28px;
   height: 28px;
-  border: none;
-  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid var(--app-border);
+  background: var(--app-surface-subtle);
   border-radius: 8px;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
-  transition: background 0.18s ease;
+  color: var(--app-text-secondary);
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    color 0.18s ease;
   padding: 0;
 }
 
 .collapse-toggle:hover {
-  background: rgba(255, 255, 255, 0.32);
+  background: var(--color-brand-light);
+  border-color: var(--color-brand-border);
+  color: var(--color-brand);
 }
 
 .is-collapsed .collapse-toggle {
   margin: 0 auto;
-}
-
-.sidebar-brand::before {
-  content: '';
-  position: absolute;
-  top: -38%;
-  right: -46%;
-  width: 132px;
-  height: 132px;
-  background: radial-gradient(circle, var(--app-text-inverse, rgba(255,255,255,0.09)) 0%, transparent 72%);
-  pointer-events: none;
 }
 
 .brand-logo {
@@ -367,15 +383,13 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .logo-icon {
   width: 44px;
   height: 44px;
-  background: var(--color-brand-light, rgba(255, 255, 255, 0.2));
+  background: var(--color-brand-light);
   border-radius: 12px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 22px;
-  color: var(--app-text-inverse, #fff);
-  backdrop-filter: blur(8px);
-  border: 1px solid var(--app-text-inverse, rgba(255, 255, 255, 0.2));
+  color: var(--color-brand);
+  border: 1px solid var(--color-brand-border);
 }
 
 .brand-text {
@@ -387,17 +401,9 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .brand-name {
   font-size: 22px;
   font-weight: 700;
-  color: var(--app-text-inverse, #fff);
+  color: var(--app-text-primary);
   margin: 0;
   letter-spacing: -0.02em;
-}
-
-.brand-slogan {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.82);
-  margin: 0;
-  font-weight: 400;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
 }
 
 /* Stats Section */
@@ -426,7 +432,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .title-icon {
   width: 16px;
   height: 16px;
-  color: var(--app-text-secondary, #64748b);
+  color: var(--app-text-secondary);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -447,14 +453,14 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--app-text-muted, #64748b);
+  color: var(--app-text-muted);
   transition: all 0.2s ease;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  box-shadow: none;
 }
 
 .refresh-btn:hover:not(:disabled) {
   background: var(--app-surface-subtle);
-  color: var(--color-brand, #4f46e5);
+  color: var(--color-brand);
 }
 
 .refresh-btn:disabled {
@@ -487,7 +493,8 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   background: var(--app-surface);
   border-radius: 12px;
   padding: 16px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--app-border);
+  box-shadow: none;
   min-height: 168px;
   box-sizing: border-box;
 }
@@ -497,7 +504,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 }
 
 .stage-dot--placeholder {
-  background: var(--app-border, rgba(148, 163, 184, 0.35));
+  background: var(--app-border);
   opacity: 0.9;
 }
 
@@ -509,13 +516,13 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 
 .stage-empty-hint {
   font-size: 12px;
-  color: var(--app-text-muted, #94a3b8);
+  color: var(--app-text-muted);
 }
 
 .stage-title {
   font-size: 13px;
   font-weight: 600;
-  color: var(--app-text-muted, #64748b);
+  color: var(--app-text-muted);
   margin: 0 0 12px;
 }
 
@@ -539,10 +546,10 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   flex-shrink: 0;
 }
 
-.stage-dot.stage-planning { background: #3b82f6; }
-.stage-dot.stage-writing { background: #f59e0b; }
-.stage-dot.stage-reviewing { background: #8b5cf6; }
-.stage-dot.stage-completed { background: #10b981; }
+.stage-dot.stage-planning { background: var(--color-info); }
+.stage-dot.stage-writing { background: var(--color-brand); }
+.stage-dot.stage-reviewing { background: var(--color-warning); }
+.stage-dot.stage-completed { background: var(--color-success); }
 
 .stage-name {
   flex: 1;
@@ -588,40 +595,56 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   gap: 8px;
   min-height: 58px;
   padding: 0 14px;
-  background: linear-gradient(135deg, var(--color-brand-hover, #6366f1) 0%, var(--color-brand, #4f46e5) 55%, var(--color-brand-pressed, #4338ca) 100%);
-  border: 1px solid color-mix(in srgb, var(--color-brand, #4f46e5) 52%, transparent);
-  border-radius: 16px;
+  background: var(--app-surface);
+  border: 1px solid var(--app-border-strong);
+  border-radius: var(--app-radius-md);
   cursor: pointer;
   transition: all 0.2s ease;
   font-size: 15px;
   font-weight: 600;
   line-height: 1;
-  color: var(--app-text-inverse, #ffffff);
+  color: var(--app-text-primary);
   box-shadow: none;
   white-space: nowrap;
 }
 
 .action-btn.action-create {
-  background: linear-gradient(135deg, var(--color-brand-hover, #6366f1) 0%, var(--color-brand, #4f46e5) 55%, var(--color-brand-pressed, #4338ca) 100%);
-  border-color: color-mix(in srgb, var(--color-brand, #4f46e5) 52%, transparent);
+  background: var(--color-brand);
+  border-color: var(--color-brand);
+  color: var(--app-text-inverse);
+}
+
+.mobile-close {
+  display: none;
 }
 
 .action-btn.action-refresh {
-  background: linear-gradient(135deg, var(--color-brand-hover, #6366f1) 0%, var(--color-brand, #4f46e5) 55%, var(--color-brand-pressed, #4338ca) 100%);
-  border-color: color-mix(in srgb, var(--color-brand, #4f46e5) 52%, transparent);
+  background: var(--app-surface);
+  border-color: var(--app-border-strong);
 }
 
 .action-btn:hover {
-  filter: none;
-  transform: none;
-  background: linear-gradient(135deg, var(--color-brand, #4f46e5) 0%, var(--color-brand-hover, #6366f1) 55%, var(--color-brand-pressed, #4338ca) 100%);
-  box-shadow: none;
+  background: var(--app-surface-subtle);
+  border-color: var(--color-brand-border);
+}
+
+.action-btn.action-create:hover {
+  background: var(--color-brand-hover);
+  border-color: var(--color-brand-hover);
+}
+
+.action-btn:focus-visible,
+.collapse-toggle:focus-visible,
+.refresh-btn:focus-visible,
+.footer-link:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
 }
 
 .action-icon {
   width: 16px;
   height: 16px;
-  color: var(--app-text-inverse, #ffffff);
+  color: currentColor;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -632,18 +655,13 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
   height: 16px;
 }
 
-[data-theme='anchor'] .action-btn:hover {
-  transform: none;
-  box-shadow: none;
-}
-
 /* Footer */
 .sidebar-footer {
   margin-top: auto;
   padding: 10px 16px 12px;
-  border-top: 1px solid var(--app-divider, rgba(15, 23, 42, 0.06));
+  border-top: 1px solid var(--app-divider);
   display: block;
-  background: var(--app-surface-subtle, rgba(248, 250, 252, 0.8));
+  background: var(--app-page-bg);
 }
 
 .footer-info {
@@ -655,7 +673,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 
 .update-time {
   font-size: 12px;
-  color: var(--app-text-muted, #64748b);
+  color: var(--app-text-muted);
   display: flex;
   align-items: center;
   gap: 4px;
@@ -676,7 +694,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 
 .footer-link {
   font-size: 12px;
-  color: var(--app-text-muted, #64748b);
+  color: var(--app-text-muted);
   text-decoration: none;
   display: inline-flex;
   align-items: center;
@@ -688,7 +706,7 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 }
 
 .footer-link:hover {
-  color: var(--color-brand, #4f46e5);
+  color: var(--color-brand);
   background: var(--app-surface-subtle);
 }
 
@@ -703,5 +721,89 @@ const updateTimeText = computed(() => formatTime(lastUpdateTime.value))
 .link-icon svg {
   width: 14px;
   height: 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stats-sidebar,
+  .collapse-toggle,
+  .refresh-btn,
+  .action-btn,
+  .footer-link { transition: none; }
+
+  .refresh-btn.loading .refresh-icon { animation: none; }
+}
+
+@media (max-width: 768px) {
+  .stats-sidebar,
+  .stats-sidebar.is-collapsed {
+    width: min(320px, calc(100vw - 32px));
+    height: 100dvh;
+    z-index: 200;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateX(-100%);
+    transition:
+      transform var(--motion-duration-base) var(--motion-ease-standard),
+      visibility 0s linear var(--motion-duration-base);
+    box-shadow: var(--app-shadow-lg);
+  }
+
+  .stats-sidebar.is-compact-open {
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateX(0);
+    transition-delay: 0s;
+  }
+
+  .stats-sidebar.is-collapsed .brand-text {
+    display: flex;
+  }
+
+  .stats-sidebar.is-collapsed .stats-section,
+  .stats-sidebar.is-collapsed .quick-actions,
+  .stats-sidebar.is-collapsed .sidebar-footer {
+    display: block;
+  }
+
+  .stats-sidebar.is-collapsed .sidebar-brand {
+    min-height: 84px;
+    padding: 16px;
+    justify-content: space-between;
+  }
+
+  .stats-sidebar.is-collapsed .logo-icon {
+    width: 40px;
+    height: 40px;
+  }
+
+  .collapse-toggle {
+    display: none;
+  }
+
+  .mobile-close {
+    width: 44px;
+    height: 44px;
+    display: inline-grid;
+    place-items: center;
+    flex: 0 0 auto;
+    padding: 0;
+    border: 1px solid var(--app-border);
+    border-radius: var(--app-radius-md);
+    color: var(--app-text-secondary);
+    background: var(--app-surface);
+    cursor: pointer;
+  }
+
+  .mobile-close:focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+}
+
+@media (max-width: 768px) and (prefers-reduced-motion: reduce) {
+  .stats-sidebar,
+  .stats-sidebar.is-collapsed {
+    transition: none;
+  }
 }
 </style>

@@ -4,8 +4,53 @@ import type { CanonicalAftermathFullResyncEvent } from '../../api/autopilot'
 export interface CanonicalAftermathPresentation {
   isFailure: boolean
   title: string
-  actionLabel: string
-  canResume: boolean
+  currentChapterAction: CanonicalAftermathRecoveryAction
+  fullResyncAction: CanonicalAftermathRecoveryAction & {
+    label: string
+    scope: string
+  }
+  resumeAction: AutopilotResumeAction
+  afterFullResyncCompleted: () => void | Promise<void>
+  asyncStatus: {
+    status: 'waiting' | 'running' | 'failed'
+    stage: string
+    message: string
+    current?: number
+    total?: number
+  } | null
+}
+
+export interface CanonicalAftermathRecoveryAction {
+  intent: 'retry' | 'resume' | 'resync-all'
+  label: string
+  disabled: boolean
+  invoke: () => void | Promise<void>
+}
+
+export interface AutopilotResumeAction extends CanonicalAftermathRecoveryAction {
+  intent: 'resume'
+  mode: 'review' | 'manual-pause' | null
+  visible: boolean
+}
+
+export interface AutopilotResumeEligibility {
+  canResumeReview: boolean
+  isManualPause: boolean
+}
+
+export interface CanonicalAftermathRecoveryHandlers {
+  retryCurrentChapter: () => void | Promise<void>
+  resyncFullBook: () => void | Promise<void>
+  resume: () => void | Promise<void>
+  refresh: () => void | Promise<void>
+}
+
+export interface CanonicalAftermathFullResyncSnapshot {
+  active: boolean
+  processed: number
+  total: number
+  currentChapter: number | null
+  firstFailureReason: string
 }
 
 export function canStartCanonicalAftermathFullResync(
@@ -107,24 +152,86 @@ export function canOfferReviewResume(
 
 export function getCanonicalAftermathPresentation(
   status: Record<string, any> | null | undefined,
+  fullResync?: CanonicalAftermathFullResyncSnapshot,
+  handlers?: CanonicalAftermathRecoveryHandlers,
+  resumeEligibility?: AutopilotResumeEligibility,
 ): CanonicalAftermathPresentation {
   const gate = status?.review_gate
   const isFailure = String(status?.autopilot_pause_reason || '') === 'canonical_aftermath_not_ready'
     || String(gate?.type || '') === 'canonical_aftermath'
+  const fullResyncActive = fullResync?.active === true
+  const guardedInvoke = (
+    disabled: boolean,
+    handler: (() => void | Promise<void>) | undefined,
+  ) => () => {
+    if (!disabled) return handler?.()
+  }
+  const currentChapterDisabled = !isFailure || fullResyncActive
+  const fullResyncDisabled = !isFailure
+    || fullResyncActive
+    || String(status?.current_stage || '') !== 'paused_for_review'
+  const currentChapterLabel = String(gate?.action_label || '重新同步本章')
+  const currentChapterAction: CanonicalAftermathRecoveryAction = {
+    intent: 'retry',
+    label: currentChapterLabel,
+    disabled: currentChapterDisabled,
+    invoke: guardedInvoke(currentChapterDisabled, handlers?.retryCurrentChapter),
+  }
+  const fullResyncAction: CanonicalAftermathPresentation['fullResyncAction'] = {
+    intent: 'resync-all',
+    label: '从第 1 章开始全流程同步',
+    scope: '第 1 章至当前章',
+    disabled: fullResyncDisabled,
+    invoke: guardedInvoke(fullResyncDisabled, handlers?.resyncFullBook),
+  }
+  const resumeMode: AutopilotResumeAction['mode'] = !isFailure && resumeEligibility?.canResumeReview
+    ? 'review'
+    : (resumeEligibility?.isManualPause ? 'manual-pause' : null)
+  const resumeVisible = resumeMode !== null && !fullResyncActive
+  const resumeDisabled = !resumeVisible
+  const resumeAction: AutopilotResumeAction = {
+    intent: 'resume',
+    label: resumeMode === 'review' ? String(gate?.action_label || '确认后继续') : '恢复',
+    mode: resumeMode,
+    visible: resumeVisible,
+    disabled: resumeDisabled,
+    invoke: guardedInvoke(resumeDisabled, handlers?.resume),
+  }
+  const afterFullResyncCompleted = () => handlers?.refresh()
 
   if (!isFailure) {
     return {
       isFailure: false,
       title: '',
-      actionLabel: '',
-      canResume: true,
+      currentChapterAction,
+      fullResyncAction,
+      resumeAction,
+      afterFullResyncCompleted,
+      asyncStatus: null,
     }
   }
+
+  const firstFailureReason = String(fullResync?.firstFailureReason || '')
+  const currentChapter = Number(fullResync?.currentChapter || 0)
+  const asyncStatus = fullResync
+    ? {
+        status: fullResyncActive ? 'running' as const : (firstFailureReason ? 'failed' as const : 'waiting' as const),
+        stage: '第 1 章至当前章',
+        message: firstFailureReason
+          ? `同步中断：${firstFailureReason}`
+          : (currentChapter > 0 ? `正在同步第 ${currentChapter} 章` : '准备从第 1 章开始同步'),
+        current: Math.max(0, Number(fullResync.processed || 0)),
+        total: Math.max(0, Number(fullResync.total || 0)),
+      }
+    : null
 
   return {
     isFailure: true,
     title: '规范章后同步失败',
-    actionLabel: String(gate?.action_label || '重新同步本章'),
-    canResume: false,
+    currentChapterAction,
+    fullResyncAction,
+    resumeAction,
+    afterFullResyncCompleted,
+    asyncStatus,
   }
 }

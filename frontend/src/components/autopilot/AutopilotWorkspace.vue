@@ -148,6 +148,7 @@ function onBeatsPlanned(payload: { chapterNumber: number; beats: Array<Record<st
   min-height: 0;
   position: relative;
   overflow: hidden;
+  background: var(--app-page-bg);
 }
 
 .ap-workspace__pane {
@@ -171,10 +172,18 @@ function onBeatsPlanned(payload: { chapterNumber: number; beats: Array<Record<st
 
 .ap-workspace__cockpit-panel {
   flex-shrink: 0;
-  margin: 12px 16px 16px;
+  width: min(1180px, calc(100% - 32px));
+  margin: 16px auto 24px;
 }
 
 .ap-workspace__pane--ops {
   background: var(--app-surface-subtle);
+}
+
+@media (max-width: 720px) {
+  .ap-workspace__cockpit-panel {
+    width: calc(100% - 16px);
+    margin: 8px auto 16px;
+  }
 }
 </style>

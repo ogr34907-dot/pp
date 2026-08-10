@@ -33,7 +33,7 @@
         <div v-if="generatingBible" class="step-generating">
           <div class="generating-header">
             <div class="generating-icon">
-              <n-icon size="36" color="#2080f0">
+              <n-icon size="36" color="var(--color-brand)">
                 <IconBook />
               </n-icon>
             </div>
@@ -113,7 +113,7 @@
           <!-- 文风公约实时预览（SSE 生成中即可见） -->
           <div v-if="styleText" class="style-preview-generating">
             <div class="style-preview-header">
-              <n-icon size="16" color="#18a058"><IconCheck /></n-icon>
+              <n-icon size="16" color="var(--color-success)"><IconCheck /></n-icon>
               <span class="style-preview-title">文风公约</span>
               <n-tag size="tiny" type="success">已生成</n-tag>
             </div>
@@ -164,7 +164,7 @@
 
         <!-- 初始状态 -->
         <div v-else class="step-info">
-          <n-icon size="48" color="#18a058">
+          <n-icon size="48" color="var(--color-success)">
             <IconBook />
           </n-icon>
           <h3>准备生成文风公约与世界观</h3>
@@ -185,7 +185,7 @@
         <div v-if="generatingCharacters && !charactersGenerated" class="step-generating">
           <div class="generating-header">
             <div class="generating-icon">
-              <n-icon size="36" color="#2080f0">
+              <n-icon size="36" color="var(--color-brand)">
                 <IconPeople />
               </n-icon>
             </div>
@@ -413,7 +413,7 @@
 
         <!-- 初始状态 -->
         <div v-else class="step-info">
-          <n-icon size="48" color="#2080f0">
+          <n-icon size="48" color="var(--color-brand)">
             <IconPeople />
           </n-icon>
           <h3>生成主要角色</h3>
@@ -434,7 +434,7 @@
         <div v-if="generatingLocations && !locationsGenerated" class="step-generating">
           <div class="generating-header">
             <div class="generating-icon">
-              <n-icon size="36" color="#f0a020">
+              <n-icon size="36" color="var(--color-warning)">
                 <IconMap />
               </n-icon>
             </div>
@@ -449,7 +449,7 @@
             <transition-group name="fade-slide">
               <div v-for="(loc, idx) in streamingLocations" :key="loc.name || loc.id || idx" class="loc-card loc-card--filled">
                 <div class="loc-card__header">
-                  <div class="loc-card__icon">📍</div>
+                  <n-icon class="loc-card__icon" :component="LocationOutline" :size="18" aria-hidden="true" />
                   <div class="loc-card__title">
                     <span class="loc-card__name">{{ loc.name }}</span>
                     <n-tag size="small" type="info" round>{{ loc.type || loc.location_type || '地点' }}</n-tag>
@@ -508,7 +508,7 @@
 
         <!-- 初始状态 -->
         <div v-else class="step-info">
-          <n-icon size="48" color="#f0a020">
+          <n-icon size="48" color="var(--color-warning)">
             <IconMap />
           </n-icon>
           <h3>生成地图系统</h3>
@@ -532,7 +532,7 @@
           已恢复上次生成的<strong>剧情总纲</strong>预览（本地缓存，减少重复生成）。
         </n-alert>
         <div class="step-info step-info--wide">
-          <n-icon size="48" color="#2080f0">
+          <n-icon size="48" color="var(--color-brand)">
             <IconTimeline />
           </n-icon>
           <h3>生成剧情总纲</h3>
@@ -549,7 +549,7 @@
         <div v-if="plotOutlineBusy && !plotOutline" class="step-generating plot-outline-generating">
           <div class="generating-header">
             <div class="generating-icon">
-              <n-icon size="36" color="#2080f0">
+              <n-icon size="36" color="var(--color-brand)">
                 <IconTimeline />
               </n-icon>
             </div>
@@ -679,12 +679,12 @@
       <!-- Step 5: Complete -->
       <div v-else-if="currentStep === 5" class="step-panel">
         <div class="step-info">
-          <n-icon size="48" color="#18a058">
+          <n-icon size="48" color="var(--color-success)">
             <IconCheck />
           </n-icon>
           <h3>准备就绪！</h3>
           <p>所有基础设置已完成，现在可以开始创作了。</p>
-          <p style="margin-top: 12px; color: #666">您可以随时在工作台的"设置"面板中调整这些内容。</p>
+          <p style="margin-top: 12px; color: var(--app-text-secondary)">您可以随时在工作台的"设置"面板中调整这些内容。</p>
         </div>
       </div>
     </div>
@@ -731,6 +731,7 @@
 <script setup lang="ts">
 import { h, ref, watch, computed, onMounted, onUnmounted } from 'vue'
 import { useMessage, useDialog } from 'naive-ui'
+import { LocationOutline } from '@vicons/ionicons5'
 import { bibleApi, type BibleDTO, consumeBibleGenerateStream, type WorldbuildingDimensionData } from '@/api/bible'
 // timeout constants removed - SSE runs until complete or error
 import { worldbuildingApi } from '@/api/worldbuilding'
@@ -2172,7 +2173,7 @@ const handleComplete = () => {
 }
 
 .step-info p {
-  color: #666;
+  color: var(--app-text-secondary);
   line-height: 1.6;
   margin: 8px 0;
 }
@@ -2201,7 +2202,8 @@ const handleComplete = () => {
   gap: 16px;
   padding: 12px 16px;
   border-radius: 12px;
-  background: linear-gradient(135deg, #f0f7ff 0%, #e8f5e9 100%);
+  background: var(--app-surface-subtle);
+  border: 1px solid var(--app-border);
 }
 
 .generating-icon {
@@ -2212,13 +2214,13 @@ const handleComplete = () => {
   margin: 0 0 4px;
   font-size: 16px;
   font-weight: 600;
-  color: #333;
+  color: var(--app-text-primary);
 }
 
 .generating-sub {
   margin: 0;
   font-size: 13px;
-  color: #888;
+  color: var(--app-text-muted);
 }
 
 /* ── 维度字段卡片 ── */
@@ -2270,12 +2272,10 @@ const handleComplete = () => {
   min-height: 42px;
   padding: 12px 14px 12px 16px;
   border-radius: 8px;
-  background:
-    linear-gradient(90deg, color-mix(in srgb, var(--color-brand, #2563eb) 9%, transparent), transparent 42%),
-    var(--app-surface-subtle, var(--n-color-modal));
-  border: 1px solid color-mix(in srgb, var(--color-brand, #2563eb) 34%, var(--app-border, rgba(15, 23, 42, 0.12)));
+  background: var(--app-surface-subtle, var(--n-color-modal));
+  border: 1px solid color-mix(in srgb, var(--color-brand) 34%, var(--app-border));
   border-left: 3px solid var(--color-brand, var(--n-primary-color));
-  box-shadow: 0 8px 22px color-mix(in srgb, var(--color-brand, #2563eb) 10%, transparent);
+  box-shadow: none;
   color: var(--app-text-primary, var(--n-text-color-1));
   font-size: 13px;
   font-weight: 500;
@@ -2291,7 +2291,7 @@ const handleComplete = () => {
   margin-bottom: 6px;
   padding: 1px 6px;
   border-radius: 6px;
-  background: var(--color-brand-light, rgba(37, 99, 235, 0.08));
+  background: var(--color-brand-light);
   color: var(--color-brand, var(--n-primary-color));
   font-size: 11px;
   font-weight: 700;
@@ -2303,10 +2303,8 @@ const handleComplete = () => {
 }
 
 .field-card--streaming {
-  border-color: color-mix(in srgb, var(--color-brand, #2563eb) 46%, var(--app-border, transparent));
-  background:
-    linear-gradient(90deg, color-mix(in srgb, var(--color-brand, #2563eb) 8%, transparent), transparent 48%),
-    var(--app-surface, var(--n-color-modal));
+  border-color: color-mix(in srgb, var(--color-brand) 46%, var(--app-border));
+  background: var(--app-surface, var(--n-color-modal));
   box-shadow: inset 3px 0 0 var(--color-brand, var(--n-primary-color));
 }
 
@@ -2327,10 +2325,8 @@ const handleComplete = () => {
   margin-top: 12px;
   padding: 12px 16px;
   border-radius: 8px;
-  background:
-    linear-gradient(90deg, color-mix(in srgb, var(--color-success, #22c55e) 9%, transparent), transparent 45%),
-    var(--app-surface-subtle, var(--n-color-modal));
-  border: 1px solid color-mix(in srgb, var(--color-success, #22c55e) 34%, var(--app-border, rgba(15, 23, 42, 0.12)));
+  background: var(--app-surface-subtle, var(--n-color-modal));
+  border: 1px solid color-mix(in srgb, var(--color-success) 34%, var(--app-border));
   border-left: 3px solid var(--color-success, var(--n-success-color));
   animation: fade-in 0.4s ease;
 }
@@ -2378,14 +2374,14 @@ const handleComplete = () => {
 }
 
 .char-card--filled {
-  border-color: #18a05830;
-  background: #18a05806;
+  border-color: color-mix(in srgb, var(--color-success) 24%, transparent);
+  background: color-mix(in srgb, var(--color-success) 3%, var(--app-surface));
 }
 
 .char-card--loading {
   border-style: dashed;
-  border-color: #2080f040;
-  background: #2080f004;
+  border-color: var(--color-brand-border);
+  background: var(--app-surface-subtle);
 }
 
 .char-card__header {
@@ -2398,8 +2394,9 @@ const handleComplete = () => {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
+  background: var(--color-brand-light);
+  color: var(--color-brand);
+  border: 1px solid var(--color-brand-border);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2409,12 +2406,14 @@ const handleComplete = () => {
 }
 
 .char-card__avatar--protag {
-  background: linear-gradient(135deg, #f5af19 0%, #f12711 100%);
-  box-shadow: 0 0 0 2px #f5af1930;
+  background: var(--color-brand);
+  color: var(--app-text-inverse);
+  border-color: var(--color-brand);
+  box-shadow: none;
 }
 
 .char-card__avatar--skeleton {
-  background: #f0f0f0;
+  background: var(--app-surface-subtle);
   color: transparent;
 }
 
@@ -2457,7 +2456,7 @@ const handleComplete = () => {
   flex: 0 0 auto;
   padding: 1px 6px;
   border-radius: 6px;
-  background: var(--color-brand-light, rgba(37, 99, 235, 0.08));
+  background: var(--color-brand-light);
   color: var(--color-brand, var(--n-primary-color));
   font-weight: 700;
 }
@@ -2474,7 +2473,7 @@ const handleComplete = () => {
   display: inline-block;
   height: 14px;
   border-radius: 4px;
-  background: linear-gradient(90deg, #f0f0f0 25%, #e4e4e4 50%, #f0f0f0 75%);
+  background: linear-gradient(90deg, var(--app-surface-subtle) 25%, var(--app-border) 50%, var(--app-surface-subtle) 75%);
   background-size: 200% 100%;
   animation: shimmer 1.5s ease-in-out infinite;
 }
@@ -2515,14 +2514,14 @@ const handleComplete = () => {
 }
 
 .loc-card--filled {
-  border-color: #2080f030;
-  background: #2080f006;
+  border-color: var(--color-brand-border);
+  background: color-mix(in srgb, var(--color-brand) 3%, var(--app-surface));
 }
 
 .loc-card--loading {
   border-style: dashed;
-  border-color: #f0a02040;
-  background: #f0a02004;
+  border-color: color-mix(in srgb, var(--color-warning) 25%, transparent);
+  background: color-mix(in srgb, var(--color-warning) 3%, var(--app-surface));
 }
 
 .loc-card__header {
@@ -2540,7 +2539,7 @@ const handleComplete = () => {
   width: 18px;
   height: 18px;
   border-radius: 4px;
-  background: #f0f0f0;
+  background: var(--app-surface-subtle);
   animation: shimmer 1.5s ease-in-out infinite;
   background-size: 200% 100%;
 }
@@ -2563,7 +2562,7 @@ const handleComplete = () => {
 
 .loc-card__desc {
   font-size: 13px;
-  color: #666;
+  color: var(--app-text-secondary);
   line-height: 1.5;
   margin-top: 6px;
   padding-left: 26px;
@@ -2573,7 +2572,7 @@ const handleComplete = () => {
   display: inline-block;
   height: 12px;
   border-radius: 4px;
-  background: linear-gradient(90deg, #f0f0f0 25%, #e4e4e4 50%, #f0f0f0 75%);
+  background: linear-gradient(90deg, var(--app-surface-subtle) 25%, var(--app-border) 50%, var(--app-surface-subtle) 75%);
   background-size: 200% 100%;
   animation: shimmer 1.5s ease-in-out infinite;
 }
@@ -2646,15 +2645,13 @@ const handleComplete = () => {
 }
 
 .plot-outline-progress__item--active {
-  border-color: color-mix(in srgb, var(--color-brand, #2563eb) 42%, var(--app-border, transparent));
-  background:
-    linear-gradient(90deg, color-mix(in srgb, var(--color-brand, #2563eb) 7%, transparent), transparent 50%),
-    var(--app-surface, var(--n-color-modal));
+  border-color: color-mix(in srgb, var(--color-brand) 42%, var(--app-border));
+  background: var(--app-surface-subtle, var(--n-color-modal));
 }
 
 .plot-outline-progress__item--active .plot-outline-progress__dot {
   background: var(--color-brand, var(--n-primary-color));
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-brand, #2563eb) 12%, transparent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-brand) 12%, transparent);
   animation: plot-progress-pulse 1.2s ease-in-out infinite;
 }
 
@@ -2709,7 +2706,7 @@ const handleComplete = () => {
 .plot-line {
   font-size: 13px;
   line-height: 1.55;
-  color: #555;
+  color: var(--app-text-secondary);
   text-align: left;
 }
 
@@ -2734,7 +2731,7 @@ const handleComplete = () => {
   width: fit-content;
   padding: 1px 7px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--color-brand, #2563eb) 8%, transparent);
+  background: var(--color-brand-light);
   color: var(--app-text-secondary, var(--n-text-color-2));
   font-size: 12px;
   font-weight: 700;
@@ -2744,7 +2741,7 @@ const handleComplete = () => {
 .plot-subline-list {
   padding: 8px 10px;
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.03);
+  background: var(--app-surface-subtle);
   text-align: left;
 }
 
@@ -2763,19 +2760,19 @@ const handleComplete = () => {
 }
 
 .plot-guard-k {
-  color: #777;
+  color: var(--app-text-muted);
   font-weight: 700;
 }
 
 .plot-guard-v {
-  color: #555;
+  color: var(--app-text-secondary);
 }
 
 .plot-subline-title {
   margin-bottom: 6px;
   font-size: 12px;
   font-weight: 700;
-  color: #666;
+  color: var(--app-text-secondary);
 }
 
 .plot-subline-item {
@@ -2785,7 +2782,7 @@ const handleComplete = () => {
   flex-wrap: wrap;
   font-size: 12px;
   line-height: 1.5;
-  color: #555;
+  color: var(--app-text-secondary);
 }
 
 .plot-subline-item + .plot-subline-item {
@@ -2797,7 +2794,7 @@ const handleComplete = () => {
 }
 
 .plot-subline-purpose {
-  color: #777;
+  color: var(--app-text-muted);
 }
 
 .plot-outline-stage-editor {
@@ -2884,13 +2881,11 @@ const handleComplete = () => {
   padding: 10px 12px;
   border-radius: 8px;
   border: 1px solid var(--app-border, var(--n-border-color));
-  background:
-    linear-gradient(90deg, color-mix(in srgb, var(--color-brand, #2563eb) 5%, transparent), transparent 42%),
-    var(--app-surface, var(--n-color-modal));
+  background: var(--app-surface, var(--n-color-modal));
 }
 
 .role-lock-panel--strong {
-  border-color: color-mix(in srgb, var(--color-brand, #2563eb) 30%, var(--app-border, rgba(15, 23, 42, 0.12)));
+  border-color: color-mix(in srgb, var(--color-brand) 30%, var(--app-border));
   box-shadow: inset 3px 0 0 var(--color-brand, var(--n-primary-color));
 }
 
@@ -2975,6 +2970,6 @@ const handleComplete = () => {
   cursor: pointer !important;
 }
 .wizard-step-clickable:hover :deep(.n-step-indicator) {
-  box-shadow: 0 0 0 3px rgba(24, 160, 88, 0.15);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-success) 15%, transparent);
 }
 </style>
