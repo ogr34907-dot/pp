@@ -8,6 +8,15 @@ export interface CanonicalAftermathPresentation {
   canResume: boolean
 }
 
+export function canStartCanonicalAftermathFullResync(
+  status: Record<string, any> | null | undefined,
+  fullResyncActive: boolean,
+): boolean {
+  return !fullResyncActive
+    && getCanonicalAftermathPresentation(status).isFailure
+    && String(status?.current_stage || '') === 'paused_for_review'
+}
+
 export function createCanonicalAftermathFullResyncState() {
   const active = ref(false)
   const processed = ref(0)

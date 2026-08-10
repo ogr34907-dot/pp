@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  canStartCanonicalAftermathFullResync,
   canOfferReviewResume,
   createCanonicalAftermathFullResyncState,
   shouldShowCanonicalAftermathFullResyncProgress,
@@ -42,6 +43,14 @@ describe('canonical aftermath full resync presentation state', () => {
 
     state.completed({ type: 'completed', total: 4, processed: 4 })
     expect(canOfferReviewResume(true, state.active.value)).toBe(true)
+  })
+
+  it('enables full-book resync for a canonical failure paused for review even while autopilot remains running', () => {
+    expect(canStartCanonicalAftermathFullResync({
+      autopilot_pause_reason: 'canonical_aftermath_not_ready',
+      autopilot_status: 'running',
+      current_stage: 'paused_for_review',
+    }, false)).toBe(true)
   })
 
   it('marks completion without requesting a resume', () => {

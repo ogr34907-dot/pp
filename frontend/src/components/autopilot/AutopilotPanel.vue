@@ -409,6 +409,7 @@ import { featureFlags } from '../../config/features'
 import { runtimePerformance } from '../../config/performance'
 import { normalizeAutopilotStartConfig } from './autopilotStartConfig'
 import {
+  canStartCanonicalAftermathFullResync,
   canOfferReviewResume,
   createCanonicalAftermathFullResyncState,
   getCanonicalAftermathPresentation,
@@ -546,10 +547,9 @@ const reviewGateNeedsAIPanel = computed(() =>
 )
 const canonicalAftermathPresentation = computed(() => getCanonicalAftermathPresentation(status.value))
 const canonicalAftermathFailure = computed(() => canonicalAftermathPresentation.value.isFailure)
-const canStartFullResync = computed(() => (
-  canonicalAftermathFailure.value &&
-  !fullResyncActive.value &&
-  ['stopped', 'paused'].includes(String(status.value?.autopilot_status || ''))
+const canStartFullResync = computed(() => canStartCanonicalAftermathFullResync(
+  status.value,
+  fullResyncActive.value,
 ))
 const showReviewGate = computed(() => needsReview.value || reviewGateNeedsAIPanel.value)
 const canResumeReview = computed(() => canOfferReviewResume(
