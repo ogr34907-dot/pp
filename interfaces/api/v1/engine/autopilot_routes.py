@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -1642,8 +1642,21 @@ class StartRequest(BaseModel):
     )
 
 
+def reject_legacy_autopilot_start() -> None:
+    """Keep legacy direct-writing controls from bypassing candidates."""
+
+    raise HTTPException(
+        status_code=410,
+        detail="legacy direct autopilot control is disabled; use /api/v1/generation/novels/{novel_id}/start",
+    )
+
+
 @router.post("/{novel_id}/start")
-async def start_autopilot(novel_id: str, body: StartRequest = StartRequest()):
+async def start_autopilot(
+    novel_id: str,
+    body: StartRequest = StartRequest(),
+    _legacy_start_guard: None = Depends(reject_legacy_autopilot_start),
+):
     """启动自动驾驶（共享内存先行；目标章数字数原子落库后再发 IPC，避免与 PUT 竞态）。
 
     架构：
@@ -2241,7 +2254,10 @@ async def resync_all_canonical_aftermath(novel_id: str):
 
 
 @router.post("/{novel_id}/resume")
-async def resume_from_review(novel_id: str):
+async def resume_from_review(
+    novel_id: str,
+    _legacy_resume_guard: None = Depends(reject_legacy_autopilot_start),
+):
     """从人工审阅点或人工暂停恢复（非阻塞版）
 
     架构优化：与 start_autopilot 一致

@@ -1,7 +1,12 @@
 """Tail regeneration archives all chapter-derived facts before a new epoch starts."""
 
+import pytest
+
 from infrastructure.persistence.database.connection import DatabaseConnection
-from application.engine.services.worldline_regeneration_service import WorldlineRegenerationService
+from application.engine.services.worldline_regeneration_service import (
+    WorldlineRegenerationError,
+    WorldlineRegenerationService,
+)
 
 
 def _seed(db):
@@ -73,6 +78,18 @@ def test_regenerate_from_any_chapter_archives_tail_and_preserves_prefix_hash(tmp
     assert tuple(run) == (1, "paused", "chapter_review", 1, "rebuilding", "rebuild_worldline")
 
 
+def test_regeneration_target_must_include_the_restart_chapter(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-target-boundary.db"))
+    _seed(db)
+    service = WorldlineRegenerationService(db)
+
+    with pytest.raises(
+        WorldlineRegenerationError,
+        match="target_chapters must be at least start_chapter",
+    ):
+        service.preview("novel-1", start_chapter=2, target_chapters=1)
+
+
 def test_reset_past_the_current_tail_is_regular_continuation_not_destructive(tmp_path):
     db = DatabaseConnection(str(tmp_path / "worldline-continue.db"))
     _seed(db)
@@ -84,6 +101,33 @@ def test_reset_past_the_current_tail_is_regular_continuation_not_destructive(tmp
 
     assert result.operation == "continue"
     assert db.get_connection().execute("SELECT COUNT(*) FROM chapters WHERE novel_id = 'novel-1'").fetchone()[0] == 3
+
+
+def test_continue_preview_is_consumed_after_execution(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-continue-once.db"))
+    _seed(db)
+    service = WorldlineRegenerationService(db)
+    preview = service.preview("novel-1", start_chapter=4, target_chapters=8)
+
+    service.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+
+    with pytest.raises(WorldlineRegenerationError, match="already consumed"):
+        service.execute("novel-1", preview_token=preview.token, run_mode="chapter_review")
+
+
+def test_continue_preview_revalidates_the_existing_chapter_prefix(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-continue-stale.db"))
+    _seed(db)
+    service = WorldlineRegenerationService(db)
+    preview = service.preview("novel-1", start_chapter=4, target_chapters=8)
+    db.execute(
+        "UPDATE chapters SET content = '已修改正文', content_sha256 = 'changed' "
+        "WHERE novel_id = 'novel-1' AND number = 1"
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(WorldlineRegenerationError, match="chapter prefix changed"):
+        service.execute("novel-1", preview_token=preview.token, run_mode="continuous")
 
 
 def test_restore_archived_worldline_replaces_new_tail_and_creates_a_new_epoch(tmp_path):

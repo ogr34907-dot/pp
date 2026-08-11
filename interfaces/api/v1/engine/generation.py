@@ -473,10 +473,23 @@ class HostedWriteStreamRequest(BaseModel):
     )
 
 
+def reject_legacy_direct_prose_generation() -> None:
+    """Keep generated prose inside the candidate review and commit workflow."""
+
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "legacy direct prose generation is disabled; use "
+            "/api/v1/generation/novels/{novel_id}/start"
+        ),
+    )
+
+
 # Endpoints
 @router.post(
     "/{novel_id}/generate-chapter-stream",
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(reject_legacy_direct_prose_generation)],
 )
 async def generate_chapter_stream(
     novel_id: str,
@@ -550,6 +563,7 @@ async def generate_chapter_stream(
 @router.post(
     "/{novel_id}/hosted-write-stream",
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(reject_legacy_direct_prose_generation)],
 )
 async def hosted_write_stream(
     novel_id: str,

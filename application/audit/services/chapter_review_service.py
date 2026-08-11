@@ -19,6 +19,7 @@ from domain.cast.repositories.cast_repository import CastRepository
 from domain.novel.repositories.timeline_repository import TimelineRepository
 from domain.novel.repositories.storyline_repository import StorylineRepository
 from domain.novel.repositories.foreshadowing_repository import ForeshadowingRepository
+from domain.novel.value_objects.novel_id import NovelId
 from application.ai.llm_json_extract import parse_llm_json_to_dict
 from domain.ai.services.llm_service import LLMService
 from application.ai.trace_context import ensure_trace
@@ -351,23 +352,20 @@ class ChapterReviewService:
         """检查伏笔使用"""
         issues = []
 
-        # 获取未回收的伏笔
-        unrevealed_foreshadowings = self.foreshadowing_repo.get_unrevealed(novel_id)
+        # The canonical registry is rebuilt with the active worldline.  Do not
+        # use historical vector hits here because a reset may leave old tails
+        # physically present until their cleanup job finishes.
+        registry = self.foreshadowing_repo.get_by_novel_id(NovelId(novel_id))
+        unrevealed_foreshadowings = registry.get_unresolved() if registry else []
 
         if not unrevealed_foreshadowings:
             return issues
 
-        # 使用向量检索找到相关伏笔
-        relevant_foreshadowings = self.vector_store.search(
-            query_text=chapter.content[:500],  # 使用章节开头作为查询
-            top_k=5
-        )
-
         # 使用 LLM 检查伏笔是否被合理使用
-        if relevant_foreshadowings:
+        if unrevealed_foreshadowings:
             foreshadowings_str = "\n".join(
-                f"- {f.get('metadata', {}).get('description', '无描述')}"
-                for f in relevant_foreshadowings
+                f"- {foreshadowing.description}"
+                for foreshadowing in unrevealed_foreshadowings
             )
             prompt = self._render_review_prompt(
                 "foreshadowing",

@@ -3,27 +3,19 @@
     <AutopilotShellNav />
 
     <div class="ap-workspace__body">
-      <!-- 驾驶舱保留挂载以维持写作 SSE；其它重页面按需挂载，避免隐藏图表/DAG 常驻吃内存。 -->
+      <!-- 候选写作页保持挂载；其它重页面按需挂载，避免隐藏图表/DAG 常驻占用内存。 -->
       <section
         v-show="workspace.activeTab === 'cockpit'"
       class="ap-workspace__pane ap-workspace__pane--cockpit"
-      aria-label="全托管驾驶"
+      aria-label="候选写作"
     >
       <GenerationModeLauncher
         class="ap-workspace__candidate-launcher"
         :novel-id="novelId"
         :target-chapters="targetChapters"
+        @status-change="onCandidateStatusChange"
       />
-      <AutopilotPanel
-          class="ap-workspace__cockpit-panel"
-          :novel-id="novelId"
-          :render-live-preview="(cockpitVisible ?? true) && workspace.activeTab === 'cockpit'"
-          @status-change="onStatusChange"
-          @chapter-content-update="onChapterContentUpdate"
-          @chapter-chunk="onChapterChunk"
-          @desk-refresh="onDeskRefresh"
-          @beats-planned="onBeatsPlanned"
-        />
+      <CandidateGenerationProgress :run="candidateRun" />
       </section>
 
       <section
@@ -66,8 +58,9 @@ import { computed, defineAsyncComponent, ref, toRef, watch, nextTick } from 'vue
 import { useAutopilotWorkspaceStore } from '@/stores/autopilotWorkspaceStore'
 import { useDAGSSE } from '@/composables/useDAGSSE'
 import AutopilotShellNav from './AutopilotShellNav.vue'
-import AutopilotPanel from './AutopilotPanel.vue'
 import GenerationModeLauncher from './GenerationModeLauncher.vue'
+import CandidateGenerationProgress from './CandidateGenerationProgress.vue'
+import type { GenerationRun } from '@/api/generation'
 
 const NarrativeGovernanceCockpit = defineAsyncComponent(() => import('./NarrativeGovernanceCockpit.vue'))
 const AutopilotMetricsDashboard = defineAsyncComponent(() => import('./AutopilotMetricsDashboard.vue'))
@@ -76,23 +69,19 @@ const AutopilotOperationsView = defineAsyncComponent(() => import('./AutopilotOp
 const props = defineProps<{
   novelId: string
   targetChapters?: number
-  cockpitVisible?: boolean
 }>()
 
 const emit = defineEmits<{
-  'status-change': [status: Record<string, unknown>]
-  'chapter-content-update': [data: { chapterNumber: number; content: string; wordCount: number }]
-  'chapter-chunk': [data: { chunk: string; beatIndex: number; content: string; chapterNumber: number }]
   'desk-refresh': []
-  'beats-planned': [payload: { chapterNumber: number; beats: Array<Record<string, unknown>> }]
   'chapter-metrics-refresh': []
 }>()
 
 const workspace = useAutopilotWorkspaceStore()
 const metricsRef = ref<{ relayoutTension?: () => void; bumpRefresh?: () => void } | null>(null)
+const candidateRun = ref<GenerationRun | null>(null)
 const operationsActive = computed(() => workspace.activeTab === 'operations')
 
-/** DAG/日志 SSE 只在监控页打开时连接；写作正文 SSE 仍由驾驶舱常驻维护。 */
+/** DAG/日志 SSE 只在监控页打开时连接。 */
 useDAGSSE(toRef(props, 'novelId'), operationsActive)
 
 watch(
@@ -119,24 +108,8 @@ function onChapterMetricsRefresh() {
   emit('chapter-metrics-refresh')
 }
 
-function onStatusChange(status: Record<string, unknown>) {
-  emit('status-change', status)
-}
-
-function onChapterContentUpdate(data: { chapterNumber: number; content: string; wordCount: number }) {
-  emit('chapter-content-update', data)
-}
-
-function onChapterChunk(data: { chunk: string; beatIndex: number; content: string; chapterNumber: number }) {
-  emit('chapter-chunk', data)
-}
-
-function onDeskRefresh() {
-  emit('desk-refresh')
-}
-
-function onBeatsPlanned(payload: { chapterNumber: number; beats: Array<Record<string, unknown>> }) {
-  emit('beats-planned', payload)
+function onCandidateStatusChange(run: GenerationRun | null) {
+  candidateRun.value = run
 }
 </script>
 
@@ -177,12 +150,6 @@ function onBeatsPlanned(payload: { chapterNumber: number; beats: Array<Record<st
   background: var(--app-page-bg);
 }
 
-.ap-workspace__cockpit-panel {
-  flex-shrink: 0;
-  width: min(1180px, calc(100% - 32px));
-  margin: 16px auto 24px;
-}
-
 .ap-workspace__candidate-launcher {
   flex-shrink: 0;
   width: min(1180px, calc(100% - 32px));
@@ -194,11 +161,6 @@ function onBeatsPlanned(payload: { chapterNumber: number; beats: Array<Record<st
 }
 
 @media (max-width: 720px) {
-  .ap-workspace__cockpit-panel {
-    width: calc(100% - 16px);
-    margin: 8px auto 16px;
-  }
-
   .ap-workspace__candidate-launcher {
     width: calc(100% - 16px);
     margin: 8px auto 0;

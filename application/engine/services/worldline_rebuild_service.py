@@ -14,6 +14,14 @@ class WorldlineRebuildError(RuntimeError):
     pass
 
 
+class WorldlineRebuildCancelled(WorldlineRebuildError):
+    """The rebuild task lost ownership of its generation epoch."""
+
+    def __init__(self, generation_epoch: int):
+        super().__init__("worldline rebuild was cancelled or superseded")
+        self.generation_epoch = generation_epoch
+
+
 class WorldlineRebuildService:
     """Replay only formal retained chapters through the canonical aftermath path."""
 
@@ -38,6 +46,22 @@ class WorldlineRebuildService:
     @staticmethod
     def _now() -> str:
         return datetime.now().isoformat()
+
+    @staticmethod
+    def _current_epoch(conn, novel_id: str) -> int:
+        row = conn.execute(
+            "SELECT generation_epoch FROM novel_generation_runs WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        if row is None:
+            raise WorldlineRebuildError("generation run not found")
+        return int(row["generation_epoch"] or 0)
+
+    @classmethod
+    def _ensure_epoch(cls, conn, novel_id: str, expected_epoch: int) -> None:
+        current_epoch = cls._current_epoch(conn, novel_id)
+        if current_epoch != expected_epoch:
+            raise WorldlineRebuildCancelled(current_epoch)
 
     async def rebuild(self, novel_id: str) -> dict[str, Any]:
         conn = self._connection()
@@ -77,6 +101,7 @@ class WorldlineRebuildService:
         ).fetchall()
         try:
             for chapter in rows:
+                self._ensure_epoch(conn, novel_id, epoch)
                 result = await self.aftermath_pipeline.run_after_chapter_saved(
                     novel_id,
                     int(chapter["number"]),
@@ -85,9 +110,16 @@ class WorldlineRebuildService:
                     expected_content_revision=int(chapter["content_revision"] or 0),
                     outline=str(chapter["outline"] or ""),
                 )
+                self._ensure_epoch(conn, novel_id, epoch)
                 if not isinstance(result, dict) or not result.get("narrative_sync_ok"):
                     reason = str((result or {}).get("failure_reason") or "canonical_aftermath_not_ready")
                     raise WorldlineRebuildError(reason)
+        except WorldlineRebuildCancelled as exc:
+            return {
+                "status": "cancelled",
+                "generation_epoch": exc.generation_epoch,
+                "rebuilt_chapters": 0,
+            }
         except Exception as exc:
             failure = str(exc)
             now = self._now()
@@ -104,13 +136,21 @@ class WorldlineRebuildService:
                 UPDATE novel_generation_runs
                 SET state = 'paused', canonical_sync_status = 'failed',
                     next_action = 'retry_worldline_rebuild', last_error = ?, updated_at = ?
-                WHERE novel_id = ?
+                WHERE novel_id = ? AND generation_epoch = ?
                 """,
-                (failure, now, novel_id),
+                (failure, now, novel_id, epoch),
             )
             conn.commit()
+            if self._current_epoch(conn, novel_id) != epoch:
+                current_epoch = self._current_epoch(conn, novel_id)
+                return {
+                    "status": "cancelled",
+                    "generation_epoch": current_epoch,
+                    "rebuilt_chapters": 0,
+                }
             raise WorldlineRebuildError(failure) from exc
         now = self._now()
+        self._ensure_epoch(conn, novel_id, epoch)
         conn.execute(
             """
             UPDATE worldline_rebuild_jobs
@@ -124,9 +164,9 @@ class WorldlineRebuildService:
             UPDATE novel_generation_runs
             SET state = 'paused', canonical_sync_status = 'ready',
                 next_action = 'select_run_mode', last_error = '', updated_at = ?
-            WHERE novel_id = ?
+            WHERE novel_id = ? AND generation_epoch = ?
             """,
-            (now, novel_id),
+            (now, novel_id, epoch),
         )
         conn.commit()
         return {"status": "completed", "generation_epoch": epoch, "rebuilt_chapters": len(rows)}

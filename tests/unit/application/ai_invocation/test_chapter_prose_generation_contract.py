@@ -1,4 +1,3 @@
-import hashlib
 import sqlite3
 from contextlib import contextmanager
 
@@ -74,7 +73,7 @@ class _Db:
         return dict(row) if row else None
 
 
-def test_project_chapter_prose_updates_existing_chapter():
+def test_legacy_chapter_prose_projection_cannot_write_formal_chapters():
     db = _Db()
     with db.transaction() as conn:
         conn.execute(
@@ -94,97 +93,10 @@ def test_project_chapter_prose_updates_existing_chapter():
         },
     )
 
-    row = db.fetch_one("SELECT content, status, word_count FROM chapters WHERE id = ?", ("chapter-1",))
-    assert result["action"] == "updated"
-    assert row == {"content": "新的正文", "status": "draft", "word_count": 4}
-
-
-def test_project_chapter_prose_updates_content_version_for_existing_chapter():
-    db = _Db()
-    with db.transaction() as conn:
-        conn.execute(
-            "INSERT INTO chapters (id, novel_id, number, title, content, status, word_count, content_sha256, content_revision) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "chapter-1",
-                "novel-1",
-                2,
-                "旧章",
-                "旧正文",
-                "draft",
-                3,
-                hashlib.sha256("旧正文".encode("utf-8")).hexdigest(),
-                1,
-            ),
-        )
-
-    project_chapter_prose_to_chapters(
-        db,
-        {
-            "adapter": "chapters_table",
-            "novel_id": "novel-1",
-            "chapter_number": 2,
-            "content": "新的正文",
-            "word_count": 4,
-        },
-    )
-
-    row = db.fetch_one(
-        "SELECT content_sha256, content_revision FROM chapters WHERE id = ?",
-        ("chapter-1",),
-    )
-    assert row == {
-        "content_sha256": hashlib.sha256("新的正文".encode("utf-8")).hexdigest(),
-        "content_revision": 2,
-    }
-
-
-def test_project_chapter_prose_refuses_empty_overwrite():
-    db = _Db()
-    with db.transaction() as conn:
-        conn.execute(
-            "INSERT INTO chapters (id, novel_id, number, title, content, status, word_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("chapter-1", "novel-1", 2, "旧章", "旧正文", "draft", 3),
-        )
-
-    result = project_chapter_prose_to_chapters(
-        db,
-        {
-            "adapter": "chapters_table",
-            "novel_id": "novel-1",
-            "chapter_number": 2,
-            "content": " ",
-        },
-    )
-
     row = db.fetch_one("SELECT content FROM chapters WHERE id = ?", ("chapter-1",))
-    assert result == {"blocked": True, "reason": "empty_content_refuses_overwrite"}
+    assert result["blocked"] is True
+    assert result["reason"] == "legacy_chapter_projection_retired"
     assert row == {"content": "旧正文"}
-
-
-def test_project_chapter_prose_inserts_missing_chapter():
-    db = _Db()
-
-    result = project_chapter_prose_to_chapters(
-        db,
-        {
-            "adapter": "chapters_table",
-            "novel_id": "novel-1",
-            "chapter_number": 3,
-            "content": "新章节正文",
-            "word_count": 5,
-        },
-    )
-
-    row = db.fetch_one("SELECT novel_id, number, content, status, word_count FROM chapters WHERE number = ?", (3,))
-    assert result["action"] == "inserted"
-    assert row == {
-        "novel_id": "novel-1",
-        "number": 3,
-        "content": "新章节正文",
-        "status": "draft",
-        "word_count": 5,
-    }
 
 
 def test_chapter_prose_output_payload_writes_generated_and_accepted_variables():
@@ -230,7 +142,7 @@ def test_chapter_prose_output_payload_writes_generated_and_accepted_variables():
     assert accepted is not None and accepted.value == "正文"
 
 
-def test_chapter_prose_commit_writes_outputs_and_projects_to_chapters(monkeypatch):
+def test_chapter_prose_commit_blocks_the_retired_chapters_projection(monkeypatch):
     db = _Db()
     repo = InMemoryVariableHubRepository()
     repo.set_bindings(OUTPUT_BINDING_SET_ID, NODE_KEY, _output_bindings(), direction="output")
@@ -272,9 +184,10 @@ def test_chapter_prose_commit_writes_outputs_and_projects_to_chapters(monkeypatc
     row = db.fetch_one("SELECT content, status, word_count FROM chapters WHERE novel_id = ? AND number = ?", ("novel-1", 4))
     generated = repo.get_value("chapter.prose.generated", "novel_id:novel-1|chapter_number:4")
     accepted = repo.get_value("chapter.prose.accepted", "novel_id:novel-1|chapter_number:4")
-    assert commit.status.value == "succeeded"
-    assert session.status == InvocationSessionStatus.COMPLETED
-    assert row == {"content": "完整正文", "status": "draft", "word_count": 4}
+    assert commit.status.value == "blocked"
+    assert commit.error == "legacy_chapter_projection_retired"
+    assert session.status == InvocationSessionStatus.BLOCKED
+    assert row is None
     assert generated is not None and generated.value == "完整正文"
     assert accepted is not None and accepted.value == "完整正文"
     assert [step.name for step in commit.steps] == [
@@ -284,6 +197,7 @@ def test_chapter_prose_commit_writes_outputs_and_projects_to_chapters(monkeypatc
         "commit_variable_outputs",
         "commit_projection",
     ]
+    assert commit.steps[-1].status.value == "blocked"
 
 
 def test_chapter_prose_inputs_are_materialized_to_variable_hub():

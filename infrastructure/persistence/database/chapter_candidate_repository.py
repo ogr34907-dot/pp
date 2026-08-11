@@ -118,32 +118,38 @@ class ChapterCandidateRepository:
         existing = conn.execute(
             "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
         ).fetchone()
+        chapter_head = conn.execute(
+            "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        persisted_chapter_head = int(chapter_head["max_number"] or 0)
         if existing is not None:
             current = self._run_from_row(existing)
             if current.canonical_sync_status not in {"ready", ""}:
                 raise CandidateGateError(
                     "canonical rebuild or sync is not ready; resolve the current recovery action first"
                 )
-            if current.current_candidate_id and current.state in {
-                GenerationRunState.WAITING_REVIEW,
-                GenerationRunState.RUNNING,
-                GenerationRunState.PAUSED,
-            }:
+            if current.current_candidate_id:
                 raise CandidateGateError("cannot start a new run while a pending candidate exists")
             epoch = current.generation_epoch
+            current_formal_chapter = max(current.current_formal_chapter, persisted_chapter_head)
         else:
             epoch = 0
+            current_formal_chapter = persisted_chapter_head
         now = self._now()
         conn.execute(
             """
             INSERT INTO novel_generation_runs
                 (novel_id, run_mode, state, generation_epoch, target_chapters,
-                 max_pending_candidates, prefetch, canonical_sync_status, next_action, updated_at)
-            VALUES (?, ?, 'running', ?, ?, 1, 0, 'ready', 'generate_candidate', ?)
+                 current_formal_chapter, max_pending_candidates, prefetch,
+                 canonical_sync_status, next_action, updated_at)
+            VALUES (?, ?, 'running', ?, ?, ?, 1, 0, 'ready', 'generate_candidate', ?)
             ON CONFLICT(novel_id) DO UPDATE SET
                 run_mode = excluded.run_mode,
                 state = 'running',
                 target_chapters = excluded.target_chapters,
+                current_formal_chapter = MAX(novel_generation_runs.current_formal_chapter,
+                                             excluded.current_formal_chapter),
                 max_pending_candidates = 1,
                 prefetch = 0,
                 canonical_sync_status = 'ready',
@@ -151,7 +157,7 @@ class ChapterCandidateRepository:
                 last_error = '',
                 updated_at = excluded.updated_at
             """,
-            (novel_id, run_mode.value, epoch, target_chapters, now),
+            (novel_id, run_mode.value, epoch, target_chapters, current_formal_chapter, now),
         )
         conn.commit()
         return self.get_run(novel_id)
@@ -215,8 +221,8 @@ class ChapterCandidateRepository:
             raise CandidateGateError(f"generation run is {run.state.value}; cannot generate next candidate")
         if run.current_candidate_id:
             raise CandidateGateError("pending candidate blocks next chapter generation")
-        if chapter_number <= run.current_formal_chapter:
-            raise CandidateGateError("candidate chapter must be after the formal chapter cursor")
+        if chapter_number != run.current_formal_chapter + 1:
+            raise CandidateGateError("candidate chapter must be the immediate next chapter after the formal cursor")
         conn = self._connection()
         open_row = conn.execute(
             """

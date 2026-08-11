@@ -1,8 +1,11 @@
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from interfaces.api.v1.engine import autopilot_routes
+from interfaces.main import create_app
 
 
 @pytest.mark.asyncio
@@ -56,6 +59,21 @@ async def test_start_publishes_selected_protection_limit_to_shared_state(monkeyp
     assert shared_updates[0][0] == "novel-1"
     assert shared_updates[0][1]["max_auto_chapters"] == 1
     assert start_signals == ["novel-1"]
+
+
+def test_legacy_start_guard_requires_candidate_generation_entrypoint():
+    with pytest.raises(HTTPException) as exc_info:
+        autopilot_routes.reject_legacy_autopilot_start()
+
+    assert exc_info.value.status_code == 410
+    assert "generation/novels/{novel_id}/start" in str(exc_info.value.detail)
+
+
+def test_legacy_start_http_route_returns_gone_from_the_main_application():
+    response = TestClient(create_app()).post("/api/v1/autopilot/novel-1/start")
+
+    assert response.status_code == 410
+    assert "generation/novels/{novel_id}/start" in response.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -152,69 +170,8 @@ async def test_terminate_publishes_destructive_stop_intent(monkeypatch):
     )
 
 
-@pytest.mark.asyncio
-async def test_resume_accepts_a_manually_paused_writing_stage(monkeypatch):
-    """AUTOPILOT-002: manual pause can resume the same stable stage."""
-    shared_updates = []
-    start_signals = []
-    persisted = []
-    shared = {
-        "_updated_at": 1,
-        "autopilot_status": "stopped",
-        "autopilot_recovery_reason": "manual_pause",
-        "current_stage": "writing",
-        "current_act": 1,
-    }
+def test_legacy_resume_http_route_returns_gone_from_the_main_application():
+    response = TestClient(create_app()).post("/api/v1/autopilot/novel-1/resume")
 
-    class _Repo:
-        def get_by_id(self, _novel_id):
-            return SimpleNamespace(
-                max_auto_chapters=9999,
-                target_chapters=20,
-                target_words_per_chapter=2500,
-            )
-
-    monkeypatch.setattr(autopilot_routes, "_get_shared_state_for_novel", lambda _novel_id: shared)
-    monkeypatch.setattr(autopilot_routes, "_canonical_resume_block_reason", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(autopilot_routes, "get_novel_repository", lambda: _Repo())
-    monkeypatch.setattr(
-        autopilot_routes,
-        "_persist_autopilot_resume_sync",
-        lambda novel_id, **kwargs: persisted.append((novel_id, kwargs)),
-    )
-    monkeypatch.setattr(
-        "interfaces.runtime_state.update_shared_novel_state",
-        lambda novel_id, **fields: shared_updates.append((novel_id, fields)),
-    )
-    monkeypatch.setattr(
-        "application.engine.services.novel_stop_signal.publish_start_signal",
-        lambda novel_id: start_signals.append(novel_id),
-    )
-
-    response = await autopilot_routes.resume_from_review("novel-1")
-
-    assert response["success"] is True
-    assert response["current_stage"] == "writing"
-    assert persisted == [
-        (
-            "novel-1",
-            {
-                "next_stage": "writing",
-                "current_act": 1,
-                "max_auto_chapters": 9999,
-                "target_chapters": 20,
-                "target_words_per_chapter": 2500,
-            },
-        )
-    ]
-    assert shared_updates[-1] == (
-        "novel-1",
-        {
-            "autopilot_status": "running",
-            "current_stage": "writing",
-            "current_act": 1,
-            "autopilot_pause_reason": "",
-            "autopilot_recovery_reason": "",
-        },
-    )
-    assert start_signals == ["novel-1"]
+    assert response.status_code == 410
+    assert "generation/novels/{novel_id}/start" in response.json()["detail"]

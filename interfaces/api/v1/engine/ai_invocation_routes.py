@@ -116,6 +116,27 @@ class VariableUpdateRequest(BaseModel):
 
 
 _VARIABLE_HUB_FACT_SOURCE_PREFIXES = ("setup.", "bible.setup.")
+_LEGACY_DIRECT_PROSE_OPERATIONS = frozenset(
+    {
+        "chapter.generate",
+        "chapter.generate.prose",
+        "autopilot.chapter.prose",
+        "autopilot.prose.from_script",
+    }
+)
+_CANDIDATE_GENERATION_ENTRYPOINT = "/api/v1/generation/novels/{novel_id}/start"
+
+
+def _reject_legacy_direct_prose_operation(operation: str) -> None:
+    if str(operation or "").strip() not in _LEGACY_DIRECT_PROSE_OPERATIONS:
+        return
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "legacy direct prose invocation is disabled; use "
+            f"{_CANDIDATE_GENERATION_ENTRYPOINT}"
+        ),
+    )
 
 
 def _config_from_dict(raw: Mapping[str, Any] | None) -> GenerationConfig | None:
@@ -807,6 +828,7 @@ def _render_prompt_draft(session, system_template: str, user_template: str | Non
 
 @router.post("")
 async def create_invocation(request: InvocationCreateRequest) -> dict[str, Any]:
+    _reject_legacy_direct_prose_operation(request.operation)
     repos = _repositories()
     try:
         from application.ai_invocation.contracts import ensure_invocation_contract
@@ -1090,6 +1112,7 @@ async def accept_invocation(session_id: str, request: AdoptionAcceptRequest) -> 
     session = repos["session"].get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="invocation_session_not_found")
+    _reject_legacy_direct_prose_operation(session.operation)
     attempt = repos["attempt"].get(request.attempt_id)
     if attempt is None or attempt.session_id != session_id:
         raise HTTPException(status_code=404, detail="invocation_attempt_not_found")
@@ -1120,6 +1143,7 @@ async def resume_invocation(session_id: str, request: ResumeInvocationRequest) -
     session = repos["session"].get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="invocation_session_not_found")
+    _reject_legacy_direct_prose_operation(session.operation)
     if session.status != InvocationSessionStatus.AWAITING_PRE_CALL_REVIEW:
         raise HTTPException(status_code=400, detail="invocation_session_not_waiting_for_pre_call_review")
     if session.prompt_snapshot is None:
@@ -1166,6 +1190,7 @@ async def retry_invocation(session_id: str, request: ResumeInvocationRequest) ->
     session = repos["session"].get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="invocation_session_not_found")
+    _reject_legacy_direct_prose_operation(session.operation)
     if session.prompt_snapshot is None:
         raise HTTPException(status_code=400, detail="invocation_session_missing_prompt_snapshot")
     if session.status not in {
@@ -1238,6 +1263,7 @@ async def create_commit(session_id: str, request: CommitCreateRequest) -> dict[s
     session = repos["session"].get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="invocation_session_not_found")
+    _reject_legacy_direct_prose_operation(session.operation)
     decision = repos["adoption"].get_decision(request.decision_id)
     if decision is None or decision.session_id != session_id:
         raise HTTPException(status_code=404, detail="adoption_decision_not_found")

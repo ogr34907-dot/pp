@@ -129,6 +129,29 @@ async def test_search_chapters_default_limit(indexing_service, mock_embedding_se
 
 
 @pytest.mark.asyncio
+async def test_search_chapters_filters_retired_worldline_vectors(
+    indexing_service, mock_vector_store, monkeypatch,
+):
+    from application.analyst.services import indexing_service as indexing_module
+
+    monkeypatch.setattr(indexing_module, "active_generation_epoch", lambda _novel_id: 1)
+    mock_vector_store.search = AsyncMock(return_value=[
+        {
+            "id": "novel1_1", "score": 0.95,
+            "payload": {"novel_id": "novel1", "chapter_number": 1, "generation_epoch": 0},
+        },
+        {
+            "id": "novel1_2", "score": 0.90,
+            "payload": {"novel_id": "novel1", "chapter_number": 2, "generation_epoch": 1},
+        },
+    ])
+
+    results = await indexing_service.search_chapters("最新剧情")
+
+    assert [result["id"] for result in results] == ["novel1_2"]
+
+
+@pytest.mark.asyncio
 async def test_delete_chapter(indexing_service, mock_vector_store):
     """Test deleting a chapter from the index"""
     # Arrange

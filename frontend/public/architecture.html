@@ -534,7 +534,7 @@ flowchart TB
     end
     subgraph consume["再消费"]
         CTX[context/retrieve 组装上下文]
-        GEN[generate-chapter-stream / 审稿 / 伏笔匹配]
+        GEN[候选生成 / 机器审校 / 作者审核 / 正式提交 / 规范同步]
     end
     AC -->|确认后| ED
     PUT --> SQ
@@ -786,8 +786,9 @@ flowchart LR
                 <table class="dense">
                     <thead><tr><th></th><th>路径</th><th>说明</th></tr></thead>
                     <tbody>
-                        <tr><td><span class="badge badge-post">POST</span></td><td><code>/api/v1/novels/{id}/generate-chapter-stream</code></td><td>流式生成（正文 + 一致性等，done 事件）</td></tr>
-                        <tr><td><span class="badge badge-post">POST</span></td><td><code>/api/v1/novels/{id}/hosted-write-stream</code></td><td>托管写作流</td></tr>
+                        <tr><td><span class="badge badge-post">POST</span></td><td><code>/api/v1/generation/novels/{id}/start</code></td><td>候选优先生成入口；正文须经审校、作者审核、正式提交和规范同步</td></tr>
+                        <tr><td><span class="badge badge-post">POST</span></td><td><code>/api/v1/novels/{id}/generate-chapter-stream</code></td><td>历史直写接口，已停用（410 Gone）</td></tr>
+                        <tr><td><span class="badge badge-post">POST</span></td><td><code>/api/v1/novels/{id}/hosted-write-stream</code></td><td>历史连写接口，已停用（410 Gone）</td></tr>
                         <tr><td><span class="badge badge-post">POST</span></td><td><code>/api/v1/novels/{id}/setup/suggest-main-plot-options</code></td><td>主线候选</td></tr>
                         <tr><td><span class="badge badge-get">GET</span></td><td><code>/api/v1/novels/{id}/storylines</code></td><td>故事线列表</td></tr>
                         <tr><td><span class="badge badge-post">POST</span></td><td><code>/api/v1/novels/{id}/storylines</code></td><td>新建故事线</td></tr>

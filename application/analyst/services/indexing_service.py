@@ -3,7 +3,11 @@ from typing import List
 from domain.ai.services.embedding_service import EmbeddingService
 from domain.ai.services.vector_store import VectorStore
 from domain.ai.services.chapter_summarizer import ChapterSummarizer
-from application.engine.services.worldline_generation_guard import tag_payload_for_active_epoch
+from application.engine.services.worldline_generation_guard import (
+    active_generation_epoch,
+    is_payload_in_active_epoch,
+    tag_payload_for_active_epoch,
+)
 
 
 class IndexingService:
@@ -101,7 +105,20 @@ class IndexingService:
             limit=limit
         )
 
-        return results
+        active_epochs: dict[str, int] = {}
+        visible_results: list[dict] = []
+        for result in results:
+            payload = dict(result.get("payload") or {})
+            novel_id = str(payload.get("novel_id") or "").strip()
+            if not novel_id:
+                continue
+            active_epoch = active_epochs.setdefault(
+                novel_id, active_generation_epoch(novel_id)
+            )
+            if is_payload_in_active_epoch(payload, active_epoch=active_epoch):
+                visible_results.append(result)
+
+        return visible_results
 
     async def delete_chapter(
         self,

@@ -122,6 +122,8 @@ class WorldlineRegenerationService:
             raise WorldlineRegenerationError("start_chapter must be at least 1")
         if target_chapters < 1:
             raise WorldlineRegenerationError("target_chapters must be at least 1")
+        if target_chapters < start_chapter:
+            raise WorldlineRegenerationError("target_chapters must be at least start_chapter")
         conn = self._connection()
         exists = conn.execute("SELECT 1 FROM novels WHERE id = ?", (novel_id,)).fetchone()
         if exists is None:
@@ -223,6 +225,20 @@ class WorldlineRegenerationService:
                 payload = json.loads(existing["result_json"] or "{}")
                 return WorldlineRegenerationResult(**payload)
 
+        if preview_row["consumed_at"] is not None:
+            raise WorldlineRegenerationError("preview token was already consumed")
+        current_generated = conn.execute(
+            "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        if int(current_generated["max_number"] or 0) != int(preview["current_generated_chapters"]):
+            raise WorldlineRegenerationError("chapter tail changed; request a new worldline preview")
+        if self._generation_epoch(conn, novel_id) != int(preview["generation_epoch"]):
+            raise WorldlineRegenerationError("generation epoch changed; request a new worldline preview")
+        retained = int(preview["retained_through"])
+        if self._prefix_digest(conn, novel_id, retained) != str(preview["prefix_digest"]):
+            raise WorldlineRegenerationError("chapter prefix changed; request a new worldline preview")
+
         if operation == "continue":
             run = ChapterCandidateRepository(self._db or self.db_path).start_run(
                 novel_id,
@@ -237,6 +253,10 @@ class WorldlineRegenerationService:
                 retained_through=int(preview["retained_through"]),
                 next_action="generate_candidate",
             )
+            conn.execute(
+                "UPDATE worldline_regeneration_previews SET consumed_at = ? WHERE token = ?",
+                (self._now(), preview_token),
+            )
             if idempotency_key:
                 conn.execute(
                     """
@@ -246,23 +266,11 @@ class WorldlineRegenerationService:
                     """,
                     (novel_id, idempotency_key, operation, json.dumps(asdict(result), ensure_ascii=False)),
                 )
-                conn.commit()
+            conn.commit()
             return result
-
-        if preview_row["consumed_at"] is not None:
-            raise WorldlineRegenerationError("preview token was already consumed")
-        current_generated = conn.execute(
-            "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE novel_id = ?",
-            (novel_id,),
-        ).fetchone()
-        if int(current_generated["max_number"] or 0) != int(preview["current_generated_chapters"]):
-            raise WorldlineRegenerationError("chapter tail changed; request a new worldline preview")
-        if self._generation_epoch(conn, novel_id) != int(preview["generation_epoch"]):
-            raise WorldlineRegenerationError("generation epoch changed; request a new worldline preview")
 
         start = int(preview["start_chapter"])
         end = int(preview["current_generated_chapters"])
-        retained = int(preview["retained_through"])
         old_epoch = int(preview["generation_epoch"])
         new_epoch = old_epoch + 1
         archive_id = f"worldline-{uuid4()}"

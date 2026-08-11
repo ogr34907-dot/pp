@@ -33,21 +33,9 @@ class StartGenerationRequest(BaseModel):
     target_chapters: int = Field(..., ge=1, le=100000)
 
 
-class CreateCandidateRequest(BaseModel):
-    chapter_number: int = Field(..., ge=1)
-    title: str = ""
-    outline_chain: dict[str, Any] = Field(default_factory=dict)
-    llm_content: str = ""
-
-
 class ContentRequest(BaseModel):
     content: str = Field(..., min_length=1)
     feedback: str = ""
-
-
-class AuditResultRequest(BaseModel):
-    audit: dict[str, Any] = Field(default_factory=dict)
-    commit_plan: dict[str, Any] = Field(default_factory=dict)
 
 
 class CommitPlanRequest(BaseModel):
@@ -56,10 +44,6 @@ class CommitPlanRequest(BaseModel):
 
 class ApprovalRequest(BaseModel):
     continue_after_commit: bool = True
-
-
-class SyncFailureRequest(BaseModel):
-    reason: str = Field(..., min_length=1)
 
 
 class RegenerateRequest(BaseModel):
@@ -175,27 +159,6 @@ def get_generation_state(
         _raise_candidate_error(exc)
 
 
-@router.post("/novels/{novel_id}/candidates")
-def create_candidate(
-    novel_id: str,
-    body: CreateCandidateRequest,
-    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
-):
-    """Internal/worker entry: creates a candidate, never a formal chapter."""
-
-    try:
-        candidate = repository.create_streaming_candidate(
-            novel_id=novel_id,
-            chapter_number=body.chapter_number,
-            title=body.title,
-            outline_chain=body.outline_chain,
-            llm_content=body.llm_content,
-        )
-        return {"success": True, "data": _candidate_to_dict(candidate)}
-    except Exception as exc:
-        _raise_candidate_error(exc)
-
-
 @router.get("/candidates/{candidate_id}")
 def get_candidate(
     candidate_id: str,
@@ -220,48 +183,6 @@ def list_candidate_versions(
         _raise_candidate_error(exc)
 
 
-@router.post("/candidates/{candidate_id}/generated-content")
-def save_generated_content(
-    candidate_id: str,
-    body: ContentRequest,
-    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
-):
-    try:
-        return {"success": True, "data": _candidate_to_dict(repository.set_generated_content(candidate_id, body.content))}
-    except Exception as exc:
-        _raise_candidate_error(exc)
-
-
-@router.post("/candidates/{candidate_id}/audit")
-def start_candidate_audit(
-    candidate_id: str,
-    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
-):
-    try:
-        return {"success": True, "data": _candidate_to_dict(repository.mark_auditing(candidate_id))}
-    except Exception as exc:
-        _raise_candidate_error(exc)
-
-
-@router.post("/candidates/{candidate_id}/audit-result")
-def finish_candidate_audit(
-    candidate_id: str,
-    body: AuditResultRequest,
-    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
-):
-    """Worker-only result endpoint; authors use the review endpoints below."""
-
-    try:
-        return {
-            "success": True,
-            "data": _candidate_to_dict(
-                repository.finish_audit(candidate_id, audit=body.audit, commit_plan=body.commit_plan)
-            ),
-        }
-    except Exception as exc:
-        _raise_candidate_error(exc)
-
-
 @router.patch("/candidates/{candidate_id}/content")
 def edit_candidate_content(
     candidate_id: str,
@@ -282,54 +203,6 @@ def edit_candidate_commit_plan(
 ):
     try:
         return {"success": True, "data": _candidate_to_dict(repository.update_commit_plan(candidate_id, body.commit_plan))}
-    except Exception as exc:
-        _raise_candidate_error(exc)
-
-
-@router.post("/candidates/{candidate_id}/approve")
-def approve_candidate(
-    candidate_id: str,
-    body: ApprovalRequest,
-    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
-):
-    try:
-        return {"success": True, "data": _candidate_to_dict(repository.approve_for_commit(candidate_id, continue_after_commit=body.continue_after_commit))}
-    except Exception as exc:
-        _raise_candidate_error(exc)
-
-
-@router.post("/candidates/{candidate_id}/commit")
-def commit_candidate_formally(
-    candidate_id: str,
-    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
-):
-    """Writes formal prose and deliberately leaves the run blocked in syncing."""
-
-    try:
-        return {"success": True, "data": _candidate_to_dict(repository.commit_formal(candidate_id))}
-    except Exception as exc:
-        _raise_candidate_error(exc)
-
-
-@router.post("/candidates/{candidate_id}/sync-succeeded")
-def candidate_sync_succeeded(
-    candidate_id: str,
-    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
-):
-    try:
-        return {"success": True, "data": _candidate_to_dict(repository.mark_sync_succeeded(candidate_id))}
-    except Exception as exc:
-        _raise_candidate_error(exc)
-
-
-@router.post("/candidates/{candidate_id}/sync-failed")
-def candidate_sync_failed(
-    candidate_id: str,
-    body: SyncFailureRequest,
-    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
-):
-    try:
-        return {"success": True, "data": _candidate_to_dict(repository.mark_sync_failed(candidate_id, body.reason))}
     except Exception as exc:
         _raise_candidate_error(exc)
 

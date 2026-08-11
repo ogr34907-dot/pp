@@ -175,3 +175,36 @@ async def test_scene_generation_service_retrieves_vector_context_by_novel_collec
     assert context["chapters"][0]["text"] == "上一章摘要"
     assert context["bible_snippets"][0]["text"] == "地点设定"
     assert context["foreshadowings"][0]["description"] == "旧钥匙 关联 伏笔"
+
+
+@pytest.mark.asyncio
+async def test_scene_generation_context_filters_retired_worldline_vectors(monkeypatch):
+    class EpochVectorStore(FakeVectorStore):
+        async def search(self, collection, query_vector, limit):
+            return [
+                {"score": 0.95, "payload": {"kind": "chapter_summary", "text": "旧世界线", "generation_epoch": 0}},
+                {"score": 0.90, "payload": {"kind": "chapter_summary", "text": "当前世界线", "generation_epoch": 1}},
+            ]
+
+    monkeypatch.setattr(
+        "application.core.services.scene_generation_service.active_generation_epoch",
+        lambda _novel_id: 1,
+    )
+    service = SceneGenerationService(
+        llm_service=object(),
+        scene_director=object(),
+        vector_store=EpochVectorStore(),
+        embedding_service=FakeEmbeddingService(),
+    )
+    scene = Scene(
+        title="旧车站追问", goal="逼近真相", pov_character="沈岚", location="旧车站",
+        tone="紧张", estimated_words=800, order_index=0,
+    )
+
+    context = await service._retrieve_relevant_context(
+        scene=scene,
+        scene_analysis=SimpleNamespace(characters=["沈岚"], locations=["旧车站"]),
+        bible_context={"novel_id": "novel-1"},
+    )
+
+    assert [item["text"] for item in context["chapters"]] == ["当前世界线"]

@@ -5,25 +5,10 @@
         <h2 class="work-title">{{ bookTitle || slug }}</h2>
         <n-text depth="3" class="work-sub">{{ slug }}</n-text>
       </div>
-      <div v-if="!proseOnlyWorkbench" class="work-mode-switch" role="group" aria-label="创作模式">
-        <n-switch
-          v-model:value="workMode"
-          checked-value="managed"
-          unchecked-value="assisted"
-          size="large"
-        >
-          <template #unchecked>辅助撰稿</template>
-          <template #checked>托管撰稿</template>
-        </n-switch>
-      </div>
     </header>
 
     <div class="work-body">
-      <!--
-        辅助撰稿与托管撰稿须同时保留在 DOM（v-show，勿用 v-if）：
-        切到辅助撰稿时若卸载 AutopilotPanel，其 onUnmounted 会 stopChapterStream()，
-        章节 SSE 断开会导致全托管写作异常/重连后重复写。
-      -->
+      <!-- The candidate workflow is the sole author-facing generation entry. -->
       <div v-show="workMode === 'assisted'" class="assisted-stack">
         <n-alert
           v-if="isAssistedReadOnly"
@@ -202,7 +187,7 @@
                             :disabled="isAutopilotRunning || isAssistedReadOnly"
                           >
                             <template #icon><n-icon :component="RefreshOutline" /></template>
-                            重新生成
+                            {{ proseOnlyWorkbench ? '重新生成' : '世界线重生成' }}
                           </n-button>
                         </template>
                       </n-tooltip>
@@ -324,12 +309,7 @@
         class="managed-stack"
         :novel-id="slug"
         :target-chapters="targetChapters"
-        :cockpit-visible="workMode === 'managed'"
-        @status-change="handleAutopilotStatusChange"
-        @chapter-content-update="handleChapterContentUpdate"
-        @chapter-chunk="handleChapterChunkStream"
         @desk-refresh="handleAutopilotDeskRefreshFromStream"
-        @beats-planned="handleAutopilotBeatsPlanned"
       />
 
     </div>
@@ -814,11 +794,11 @@
 
 <script setup lang="ts">
 import { ref, watch, computed, nextTick, onBeforeUnmount, defineAsyncComponent, type Component } from 'vue'
+import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useDialog, useMessage } from 'naive-ui'
 import type { AutopilotStatus } from '../../api/autopilot'
 import {
-  consumeGenerateChapterStream,
   analyzeScene,
   retrieveContext,
   saveChapterDraft,
@@ -827,7 +807,6 @@ import {
 import type { ContextPreviewResult, GenerateChapterWorkflowResponse, StreamGeneratedBeat } from '../../api/workflow'
 import type { GenerationPrefsDTO } from '@/api/novel'
 import { chapterApi } from '../../api/chapter'
-import { aiInvocationApi } from '../../api/aiInvocation'
 import { llmControlApi, type LLMProfile } from '../../api/llmControl'
 import { tensionApi } from '../../api/tools'
 import type { TensionDiagnosis } from '../../api/tools'
@@ -835,8 +814,6 @@ import ChapterWorkbenchShell from './ChapterWorkbenchShell.vue'
 import { useChapterDeskLayout } from '../../composables/useChapterDeskLayout'
 import { useDebouncedTask } from '../../composables/useDebouncedTask'
 import { useWorkbenchRefreshStore } from '../../stores/workbenchRefreshStore'
-import { useAIInvocationStore } from '../../stores/aiInvocationStore'
-import { featureFlags } from '../../config/features'
 import { runtimePerformance } from '../../config/performance'
 import {
   CHAPTER_DESK_AUX_ORDER,
@@ -910,6 +887,8 @@ const props = withDefaults(defineProps<WorkAreaProps>(), {
   targetChapters: 1,
 })
 
+const router = useRouter()
+
 function ordinalUnit(n: number) {
   return narrativeOrdinalLabel(n, props.generationPrefs ?? undefined)
 }
@@ -926,7 +905,6 @@ const desk = useChapterDeskLayout()
 
 const workbenchRefresh = useWorkbenchRefreshStore()
 const { deskTick } = storeToRefs(workbenchRefresh)
-const aiInvocationStore = useAIInvocationStore()
 const managedWorkbenchEnabled = true
 const proseOnlyWorkbench = !managedWorkbenchEnabled
 
@@ -1499,6 +1477,7 @@ const prosePrimaryGenerationTarget = computed<ProseGenerationChapterTarget | nul
 })
 
 const prosePrimaryActionLabel = computed(() => {
+  if (!proseOnlyWorkbench) return '候选写作'
   return getProsePrimaryActionLabel(proseOnlyWorkbench, hasChapterContent.value)
 })
 
@@ -1614,68 +1593,10 @@ const handleReload = async () => {
   }
 }
 
-async function openProseInvocationForChapter(
-  target: ProseGenerationChapterTarget,
-  options?: {
-    userRequirements?: string
-  },
-) {
-  if (generateInProgress.value) return
-  const chapterNumber = target.number
-  generatingChapterId.value = target.id
-  generateInProgress.value = true
-  try {
-    const payload = await aiInvocationApi.create({
-      operation: 'chapter.generate.prose',
-      node_key: 'chapter-prose-generation',
-      policy: featureFlags.aiInvocationDebug ? 'FULL_INTERACTIVE' : 'DIRECT',
-      context: {
-        novel_id: props.slug,
-        chapter_number: chapterNumber,
-      },
-      variables: {
-        novel_title: props.bookTitle || props.slug,
-        chapter_number: chapterNumber,
-        chapter_title: target.title || '',
-        user_requirements: options?.userRequirements || '',
-      },
-    })
-    if (props.chapters.some(ch => ch.number === chapterNumber)) {
-      emit('selectChapter', chapterNumber, target.title || '')
-    }
-    aiInvocationStore.openFromResponse(payload)
-    if (payload.session?.status === 'completed') {
-      emit('selectChapter', chapterNumber, target.title || '')
-      emit('chapterUpdated')
-      if (currentChapter.value?.number === chapterNumber) {
-        void handleReload()
-      }
-      return
-    }
-    if (payload.session?.id) {
-      const stopListening = aiInvocationStore.onSessionUpdate(payload.session.id, (nextPayload) => {
-        if (nextPayload.session?.status !== 'completed') return
-        stopListening()
-        emit('selectChapter', chapterNumber, target.title || '')
-        emit('chapterUpdated')
-        if (currentChapter.value?.number === chapterNumber) {
-          void handleReload()
-        }
-      })
-    }
-  } catch (err) {
-    message.error(`创建正文生成任务失败：${formatApiError(err, '未知错误')}`)
-  } finally {
-    generateInProgress.value = false
-    generatingChapterId.value = null
-  }
-}
-
 const handleGenerateChapter = async () => {
-  if (proseOnlyWorkbench) {
-    const target = prosePrimaryGenerationTarget.value
-    if (!target) return
-    await openProseInvocationForChapter(target)
+  if (!proseOnlyWorkbench) {
+    workMode.value = 'managed'
+    message.info('正文生成已改为候选写作。候选通过审校后才会正式写入书稿。')
     return
   }
   if (!currentChapter.value) return
@@ -1699,26 +1620,12 @@ const handleGenerateChapter = async () => {
 
 const handleRegenerateChapter = async () => {
   if (!currentChapter.value) return
-  if (isAssistedReadOnly.value) {
-    message.warning('托管运行中不可使用重新生成')
+  if (!proseOnlyWorkbench) {
+    await router.push(`/book/${props.slug}/worldline`)
     return
   }
-
-  if (proseOnlyWorkbench) {
-    try {
-      await saveChapterDraft(props.slug, currentChapter.value.number, 'pre_regen')
-    } catch (e: unknown) {
-      const status = getHttpStatus(e)
-      const detail = formatApiError(e, '未知错误')
-      if (status === 422 || detail.includes('内容为空')) {
-        message.warning('当前无正文可快照，将直接进入重新生成面板')
-      } else {
-        message.warning(`历史草稿快照失败，将继续打开面板：${detail}`)
-      }
-    }
-    await openProseInvocationForChapter(currentChapter.value, {
-      userRequirements: '本次为重新生成当前章节。请保留核心设定与章节定位，但整体重写为全新正文，不要沿袭现有措辞。',
-    })
+  if (isAssistedReadOnly.value) {
+    message.warning('托管运行中不可使用重新生成')
     return
   }
 
@@ -1736,226 +1643,10 @@ const handleRegenerateChapter = async () => {
   void loadLLMProfilesForModal()
 }
 
-const handleStartGenerate = async () => {
-  const target = modalTargetChapter.value
-  if (!target) {
-    message.warning('请选择目标章节')
-    return
-  }
-  if (isAssistedReadOnly.value) {
-    message.warning('托管运行中不可手动生成')
-    return
-  }
-
-  const targetChapterId = target.id
-  const targetChapterNumber = target.number
-  generatingChapterId.value = targetChapterId
-  generateInProgress.value = true
-  assistStreamBeatSession.value = null
-  assistStreamFailedChapter.value = null
-  assistStreamPlanFailedChapter.value = null
-  generateSseLog.value = []
-  generateStreamPhase.value = ''
-  outlinePartitionChunkCount.value = 0
-  proseChunkLogCount.value = 0
-  generatedContent.value = ''
-  sceneDirectorError.value = ''
-  lastWorkflowResult.value = null
-  lastQcChapterNumber.value = null
-  streamPhaseLabel.value = '连接中…'
-  streamProgressPct.value = 8
-  streamStats.value = { chars: 0, estimated_tokens: 0, chunks: 0 }
-  pushGenerateSseLog('SSE', '正在连接 generate-chapter-stream…')
-
-  const ctrl = new AbortController()
-  generateAbortCtrl.value = ctrl
-
-  let sceneDirectorResult: Record<string, unknown> | undefined = blurSceneCache.value
-  if (useSceneDirector.value && !sceneDirectorResult) {
-    analyzingScene.value = true
-    try {
-      const outline = generateOutline.value || `${ordinalUnit(targetChapterNumber)}：承接前情，推进主线`
-      const analysis = await analyzeScene(props.slug, targetChapterNumber, outline)
-      sceneDirectorResult = analysis as Record<string, unknown>
-    } catch (e: unknown) {
-      sceneDirectorError.value = e instanceof Error ? e.message : '分析失败'
-    } finally {
-      analyzingScene.value = false
-    }
-  }
-
-  const defaultOutline = `${ordinalUnit(targetChapterNumber)}：承接前情，推进主线`
-
-  // 重新生成模式：先快照当前内容；快照失败时弹确认（422 无正文仅提示后继续）
-  if (isRegenerationMode.value) {
-    savingDraftBeforeRegen.value = true
-    try {
-      await saveChapterDraft(props.slug, targetChapterNumber, 'pre_regen')
-    } catch (e: unknown) {
-      const status = getHttpStatus(e)
-      const detail = formatApiError(e, '未知错误')
-      if (status === 422 || detail.includes('内容为空')) {
-        message.warning('当前无正文可快照，将直接继续生成')
-      } else {
-        const proceed = await new Promise<boolean>((resolve) => {
-          dialog.warning({
-            title: '未能保存历史草稿',
-            content: `无法将当前版本快照到历史（${detail}）。若继续重新生成，原内容可能无法从草稿恢复。是否仍要继续？`,
-            positiveText: '继续生成',
-            negativeText: '取消',
-            maskClosable: false,
-            onPositiveClick: () => {
-              resolve(true)
-            },
-            onNegativeClick: () => {
-              resolve(false)
-            },
-            onClose: () => {
-              resolve(false)
-            },
-          })
-        })
-        if (!proceed) {
-          generateInProgress.value = false
-          generatingChapterId.value = null
-          generateAbortCtrl.value = null
-          streamPhaseLabel.value = ''
-          streamProgressPct.value = 0
-          return
-        }
-      }
-    } finally {
-      savingDraftBeforeRegen.value = false
-    }
-  }
-
-  try {
-    await consumeGenerateChapterStream(
-      props.slug,
-      {
-        chapter_number: targetChapterNumber,
-        outline: generateOutline.value || defaultOutline,
-        scene_director_result: sceneDirectorResult,
-        regeneration_guidance: isRegenerationMode.value && regenerationGuidance.value.trim()
-          ? regenerationGuidance.value.trim()
-          : undefined,
-        profile_id: generateProfileId.value || undefined,
-        script_prompt_template: useCustomScriptPrompt.value
-          ? customScriptTemplate.value || undefined
-          : undefined,
-        prose_prompt_template: useCustomProsePrompt.value
-          ? customProseTemplate.value || undefined
-          : undefined,
-        prompt_variables: buildPromptVariables() || undefined,
-      },
-      {
-        signal: ctrl.signal,
-        onPhase: (phase) => {
-          generateStreamPhase.value = phase
-          streamPhaseLabel.value = streamPhaseToLabel(phase)
-          streamProgressPct.value = streamPhaseToProgress(phase)
-          pushGenerateSseLog('SSE', streamPhaseToLogLabel(phase))
-        },
-        onBeatsGenerated: (beats) => {
-          outlinePartitionChunkCount.value = 0
-          generateStreamPhase.value = 'prose'
-          streamPhaseLabel.value = streamPhaseToLabel('prose')
-          streamProgressPct.value = streamPhaseToProgress('prose')
-          pushGenerateSseLog(
-            '规划',
-            beats.length > 0 ? `历史拆拍结果 ×${beats.length}` : '规划未返回拆拍',
-          )
-          if (beats.length >= 2) {
-            if (assistStreamPlanFailedChapter.value === targetChapterNumber) {
-              assistStreamPlanFailedChapter.value = null
-            }
-          } else if (beats.length === 0) {
-            assistStreamPlanFailedChapter.value = targetChapterNumber
-          }
-          applyAssistStreamBeats(targetChapterNumber, beats)
-        },
-        onLLMChunk: (stage, text) => {
-          if (stage === 'outline_partition') {
-            outlinePartitionChunkCount.value += 1
-            generateStreamPhase.value = 'outline_planning'
-            streamPhaseLabel.value = '章节执行剧本准备…'
-            streamProgressPct.value = Math.max(
-              streamProgressPct.value,
-              streamPhaseToProgress('outline_planning'),
-            )
-            const n = outlinePartitionChunkCount.value
-            if (n === 1 || n % 4 === 0) {
-              pushGenerateSseLog('规划', `执行剧本增量 ×${n}（+${text.length}）`)
-            }
-          }
-        },
-        onChunk: (text, stats) => {
-          generatedContent.value += text
-          proseChunkLogCount.value += 1
-          const pc = proseChunkLogCount.value
-          if (pc === 1) {
-            pushGenerateSseLog('正文', 'chunk 流式输出开始…')
-          } else if (pc % 32 === 0) {
-            pushGenerateSseLog('正文', `chunk ×${pc}`)
-          }
-          if (stats) {
-            streamStats.value = stats
-          }
-        },
-        onDone: (result) => {
-          pushGenerateSseLog('SSE', 'done · 生成完成')
-          lastWorkflowResult.value = result
-          lastQcChapterNumber.value = targetChapterNumber
-          generatedContent.value = result.content
-          streamProgressPct.value = 100
-          streamPhaseLabel.value = '已完成'
-          assistStreamFailedChapter.value = null
-          if (result.beats?.length) {
-            applyAssistStreamBeats(targetChapterNumber, result.beats)
-          }
-          const beatCount =
-            result.beats?.length ??
-            (assistStreamBeatSession.value?.chapterNumber === targetChapterNumber
-              ? assistStreamBeatSession.value.beats.length
-              : 0)
-          if (beatCount <= 1) {
-            assistStreamPlanFailedChapter.value = targetChapterNumber
-          } else if (assistStreamPlanFailedChapter.value === targetChapterNumber) {
-            assistStreamPlanFailedChapter.value = null
-          }
-          if (props.currentChapterId === targetChapterId) {
-            message.success('生成完成，质检已同步到本章侧栏')
-          } else {
-            message.success(`${ordinalUnit(targetChapterNumber)}生成完成，请在对应章侧栏查看质检`)
-          }
-          desk.nudgeRailAfterGeneration()
-        },
-        onError: (err) => {
-          if (!ctrl.signal.aborted) {
-            message.error(`生成失败: ${err}`)
-            assistStreamFailedChapter.value = targetChapterNumber
-            assistStreamPlanFailedChapter.value = targetChapterNumber
-            pushGenerateSseLog('SSE', `error · ${err}`)
-          }
-        },
-      }
-    )
-  } catch {
-    if (!ctrl.signal.aborted) {
-      message.error('生成失败')
-      assistStreamFailedChapter.value = targetChapterNumber
-      assistStreamPlanFailedChapter.value = targetChapterNumber
-      pushGenerateSseLog('SSE', 'catch · 请求异常')
-    }
-  } finally {
-    generateInProgress.value = false
-    generatingChapterId.value = null
-    generateAbortCtrl.value = null
-    if (!ctrl.signal.aborted && streamProgressPct.value < 100) {
-      streamPhaseLabel.value = ''
-      streamProgressPct.value = 0
-    }
-  }
+const handleStartGenerate = () => {
+  showGenerateModal.value = false
+  workMode.value = 'managed'
+  message.info('旧的直写生成已停用。请在候选写作中生成、审校并正式提交章节。')
 }
 
 const handleSaveGenerated = async () => {

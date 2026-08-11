@@ -59,6 +59,64 @@ def test_review_mode_enforces_one_pending_candidate_and_never_prefetches(candida
         )
 
 
+def test_start_run_resumes_formal_cursor_after_existing_chapters(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "existing-chapters.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-existing", "Existing Novel", "existing-novel", 20),
+    )
+    for number in (1, 2):
+        conn.execute(
+            """
+            INSERT INTO chapters (id, novel_id, number, title, content, status)
+            VALUES (?, 'novel-existing', ?, ?, ?, 'completed')
+            """,
+            (f"chapter-{number}", number, f"第{number}章", f"正文{number}"),
+        )
+    conn.commit()
+
+    repo = ChapterCandidateRepository(db)
+    run = repo.start_run(
+        "novel-existing", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+
+    assert run.current_formal_chapter == 2
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-existing", chapter_number=3, title="第三章", outline_chain=_chain()
+    )
+    assert candidate.chapter_number == 3
+
+
+def test_create_candidate_requires_the_immediate_next_formal_chapter(candidates):
+    repo, db = candidates
+    db.execute(
+        "UPDATE novel_generation_runs SET current_formal_chapter = 2 WHERE novel_id = 'novel-1'"
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(CandidateGateError, match="immediate next chapter"):
+        repo.create_streaming_candidate(
+            novel_id="novel-1", chapter_number=4, title="第四章", outline_chain=_chain()
+        )
+
+
+def test_stopped_review_candidate_must_be_resolved_before_a_new_run(candidates):
+    repo, _db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain(), llm_content="候选"
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    stopped = repo.stop_run("novel-1")
+
+    assert stopped.state == GenerationRunState.STOPPED
+    assert stopped.current_candidate_id == candidate.id
+    with pytest.raises(CandidateGateError, match="pending candidate"):
+        repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    assert repo.get_run("novel-1").state == GenerationRunState.STOPPED
+
+
 def test_author_edit_stales_audit_and_commit_plan_until_reaudited(candidates):
     repo, db = candidates
     candidate = repo.create_streaming_candidate(

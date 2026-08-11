@@ -110,7 +110,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMessage } from 'naive-ui'
 import {
@@ -121,6 +121,7 @@ import {
   generationApi, getGenerationRunOrNull, type CandidateVersion, type ChapterCandidate, type GenerationRun,
 } from '@/api/generation'
 import { getGenerationPresentation } from '@/domain/generationPresentation'
+import { isReviewDraftDirty, type ReviewDraft } from '@/domain/reviewDraft'
 
 type MobileTab = 'manuscript' | 'contract' | 'audit' | 'commit'
 const route = useRoute()
@@ -159,36 +160,70 @@ const auditSummary = computed(() => candidate.value?.audit?.status === 'blocked'
 const wordCount = computed(() => editorContent.value.replace(/\s/g, '').length)
 const canCommit = computed(() => Boolean(candidate.value?.audit_is_current && candidate.value?.commit_plan_is_current && candidate.value?.status === 'awaiting_review'))
 const commitPlan = reactive({ chapter_summary: '', eventsText: '', handoffText: '' })
+const savedDraft = ref<ReviewDraft>({
+  content: '', feedback: '', chapterSummary: '', eventsText: '', handoffText: '',
+})
+const hasUnsavedDraft = computed(() => isReviewDraftDirty(currentDraft(), savedDraft.value))
 let pollTimer: number | null = null
 
 function listText(value: unknown) { return Array.isArray(value) ? value.map(item => String(item)).join('\n') : '' }
-function syncEditorFromCandidate(value: ChapterCandidate | null) {
-  if (!value) { editorContent.value = ''; return }
-  editorContent.value = value.final_content
+function currentDraft(): ReviewDraft {
+  return {
+    content: editorContent.value,
+    feedback: feedback.value,
+    chapterSummary: commitPlan.chapter_summary,
+    eventsText: commitPlan.eventsText,
+    handoffText: commitPlan.handoffText,
+  }
+}
+function draftFromCandidate(value: ChapterCandidate | null): ReviewDraft {
+  if (!value) return { content: '', feedback: '', chapterSummary: '', eventsText: '', handoffText: '' }
   const plan = value.commit_plan || {}
-  commitPlan.chapter_summary = String(plan.chapter_summary || '')
-  commitPlan.eventsText = listText(plan.timeline_events)
-  commitPlan.handoffText = listText(plan.next_chapter_handoff)
+  return {
+    content: value.final_content,
+    feedback: value.feedback || '',
+    chapterSummary: String(plan.chapter_summary || ''),
+    eventsText: listText(plan.timeline_events),
+    handoffText: listText(plan.next_chapter_handoff),
+  }
+}
+function syncEditorFromCandidate(
+  value: ChapterCandidate | null,
+  { force = false, preserveFeedback = false }: { force?: boolean; preserveFeedback?: boolean } = {},
+) {
+  if (!force && hasUnsavedDraft.value) return
+  const remote = draftFromCandidate(value)
+  const localFeedback = feedback.value
+  editorContent.value = remote.content
+  feedback.value = preserveFeedback ? localFeedback : remote.feedback
+  commitPlan.chapter_summary = remote.chapterSummary
+  commitPlan.eventsText = remote.eventsText
+  commitPlan.handoffText = remote.handoffText
+  savedDraft.value = remote
 }
 function lines(value: string) { return value.split(/\r?\n/).map(item => item.trim()).filter(Boolean) }
 
-async function refresh() {
+async function refresh(options: { force?: boolean; preserveFeedback?: boolean } = {}) {
   if (!novelId.value) return
   loading.value = true
   error.value = ''
   try {
     run.value = await getGenerationRunOrNull(novelId.value)
-    syncEditorFromCandidate(candidate.value)
+    syncEditorFromCandidate(candidate.value, options)
     versions.value = candidate.value ? await generationApi.listCandidateVersions(candidate.value.id) : []
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : '读取候选状态失败'
   } finally { loading.value = false }
 }
 
-async function applyAction(action: () => Promise<unknown>, success: string) {
+async function applyAction(
+  action: () => Promise<unknown>,
+  success: string,
+  refreshOptions: { preserveFeedback?: boolean } = {},
+) {
   actionLoading.value = true
   error.value = ''
-  try { await action(); await refresh(); message.success(success) }
+  try { await action(); await refresh({ force: true, ...refreshOptions }); message.success(success) }
   catch (cause) { error.value = cause instanceof Error ? cause.message : '操作失败' }
   finally { actionLoading.value = false }
 }
@@ -208,7 +243,11 @@ async function saveCommitPlan() {
     timeline_events: lines(commitPlan.eventsText),
     next_chapter_handoff: lines(commitPlan.handoffText),
   }
-  await applyAction(() => generationApi.saveCommitPlan(candidate.value!.id, plan), '作者确认的提交清单已保存。')
+  await applyAction(
+    () => generationApi.saveCommitPlan(candidate.value!.id, plan),
+    '作者确认的提交清单已保存。',
+    { preserveFeedback: true },
+  )
 }
 async function regenerate() {
   if (!candidate.value) return
@@ -235,9 +274,8 @@ async function reject() {
   await applyAction(() => generationApi.reject(candidate.value!.id), '候选稿已放弃，运行已停止。')
 }
 
-watch(candidate, syncEditorFromCandidate)
 onMounted(async () => {
-  await refresh()
+  await refresh({ force: true })
   pollTimer = window.setInterval(() => { if (!actionLoading.value) void refresh() }, 2500)
 })
 onUnmounted(() => { if (pollTimer !== null) window.clearInterval(pollTimer) })

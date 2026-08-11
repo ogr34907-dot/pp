@@ -57,6 +57,16 @@ def test_autopilot_panel_respects_ai_invocation_debug_flag():
     assert "if (!s?.requires_ai_review || !sessionId) return" not in text
 
 
+def test_work_area_routes_prose_actions_to_candidate_and_worldline_workflows():
+    text = Path("frontend/src/components/workbench/WorkArea.vue").read_text(encoding="utf-8")
+
+    assert "consumeGenerateChapterStream" not in text
+    assert "aiInvocationApi.create" not in text
+    assert "chapter.generate.prose" not in text
+    assert "workMode.value = 'managed'" in text
+    assert "router.push(`/book/${props.slug}/worldline`)" in text
+
+
 def test_ai_invocation_review_panel_is_debug_only():
     app_text = Path("frontend/src/App.vue").read_text(encoding="utf-8")
     store_text = Path("frontend/src/stores/aiInvocationStore.ts").read_text(encoding="utf-8-sig")

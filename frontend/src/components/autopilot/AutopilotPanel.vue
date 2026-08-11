@@ -312,7 +312,7 @@
     <!-- 操作按钮 -->
     <n-space justify="end" size="small">
       <n-button
-        v-if="canonicalAftermathPresentation.resumeAction.visible && canonicalAftermathPresentation.resumeAction.mode === 'review'"
+        v-if="!props.candidateOnly && canonicalAftermathPresentation.resumeAction.visible && canonicalAftermathPresentation.resumeAction.mode === 'review'"
         type="warning"
         ghost
         size="small"
@@ -323,7 +323,7 @@
         再次确认 · 继续
       </n-button>
       <n-button
-        v-else-if="canonicalAftermathPresentation.resumeAction.visible && canonicalAftermathPresentation.resumeAction.mode === 'manual-pause'"
+        v-else-if="!props.candidateOnly && canonicalAftermathPresentation.resumeAction.visible && canonicalAftermathPresentation.resumeAction.mode === 'manual-pause'"
         type="primary"
         size="small"
         :disabled="canonicalAftermathPresentation.resumeAction.disabled"
@@ -332,15 +332,15 @@
       >
         恢复
       </n-button>
-      <n-button v-if="!isRunning && !needsReview && !needsRecovery && !isManualPause && !fullResyncActive" type="primary" size="small" :loading="toggling" @click="openStartModal">
+      <n-button v-if="!props.candidateOnly && !isRunning && !needsReview && !needsRecovery && !isManualPause && !fullResyncActive" type="primary" size="small" :loading="toggling" @click="openStartModal">
         <template #icon><n-icon><PlayOutline /></n-icon></template>
         启动全托管
       </n-button>
-      <n-button v-if="isRunning && !needsReview" type="warning" ghost size="small" :loading="toggling" @click="pause">
+      <n-button v-if="!props.candidateOnly && isRunning && !needsReview" type="warning" ghost size="small" :loading="toggling" @click="pause">
         暂停
       </n-button>
       <n-popconfirm
-        v-if="canTerminate"
+        v-if="!props.candidateOnly && canTerminate"
         positive-text="终止"
         negative-text="取消"
         @positive-click="terminate"
@@ -352,18 +352,18 @@
         </template>
         终止会清理当前未提交的临时生成内容，且不能恢复。
       </n-popconfirm>
-      <n-button v-if="needsRecovery && !isRunning" type="primary" size="small" :loading="toggling" @click="retry">
+      <n-button v-if="!props.candidateOnly && needsRecovery && !isRunning" type="primary" size="small" :loading="toggling" @click="retry">
         重试
       </n-button>
       <!-- 🔥 error 状态下显示强制停止按钮（解除挂起 + 停止） -->
-      <n-button v-if="needsRecovery && !isRunning" type="error" size="small" :loading="toggling" @click="forceStopFromError">
+      <n-button v-if="!props.candidateOnly && needsRecovery && !isRunning" type="error" size="small" :loading="toggling" @click="forceStopFromError">
         <template #icon><n-icon><StopOutline /></n-icon></template>
         强制停止
       </n-button>
     </n-space>
 
     <!-- 启动配置弹窗 -->
-    <n-modal v-model:show="showStartModal" title="启动全托管" preset="dialog" positive-text="启动" :positive-button-props="{ disabled: fullResyncActive }" @positive-click="start">
+    <n-modal v-if="!props.candidateOnly" v-model:show="showStartModal" title="启动全托管" preset="dialog" positive-text="启动" :positive-button-props="{ disabled: fullResyncActive }" @positive-click="start">
       <n-space vertical :size="12" style="width: 100%">
         <n-alert type="success" :show-icon="true" style="font-size: 12px">
           <strong>自动托管</strong>：守护进程已在后端自动启动，配置好参数后点击"启动"即可开始自动写作。
@@ -459,6 +459,7 @@ import { PlayOutline, RefreshOutline, StopOutline } from '@vicons/ionicons5'
 const props = defineProps({
   novelId: String,
   renderLivePreview: { type: Boolean, default: true },
+  candidateOnly: { type: Boolean, default: false },
 })
 const emit = defineEmits([
   'status-change',

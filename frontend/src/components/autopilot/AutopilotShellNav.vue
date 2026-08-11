@@ -1,16 +1,16 @@
 <template>
-  <header class="ap-shell-nav" role="navigation" aria-label="托管工作区分页">
+  <header class="ap-shell-nav" role="navigation" aria-label="候选写作工作区分页">
     <div class="ap-shell-nav__brand">
       <span class="ap-shell-nav__mark" aria-hidden="true" />
       <div class="ap-shell-nav__titles">
-        <span class="ap-shell-nav__eyebrow">Autopilot</span>
+        <span class="ap-shell-nav__eyebrow">候选工作台</span>
         <span class="ap-shell-nav__active-label">{{ activeMeta.label }}</span>
       </div>
     </div>
     <div
       class="ap-shell-nav__segments"
       role="tablist"
-      aria-label="切换托管视图"
+      aria-label="切换候选写作视图"
     >
       <button
         v-for="tab in AUTOPILOT_WORKSPACE_TABS"
@@ -93,7 +93,7 @@ const activeMeta = computed(() => {
 .ap-shell-nav__eyebrow {
   font-size: 10px;
   font-weight: 600;
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
   text-transform: uppercase;
   color: var(--app-text-muted);
 }
@@ -102,7 +102,7 @@ const activeMeta = computed(() => {
   font-size: 15px;
   font-weight: 650;
   color: var(--app-text-primary);
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
 }
 
 .ap-shell-nav__segments {
@@ -195,7 +195,11 @@ const activeMeta = computed(() => {
   .ap-shell-nav__segments {
     grid-column: 1;
     grid-row: 2;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 4px;
     justify-self: stretch;
+    overflow-x: visible;
   }
 
   .ap-shell-nav__desc {
@@ -206,11 +210,21 @@ const activeMeta = computed(() => {
   }
 
   .ap-shell-nav__segment {
-    min-width: 88px;
+    min-width: 0;
+    min-height: 44px;
+    align-items: center;
+    padding: 6px 4px;
+    text-align: center;
   }
 
   .ap-shell-nav__segment-hint {
     display: none;
+  }
+}
+
+@media (max-width: 360px) {
+  .ap-shell-nav__segments {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 </style>

@@ -10,6 +10,10 @@ from domain.novel.value_objects.scene import Scene
 from domain.ai.services.llm_service import LLMService, GenerationConfig
 from domain.ai.value_objects.prompt import Prompt
 from application.engine.services.scene_director_service import SceneDirectorService
+from application.engine.services.worldline_generation_guard import (
+    active_generation_epoch,
+    is_payload_in_active_epoch,
+)
 
 if TYPE_CHECKING:
     from infrastructure.ai.chromadb_vector_store import ChromaDBVectorStore
@@ -121,6 +125,7 @@ class SceneGenerationService:
         novel_id = str((bible_context or {}).get("novel_id") or "").strip()
         if not novel_id:
             return result
+        active_epoch = active_generation_epoch(novel_id)
 
         collection = f"novel_{novel_id}_chunks"
         try:
@@ -153,6 +158,8 @@ class SceneGenerationService:
         for hit in hits or []:
             payload = dict(hit.get("payload") or {})
             if not payload:
+                continue
+            if not is_payload_in_active_epoch(payload, active_epoch=active_epoch):
                 continue
             kind = str(payload.get("kind") or "").lower()
             text = self._payload_text(payload)

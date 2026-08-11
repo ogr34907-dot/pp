@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
-/** 托管撰稿主工作区顶栏分页 */
+/** 候选写作主工作区顶栏分页 */
 export type AutopilotWorkspaceTab = 'cockpit' | 'governance' | 'dashboard' | 'operations'
 
 /** 「监控 + DAG」页内子视图 */
@@ -15,9 +15,9 @@ export const AUTOPILOT_WORKSPACE_TABS: ReadonlyArray<{
 }> = [
   {
     id: 'cockpit',
-    label: '全托管驾驶',
-    short: '驾驶舱',
-    description: '启动、暂停与写作进度',
+    label: '候选写作',
+    short: '候选写作',
+    description: '生成候选章并跟踪审稿进度',
   },
   {
     id: 'governance',

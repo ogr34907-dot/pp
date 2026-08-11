@@ -25,7 +25,7 @@
         <p class="worldline-planner__intro">当前正式主线共 <strong>{{ generatedChapters }}</strong> 章。输入从哪一章开始重生成，并选择后续写作模式。</p>
         <div class="worldline-inputs">
           <n-form-item label="从第 N 章开始"><n-input-number v-model:value="startChapter" :min="1" :max="Math.max(1, generatedChapters + 1)" /></n-form-item>
-          <n-form-item label="新目标 Y 章"><n-input-number v-model:value="targetChapters" :min="1" :max="100000" /></n-form-item>
+          <n-form-item label="新目标 Y 章"><n-input-number v-model:value="targetChapters" :min="Math.max(1, startChapter)" :max="100000" /></n-form-item>
         </div>
         <p class="worldline-rule">{{ rangeRule }}</p>
         <div class="mode-cards" role="radiogroup" aria-label="重生成后的自动驾驶模式">
@@ -83,7 +83,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMessage } from 'naive-ui'
 import { ClipboardOutline, FlashOutline } from '@vicons/ionicons5'
@@ -91,7 +91,9 @@ import {
   getGenerationRunOrNull, type GenerationRun, type RunMode, type WorldlineArchive, type WorldlinePreview,
   worldlineRegenerationApi,
 } from '@/api/generation'
+import { chapterApi } from '@/api/chapter'
 import { getGenerationPresentation } from '@/domain/generationPresentation'
+import { normalizeWorldlineTarget, resolveGeneratedChapterCount } from '@/domain/worldlineChapterCount'
 
 const route = useRoute()
 const router = useRouter()
@@ -101,6 +103,7 @@ const run = ref<GenerationRun | null>(null)
 const preview = ref<WorldlinePreview | null>(null)
 const archives = ref<WorldlineArchive[]>([])
 const rebuildStatus = ref<Record<string, unknown> | null>(null)
+const existingChapterHead = ref(0)
 const startChapter = ref(1)
 const targetChapters = ref(1)
 const runMode = ref<RunMode>('continuous')
@@ -112,7 +115,10 @@ const cancelling = ref(false)
 const restoringId = ref('')
 const error = ref('')
 const presentation = computed(() => getGenerationPresentation(run.value))
-const generatedChapters = computed(() => run.value?.current_formal_chapter || 0)
+const generatedChapters = computed(() => resolveGeneratedChapterCount(
+  run.value?.current_formal_chapter,
+  [{ number: existingChapterHead.value }],
+))
 const needsRebuild = computed(() => ['rebuilding', 'failed'].includes(String(run.value?.canonical_sync_status || '')))
 const rangeRule = computed(() => {
   const n = startChapter.value || 1
@@ -144,20 +150,28 @@ async function load() {
     ])
     run.value = nextRun
     archives.value = nextArchives
+    const chapters = nextRun ? [] : await chapterApi.listChapters(novelId.value)
+    existingChapterHead.value = resolveGeneratedChapterCount(null, chapters)
+    const generated = resolveGeneratedChapterCount(nextRun?.current_formal_chapter, chapters)
     if (nextRun) {
-      startChapter.value = Math.max(1, nextRun.current_formal_chapter || 1)
-      targetChapters.value = Math.max(nextRun.target_chapters || 1, nextRun.current_formal_chapter || 1)
+      startChapter.value = Math.max(1, generated || 1)
+      targetChapters.value = Math.max(nextRun.target_chapters || 1, generated || 1)
       runMode.value = nextRun.run_mode
       if (['rebuilding', 'failed'].includes(nextRun.canonical_sync_status)) {
         rebuildStatus.value = await worldlineRegenerationApi.rebuildStatus(novelId.value)
       }
+    } else {
+      startChapter.value = Math.max(1, generated || 1)
+      targetChapters.value = Math.max(1, generated || 1)
     }
   } catch (cause) { error.value = cause instanceof Error ? cause.message : '读取世界线状态失败' }
   finally { loading.value = false }
 }
 async function createPreview() {
   previewing.value = true; error.value = ''
-  try { preview.value = await worldlineRegenerationApi.preview(novelId.value, startChapter.value, targetChapters.value) }
+  const normalizedTarget = normalizeWorldlineTarget(startChapter.value, targetChapters.value)
+  targetChapters.value = normalizedTarget
+  try { preview.value = await worldlineRegenerationApi.preview(novelId.value, startChapter.value, normalizedTarget) }
   catch (cause) { error.value = cause instanceof Error ? cause.message : '创建影响预览失败' }
   finally { previewing.value = false }
 }
@@ -190,6 +204,11 @@ async function restore(archiveId: string) {
   catch (cause) { error.value = cause instanceof Error ? cause.message : '恢复旧世界线失败' }
   finally { restoringId.value = '' }
 }
+watch([startChapter, targetChapters], ([nextStart, nextTarget]) => {
+  const normalizedTarget = normalizeWorldlineTarget(nextStart, nextTarget)
+  if (normalizedTarget !== nextTarget) targetChapters.value = normalizedTarget
+  preview.value = null
+})
 onMounted(load)
 </script>
 

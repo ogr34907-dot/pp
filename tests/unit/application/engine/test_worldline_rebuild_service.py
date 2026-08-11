@@ -1,5 +1,6 @@
 """A regenerated worldline cannot resume until its retained prefix is canonical again."""
 
+import asyncio
 import pytest
 
 from application.engine.services.worldline_rebuild_service import WorldlineRebuildService
@@ -15,6 +16,18 @@ class _Aftermath:
     async def run_after_chapter_saved(self, _novel_id, chapter_number, _content, **_kwargs):
         self.chapters.append(chapter_number)
         return {"narrative_sync_ok": self.ok, "failure_reason": "fake-sync-failed" if not self.ok else ""}
+
+
+class _BlockingAftermath(_Aftermath):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run_after_chapter_saved(self, novel_id, chapter_number, content, **kwargs):
+        self.started.set()
+        await self.release.wait()
+        return await super().run_after_chapter_saved(novel_id, chapter_number, content, **kwargs)
 
 
 def _seed(db):
@@ -55,3 +68,35 @@ async def test_rebuild_replays_retained_prefix_before_mode_can_resume(tmp_path):
     assert db.fetch_one(
         "SELECT COUNT(*) AS total FROM worldline_rebuild_jobs WHERE novel_id = 'novel-1' AND status = 'completed'"
     )["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_cancelled_rebuild_cannot_resume_or_overwrite_the_new_epoch(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-rebuild-cancel.db"))
+    _seed(db)
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    aftermath = _BlockingAftermath()
+    service = WorldlineRebuildService(db, aftermath)
+
+    task = asyncio.create_task(service.rebuild("novel-1"))
+    await asyncio.wait_for(aftermath.started.wait(), timeout=1)
+    cancelled = service.cancel("novel-1")
+    aftermath.release.set()
+
+    result = await task
+
+    assert result["status"] == "cancelled"
+    assert result["generation_epoch"] == cancelled["generation_epoch"]
+    assert aftermath.chapters == [1]
+    run = db.fetch_one(
+        "SELECT state, canonical_sync_status, next_action, generation_epoch "
+        "FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+    )
+    assert (run["state"], run["canonical_sync_status"], run["next_action"]) == (
+        "stopped",
+        "failed",
+        "restart_worldline_rebuild",
+    )
+    assert run["generation_epoch"] == cancelled["generation_epoch"]
