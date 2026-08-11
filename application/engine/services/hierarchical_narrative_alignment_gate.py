@@ -167,6 +167,68 @@ class HierarchicalNarrativeAlignmentGate:
         return getattr(value, "value", value)
 
     @classmethod
+    def derive_contract_digest(cls, node: Any) -> str:
+        """Return a stable contract digest for legacy nodes that predate the metadata field."""
+        metadata = cls._node_value(node, "metadata", {}) or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                metadata = {}
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        stored = (
+            metadata.get("contract_digest")
+            or metadata.get("contract_hash")
+            or metadata.get("plan_digest")
+        )
+        if stored:
+            return str(stored)
+
+        contract_metadata = {
+            key: metadata[key]
+            for key in (
+                "narrative_goal",
+                "plot_points",
+                "key_characters",
+                "key_locations",
+                "emotional_arc",
+                "setup_for",
+                "payoff_from",
+                "required_threads",
+                "out_of_scope",
+                "character_agency",
+                "handoff_from_previous",
+                "handoff_to_next",
+            )
+            if key in metadata
+        }
+        payload = {
+            "node_type": cls._node_type(node),
+            "number": cls._node_value(node, "number"),
+            "title": cls._node_value(node, "title", ""),
+            "parent_id": cls._node_value(node, "parent_id"),
+            "chapter_start": cls._node_value(node, "chapter_start"),
+            "chapter_end": cls._node_value(node, "chapter_end"),
+            "chapter_count": cls._node_value(node, "chapter_count", 0),
+            "suggested_chapter_count": cls._node_value(node, "suggested_chapter_count"),
+            "description": cls._node_value(node, "description", ""),
+            "outline": cls._node_value(node, "outline", ""),
+            "themes": cls._node_value(node, "themes", None) or metadata.get("themes", []),
+            "key_events": cls._node_value(node, "key_events", None) or metadata.get("key_events", []),
+            "narrative_arc": cls._node_value(node, "narrative_arc", None) or metadata.get("narrative_arc", ""),
+            "conflicts": cls._node_value(node, "conflicts", None) or metadata.get("conflicts", []),
+            "metadata": contract_metadata,
+        }
+        encoded = json.dumps(
+            _json_safe(payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @classmethod
     def _node_record(cls, node: Any) -> dict[str, Any]:
         metadata = cls._node_value(node, "metadata", {}) or {}
         if isinstance(metadata, str):
@@ -209,7 +271,7 @@ class HierarchicalNarrativeAlignmentGate:
             "narrative_arc": cls._node_value(node, "narrative_arc", None) or metadata.get("narrative_arc", ""),
             "conflicts": cls._node_value(node, "conflicts", None) or metadata.get("conflicts", []),
             "metadata": metadata,
-            "contract_digest": metadata.get("contract_digest") or metadata.get("contract_hash") or metadata.get("plan_digest"),
+            "contract_digest": cls.derive_contract_digest(node),
         }
         # Keep all existing planning fields available to consumers without
         # coupling this gate to a particular schema revision.

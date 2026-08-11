@@ -8,6 +8,7 @@ from application.engine.services.hierarchical_narrative_alignment_gate import (
     HierarchicalNarrativeAlignmentGate,
     OneShotOverride,
 )
+from application.engine.services.narrative_gate_guard import evaluate_chapter_candidate
 from domain.structure.story_node import NodeType, StoryNode
 
 
@@ -234,3 +235,42 @@ def test_cross_novel_ancestor_is_blocking(chain):
 
     assert any(v.scope == "act" and v.actual == "other-novel" for v in snapshot.structural_violations)
     assert snapshot.ancestry["act"] is None
+
+
+@pytest.mark.asyncio
+async def test_guard_rebinds_legacy_stale_contract_map_to_canonical_ancestry(chain):
+    """NARRATIVE-ALIGNMENT-001: old planned chapters must not self-block on stale digest copies."""
+    chain[2].metadata = {"narrative_goal": "突破守军"}
+    chain[-1].metadata = {
+        "contract_digest": "persisted-chapter-contract",
+        "contract_digests": {
+            "chapter": "pre-normalization-contract",
+            "act": "missing-legacy-act-contract",
+            "volume": "wrong-volume-contract",
+        },
+        "key_characters": ["hero"],
+    }
+    repository = type(
+        "StoryNodeRepository",
+        (),
+        {"get_by_novel": AsyncMock(return_value=chain)},
+    )()
+    stale_candidate = candidate() | {
+        "contract_digests": {
+            "chapter": "pre-normalization-contract",
+            "act": "missing-legacy-act-contract",
+            "volume": "wrong-volume-contract",
+        }
+    }
+
+    report = await evaluate_chapter_candidate(
+        HierarchicalNarrativeAlignmentGate(),
+        story_node_repo=repository,
+        novel_id="novel-1",
+        chapter_number=1,
+        chapter_node=chain[-1],
+        candidate=stale_candidate,
+    )
+
+    assert report is not None
+    assert report.decision == "pass"

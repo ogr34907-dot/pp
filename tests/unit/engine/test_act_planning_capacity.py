@@ -610,6 +610,7 @@ async def test_first_act_inherits_parent_contract_and_volume_capacity(monkeypatc
     first_act = next(node for node in repo.saved if node.node_type == NodeType.ACT)
     assert first_act.suggested_chapter_count == 3
     assert first_act.order_index > volume.order_index
+    assert first_act.metadata["contract_digest"]
     for marker in (
         "安丰塘前",
         "本部先解决安丰塘的春汛与修堤危机。",

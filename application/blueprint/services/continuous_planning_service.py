@@ -1942,7 +1942,7 @@ class ContinuousPlanningService:
             metadata = {"act_chapter_plan": row.get("act_chapter_plan") or row}
             metadata["contract_digest"] = self._contract_digest(row)
             metadata["contract_digests"] = dict(row.get("contract_digests") or {})
-            metadata["contract_digests"].setdefault("chapter", metadata["contract_digest"])
+            metadata["contract_digests"]["chapter"] = metadata["contract_digest"]
             for key in ("serves_volume_commitments", "serves_part_commitments", "act_goal", "out_of_scope", "character_agency"):
                 if key in row:
                     metadata[key] = row[key]

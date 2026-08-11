@@ -6,6 +6,9 @@ from typing import Any, Dict, List, Mapping
 
 from domain.novel.entities.novel import Novel, NovelStage, AutopilotStatus
 from domain.structure.story_node import StoryNode, NodeType, PlanningStatus, PlanningSource
+from application.engine.services.hierarchical_narrative_alignment_gate import (
+    HierarchicalNarrativeAlignmentGate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +364,9 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
                 planning_source=PlanningSource.AI_MACRO,
                 suggested_chapter_count=continuation_volume_capacity,
             )
+            parent_volume.metadata["contract_digest"] = (
+                HierarchicalNarrativeAlignmentGate.derive_contract_digest(parent_volume)
+            )
             await host.story_node_repo.save(parent_volume)
             if (
                 parent_part is not None
@@ -445,6 +451,9 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
                         planning_status=PlanningStatus.CONFIRMED,
                         planning_source=PlanningSource.AI_MACRO,
                         suggested_chapter_count=first_act_capacity,
+                    )
+                    first_act.metadata["contract_digest"] = (
+                        HierarchicalNarrativeAlignmentGate.derive_contract_digest(first_act)
                     )
                     await host.story_node_repo.save(first_act)
 

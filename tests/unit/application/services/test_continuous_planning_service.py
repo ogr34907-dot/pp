@@ -1329,3 +1329,68 @@ def test_parse_llm_response_logs_safe_metadata_without_raw_planning_content(
     assert "content_length=" in caplog.text
     assert "content_sha256=" in caplog.text
     assert "line=1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_confirm_act_planning_replaces_stale_chapter_digest_after_row_normalization():
+    """PLANNING-ALIGNMENT-001: persisted chapter bindings must match the normalized contract, not a pre-normalization copy."""
+    part = _story_node("part-1", NodeType.PART, 1, metadata={"contract_digest": "part-contract"})
+    volume = _story_node(
+        "volume-1",
+        NodeType.VOLUME,
+        1,
+        parent_id=part.id,
+        metadata={"contract_digest": "volume-contract"},
+    )
+    act = _story_node(
+        "act-1",
+        NodeType.ACT,
+        1,
+        parent_id=volume.id,
+        metadata={"contract_digest": "act-contract"},
+    )
+    persisted_nodes = []
+
+    async def save_batch(nodes):
+        persisted_nodes.extend(nodes)
+
+    story_repo = SimpleNamespace(
+        get_by_id=AsyncMock(return_value=act),
+        get_by_novel=AsyncMock(return_value=[part, volume, act]),
+        get_by_novel_sync=Mock(return_value=[part, volume, act]),
+        get_children_sync=Mock(return_value=[]),
+        delete=AsyncMock(),
+        save_batch=save_batch,
+        update=AsyncMock(),
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=SimpleNamespace(
+            delete_by_chapter=AsyncMock(),
+            save_batch=AsyncMock(),
+        ),
+        chapter_repository=None,
+        llm_service=Mock(),
+    )
+    service._write_chapter_plan_variables = Mock()
+
+    result = await service.confirm_act_planning(
+        act.id,
+        [
+            {
+                "number": 1,
+                "title": "契约归位",
+                "main_event": "主角承担本章代价",
+                "handoff_from_previous": "承接前章悬念",
+                "handoff_to_next": "将选择交给下一章",
+                "contract_digests": {
+                    "chapter": "pre-normalization-contract",
+                },
+            }
+        ],
+    )
+
+    assert result["success"] is True
+    chapter = persisted_nodes[0]
+    assert chapter.metadata["contract_digests"]["chapter"] == chapter.metadata["contract_digest"]
+    assert chapter.metadata["contract_digests"]["chapter"] != "pre-normalization-contract"

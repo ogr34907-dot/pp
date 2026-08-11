@@ -136,6 +136,36 @@ async def evaluate_chapter_candidate(
         memory_state=memory_state,
         vector_evidence=vector_evidence,
     )
+    # Digest bindings are persisted structure metadata, not LLM output.  Old
+    # act plans can carry a digest copied before their chapter row was
+    # normalized, so bind the candidate to the canonical snapshot immediately
+    # before the gate evaluates its narrative content.
+    ancestry = getattr(snapshot, "ancestry", None)
+    if ancestry is None and isinstance(snapshot, Mapping):
+        ancestry = snapshot.get("ancestry")
+    canonical_digests: dict[str, str] = {}
+    if isinstance(ancestry, Mapping):
+        for level in ("chapter", "act", "volume"):
+            ancestor = ancestry.get(level)
+            if not isinstance(ancestor, Mapping):
+                continue
+            digest = ancestor.get("contract_digest")
+            if not digest:
+                metadata = ancestor.get("metadata") or {}
+                if isinstance(metadata, Mapping):
+                    digest = (
+                        metadata.get("contract_digest")
+                        or metadata.get("contract_hash")
+                        or metadata.get("plan_digest")
+                    )
+            if digest:
+                canonical_digests[level] = str(digest)
+    if canonical_digests:
+        candidate = dict(candidate)
+        raw_digests = candidate.get("contract_digests") or candidate.get("plan_contract_digests") or {}
+        digests = dict(raw_digests) if isinstance(raw_digests, Mapping) else {}
+        digests.update(canonical_digests)
+        candidate["contract_digests"] = digests
     evaluator = getattr(gate, "evaluate", None) or getattr(gate, "acheck", None)
     if evaluator is None:
         evaluator = getattr(gate, "check_alignment")

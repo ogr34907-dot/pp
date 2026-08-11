@@ -211,14 +211,21 @@ class ChapterPreplanningService:
             parts: list[str] = []
             async for chunk in stream:
                 parts.append(chunk)
-            return "".join(parts)
-        close = getattr(stream, "close", None)
-        if callable(close):
-            close()
+            streamed = "".join(parts)
+            if streamed.strip():
+                return streamed
+            logger.warning("[ChapterPreplan] stream returned no content; retrying once without streaming")
+        else:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
         result = self.llm_service.generate(prompt, config)
         if inspect.isawaitable(result):
             result = await result
-        return result.content if hasattr(result, "content") else str(result or "")
+        content = result.content if hasattr(result, "content") else str(result or "")
+        if not str(content or "").strip():
+            raise ValueError("chapter_preplan_empty_model_response")
+        return str(content)
 
     def _extract_act_plan(self, node: Any, outline: str) -> dict[str, Any] | str:
         metadata = getattr(node, "metadata", {}) if node is not None else {}

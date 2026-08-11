@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import multiprocessing
 import os
@@ -9,6 +10,7 @@ import signal
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from application.core.config.config_loader import get_config
@@ -23,6 +25,59 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 def _is_orphan_cleanup_disabled() -> bool:
     return os.getenv("DISABLE_ORPHAN_CLEANUP", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _daemon_pid_registry_path() -> Path:
+    return _project_root() / "logs" / ".plotpilot-autopilot-daemon.json"
+
+
+def _read_daemon_pid_registry() -> dict[str, int | str] | None:
+    path = _daemon_pid_registry_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        pid = int(payload.get("pid"))
+        parent_pid = int(payload.get("parent_pid"))
+        workspace_root = str(payload.get("workspace_root") or "")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    expected_root = os.path.normcase(os.path.abspath(str(_project_root())))
+    actual_root = os.path.normcase(os.path.abspath(workspace_root))
+    if pid <= 0 or parent_pid <= 0 or actual_root != expected_root:
+        return None
+    return {"pid": pid, "parent_pid": parent_pid, "workspace_root": workspace_root}
+
+
+def _write_daemon_pid_registry(pid: int, *, parent_pid: int | None = None) -> None:
+    if pid <= 0:
+        return
+    path = _daemon_pid_registry_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": int(pid),
+            "parent_pid": int(parent_pid if parent_pid is not None else os.getpid()),
+            "workspace_root": str(_project_root()),
+        }
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning("写入守护进程 PID 记录失败: %s", exc)
+
+
+def _clear_daemon_pid_registry(*, pid: int | None = None) -> None:
+    path = _daemon_pid_registry_path()
+    record = _read_daemon_pid_registry()
+    if pid is not None and record is not None and int(record["pid"]) != int(pid):
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("清理守护进程 PID 记录失败: %s", exc)
 
 
 @dataclass(frozen=True)
@@ -238,6 +293,7 @@ def cleanup_orphan_python_processes(logger_: logging.Logger | None = None) -> No
     lifecycle_settings = get_daemon_lifecycle_settings()
     current_pid = os.getpid()
     current_executable = os.path.normcase(os.path.abspath(sys.executable))
+    registered_daemon = _read_daemon_pid_registry()
     log.info("检查残留进程（当前 PID=%s）...", current_pid)
 
     ps_script = r"""$ErrorActionPreference = 'SilentlyContinue'
@@ -346,7 +402,43 @@ Get-CimInstance Win32_Process | ForEach-Object {
             protected_pids.add(ancestor_pid)
             ancestor_pid = parent_by_pid.get(ancestor_pid)
 
+        candidate_by_pid = {pid: (parent_pid, cmdline) for pid, parent_pid, cmdline in candidates}
+        if registered_daemon is not None:
+            registered_pid = int(registered_daemon["pid"])
+            registered_parent_pid = int(registered_daemon["parent_pid"])
+            registered_candidate = candidate_by_pid.get(registered_pid)
+            if registered_candidate is None:
+                # The tracked child has already exited.  Do not leave a stale
+                # record that could ever be matched against a reused PID.
+                if candidates:
+                    _clear_daemon_pid_registry(pid=registered_pid)
+                    registered_daemon = None
+            else:
+                candidate_parent_pid, candidate_cmdline = registered_candidate
+                is_current_child = registered_parent_pid in protected_pids
+                is_spawn_child = "--multiprocessing-fork" in candidate_cmdline.lower()
+                if (
+                    not is_current_child
+                    and candidate_parent_pid == registered_parent_pid
+                    and is_spawn_child
+                ):
+                    try:
+                        log.info("清理已登记的残留守护进程 PID=%s", registered_pid)
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(registered_pid)],
+                            capture_output=True,
+                            timeout=lifecycle_settings.orphan_taskkill_timeout_seconds,
+                            creationflags=NO_WINDOW,
+                        )
+                        killed_count += 1
+                        _clear_daemon_pid_registry(pid=registered_pid)
+                    except Exception as exc:
+                        log.warning("清理已登记守护进程 %s 失败: %s", registered_pid, exc)
+                    registered_daemon = None
+
         for pid, _parent_pid, cmdline in candidates:
+            if registered_daemon is not None and pid == int(registered_daemon["pid"]):
+                continue
             low = cmdline.lower()
             if not any(k in low for k in keywords) or pid in protected_pids:
                 continue
@@ -425,6 +517,14 @@ class AutopilotDaemonManager:
             self._logger.info("守护进程自动启动已禁用（DISABLE_AUTO_DAEMON=1）")
             return
 
+        if os.name == "nt":
+            try:
+                multiprocessing.set_executable(sys.executable)
+            except Exception as exc:
+                self._logger.warning("无法固定守护进程解释器: %s", exc)
+            if not _is_orphan_cleanup_disabled():
+                self.cleanup_orphans()
+
         from application.engine.services.streaming_bus import init_streaming_bus
 
         stream_queue = init_streaming_bus()
@@ -478,6 +578,8 @@ class AutopilotDaemonManager:
             daemon=True,
         )
         self.process.start()
+        if os.name == "nt" and self.process.pid:
+            _write_daemon_pid_registry(self.process.pid, parent_pid=os.getpid())
         self._logger.info("守护进程已创建并启动（独立进程模式，流式队列 + 共享状态 + 持久化队列已传递）")
 
     def stop(self) -> None:
@@ -529,6 +631,7 @@ class AutopilotDaemonManager:
                 self._logger.info("Windows: 已通过 taskkill 终止守护进程 PID=%s", daemon_pid)
             except Exception as exc:
                 self._logger.debug("taskkill 终止守护进程失败（可能已退出）: %s", exc)
+            _clear_daemon_pid_registry(pid=daemon_pid)
 
         self.process = None
         self.stop_event = None
