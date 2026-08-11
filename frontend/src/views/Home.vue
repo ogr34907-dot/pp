@@ -273,12 +273,12 @@
                   @keydown.space.self.prevent="navigateToBook(book.slug)"
                 >
                   <div class="card-top">
-                    <span class="book-dot" :class="`dot-${book.stage}`"></span>
+                    <span class="book-dot" :class="`dot-${book.statusKey}`"></span>
                     <span class="book-card-title">{{ book.title }}</span>
                   </div>
                   <div class="card-meta">
-                    <n-tag :type="getStageType(book.stage)" size="small" round borderable>
-                      {{ book.stage_label }}
+                    <n-tag :type="book.statusTagType" size="small" round borderable>
+                      {{ book.statusLabel }}
                     </n-tag>
                     <span class="meta-genre">{{ book.genre || '未分类' }}</span>
                   </div>
@@ -408,12 +408,12 @@
             @keydown.space.self.prevent="navigateToBook(book.slug); showAllModal = false"
           >
             <div class="card-top">
-              <span class="book-dot" :class="`dot-${book.stage}`"></span>
+              <span class="book-dot" :class="`dot-${book.statusKey}`"></span>
               <span class="book-card-title">{{ book.title }}</span>
             </div>
             <div class="card-meta">
-              <n-tag :type="getStageType(book.stage)" size="small" round borderable>
-                {{ book.stage_label }}
+              <n-tag :type="book.statusTagType" size="small" round borderable>
+                {{ book.statusLabel }}
               </n-tag>
               <span class="meta-genre">{{ book.genre || '未分类' }}</span>
             </div>
@@ -484,10 +484,12 @@ import { readStorageBoolean } from '@/utils/storage'
 import { formatApiError } from '@/utils/apiError'
 import {
   NOVEL_LENGTH_TIER_OPTIONS,
-  getNovelStageLabel,
-  getNovelStageTagType,
   type NovelLengthTier,
 } from '@/domain/novel'
+import {
+  getProjectCardStatusPresentation,
+  type ProjectCardStatusTagType,
+} from '@/domain/projectCardStatus'
 
 const MarketTaxonomyPicker = defineAsyncComponent(
   () => import('@/components/taxonomy/MarketTaxonomyPicker.vue'),
@@ -499,8 +501,9 @@ const NovelSetupGuide = defineAsyncComponent(
 interface BookListItem {
   slug: string
   title: string
-  stage: string
-  stage_label: string
+  statusKey: string
+  statusLabel: string
+  statusTagType: ProjectCardStatusTagType
   genre: string
   chapter_count?: number
   word_count?: number
@@ -613,11 +616,17 @@ const fetchBooks = async () => {
     books.value = novels.map((novel: NovelDTO) => {
       const fromPrefix = parseGenreWorldFromPremise(novel.premise || '').genre
       const g = novel.locked_genre?.trim() || fromPrefix || ''
+      const status = getProjectCardStatusPresentation({
+        stage: novel.stage,
+        autopilotStatus: novel.autopilot_status,
+        recoveryReason: novel.autopilot_recovery_reason,
+      })
       return {
         slug: novel.id,
         title: novel.title,
-        stage: novel.stage,
-        stage_label: getNovelStageLabel(novel.stage),
+        statusKey: status.key,
+        statusLabel: status.label,
+        statusTagType: status.tagType,
         genre: g,
         chapter_count: novel.chapters?.length || 0,
         word_count: novel.total_word_count,
@@ -798,10 +807,6 @@ const focusCreateInput = () => {
 const handleRefreshList = async () => {
   await fetchBooks()
   message.success('列表已刷新')
-}
-
-const getStageType = (stage: string) => {
-  return getNovelStageTagType(stage)
 }
 
 onMounted(() => {
@@ -1248,6 +1253,9 @@ onMounted(() => {
 .book-dot.dot-writing { background: var(--color-warning); }
 .book-dot.dot-reviewing { background: var(--color-brand); }
 .book-dot.dot-completed { background: var(--color-success); }
+.book-dot.dot-paused { background: var(--color-warning); }
+.book-dot.dot-terminated,
+.book-dot.dot-error { background: var(--color-danger); }
 
 /* 卡片顶部：标题 + 圆点 */
 .card-top {

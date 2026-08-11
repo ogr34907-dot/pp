@@ -79,6 +79,7 @@ class NovelDTO:
     has_bible: bool = False
     has_outline: bool = False
     autopilot_status: str = "stopped"
+    autopilot_recovery_reason: str = ""
     auto_approve_mode: bool = False
     locked_genre: str = ""
     locked_world_preset: str = ""
@@ -103,6 +104,9 @@ class NovelDTO:
         
         _ap = getattr(novel, 'autopilot_status', 'stopped')
         autopilot_status = _ap.value if hasattr(_ap, 'value') else str(_ap)
+        autopilot_recovery_reason = str(
+            getattr(novel, 'autopilot_recovery_reason', '') or ''
+        )
 
         premise_text = getattr(novel, 'premise', '') or ''
         from application.core.premise_genre_world import parse_genre_world_from_premise
@@ -130,6 +134,7 @@ class NovelDTO:
             chapters=chapters,
             total_word_count=novel.get_total_word_count().value,
             autopilot_status=autopilot_status,
+            autopilot_recovery_reason=autopilot_recovery_reason,
             auto_approve_mode=getattr(novel, 'auto_approve_mode', False),
             locked_genre=lg,
             locked_world_preset=lw,

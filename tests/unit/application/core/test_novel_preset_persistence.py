@@ -71,6 +71,20 @@ def test_novel_dto_prefers_generation_prefs_over_premise_parsing_for_locked_pres
     assert dto.locked_special_requirements == "资源、寿命、因果都要闭环。"
 
 
+def test_novel_dto_exposes_explicit_autopilot_recovery_reason():
+    novel = Novel(
+        id=NovelId("novel-1"),
+        title="测试小说",
+        author="测试作者",
+        target_chapters=100,
+        autopilot_recovery_reason="manual_terminate",
+    )
+
+    dto = NovelDTO.from_domain(novel)
+
+    assert dto.autopilot_recovery_reason == "manual_terminate"
+
+
 def test_variable_hub_sync_overwrites_empty_locked_preferences_and_setup_aliases(monkeypatch):
     """SETTING-002: clearing setup must remove stale canonical and alias values."""
     writes = []

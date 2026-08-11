@@ -117,6 +117,8 @@ export interface NovelDTO {
   has_bible?: boolean
   has_outline?: boolean
   autopilot_status?: string
+  /** 自动驾驶停止后的可读终态原因；为空时沿用小说生命周期状态 */
+  autopilot_recovery_reason?: string
   auto_approve_mode?: boolean
   /** 每章目标字数（与首页建档/PUT 一致；部分接口可能未返回） */
   target_words_per_chapter?: number
