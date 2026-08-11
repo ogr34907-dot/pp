@@ -3,6 +3,7 @@ from typing import List
 from domain.ai.services.embedding_service import EmbeddingService
 from domain.ai.services.vector_store import VectorStore
 from domain.ai.services.chapter_summarizer import ChapterSummarizer
+from application.engine.services.worldline_generation_guard import tag_payload_for_active_epoch
 
 
 class IndexingService:
@@ -56,11 +57,11 @@ class IndexingService:
 
         # 3. 存储到向量数据库
         chapter_id = f"{novel_id}_{chapter_number}"
-        payload = {
+        payload = tag_payload_for_active_epoch(novel_id, {
             "novel_id": novel_id,
             "chapter_number": chapter_number,
             "summary": summary
-        }
+        })
 
         await self._vector_store.insert(
             collection="chapters",

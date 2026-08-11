@@ -6,10 +6,15 @@
       <!-- 驾驶舱保留挂载以维持写作 SSE；其它重页面按需挂载，避免隐藏图表/DAG 常驻吃内存。 -->
       <section
         v-show="workspace.activeTab === 'cockpit'"
-        class="ap-workspace__pane ap-workspace__pane--cockpit"
-        aria-label="全托管驾驶"
-      >
-        <AutopilotPanel
+      class="ap-workspace__pane ap-workspace__pane--cockpit"
+      aria-label="全托管驾驶"
+    >
+      <GenerationModeLauncher
+        class="ap-workspace__candidate-launcher"
+        :novel-id="novelId"
+        :target-chapters="targetChapters"
+      />
+      <AutopilotPanel
           class="ap-workspace__cockpit-panel"
           :novel-id="novelId"
           :render-live-preview="(cockpitVisible ?? true) && workspace.activeTab === 'cockpit'"
@@ -62,6 +67,7 @@ import { useAutopilotWorkspaceStore } from '@/stores/autopilotWorkspaceStore'
 import { useDAGSSE } from '@/composables/useDAGSSE'
 import AutopilotShellNav from './AutopilotShellNav.vue'
 import AutopilotPanel from './AutopilotPanel.vue'
+import GenerationModeLauncher from './GenerationModeLauncher.vue'
 
 const NarrativeGovernanceCockpit = defineAsyncComponent(() => import('./NarrativeGovernanceCockpit.vue'))
 const AutopilotMetricsDashboard = defineAsyncComponent(() => import('./AutopilotMetricsDashboard.vue'))
@@ -69,6 +75,7 @@ const AutopilotOperationsView = defineAsyncComponent(() => import('./AutopilotOp
 
 const props = defineProps<{
   novelId: string
+  targetChapters?: number
   cockpitVisible?: boolean
 }>()
 
@@ -176,6 +183,12 @@ function onBeatsPlanned(payload: { chapterNumber: number; beats: Array<Record<st
   margin: 16px auto 24px;
 }
 
+.ap-workspace__candidate-launcher {
+  flex-shrink: 0;
+  width: min(1180px, calc(100% - 32px));
+  margin: 16px auto 0;
+}
+
 .ap-workspace__pane--ops {
   background: var(--app-surface-subtle);
 }
@@ -184,6 +197,11 @@ function onBeatsPlanned(payload: { chapterNumber: number; beats: Array<Record<st
   .ap-workspace__cockpit-panel {
     width: calc(100% - 16px);
     margin: 8px auto 16px;
+  }
+
+  .ap-workspace__candidate-launcher {
+    width: calc(100% - 16px);
+    margin: 8px auto 0;
   }
 }
 </style>

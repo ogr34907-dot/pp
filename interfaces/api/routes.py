@@ -57,6 +57,7 @@ def register_api_routes(app: FastAPI) -> None:
     from interfaces.api.v1.blueprint import (
         beat_sheet_routes,
         continuous_planning_routes,
+        outline_routes,
         story_structure,
     )
     from interfaces.api.v1.blueprint.confluence_routes import router as confluence_router
@@ -76,11 +77,13 @@ def register_api_routes(app: FastAPI) -> None:
         chronicles,
         context_intelligence,
         evolution_routes,
+        generation_routes,
         generation,
         governance_routes,
         narrative_engine_routes,
         snapshot_routes,
         workbench_context_routes,
+        worldline_regeneration_routes,
         worldline_routes,
     )
     from interfaces.api.v1.engine.dag.dag_routes import router as dag_router
@@ -113,10 +116,12 @@ def register_api_routes(app: FastAPI) -> None:
             RouterRegistration(knowledge_graph_routes.router, API_V1_PREFIX),
             RouterRegistration(worldbuilding_routes.router, API_V1_PREFIX),
             RouterRegistration(continuous_planning_routes.router, API_V1_PREFIX),
+            RouterRegistration(outline_routes.router, API_V1_PREFIX),
             RouterRegistration(beat_sheet_routes.router, API_V1_PREFIX),
             RouterRegistration(story_structure.router, API_V1_PREFIX),
             RouterRegistration(confluence_router, API_V1_PREFIX),
             RouterRegistration(generation.router, API_V1_PREFIX),
+            RouterRegistration(generation_routes.router, API_V1_PREFIX),
             RouterRegistration(context_intelligence.router, API_V1_PREFIX),
             RouterRegistration(chronicles.router, API_V1_PREFIX),
             RouterRegistration(snapshot_routes.router, API_V1_PREFIX),
@@ -128,6 +133,7 @@ def register_api_routes(app: FastAPI) -> None:
             RouterRegistration(narrative_engine_routes.surface_router, API_V1_PREFIX),
             RouterRegistration(governance_routes.router, API_V1_PREFIX),
             RouterRegistration(worldline_routes.router, API_V1_PREFIX),
+            RouterRegistration(worldline_regeneration_routes.router, API_V1_PREFIX),
             RouterRegistration(evolution_routes.router, API_V1_PREFIX),
             RouterRegistration(ai_invocation_routes.router, API_V1_PREFIX),
             RouterRegistration(prop_routes.router, API_V1_PREFIX),

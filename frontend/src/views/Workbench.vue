@@ -76,6 +76,7 @@
                     :chapter-content="chapterContent"
                     :chapter-loading="chapterLoading"
                     :generation-prefs="generationPrefs"
+                    :target-chapters="bookMeta.target_chapters"
                     @chapter-updated="handleChapterUpdated"
                     @select-chapter="handleChapterSelect"
                   />

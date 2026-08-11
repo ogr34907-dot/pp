@@ -72,6 +72,43 @@ export const apiRoutes = {
     circuitBreaker: (novelId: string) => apiRootPath('autopilot', novelId, 'circuit-breaker'),
     circuitBreakerReset: (novelId: string) => apiRootPath('autopilot', novelId, 'circuit-breaker', 'reset'),
   },
+  generation: {
+    run: (novelId: string) => apiRootPath('generation', 'novels', novelId),
+    state: (novelId: string) => apiRootPath('generation', 'novels', novelId, 'state'),
+    start: (novelId: string) => apiRootPath('generation', 'novels', novelId, 'start'),
+    generateNext: (novelId: string) => apiRootPath('generation', 'novels', novelId, 'generate-next'),
+    runContinuous: (novelId: string) => apiRootPath('generation', 'novels', novelId, 'run-continuous'),
+    stop: (novelId: string) => apiRootPath('generation', 'novels', novelId, 'stop'),
+    candidate: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId),
+    candidateVersions: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'versions'),
+    candidateContent: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'content'),
+    candidateCommitPlan: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'commit-plan'),
+    candidateReaudit: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 're-audit'),
+    candidateRegenerate: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'regenerate'),
+    candidateApprove: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'approve-and-commit'),
+    candidateRetrySync: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'retry-sync'),
+    candidateReject: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'reject'),
+  },
+  outline: {
+    tree: (novelId: string) => apiRootPath('outline', 'novels', novelId, 'tree'),
+    contract: (contractId: string) => apiRootPath('outline', 'contracts', contractId),
+    draft: (contractId: string) => apiRootPath('outline', 'contracts', contractId, 'draft'),
+    publish: (contractId: string) => apiRootPath('outline', 'contracts', contractId, 'publish'),
+    generateDraft: (contractId: string) => apiRootPath('outline', 'contracts', contractId, 'generate-draft'),
+    generateDraftStream: (contractId: string) => apiRootPath('outline', 'contracts', contractId, 'generate-draft-stream'),
+    chapterContext: (novelId: string, chapterNodeId: string) =>
+      apiRootPath('outline', 'novels', novelId, 'chapters', chapterNodeId, 'published-context'),
+  },
+  worldlineRegeneration: {
+    preview: (novelId: string) => apiRootPath('worldline-regeneration', 'novels', novelId, 'preview'),
+    execute: (novelId: string) => apiRootPath('worldline-regeneration', 'novels', novelId, 'execute'),
+    archives: (novelId: string) => apiRootPath('worldline-regeneration', 'novels', novelId, 'archives'),
+    restore: (novelId: string, archiveId: string) =>
+      apiRootPath('worldline-regeneration', 'novels', novelId, 'archives', archiveId, 'restore'),
+    rebuildStatus: (novelId: string) => apiRootPath('worldline-regeneration', 'novels', novelId, 'rebuild-status'),
+    rebuild: (novelId: string) => apiRootPath('worldline-regeneration', 'novels', novelId, 'rebuild'),
+    cancelRebuild: (novelId: string) => apiRootPath('worldline-regeneration', 'novels', novelId, 'rebuild', 'cancel'),
+  },
   dag: {
     events: (novelId: string, afterEventId?: string) =>
       withQuery(apiRootPath('dag', 'events'), {

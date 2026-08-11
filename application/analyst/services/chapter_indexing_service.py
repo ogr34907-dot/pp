@@ -7,10 +7,12 @@ Collection 命名约定：
   * text: str - 章节摘要或 Bible 片段
   * kind: str - "chapter_summary" | "bible_snippet"
   * novel_id: str - 小说 ID（冗余但便于跨 collection 查询）
+  * generation_epoch: int - 当前世界线世代，重生成后隔离旧向量
 """
 from typing import Optional
 from domain.ai.services.embedding_service import EmbeddingService
 from domain.ai.services.vector_store import VectorStore
+from application.engine.services.worldline_generation_guard import tag_payload_for_active_epoch
 
 
 class ChapterIndexingService:
@@ -103,12 +105,12 @@ class ChapterIndexingService:
         vector = await self._embedding_service.embed(summary)
 
         # 构造 payload
-        payload = {
+        payload = tag_payload_for_active_epoch(novel_id, {
             "chapter_number": chapter_number,
             "text": summary,
             "kind": "chapter_summary",
             "novel_id": novel_id
-        }
+        })
         if content_sha256 is not None:
             payload["content_sha256"] = content_sha256
         if content_revision is not None:
@@ -162,12 +164,12 @@ class ChapterIndexingService:
         vector = await self._embedding_service.embed(snippet)
 
         # 构造 payload
-        payload = {
+        payload = tag_payload_for_active_epoch(novel_id, {
             "chapter_number": chapter_number,
             "text": snippet,
             "kind": "bible_snippet",
             "novel_id": novel_id
-        }
+        })
 
         # 领域层使用可读、确定性的业务 ID；具体存储若要求 UUID，由适配器内部转换。
         raw_id = f"{novel_id}_ch{chapter_number}_bible_{snippet_id}" if snippet_id else f"{novel_id}_ch{chapter_number}_bible"

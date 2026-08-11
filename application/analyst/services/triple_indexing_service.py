@@ -159,7 +159,9 @@ class TripleIndexingService:
         vector = await self._embedding_service.embed(text)
 
         # 构造 payload
-        payload = {
+        from application.engine.services.worldline_generation_guard import tag_payload_for_active_epoch
+
+        payload = tag_payload_for_active_epoch(novel_id, {
             "triple_id": triple_id,
             "subject": triple.get("subject", ""),
             "predicate": triple.get("predicate", ""),
@@ -170,7 +172,7 @@ class TripleIndexingService:
             "chapter_number": triple.get("chapter_number") or triple.get("first_appearance"),
             "confidence": triple.get("confidence", 1.0),
             "text": text,
-        }
+        })
 
         # 写入向量存储
         collection_name = self._get_collection_name(novel_id)
@@ -226,7 +228,9 @@ class TripleIndexingService:
             if not triple_id:
                 continue
 
-            payload = {
+            from application.engine.services.worldline_generation_guard import tag_payload_for_active_epoch
+
+            payload = tag_payload_for_active_epoch(novel_id, {
                 "triple_id": triple_id,
                 "subject": triple.get("subject", ""),
                 "predicate": triple.get("predicate", ""),
@@ -237,7 +241,7 @@ class TripleIndexingService:
                 "chapter_number": triple.get("chapter_number") or triple.get("first_appearance"),
                 "confidence": triple.get("confidence", 1.0),
                 "text": self._triple_to_text(triple),
-            }
+            })
 
             await self._vector_store.insert(
                 collection=collection_name,
@@ -289,6 +293,12 @@ class TripleIndexingService:
         )
 
         # 过滤结果
+        from application.engine.services.worldline_generation_guard import (
+            active_generation_epoch,
+            is_payload_in_active_epoch,
+        )
+
+        active_epoch = active_generation_epoch(novel_id)
         filtered = []
         for hit in results:
             # 过滤相似度
@@ -296,6 +306,8 @@ class TripleIndexingService:
                 continue
 
             payload = hit.get("payload", {})
+            if not is_payload_in_active_epoch(payload, active_epoch=active_epoch):
+                continue
 
             # 过滤主体类型
             if subject_type and payload.get("subject_type") != subject_type:

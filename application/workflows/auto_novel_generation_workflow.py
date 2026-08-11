@@ -750,6 +750,62 @@ class AutoNovelGenerationWorkflow:
             style_warnings=style_warnings
         )
 
+    async def generate_candidate_draft(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        chapter_title: str,
+        outline_chain: Dict[str, Any],
+        outline_text: str,
+    ) -> Dict[str, Any]:
+        """Generate a chapter draft without applying any formal aftermath.
+
+        The legacy generation path performs state extraction and memory writes
+        immediately after prose.  That is explicitly unsafe for the review
+        mode: this method uses the same current formal-memory context and
+        narrative gate, but returns only a candidate script/prose payload.
+        """
+
+        if chapter_number < 1:
+            raise ValueError("chapter_number must be positive")
+        if not outline_text.strip():
+            raise ValueError("published outline chain cannot be empty")
+        await self._enforce_narrative_gate(novel_id, chapter_number, outline_text)
+        self._require_narrative_memory()
+        self._current_novel_id = novel_id
+        self._current_chapter_number = chapter_number
+        bundle = self.prepare_chapter_generation(
+            novel_id,
+            chapter_number,
+            outline_text,
+        )
+        plan_context = json.dumps(outline_chain, ensure_ascii=False, sort_keys=True)
+        context = f"{bundle['context']}\n\n=== PUBLISHED FIVE-LEVEL OUTLINE CONTRACT ===\n{plan_context}"
+        target_words = self._resolve_target_chapter_words(novel_id)
+        script = await self._generate_script(
+            context=context,
+            outline=outline_text,
+            target_words=target_words,
+            storyline_context=bundle["storyline_context"],
+            plot_tension=bundle["plot_tension"],
+            style_summary=bundle["style_summary"],
+        )
+        prose = await self._generate_prose_from_script(
+            script=script,
+            outline=outline_text,
+            target_words=target_words,
+        )
+        content = self._finalize_chapter_body_text(novel_id, prose)
+        if not content.strip():
+            raise RuntimeError("candidate prose generation returned empty content")
+        return {
+            "content": content,
+            "script": script,
+            "chapter_title": chapter_title,
+            "context_tokens": bundle["context_tokens"],
+        }
+
 
     async def generate_chapter_stream(
         self,

@@ -29,7 +29,9 @@ function isTauri(): boolean {
   return _isTauri
 }
 
-export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1'
+// A browser build is served by FastAPI, so its API must stay on the same
+// origin. Tauri replaces this value with its IPC-reported backend port.
+export const API_BASE_URL = '/api/v1'
 
 const axiosInstance = axios.create({
   baseURL: API_BASE_URL,

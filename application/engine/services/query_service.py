@@ -190,6 +190,102 @@ def _augment_review_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _overlay_generation_authority(
+    payload: Dict[str, Any],
+    run: Optional[Mapping[str, Any]],
+    candidate: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Overlay the durable candidate-run state on stale legacy daemon state.
+
+    The old daemon's shared memory is still useful for legacy execution
+    details, but it must not claim a novel is "writing" after the new
+    candidate control plane has been stopped or is awaiting review.
+    """
+
+    if not run:
+        return payload
+    normalized = dict(run)
+    state = str(normalized.get("state") or "idle")
+    mode = str(normalized.get("run_mode") or "continuous")
+    candidate_payload = dict(candidate) if candidate else None
+    presentation_status = {
+        "idle": "stopped",
+        "running": "running",
+        "waiting_review": "paused_for_review",
+        "paused": "stopped",
+        "stopped": "stopped",
+        "completed": "completed",
+        "error": "error",
+    }.get(state, "stopped")
+    stage = {
+        "running": str((candidate_payload or {}).get("status") or "candidate_pending"),
+        "waiting_review": "waiting_review",
+        "paused": "paused",
+        "stopped": "stopped",
+        "completed": "completed",
+        "error": "error",
+        "idle": "idle",
+    }.get(state, state)
+    formal = int(normalized.get("current_formal_chapter") or 0)
+    candidate_chapter = normalized.get("current_candidate_chapter")
+    payload["generation"] = {
+        "run_mode": mode,
+        "state": state,
+        "generation_epoch": int(normalized.get("generation_epoch") or 0),
+        "target_chapters": int(normalized.get("target_chapters") or 0),
+        "current_formal_chapter": formal,
+        "current_candidate_id": normalized.get("current_candidate_id"),
+        "current_candidate_chapter": candidate_chapter,
+        "canonical_sync_status": str(normalized.get("canonical_sync_status") or "ready"),
+        "next_action": str(normalized.get("next_action") or ""),
+        "last_error": str(normalized.get("last_error") or ""),
+        "max_pending_candidates": int(normalized.get("max_pending_candidates") or 1),
+        "prefetch": int(normalized.get("prefetch") or 0),
+        "candidate": candidate_payload,
+    }
+    payload["autopilot_status"] = presentation_status
+    payload["current_stage"] = stage
+    payload["needs_review"] = state == "waiting_review"
+    if candidate_chapter is not None:
+        payload["current_chapter_number"] = int(candidate_chapter)
+    elif formal:
+        payload["current_chapter_number"] = formal + 1
+    return payload
+
+
+def _load_generation_authority(novel_id: str) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Read the persisted control plane; absence means the legacy path owns status."""
+
+    try:
+        from application.paths import get_db_path
+        from infrastructure.persistence.database.connection import get_database
+
+        db = get_database(get_db_path())
+        run = db.fetch_one(
+            "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+        )
+        if not run:
+            return None, None
+        candidate_id = run.get("current_candidate_id")
+        candidate = (
+            db.fetch_one(
+                """
+                SELECT id, novel_id, chapter_number, title, generation_epoch, status,
+                       content_revision, audit_revision, commit_plan_revision,
+                       failure_reason, feedback, formal_chapter_id, updated_at
+                FROM chapter_candidates WHERE id = ?
+                """,
+                (candidate_id,),
+            )
+            if candidate_id
+            else None
+        )
+        return dict(run), dict(candidate) if candidate else None
+    except Exception as exc:
+        logger.debug("candidate generation authority unavailable novel=%s: %s", novel_id, exc)
+        return None, None
+
+
 def _merge_runtime_fields_from_raw(
     payload: Dict[str, Any],
     raw: Optional[Dict[str, Any]],
@@ -555,7 +651,9 @@ class QueryService:
             return None
         raw = self._shared.get_raw_state(novel_id)
         payload = _merge_runtime_fields_from_raw(response.to_dict(), raw)
-        return _augment_review_fields(reconcile_canonical_aftermath_status(payload))
+        payload = _augment_review_fields(reconcile_canonical_aftermath_status(payload))
+        run, candidate = _load_generation_authority(novel_id)
+        return _overlay_generation_authority(payload, run, candidate)
 
     # ==================== 工作台上下文 ====================
 

@@ -323,6 +323,7 @@
         v-show="workMode === 'managed'"
         class="managed-stack"
         :novel-id="slug"
+        :target-chapters="targetChapters"
         :cockpit-visible="workMode === 'managed'"
         @status-change="handleAutopilotStatusChange"
         @chapter-content-update="handleChapterContentUpdate"
@@ -897,6 +898,7 @@ interface WorkAreaProps {
   chapterContent?: string
   chapterLoading?: boolean
   generationPrefs?: GenerationPrefsDTO | null
+  targetChapters?: number
 }
 
 const props = withDefaults(defineProps<WorkAreaProps>(), {
@@ -905,6 +907,7 @@ const props = withDefaults(defineProps<WorkAreaProps>(), {
   chapterContent: '',
   chapterLoading: false,
   generationPrefs: null,
+  targetChapters: 1,
 })
 
 function ordinalUnit(n: number) {

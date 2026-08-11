@@ -51,7 +51,7 @@ describe('initApiClient', () => {
     })
 
     expect(result).toEqual(['browser-api-fallback'])
-    expect(apiAxios.defaults.baseURL).not.toBe('http://127.0.0.1:45123/api/v1')
+    expect(apiAxios.defaults.baseURL).toBe('/api/v1')
   })
 
   it('keeps the Tauri backend port path when IPC is callable', async () => {

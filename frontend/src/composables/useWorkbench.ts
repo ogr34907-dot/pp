@@ -13,6 +13,7 @@ const STATS_DAYS = 30
 export interface BookMeta {
   has_bible?: boolean
   has_outline?: boolean
+  target_chapters?: number
 }
 
 export interface UseWorkbenchOptions {
@@ -71,6 +72,7 @@ export function useWorkbench(options: UseWorkbenchOptions) {
     bookMeta.value = {
       has_bible: novelData.has_bible,
       has_outline: novelData.has_outline,
+      target_chapters: novelData.target_chapters,
     }
 
     const gp = novelData.generation_prefs

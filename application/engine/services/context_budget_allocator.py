@@ -2181,6 +2181,12 @@ class ContextBudgetAllocator:
             return ""
         
         try:
+            from application.engine.services.worldline_generation_guard import (
+                active_generation_epoch,
+                is_payload_in_active_epoch,
+            )
+
+            active_epoch = active_generation_epoch(novel_id)
             collection_name = f"novel_{novel_id}_chunks"
 
             # 新书首次运行时 collection 可能不存在，自动创建
@@ -2221,6 +2227,8 @@ class ContextBudgetAllocator:
                 if float(hit.get("score", 0) or 0) < 0.5:
                     continue
                 payload = hit.get("payload", {}) or {}
+                if not is_payload_in_active_epoch(payload, active_epoch=active_epoch):
+                    continue
                 try:
                     source_chapter = int(payload.get("chapter_number"))
                 except (TypeError, ValueError):

@@ -1,0 +1,386 @@
+<template>
+  <main class="outline-studio" aria-labelledby="outline-studio-title">
+    <header class="outline-studio__header">
+      <div>
+        <p class="outline-studio__eyebrow">计划层 · 已发布版本才会进入正文提示词</p>
+        <h1 id="outline-studio-title">五级大纲工作室</h1>
+        <p>总纲 → 部纲 → 卷纲 → 幕纲 → 章纲。先发布并同步父级，才可生成下一层。</p>
+      </div>
+      <div class="outline-studio__header-actions">
+        <n-button secondary @click="loadTree" :loading="loading">刷新状态</n-button>
+        <n-button type="primary" @click="router.push(`/book/${novelId}/workbench`)">
+          <template #icon><n-icon :component="CreateOutline" /></template>
+          返回工作台
+        </n-button>
+      </div>
+    </header>
+
+    <n-alert v-if="error" type="error" :show-icon="true" role="alert" class="outline-studio__alert">
+      {{ error }}
+    </n-alert>
+
+    <div class="outline-studio__grid">
+      <aside class="outline-panel outline-tree-panel" aria-label="五级大纲树">
+        <div class="outline-panel__head">
+          <div>
+            <span class="outline-panel__kicker">结构</span>
+            <h2>当前计划树</h2>
+          </div>
+          <span class="outline-count">{{ flattenedTree.length }} 节点</span>
+        </div>
+        <div v-if="loading && !tree" class="outline-tree-empty">正在读取大纲…</div>
+        <div v-else-if="!tree" class="outline-tree-empty">尚未建立规划结构。</div>
+        <nav v-else class="outline-tree" aria-label="大纲节点">
+          <button
+            v-for="item in flattenedTree"
+            :key="item.node.id"
+            type="button"
+            class="outline-tree__node"
+            :class="{ 'is-selected': selectedNode?.id === item.node.id }"
+            :style="{ '--tree-depth': item.depth }"
+            :aria-current="selectedNode?.id === item.node.id ? 'page' : undefined"
+            @click="selectNode(item.node)"
+          >
+            <span class="outline-tree__level">{{ levelLabel(item.node.node_type) }}</span>
+            <span class="outline-tree__copy">
+              <strong>{{ item.node.title || defaultTitle(item.node.node_type) }}</strong>
+              <small>{{ nodeStatusLabel(item.node) }}</small>
+            </span>
+            <span class="outline-tree__state" :class="`is-${nodeStatus(item.node)}`" aria-hidden="true" />
+          </button>
+        </nav>
+      </aside>
+
+      <section class="outline-panel outline-editor-panel" aria-label="大纲编辑器">
+        <div class="outline-panel__head outline-editor-head">
+          <div>
+            <span class="outline-panel__kicker">{{ selectedNode ? levelLabel(selectedNode.node_type) : '选择节点' }}</span>
+            <h2>{{ selectedNode?.title || '大纲编辑器' }}</h2>
+          </div>
+          <StatusPill v-if="selectedContract" :status="selectedContract.active?.status || selectedContract.draft?.status || 'missing'" />
+        </div>
+
+        <div v-if="!selectedNode" class="outline-editor-empty">
+          <n-icon :component="GitNetworkOutline" :size="36" aria-hidden="true" />
+          <p>从左侧选择一个大纲节点，开始编辑其计划契约。</p>
+        </div>
+
+        <div v-else-if="!selectedContract" class="outline-editor-empty">
+          <n-icon :component="LockClosedOutline" :size="32" aria-hidden="true" />
+          <h3>该层尚未开放</h3>
+          <p>先让父级处于“已同步”状态，再建立本层契约。作者已锁定或人工修改过的子纲不会被静默覆盖。</p>
+          <n-button v-if="selectedNode.node_type !== 'outline'" type="primary" :loading="binding" @click="bindSelectedNode">
+            建立本层契约
+          </n-button>
+        </div>
+
+        <form v-else class="outline-editor" @submit.prevent="saveDraft">
+          <div class="outline-editor__summary">
+            <n-input v-model:value="form.title" placeholder="本层标题" aria-label="大纲标题" />
+            <n-input v-model:value="form.creative_goal" placeholder="创作目标：这一层需要完成什么？" aria-label="创作目标" />
+          </div>
+          <n-input
+            v-model:value="form.narrative_text"
+            type="textarea"
+            :rows="5"
+            placeholder="叙述性计划：给作者和下一层 AI 的清晰说明。"
+            aria-label="叙述性计划"
+          />
+          <div class="outline-editor__grid">
+            <FieldTextarea v-model="form.entry_state" label="进入状态" placeholder="人物、关系、地点与世界从何处开始" />
+            <FieldTextarea v-model="form.exit_state" label="结束状态" placeholder="这一层结束时必须抵达的状态" />
+            <FieldTextarea v-model="form.requiredEventsText" label="必须发生" placeholder="每行一条事件" />
+            <FieldTextarea v-model="form.forbiddenEventsText" label="禁止发生" placeholder="每行一条禁止项" />
+            <FieldTextarea v-model="form.handoffText" label="向下交接" placeholder="每行一条必须留给下层的条件" />
+            <FieldTextarea v-model="form.foreshadowText" label="伏笔要求" placeholder="每行一条：设置 / 推进 / 兑现" />
+          </div>
+          <div class="outline-editor__grid outline-editor__grid--numbers">
+            <n-form-item label="起始章节"><n-input-number v-model:value="form.chapter_start" :min="1" clearable /></n-form-item>
+            <n-form-item label="结束章节"><n-input-number v-model:value="form.chapter_end" :min="1" clearable /></n-form-item>
+            <n-form-item label="篇幅预算（字）"><n-input-number v-model:value="form.word_budget" :min="0" :step="1000" clearable /></n-form-item>
+          </div>
+          <div v-if="selectedContract.level === 'chapter'" class="outline-editor__chapter-fields">
+            <n-input v-model:value="form.pov" placeholder="POV / 叙事视角" aria-label="POV" />
+            <FieldTextarea v-model="form.scenesText" label="场景" placeholder="每行一个场景" />
+            <FieldTextarea v-model="form.beatsText" label="节拍" placeholder="每行一个节拍" />
+            <FieldTextarea v-model="form.conflictsText" label="冲突" placeholder="每行一个冲突" />
+            <n-input v-model:value="form.ending_hook" placeholder="结尾钩子" aria-label="结尾钩子" />
+          </div>
+          <div class="outline-editor__actions">
+            <n-button type="primary" attr-type="submit" :loading="saving">保存草稿</n-button>
+            <n-button secondary :loading="streaming" @click.prevent="generateDraftStream">
+              <template #icon><n-icon :component="SparklesOutline" /></template>
+              AI 流式生成草稿
+            </n-button>
+            <n-button
+              :disabled="!selectedContract.draft"
+              :loading="publishing"
+              @click.prevent="publishAndSync"
+            >
+              <template #icon><n-icon :component="CloudUploadOutline" /></template>
+              发布并同步
+            </n-button>
+          </div>
+          <p class="outline-editor__note">草稿不会进入正文提示词；发布后会切换计划投影，并使受影响的未锁定子纲过期。</p>
+        </form>
+      </section>
+
+      <aside class="outline-panel outline-inspector" aria-label="计划约束与影响">
+        <div class="outline-panel__head">
+          <div>
+            <span class="outline-panel__kicker">检查器</span>
+            <h2>约束与影响</h2>
+          </div>
+        </div>
+        <template v-if="selectedNode">
+          <section class="inspector-block">
+            <h3>父级约束</h3>
+            <p v-if="selectedParent">{{ selectedParent.title || defaultTitle(selectedParent.node_type) }} · {{ nodeStatusLabel(selectedParent) }}</p>
+            <p v-else>总纲是此书唯一的计划根节点。</p>
+          </section>
+          <section class="inspector-block">
+            <h3>当前版本</h3>
+            <dl v-if="selectedContract" class="inspector-facts">
+              <div><dt>已发布</dt><dd>r{{ selectedContract.active?.revision ?? '—' }}</dd></div>
+              <div><dt>草稿</dt><dd>r{{ selectedContract.draft?.revision ?? '—' }}</dd></div>
+              <div><dt>作者锁定</dt><dd>{{ selectedContract.author_locked ? '是' : '否' }}</dd></div>
+              <div><dt>人工修改</dt><dd>{{ selectedContract.has_author_edits ? '是' : '否' }}</dd></div>
+            </dl>
+            <p v-else>父级发布并同步后才允许建立该层。</p>
+          </section>
+          <section class="inspector-block inspector-block--impact">
+            <h3>发布影响</h3>
+            <p>未来章节将使用新版本；已经发生的正文事实不会被覆盖。若新计划与历史冲突，请从冲突章节创建世界线重生成。</p>
+            <n-button text type="primary" :disabled="!selectedContract" @click="router.push(`/book/${novelId}/worldline`)">
+              打开世界线重生成
+            </n-button>
+          </section>
+          <section v-if="streamText || streaming" class="inspector-block inspector-block--stream" aria-live="polite">
+            <h3>AI 草稿流</h3>
+            <p>{{ streaming ? '正在接收流式草稿…' : '草稿已解析，已写入当前节点的草稿版本。' }}</p>
+            <pre>{{ streamText || '正在准备…' }}</pre>
+          </section>
+        </template>
+        <div v-else class="outline-inspector__empty">选择一个节点后，可在此查看父级链、版本和发布影响。</div>
+      </aside>
+    </div>
+  </main>
+</template>
+
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { useMessage } from 'naive-ui'
+import {
+  CloudUploadOutline,
+  CreateOutline,
+  GitNetworkOutline,
+  LockClosedOutline,
+  SparklesOutline,
+} from '@vicons/ionicons5'
+import FieldTextarea from '@/components/outline/OutlineFieldTextarea.vue'
+import StatusPill from '@/components/outline/OutlineStatusPill.vue'
+import {
+  consumeOutlineDraftStream,
+  outlineApi,
+  type OutlineContract,
+  type OutlinePayload,
+  type OutlineTreeNode,
+} from '@/api/generation'
+
+type FlattenedNode = { node: OutlineTreeNode; depth: number; parent?: OutlineTreeNode }
+type FormState = {
+  title: string; narrative_text: string; creative_goal: string; entry_state: string; exit_state: string
+  requiredEventsText: string; forbiddenEventsText: string; handoffText: string; foreshadowText: string
+  chapter_start: number | null; chapter_end: number | null; word_budget: number | null
+  pov: string; scenesText: string; beatsText: string; conflictsText: string; ending_hook: string
+}
+
+const route = useRoute()
+const router = useRouter()
+const message = useMessage()
+const novelId = computed(() => String(route.params.slug || ''))
+const tree = ref<OutlineTreeNode | null>(null)
+const selectedNode = ref<OutlineTreeNode | null>(null)
+const selectedParent = ref<OutlineTreeNode | undefined>()
+const selectedContract = ref<OutlineContract | null>(null)
+const loading = ref(false)
+const saving = ref(false)
+const publishing = ref(false)
+const binding = ref(false)
+const streaming = ref(false)
+const streamText = ref('')
+const error = ref('')
+let streamController: AbortController | null = null
+
+const form = reactive<FormState>({
+  title: '', narrative_text: '', creative_goal: '', entry_state: '', exit_state: '',
+  requiredEventsText: '', forbiddenEventsText: '', handoffText: '', foreshadowText: '',
+  chapter_start: null, chapter_end: null, word_budget: null, pov: '', scenesText: '', beatsText: '', conflictsText: '', ending_hook: '',
+})
+
+const flattenedTree = computed<FlattenedNode[]>(() => {
+  const result: FlattenedNode[] = []
+  const visit = (node: OutlineTreeNode, depth: number, parent?: OutlineTreeNode) => {
+    result.push({ node, depth, parent })
+    for (const child of node.children || []) visit(child, depth + 1, node)
+  }
+  if (tree.value) visit(tree.value, 0)
+  return result
+})
+
+function levelLabel(level?: string) {
+  return ({ outline: '总纲', part: '部纲', volume: '卷纲', act: '幕纲', chapter: '章纲' } as Record<string, string>)[String(level)] || '计划'
+}
+function defaultTitle(level?: string) { return `${levelLabel(level)}（未命名）` }
+function nodeStatus(node: OutlineTreeNode) { return String(node.outline_contract?.status || 'missing') }
+function nodeStatusLabel(node: OutlineTreeNode) {
+  return ({ synced: '已发布 · 已同步', syncing: '发布同步中', published: '已发布', draft: '草稿待发布', stale: '需要重新校验', conflict: '需要处理冲突', missing: '等待父级开放' } as Record<string, string>)[nodeStatus(node)] || '等待配置'
+}
+function toLines(value?: string[]) { return (value || []).join('\n') }
+function fromLines(value: string) { return value.split(/\r?\n/).map(item => item.trim()).filter(Boolean) }
+function payloadToForm(payload?: OutlinePayload | null) {
+  const data = payload || {}
+  form.title = data.title || ''
+  form.narrative_text = data.narrative_text || ''
+  form.creative_goal = data.creative_goal || ''
+  form.entry_state = data.entry_state || ''
+  form.exit_state = data.exit_state || ''
+  form.requiredEventsText = toLines(data.required_events)
+  form.forbiddenEventsText = toLines(data.forbidden_events)
+  form.handoffText = toLines(data.handoff_conditions)
+  form.foreshadowText = Object.values(data.foreshadowing || {}).flat().join('\n')
+  form.chapter_start = data.chapter_start ?? null
+  form.chapter_end = data.chapter_end ?? null
+  form.word_budget = data.word_budget ?? null
+  form.pov = data.pov || ''
+  form.scenesText = toLines(data.scenes)
+  form.beatsText = toLines(data.beats)
+  form.conflictsText = toLines(data.conflicts)
+  form.ending_hook = data.ending_hook || ''
+}
+function formToPayload(): OutlinePayload {
+  return {
+    title: form.title.trim(), narrative_text: form.narrative_text.trim(), creative_goal: form.creative_goal.trim(),
+    entry_state: form.entry_state.trim(), exit_state: form.exit_state.trim(),
+    required_events: fromLines(form.requiredEventsText), forbidden_events: fromLines(form.forbiddenEventsText),
+    state_changes: {}, foreshadowing: { author_notes: fromLines(form.foreshadowText) },
+    chapter_start: form.chapter_start, chapter_end: form.chapter_end, word_budget: form.word_budget,
+    handoff_conditions: fromLines(form.handoffText), pov: form.pov.trim(), scenes: fromLines(form.scenesText),
+    beats: fromLines(form.beatsText), conflicts: fromLines(form.conflictsText), ending_hook: form.ending_hook.trim(), extra: {},
+  }
+}
+function idempotencyKey(prefix: string) { return `${prefix}-${crypto.randomUUID()}` }
+
+async function loadTree() {
+  if (!novelId.value) return
+  loading.value = true
+  error.value = ''
+  try {
+    tree.value = await outlineApi.getTree(novelId.value)
+    if (!selectedNode.value) await selectNode(tree.value)
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '读取五级大纲失败'
+  } finally { loading.value = false }
+}
+
+async function selectNode(node: OutlineTreeNode) {
+  selectedNode.value = node
+  selectedParent.value = flattenedTree.value.find(item => item.node.id === node.id)?.parent
+  streamText.value = ''
+  const contractId = node.outline_contract?.contract_id
+  if (!contractId) { selectedContract.value = null; return }
+  try {
+    selectedContract.value = await outlineApi.getContract(contractId)
+    payloadToForm(selectedContract.value.draft?.payload || selectedContract.value.active?.payload)
+  } catch (cause) {
+    selectedContract.value = null
+    error.value = cause instanceof Error ? cause.message : '读取大纲节点失败'
+  }
+}
+
+async function bindSelectedNode() {
+  if (!selectedNode.value || selectedNode.value.node_type === 'outline') return
+  binding.value = true
+  error.value = ''
+  try {
+    selectedContract.value = await outlineApi.bindNode(novelId.value, selectedNode.value.id)
+    payloadToForm(selectedContract.value.draft?.payload || selectedContract.value.active?.payload)
+    await loadTree()
+    message.success('本层契约已建立；现在可以生成或编辑草稿。')
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : '建立本层契约失败' } finally { binding.value = false }
+}
+
+async function saveDraft() {
+  if (!selectedContract.value) return
+  saving.value = true
+  error.value = ''
+  try {
+    selectedContract.value = await outlineApi.saveDraft(selectedContract.value.id, formToPayload())
+    payloadToForm(selectedContract.value.draft?.payload)
+    await loadTree()
+    message.success('草稿已保存，尚未进入正文上下文。')
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : '保存草稿失败' } finally { saving.value = false }
+}
+
+async function publishAndSync() {
+  const draft = selectedContract.value?.draft
+  if (!selectedContract.value || !draft) return
+  publishing.value = true
+  error.value = ''
+  try {
+    selectedContract.value = await outlineApi.publish(selectedContract.value.id, draft.revision, idempotencyKey('outline-publish'))
+    await loadTree()
+    message.success('已发布并同步；下一级现在可按新的计划链生成。')
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : '发布并同步失败' } finally { publishing.value = false }
+}
+
+async function generateDraftStream() {
+  if (!selectedContract.value || streaming.value) return
+  streamController?.abort()
+  streamController = new AbortController()
+  streaming.value = true
+  streamText.value = ''
+  error.value = ''
+  try {
+    await consumeOutlineDraftStream(selectedContract.value.id, async event => {
+      if (event.type === 'chunk') streamText.value += event.text || ''
+      if (event.type === 'done') {
+        payloadToForm(event.payload)
+        selectedContract.value = await outlineApi.getContract(selectedContract.value!.id)
+        await loadTree()
+      }
+      if (event.type === 'error') error.value = event.message || 'AI 大纲生成失败'
+    }, streamController.signal)
+  } catch (cause) {
+    if (!(cause instanceof DOMException && cause.name === 'AbortError')) {
+      error.value = cause instanceof Error ? cause.message : 'AI 大纲生成失败'
+    }
+  } finally { streaming.value = false }
+}
+
+onMounted(loadTree)
+</script>
+
+<style scoped>
+.outline-studio { min-height: 100vh; padding: 28px; color: var(--app-text-primary); background: var(--app-page-bg); }
+.outline-studio__header { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; max-width: 1540px; margin: 0 auto 20px; }
+.outline-studio__eyebrow, .outline-panel__kicker { margin: 0 0 4px; color: var(--color-brand); font-size: 12px; font-weight: 700; letter-spacing: .06em; }
+.outline-studio h1 { margin: 0; font: 700 clamp(24px, 3vw, 34px)/1.2 var(--app-font-serif, serif); }
+.outline-studio__header p:not(.outline-studio__eyebrow) { margin: 8px 0 0; color: var(--app-text-secondary); }
+.outline-studio__header-actions, .outline-editor__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.outline-studio__alert { max-width: 1540px; margin: 0 auto 16px; }
+.outline-studio__grid { display: grid; grid-template-columns: minmax(220px, .72fr) minmax(440px, 1.5fr) minmax(250px, .78fr); gap: 16px; max-width: 1540px; margin: 0 auto; align-items: start; }
+.outline-panel { min-width: 0; border: 1px solid var(--app-border); border-radius: var(--app-radius-lg); background: var(--app-surface); box-shadow: var(--app-shadow-sm); }
+.outline-panel__head { display: flex; align-items: start; justify-content: space-between; gap: 12px; padding: 16px; border-bottom: 1px solid var(--app-divider); }
+.outline-panel__head h2 { margin: 0; font-size: 16px; }.outline-count { color: var(--app-text-muted); font-size: 12px; }
+.outline-tree { padding: 8px; max-height: calc(100vh - 210px); overflow: auto; }.outline-tree-empty, .outline-editor-empty, .outline-inspector__empty { padding: 24px 18px; color: var(--app-text-secondary); line-height: 1.6; }
+.outline-tree__node { width: 100%; display: grid; grid-template-columns: 36px minmax(0, 1fr) 8px; gap: 8px; align-items: center; padding: 10px 8px 10px calc(8px + var(--tree-depth) * 14px); text-align: left; color: inherit; border: 1px solid transparent; border-radius: var(--app-radius-sm); background: transparent; cursor: pointer; transition: background .18s ease, border-color .18s ease; }
+.outline-tree__node:hover, .outline-tree__node.is-selected { border-color: var(--app-border); background: var(--app-surface-subtle); }.outline-tree__node.is-selected { box-shadow: inset 3px 0 var(--color-brand); }
+.outline-tree__level { color: var(--color-brand); font-size: 11px; font-weight: 700; }.outline-tree__copy { min-width: 0; display: grid; gap: 2px; }.outline-tree__copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }.outline-tree__copy small { color: var(--app-text-muted); font-size: 11px; }.outline-tree__state { width: 7px; height: 7px; border-radius: 99px; background: var(--app-text-muted); }.outline-tree__state.is-synced { background: var(--color-success); }.outline-tree__state.is-draft, .outline-tree__state.is-published { background: var(--color-warning); }.outline-tree__state.is-conflict { background: var(--color-danger); }
+.outline-editor { display: grid; gap: 14px; padding: 16px; }.outline-editor__summary, .outline-editor__grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }.outline-editor__grid--numbers { grid-template-columns: repeat(3, minmax(0, 1fr)); }.outline-editor__grid :deep(.n-form-item) { margin: 0; }.outline-editor__chapter-fields { display: grid; gap: 12px; padding: 14px; border: 1px solid var(--app-border); border-radius: var(--app-radius-md); background: var(--app-surface-subtle); }.outline-editor__note { margin: 0; color: var(--app-text-muted); font-size: 12px; line-height: 1.5; }.outline-editor-empty { min-height: 400px; display: grid; place-content: center; justify-items: start; gap: 10px; }.outline-editor-empty h3 { margin: 0; }.outline-editor-empty p { max-width: 46ch; margin: 0; }
+.outline-inspector { position: sticky; top: 16px; }.inspector-block { padding: 15px 16px; border-bottom: 1px solid var(--app-divider); }.inspector-block:last-child { border-bottom: 0; }.inspector-block h3 { margin: 0 0 7px; font-size: 13px; }.inspector-block p { margin: 0; color: var(--app-text-secondary); font-size: 13px; line-height: 1.55; }.inspector-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 0; }.inspector-facts div { display: grid; gap: 2px; }.inspector-facts dt { color: var(--app-text-muted); font-size: 11px; }.inspector-facts dd { margin: 0; font-size: 13px; }.inspector-block--stream pre { max-height: 260px; margin: 10px 0 0; overflow: auto; white-space: pre-wrap; color: var(--app-text-secondary); font: 12px/1.55 var(--app-font-mono, ui-monospace, monospace); }
+@media (max-width: 1120px) { .outline-studio__grid { grid-template-columns: minmax(190px, .75fr) minmax(0, 1.5fr); }.outline-inspector { grid-column: 1 / -1; position: static; }.outline-inspector { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }.outline-inspector .outline-panel__head { grid-column: 1 / -1; }.inspector-block { border-right: 1px solid var(--app-divider); border-bottom: 0; }.inspector-block--stream { grid-column: 1 / -1; border-right: 0; border-top: 1px solid var(--app-divider); } }
+@media (max-width: 760px) { .outline-studio { padding: 16px; }.outline-studio__header { flex-direction: column; gap: 14px; }.outline-studio__grid { grid-template-columns: 1fr; }.outline-tree { max-height: 250px; }.outline-inspector { display: block; }.inspector-block { border-right: 0; border-bottom: 1px solid var(--app-divider); }.outline-editor__summary, .outline-editor__grid, .outline-editor__grid--numbers { grid-template-columns: 1fr; }.outline-studio__header-actions { width: 100%; }.outline-studio__header-actions :deep(.n-button) { flex: 1; } }
+@media (prefers-reduced-motion: reduce) { .outline-tree__node { transition: none; } }
+</style>

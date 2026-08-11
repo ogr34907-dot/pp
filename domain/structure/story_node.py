@@ -11,6 +11,7 @@ import json
 
 class NodeType(str, Enum):
     """节点类型"""
+    OUTLINE = "outline"
     PART = "part"
     VOLUME = "volume"
     ACT = "act"
@@ -107,8 +108,13 @@ class StoryNode:
         ]
 
     def is_container(self) -> bool:
-        """是否是容器节点（part/volume/act）"""
-        return self.node_type in [NodeType.PART, NodeType.VOLUME, NodeType.ACT]
+        """是否是容器节点（总纲/部/卷/幕）。
+
+        ``OUTLINE`` is a logical root.  Existing databases do not persist it in
+        ``story_nodes``; the outline-contract projection exposes it as the
+        parent of legacy part roots.
+        """
+        return self.node_type in [NodeType.OUTLINE, NodeType.PART, NodeType.VOLUME, NodeType.ACT]
 
     def is_chapter(self) -> bool:
         """是否是章节节点"""

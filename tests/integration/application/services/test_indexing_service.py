@@ -76,7 +76,8 @@ async def test_index_chapter_flow(indexing_service, mock_summarizer, mock_embedd
         payload={
             "novel_id": "novel123",
             "chapter_number": 5,
-            "summary": "This is a summary of the chapter content."
+            "summary": "This is a summary of the chapter content.",
+            "generation_epoch": 0,
         }
     )
 
