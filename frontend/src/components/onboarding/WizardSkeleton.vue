@@ -7,7 +7,9 @@
         <aside class="worldbuilding-progress__rail" aria-label="世界观生成阶段">
           <div class="worldbuilding-progress__rail-head">
             <span class="worldbuilding-progress__eyebrow">生成阶段</span>
-            <span class="worldbuilding-progress__count">{{ completedCount }} / {{ dimensions.length }}</span>
+            <span class="worldbuilding-progress__count">
+              {{ invocationActive ? '完整设定生成中' : `${completedCount} / ${dimensions.length}` }}
+            </span>
           </div>
           <div class="worldbuilding-progress__list" role="list">
             <button
@@ -16,8 +18,8 @@
               type="button"
               class="worldbuilding-progress__item"
               :class="{
-                'worldbuilding-progress__item--active': activeDimension === dim.key && !completedDimensions.has(dim.key),
-                'worldbuilding-progress__item--done': completedDimensions.has(dim.key),
+                'worldbuilding-progress__item--active': !invocationActive && activeDimension === dim.key && !completedDimensions.has(dim.key),
+                'worldbuilding-progress__item--done': !invocationActive && completedDimensions.has(dim.key),
                 'worldbuilding-progress__item--selected': selectedDimension.key === dim.key,
               }"
               role="listitem"
@@ -26,13 +28,13 @@
               <span
                 class="skeleton-dot"
                 :class="{
-                  'skeleton-dot--active': activeDimension === dim.key && !completedDimensions.has(dim.key),
-                  'skeleton-dot--done': completedDimensions.has(dim.key),
+                  'skeleton-dot--active': !invocationActive && activeDimension === dim.key && !completedDimensions.has(dim.key),
+                  'skeleton-dot--done': !invocationActive && completedDimensions.has(dim.key),
                 }"
                 aria-hidden="true"
               >
-                <span v-if="completedDimensions.has(dim.key)" class="skeleton-dot__check">✓</span>
-                <span v-else-if="activeDimension === dim.key" class="skeleton-dot__pulse"></span>
+                <span v-if="!invocationActive && completedDimensions.has(dim.key)" class="skeleton-dot__check">✓</span>
+                <span v-else-if="!invocationActive && activeDimension === dim.key" class="skeleton-dot__pulse"></span>
               </span>
               <span class="worldbuilding-progress__item-text">
                 <span class="worldbuilding-progress__item-title">{{ dim.label }}</span>
@@ -43,7 +45,7 @@
           </div>
           <div class="worldbuilding-progress__rail-foot">
             <span class="worldbuilding-progress__legend-dot worldbuilding-progress__legend-dot--active" />
-            <span>当前生成项可实时查看</span>
+            <span>{{ invocationActive ? '完整结果校验后将写入五个维度' : '当前生成项可实时查看' }}</span>
           </div>
         </aside>
 
@@ -51,24 +53,29 @@
           <header class="worldbuilding-progress__preview-head">
             <div>
               <span class="worldbuilding-progress__eyebrow">实时预览</span>
-              <h4>{{ selectedDimension.label }}</h4>
+              <h4>{{ invocationActive ? '完整世界观设定' : selectedDimension.label }}</h4>
             </div>
-            <n-tag :type="selectedStatus.type" size="small">{{ selectedStatus.label }}</n-tag>
+            <span class="worldbuilding-progress__state" :class="`worldbuilding-progress__state--${selectedStatus.type}`">
+              {{ selectedStatus.label }}
+            </span>
           </header>
 
           <div
-            v-if="activeDimension === selectedDimension.key && !completedDimensions.has(selectedDimension.key)"
+            v-if="invocationActive || (activeDimension === selectedDimension.key && !completedDimensions.has(selectedDimension.key))"
             class="worldbuilding-progress__live-line"
           >
             <span class="worldbuilding-progress__live-dot" aria-hidden="true" />
-            <span>{{ phaseMessage || `正在生成${selectedDimension.label}` }}</span>
+            <span>{{ invocationActive ? invocationMessage : (phaseMessage || `正在生成${selectedDimension.label}`) }}</span>
           </div>
 
           <div
-            v-if="activeDimension === selectedDimension.key || completedDimensions.has(selectedDimension.key)"
+            v-if="!invocationActive && (activeDimension === selectedDimension.key || completedDimensions.has(selectedDimension.key))"
             class="worldbuilding-progress__preview-body"
           >
             <slot :name="selectedDimension.key" />
+          </div>
+          <div v-else-if="invocationActive" class="worldbuilding-progress__invocation-copy">
+            <p>{{ invocationMessage || '正在等待服务端返回完整设定。' }}</p>
           </div>
           <div v-else class="worldbuilding-progress__waiting">
             <div class="worldbuilding-progress__waiting-lines" aria-hidden="true">
@@ -154,12 +161,17 @@ const props = withDefaults(
     completedCount?: number
     /** 世界观当前阶段的状态描述 */
     phaseMessage?: string
+    /** 一次性 Invocation 会在校验后统一写入，不可伪装成逐维度完成。 */
+    invocationActive?: boolean
+    invocationMessage?: string
   }>(),
   {
     activeDimension: '',
     completedDimensions: () => new Set<string>(),
     completedCount: 0,
     phaseMessage: '',
+    invocationActive: false,
+    invocationMessage: '',
   }
 )
 
@@ -180,6 +192,9 @@ const selectedDimension = computed(() =>
 const completedCount = computed(() => dimensions.filter(dim => props.completedDimensions.has(dim.key)).length)
 
 const selectedStatus = computed(() => {
+  if (props.invocationActive) {
+    return { label: '统一生成中', type: 'info' as const }
+  }
   if (props.completedDimensions.has(selectedDimension.value.key)) {
     return { label: '已生成', type: 'success' as const }
   }
@@ -190,6 +205,7 @@ const selectedStatus = computed(() => {
 })
 
 function dimensionStatus(key: string) {
+  if (props.invocationActive) return '统一生成中'
   if (props.completedDimensions.has(key)) return '已生成'
   if (props.activeDimension === key) return '生成中'
   return '等待中'
@@ -377,6 +393,21 @@ watch(
   font-weight: 700;
 }
 
+.worldbuilding-progress__state {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid var(--app-border, var(--n-border-color));
+  border-radius: 999px;
+  color: var(--app-text-secondary, var(--n-text-color-2));
+  background: var(--app-surface-subtle, var(--n-color-modal));
+  font-size: 12px;
+}
+
+.worldbuilding-progress__state--info {
+  color: var(--color-brand, var(--n-primary-color));
+  border-color: color-mix(in srgb, var(--color-brand, var(--n-primary-color)) 34%, var(--app-border));
+}
+
 .worldbuilding-progress__live-line {
   display: flex;
   align-items: center;
@@ -392,6 +423,18 @@ watch(
   padding-top: 12px;
   overflow: auto;
 }
+
+.worldbuilding-progress__invocation-copy {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  min-height: 112px;
+  color: var(--app-text-secondary, var(--n-text-color-2));
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.worldbuilding-progress__invocation-copy p { margin: 0; }
 
 .worldbuilding-progress__waiting {
   display: flex;

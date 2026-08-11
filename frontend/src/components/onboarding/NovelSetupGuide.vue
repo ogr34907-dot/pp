@@ -41,11 +41,14 @@
               <div class="generating-title-row">
                 <h3>{{ phaseMessage || '正在生成文风公约与世界观...' }}</h3>
                 <span class="generation-progress-count">
-                  {{ worldbuildingCompletedCount }} / {{ WB_DIMS.length }} 个维度
+                  {{ worldbuildingInvocation ? '完整设定生成中' : `${worldbuildingCompletedCount} / ${WB_DIMS.length} 个维度` }}
                 </span>
               </div>
-              <p class="generating-sub">AI 会先定文风，再逐维度构建您的世界，出一个渲染一个</p>
+              <p class="generating-sub">
+                {{ worldbuildingInvocation ? '模型正在一次产出完整设定，校验完成后才会写入五个维度。' : 'AI 会先定文风，再逐维度构建您的世界，出一个渲染一个。' }}
+              </p>
               <n-progress
+                v-if="!worldbuildingInvocation"
                 class="generation-progress-bar"
                 type="line"
                 :percentage="worldbuildingProgressPercent"
@@ -56,18 +59,32 @@
               />
             </div>
             <div class="generation-metrics">
-              <span class="generation-metric">已解析 {{ worldbuildingFieldCount }} 个字段</span>
+              <span class="generation-metric">
+                {{ worldbuildingInvocation
+                  ? (worldbuildingInvocation.streamContent ? `已接收 ${worldbuildingInvocation.streamContent.length} 字符` : '等待首段输出')
+                  : `已解析 ${worldbuildingFieldCount} 个字段` }}
+              </span>
               <n-tag size="tiny" :type="bibleError ? 'error' : 'success'">
-                {{ bibleError ? '连接异常' : worldbuildingStreamLabel }}
+                {{ bibleError ? '连接异常' : (worldbuildingInvocation ? '任务进行中' : worldbuildingStreamLabel) }}
               </n-tag>
             </div>
           </div>
+
+          <OnboardingTaskProgress
+            v-if="worldbuildingInvocation"
+            task="worldbuilding"
+            :phase="worldbuildingInvocation.phase"
+            :elapsed-seconds="worldbuildingInvocation.elapsedSeconds"
+            :stream-content="worldbuildingInvocation.streamContent"
+          />
 
           <WizardSkeleton
             type="worldbuilding"
             :active-dimension="activeDimension"
             :completed-dimensions="completedDimensions"
             :phase-message="phaseMessage"
+            :invocation-active="worldbuildingInvocation !== null"
+            :invocation-message="worldbuildingInvocation ? '完整设定正在生成，五个维度会在校验后统一写入。' : ''"
           >
             <template #core_rules>
               <div class="dimension-fields" v-if="orderedWorldbuildingFields('core_rules').length">
@@ -220,9 +237,17 @@
             </div>
             <div class="generating-text">
               <h3>{{ phaseMessage || '正在生成人物...' }}</h3>
-              <p class="generating-sub">角色逐一呈现</p>
+              <p class="generating-sub">模型输出会在校验后回填为可编辑人物卡片。</p>
             </div>
           </div>
+
+          <OnboardingTaskProgress
+            v-if="charactersInvocation"
+            task="characters"
+            :phase="charactersInvocation.phase"
+            :elapsed-seconds="charactersInvocation.elapsedSeconds"
+            :stream-content="charactersInvocation.streamContent"
+          />
 
           <div class="streaming-cards">
             <!-- 已接收的角色 —— 完整卡片 -->
@@ -469,9 +494,17 @@
             </div>
             <div class="generating-text">
               <h3>{{ phaseMessage || '正在生成地图...' }}</h3>
-              <p class="generating-sub">地点逐一呈现</p>
+              <p class="generating-sub">模型输出会在校验后回填为可编辑地点卡片。</p>
             </div>
           </div>
+
+          <OnboardingTaskProgress
+            v-if="locationsInvocation"
+            task="locations"
+            :phase="locationsInvocation.phase"
+            :elapsed-seconds="locationsInvocation.elapsedSeconds"
+            :stream-content="locationsInvocation.streamContent"
+          />
 
           <div class="streaming-loc-cards">
             <!-- 已接收的地点 —— 完整卡片 -->
@@ -588,7 +621,15 @@
             </div>
           </div>
 
-          <div class="plot-outline-progress">
+          <OnboardingTaskProgress
+            v-if="plotOutlineInvocation"
+            task="plot_outline"
+            :phase="plotOutlineInvocation.phase"
+            :elapsed-seconds="plotOutlineInvocation.elapsedSeconds"
+            :stream-content="plotOutlineInvocation.streamContent"
+          />
+
+          <div v-else class="plot-outline-progress">
             <div
               v-for="item in plotOutlineProgressItems"
               :key="item.key"
@@ -604,10 +645,6 @@
           </div>
 
           <WizardSkeleton type="storyline" />
-
-          <div v-if="plotOutlineLivePreview" class="raw-stream-preview plot-outline-live-preview">
-            {{ plotOutlineLivePreview }}<span class="streaming-cursor">▎</span>
-          </div>
 
           <n-space v-if="featureFlags.aiInvocationDebug && plotOutlineSessionId" justify="center">
             <n-button secondary @click="openPlotOutlineReviewPanel(plotOutlineSessionId)">
@@ -815,7 +852,13 @@ import {
 import { useAIInvocationStore } from '@/stores/aiInvocationStore'
 import { extractBoundOutputMaps, parseJsonLikeRecord } from '@/utils/invocationOutput'
 import BibleLocationsGraphPreview from './BibleLocationsGraphPreview.vue'
+import OnboardingTaskProgress from './OnboardingTaskProgress.vue'
 import WizardSkeleton from './WizardSkeleton.vue'
+import {
+  getOnboardingInvocationPresentation,
+  type OnboardingInvocationPhase,
+  type OnboardingInvocationTask,
+} from '@/onboarding/onboardingInvocationProgress'
 import {
   clearWizardUiCache,
   isPlotOutlineCacheFresh,
@@ -869,8 +912,10 @@ function applyWorldbuildingBoundOutputs(record: Record<string, unknown>, binding
 }
 
 function applyBibleInvocationPreview(stage: 'worldbuilding' | 'characters' | 'locations', payload: InvocationResponseDTO) {
+  updateOnboardingInvocation(stage, payload.session?.id || '', payload)
   if (stage !== 'worldbuilding') return
   const content = payload.attempt?.content || ''
+  if (content) worldbuildingRawStream.value = content
   const record = parseJsonLikeRecord(content)
   if (!record) return
   applyWorldbuildingRecord(record)
@@ -883,6 +928,7 @@ function applyBibleInvocationPreview(stage: 'worldbuilding' | 'characters' | 'lo
 function applyWorldbuildingChunk(chunk: string) {
   if (!chunk) return
   worldbuildingRawStream.value += chunk
+  appendOnboardingInvocationStream('worldbuilding', chunk)
 }
 
 const IconBook = () =>
@@ -933,6 +979,133 @@ const message = useMessage()
 const aiInvocationStore = useAIInvocationStore()
 let mainPlotSessionUnsub: (() => void) | null = null
 const bibleInvocationUnsubs = new Map<string, () => void>()
+
+interface ActiveOnboardingInvocation {
+  task: OnboardingInvocationTask
+  sessionId: string
+  attemptId: string
+  phase: OnboardingInvocationPhase
+  startedAt: number
+  elapsedSeconds: number
+  streamContent: string
+}
+
+const activeOnboardingInvocation = ref<ActiveOnboardingInvocation | null>(null)
+let onboardingInvocationTimer: ReturnType<typeof setInterval> | null = null
+
+const worldbuildingInvocation = computed(() => (
+  activeOnboardingInvocation.value?.task === 'worldbuilding'
+    ? activeOnboardingInvocation.value
+    : null
+))
+const charactersInvocation = computed(() => (
+  activeOnboardingInvocation.value?.task === 'characters'
+    ? activeOnboardingInvocation.value
+    : null
+))
+const locationsInvocation = computed(() => (
+  activeOnboardingInvocation.value?.task === 'locations'
+    ? activeOnboardingInvocation.value
+    : null
+))
+const plotOutlineInvocation = computed(() => (
+  activeOnboardingInvocation.value?.task === 'plot_outline'
+    ? activeOnboardingInvocation.value
+    : null
+))
+
+function stopOnboardingInvocation(task?: OnboardingInvocationTask) {
+  const current = activeOnboardingInvocation.value
+  if (task && current?.task !== task) return
+  if (onboardingInvocationTimer) {
+    clearInterval(onboardingInvocationTimer)
+    onboardingInvocationTimer = null
+  }
+  activeOnboardingInvocation.value = null
+}
+
+function beginOnboardingInvocation(task: OnboardingInvocationTask, sessionId = '') {
+  const current = activeOnboardingInvocation.value
+  if (
+    current?.task === task &&
+    (!sessionId || !current.sessionId || current.sessionId === sessionId)
+  ) {
+    activeOnboardingInvocation.value = {
+      ...current,
+      sessionId: sessionId || current.sessionId,
+    }
+    return
+  }
+
+  stopOnboardingInvocation()
+  const startedAt = Date.now()
+  activeOnboardingInvocation.value = {
+    task,
+    sessionId,
+    attemptId: '',
+    phase: 'creating',
+    startedAt,
+    elapsedSeconds: 0,
+    streamContent: '',
+  }
+  onboardingInvocationTimer = setInterval(() => {
+    const latest = activeOnboardingInvocation.value
+    if (!latest || latest.task !== task) return
+    activeOnboardingInvocation.value = {
+      ...latest,
+      elapsedSeconds: Math.max(0, Math.floor((Date.now() - latest.startedAt) / 1000)),
+    }
+  }, 1000)
+}
+
+function setOnboardingInvocationPhase(
+  task: OnboardingInvocationTask,
+  phase: OnboardingInvocationPhase,
+) {
+  const current = activeOnboardingInvocation.value
+  if (current?.task !== task) return
+  activeOnboardingInvocation.value = { ...current, phase }
+}
+
+function appendOnboardingInvocationStream(task: OnboardingInvocationTask, chunk: string) {
+  if (!chunk) return
+  const current = activeOnboardingInvocation.value
+  if (current?.task !== task) return
+  activeOnboardingInvocation.value = {
+    ...current,
+    phase: 'generating',
+    streamContent: `${current.streamContent}${chunk}`,
+  }
+}
+
+function updateOnboardingInvocation(
+  task: OnboardingInvocationTask,
+  sessionId: string,
+  payload: InvocationResponseDTO,
+) {
+  if (activeOnboardingInvocation.value?.task !== task) {
+    beginOnboardingInvocation(task, sessionId)
+  }
+  const current = activeOnboardingInvocation.value
+  if (!current) return
+  const attempt = payload.attempt
+  const attemptChanged = Boolean(attempt?.id && attempt.id !== current.attemptId)
+  const streamContent = attempt
+    ? (attemptChanged ? attempt.content || '' : attempt.content ?? current.streamContent)
+    : current.streamContent
+  const presentation = getOnboardingInvocationPresentation({
+    task,
+    sessionStatus: payload.session?.status,
+    commitStatus: payload.commit?.status,
+  })
+  activeOnboardingInvocation.value = {
+    ...current,
+    sessionId: sessionId || current.sessionId,
+    attemptId: attempt?.id || current.attemptId,
+    phase: presentation.phase,
+    streamContent,
+  }
+}
 
 const emit = defineEmits<{
   (e: 'update:show', value: boolean): void
@@ -1081,12 +1254,14 @@ function markBibleStageCommitted(stage: string) {
     generatingLocations.value = false
     locationsGenerated.value = true
   }
+  stopOnboardingInvocation(stage as OnboardingInvocationTask)
   phaseMessage.value = ''
   void loadBibleData()
 }
 
 async function openBibleReviewPanel(stage: 'worldbuilding' | 'characters' | 'locations', sessionId: string) {
   if (!sessionId) return
+  beginOnboardingInvocation(stage, sessionId)
   if (featureFlags.aiInvocationDebug) {
     setBibleStageReviewWaiting(stage, true)
   } else {
@@ -1115,6 +1290,7 @@ async function openBibleReviewPanel(stage: 'worldbuilding' | 'characters' | 'loc
     }
   } catch (e: unknown) {
     setBibleStageReviewWaiting(stage, false)
+    stopOnboardingInvocation(stage)
     message.error(formatApiError(e) || 'AI 调用处理失败')
   }
 }
@@ -1151,13 +1327,6 @@ const plotOutlineStatusMessage = computed(() => {
   if (plotOutlineStatus.value === 'generating') return 'AI 正在生成剧情总纲...'
   if (plotOutlineStatus.value === 'committing') return '正在写入剧情总纲...'
   return '正在生成剧情总纲...'
-})
-const plotOutlineLivePreview = computed(() => {
-  if (!plotOutlineSessionId.value) return ''
-  if (aiInvocationStore.session?.id !== plotOutlineSessionId.value) return ''
-  const text = aiInvocationStore.liveAttemptDisplay.trim()
-  if (!text) return ''
-  return text.length > 1000 ? text.slice(-1000) : text
 })
 const plotOutlineProgressIndex = computed(() => {
   if (plotOutlineStatus.value === 'done') return 4
@@ -1229,6 +1398,7 @@ function persistStepFourUiToCache(opts?: { includePlotOutline?: boolean }) {
 }
 
 function finishPlotOutlineInvocation() {
+  stopOnboardingInvocation('plot_outline')
   plotOutlineGenerating.value = false
   plotOutlineStatus.value = 'done'
   phaseMessage.value = ''
@@ -1237,6 +1407,7 @@ function finishPlotOutlineInvocation() {
 }
 
 function failPlotOutlineInvocation(messageText: string) {
+  stopOnboardingInvocation('plot_outline')
   plotOutlineError.value = messageText
   plotOutlineGenerating.value = false
   plotOutlineStatus.value = 'error'
@@ -1246,6 +1417,7 @@ function failPlotOutlineInvocation(messageText: string) {
 }
 
 function resetPlotOutlineInvocationState() {
+  stopOnboardingInvocation('plot_outline')
   plotOutlineGenerating.value = false
   plotOutlineStatus.value = 'idle'
   phaseMessage.value = ''
@@ -1318,6 +1490,7 @@ function applyPlotOutlineFromResult(
 }
 
 async function handlePlotOutlineInvocationUpdate(payload: InvocationResponseDTO) {
+  updateOnboardingInvocation('plot_outline', payload.session?.id || plotOutlineSessionId.value, payload)
   updatePlotOutlineStatusFromInvocation(payload)
   const result = payload.commit?.result
   if (result && applyPlotOutlineFromResult(result, payload.session?.output_bindings || [])) {
@@ -1344,6 +1517,7 @@ async function handlePlotOutlineInvocationUpdate(payload: InvocationResponseDTO)
 
 async function openPlotOutlineReviewPanel(sessionId: string) {
   if (!sessionId) return
+  beginOnboardingInvocation('plot_outline', sessionId)
   plotOutlineSessionId.value = sessionId
   plotOutlineGenerating.value = true
   if (plotOutlineStatus.value === 'idle' || plotOutlineStatus.value === 'done' || plotOutlineStatus.value === 'error') {
@@ -1375,6 +1549,7 @@ async function openPlotOutlineReviewPanel(sessionId: string) {
 }
 
 async function loadPlotOutline(opts?: { forceNew?: boolean }) {
+  beginOnboardingInvocation('plot_outline')
   step4RestoredFromCache.value = false
   plotOutlineError.value = ''
   plotOutlineStatus.value = 'creating'
@@ -1422,6 +1597,7 @@ async function loadPlotOutline(opts?: { forceNew?: boolean }) {
       },
       onPhase: (message) => {
         if (message) phaseMessage.value = message
+        setOnboardingInvocationPhase('plot_outline', 'generating')
       },
       onDone: (outline) => {
         if (outline) {
@@ -1507,6 +1683,7 @@ function hydrateStepFourFromCache() {
 // ════════════════════════════════════════════════════════════════════════════
 
 function finishWorldbuildingGeneration() {
+  stopOnboardingInvocation('worldbuilding')
   completedDimensions.value = new Set(WB_DIMS)
   activeDimension.value = ''
   activeField.value = ''
@@ -1527,6 +1704,8 @@ function startBibleGeneration() {
 
 /** 启动第1步：生成文风公约与世界观 */
 function startBibleGenerationSSE() {
+  stopOnboardingInvocation('worldbuilding')
+  beginOnboardingInvocation('worldbuilding')
   generatingBible.value = true
   bibleGenerated.value = false
   bibleError.value = ''
@@ -1546,6 +1725,9 @@ function startBibleGenerationSSE() {
     signal: ctrl.signal,
     onPhase: (phase, msg) => {
       phaseMessage.value = msg
+      if (phase === 'worldbuilding' || phase === 'worldbuilding_streaming' || phase.startsWith('worldbuilding_')) {
+        setOnboardingInvocationPhase('worldbuilding', 'generating')
+      }
       // 世界观维度级阶段：worldbuilding_core_rules / worldbuilding_geography 等
       if (phase.startsWith('worldbuilding_') && phase !== 'worldbuilding_done') {
         const dimKey = phase.replace('worldbuilding_', '')
@@ -1601,6 +1783,8 @@ function startBibleGenerationSSE() {
       finishWorldbuildingGeneration()
     },
     onError: (msg) => {
+      stopOnboardingInvocation('worldbuilding')
+      generatingBible.value = false
       bibleError.value = msg
       phaseMessage.value = ''
     },
@@ -1614,6 +1798,8 @@ function startCharactersGeneration() {
 
 /** 启动第2步：生成人物 */
 function startCharactersGenerationSSE() {
+  stopOnboardingInvocation('characters')
+  beginOnboardingInvocation('characters')
   generatingCharacters.value = true
   charactersGenerated.value = false
   charactersError.value = ''
@@ -1629,6 +1815,7 @@ function startCharactersGenerationSSE() {
     signal: ctrl.signal,
     onPhase: (_phase, msg) => {
       phaseMessage.value = msg
+      setOnboardingInvocationPhase('characters', 'generating')
     },
     onCharacter: (char) => {
       const c = char as GeneratedCharacterPayload
@@ -1644,7 +1831,8 @@ function startCharactersGenerationSSE() {
         streamingCharacters.value = [...streamingCharacters.value, editable]
       }
     },
-    onCharacterChunk: (_chunk) => {
+    onCharacterChunk: (chunk) => {
+      appendOnboardingInvocationStream('characters', chunk)
       // LLM 逐 token 输出中 —— 更新进度提示
       if (!phaseMessage.value.includes('正在生成')) {
         phaseMessage.value = 'AI 正在构思角色...'
@@ -1654,12 +1842,14 @@ function startCharactersGenerationSSE() {
       void openBibleReviewPanel('characters', sessionId)
     },
     onDone: () => {
+      stopOnboardingInvocation('characters')
       generatingCharacters.value = false
       charactersGenerated.value = true
       phaseMessage.value = ''
       loadBibleData()
     },
     onError: (msg) => {
+      stopOnboardingInvocation('characters')
       generatingCharacters.value = false
       charactersError.value = msg
       phaseMessage.value = ''
@@ -1674,6 +1864,8 @@ function startLocationsGeneration() {
 
 /** 启动第3步：生成地点 */
 function startLocationsGenerationSSE() {
+  stopOnboardingInvocation('locations')
+  beginOnboardingInvocation('locations')
   generatingLocations.value = true
   locationsGenerated.value = false
   locationsError.value = ''
@@ -1688,6 +1880,7 @@ function startLocationsGenerationSSE() {
     signal: ctrl.signal,
     onPhase: (_phase, msg) => {
       phaseMessage.value = msg
+      setOnboardingInvocationPhase('locations', 'generating')
     },
     onLocation: (loc) => {
       const l = loc as { name?: string; id?: string; type?: string; location_type?: string; description?: string }
@@ -1701,7 +1894,8 @@ function startLocationsGenerationSSE() {
         }]
       }
     },
-    onLocationChunk: (_chunk) => {
+    onLocationChunk: (chunk) => {
+      appendOnboardingInvocationStream('locations', chunk)
       // LLM 逐 token 输出中 —— 更新进度提示
       if (!phaseMessage.value.includes('正在生成')) {
         phaseMessage.value = 'AI 正在构思地点...'
@@ -1711,12 +1905,14 @@ function startLocationsGenerationSSE() {
       void openBibleReviewPanel('locations', sessionId)
     },
     onDone: () => {
+      stopOnboardingInvocation('locations')
       generatingLocations.value = false
       locationsGenerated.value = true
       phaseMessage.value = ''
       loadBibleData()
     },
     onError: (msg) => {
+      stopOnboardingInvocation('locations')
       generatingLocations.value = false
       locationsError.value = msg
       phaseMessage.value = ''
@@ -1761,6 +1957,7 @@ async function loadBibleData() {
 // ════════════════════════════════════════════════════════════════════════════
 
 function resetWizardStateForOpen() {
+  stopOnboardingInvocation()
   currentStep.value = 1
   stepStatus.value = 'process'
   plotOutline.value = null
@@ -1880,6 +2077,7 @@ async function runWizardOpenSequence() {
 }
 
 function stopGenerationOnClose() {
+  stopOnboardingInvocation()
   sseAbortController.value?.abort()
   charactersSseAbort.value?.abort()
   locationsSseAbort.value?.abort()
