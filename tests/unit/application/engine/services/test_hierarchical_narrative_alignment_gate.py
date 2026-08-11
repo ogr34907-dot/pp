@@ -9,6 +9,7 @@ from application.engine.services.hierarchical_narrative_alignment_gate import (
     OneShotOverride,
 )
 from application.engine.services.narrative_gate_guard import evaluate_chapter_candidate
+from domain.ai.services.vector_store import VectorStore
 from domain.structure.story_node import NodeType, StoryNode
 
 
@@ -184,6 +185,44 @@ async def test_async_vector_retriever_is_awaited_during_evaluation(chain):
 
     assert report.decision == "pass"
     assert calls
+
+
+@pytest.mark.asyncio
+async def test_raw_vector_store_is_not_treated_as_chapter_evidence_retriever(chain):
+    """A storage backend needs embeddings and collection metadata, not novel/chapter ids."""
+
+    class RawVectorStore(VectorStore):
+        def __init__(self):
+            self.search_calls = []
+
+        async def insert(self, collection, id, vector, payload):
+            return None
+
+        async def search(self, collection, query_vector, limit):
+            self.search_calls.append((collection, query_vector, limit))
+            return []
+
+        async def delete(self, collection, id):
+            return None
+
+        async def create_collection(self, collection, dimension):
+            return None
+
+        async def delete_collection(self, collection):
+            return None
+
+        async def list_collections(self):
+            return []
+
+    store = RawVectorStore()
+    gate = HierarchicalNarrativeAlignmentGate(vector_retriever=store)
+
+    snapshot = gate.build_snapshot("chapter-1", chain)
+    report = await gate.evaluate(snapshot, candidate())
+
+    assert report.decision == "pass"
+    assert report.evidence_degraded is False
+    assert store.search_calls == []
 
 
 def test_unknown_candidate_reference_blocks_even_without_known_references(chain):

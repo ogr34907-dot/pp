@@ -15,6 +15,8 @@ import math
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 
+from domain.ai.services.vector_store import VectorStore
+
 
 def _json_safe(value: Any, _seen: Optional[set[int]] = None) -> Any:
     """Convert arbitrary application values into JSON-compatible values."""
@@ -303,14 +305,9 @@ class HierarchicalNarrativeAlignmentGate:
         return AlignmentReport(violations=violations_tuple, **kwargs)
 
     def _retrieve_vectors(self, novel_id: str, chapter_id: str) -> tuple[list[Any], bool]:
-        retriever = self.vector_retriever
-        if retriever is None:
+        operation = self._chapter_evidence_operation()
+        if operation is None:
             return [], False
-        operation = retriever
-        for name in ("retrieve", "search", "get_evidence"):
-            if hasattr(retriever, name):
-                operation = getattr(retriever, name)
-                break
         if inspect.iscoroutinefunction(operation):
             return [{"degraded": True, "error": "async vector retriever requires async evaluation"}], True
         try:
@@ -532,12 +529,9 @@ class HierarchicalNarrativeAlignmentGate:
         return replace(report, confidence=confidence)
 
     async def _retrieve_vectors_async(self, novel_id: str, chapter_id: str) -> tuple[list[Any], bool]:
-        retriever = self.vector_retriever
-        operation = retriever
-        for name in ("retrieve", "search", "get_evidence"):
-            if hasattr(retriever, name):
-                operation = getattr(retriever, name)
-                break
+        operation = self._chapter_evidence_operation()
+        if operation is None:
+            return [], False
         try:
             try:
                 result = operation(novel_id, chapter_id)
@@ -555,6 +549,26 @@ class HierarchicalNarrativeAlignmentGate:
             return list(result or []), False
         except Exception as exc:
             return [{"degraded": True, "error": str(exc)}], True
+
+    def _chapter_evidence_operation(self) -> Optional[Callable[..., Any]]:
+        """Return an operation that accepts a novel/chapter evidence query.
+
+        ``VectorStore`` is a persistence primitive whose ``search`` method
+        requires a collection, an embedding vector and a result limit.  It is
+        not a narrative-evidence retriever, so treating it as one produces a
+        TypeError and incorrectly turns a structurally valid plan into a
+        blocking ``review`` state.
+        """
+        retriever = self.vector_retriever
+        if retriever is None or isinstance(retriever, VectorStore):
+            return None
+        if callable(retriever):
+            return retriever
+        for name in ("retrieve", "get_evidence", "search"):
+            operation = getattr(retriever, name, None)
+            if callable(operation):
+                return operation
+        return None
 
     async def acheck(self, snapshot: HierarchySnapshot, candidate: Mapping[str, Any]) -> AlignmentReport:
         return await self.evaluate(snapshot, candidate)

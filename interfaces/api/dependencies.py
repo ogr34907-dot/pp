@@ -809,7 +809,6 @@ def build_auto_workflow(
     from application.engine.services.hierarchical_narrative_alignment_gate import HierarchicalNarrativeAlignmentGate
     hierarchy_gate = HierarchicalNarrativeAlignmentGate(
         memory_engine=memory_engine,
-        vector_retriever=get_vector_store(),
     )
     story_node_repo = get_story_node_repository()
 
