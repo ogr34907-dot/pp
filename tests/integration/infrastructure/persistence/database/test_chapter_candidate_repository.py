@@ -225,6 +225,24 @@ def test_review_candidate_can_be_regenerated_or_rejected_without_formal_side_eff
     assert db.fetch_one("SELECT COUNT(*) AS total FROM chapters WHERE novel_id = ?", ("novel-1",))["total"] == 0
 
 
+def test_rejecting_an_inflight_candidate_cancels_its_dag_trace(candidates):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain()
+    )
+    trace = repo.start_dag_run(candidate.id, content_revision=0)
+
+    rejected = repo.reject_and_stop(candidate.id)
+
+    assert rejected.status == CandidateStatus.REJECTED
+    assert repo.get_run("novel-1").generation_epoch == 1
+    assert db.fetch_one(
+        "SELECT status FROM candidate_dag_runs WHERE id = ?", (trace["id"],)
+    )["status"] == "cancelled"
+    with pytest.raises(CandidateGateError, match="not active"):
+        repo.finish_dag_run(trace["id"], status="completed", final_state={})
+
+
 def test_formal_candidate_with_failed_sync_can_retry_without_duplicate_chapter(candidates):
     repo, db = candidates
     candidate = repo.create_streaming_candidate(
@@ -241,6 +259,24 @@ def test_formal_candidate_with_failed_sync_can_retry_without_duplicate_chapter(c
     assert retrying.status == CandidateStatus.SYNCING
     repo.mark_sync_succeeded(candidate.id)
     assert db.fetch_one("SELECT COUNT(*) AS total FROM chapters WHERE novel_id = ?", ("novel-1",))["total"] == 1
+
+
+def test_formal_candidate_with_failed_sync_cannot_be_rejected(candidates):
+    repo, _db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain(), llm_content="候选"
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    repo.approve_for_commit(candidate.id, continue_after_commit=False)
+    repo.commit_formal(candidate.id)
+    repo.mark_sync_failed(candidate.id, "canonical_aftermath_not_ready")
+
+    with pytest.raises(CandidateGateError, match="formal candidate"):
+        repo.reject_and_stop(candidate.id)
+
+    assert repo.get_candidate(candidate.id).formal_chapter_id is not None
+    assert repo.get_run("novel-1").next_action == "retry_sync"
 
 
 def test_stopping_during_canonical_sync_finishes_sync_then_pauses(candidates):
@@ -269,16 +305,20 @@ def test_stopping_during_canonical_sync_finishes_sync_then_pauses(candidates):
 
 
 def test_stopping_an_inflight_candidate_retires_late_worker_writes(candidates):
-    repo, _db = candidates
+    repo, db = candidates
     candidate = repo.create_streaming_candidate(
         novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain()
     )
+    trace = repo.start_dag_run(candidate.id, content_revision=0)
 
     stopped = repo.stop_run("novel-1")
 
     assert stopped.state == GenerationRunState.STOPPED
     assert stopped.current_candidate_id is None
     assert repo.get_candidate(candidate.id).status == CandidateStatus.CANCELLED
+    assert db.fetch_one(
+        "SELECT status FROM candidate_dag_runs WHERE id = ?", (trace["id"],)
+    )["status"] == "cancelled"
     with pytest.raises(CandidateGateError, match="retired generation epoch"):
         repo.set_generated_content(candidate.id, "终止后迟到的正文")
 
@@ -322,3 +362,85 @@ def test_candidate_dag_trace_persists_node_attempts_and_resumable_events(candida
         "duration_ms": 12,
     }]
     assert [event["sequence"] for event in restored["events"]] == [1, 2]
+
+
+def test_completed_dag_trace_rejects_late_events_and_second_completion(candidates):
+    repo, _db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain()
+    )
+    trace = repo.start_dag_run(candidate.id, content_revision=0)
+    repo.finish_dag_run(trace["id"], status="completed", final_state={"content": "候选正文"})
+
+    with pytest.raises(CandidateGateError, match="not active"):
+        repo.record_dag_event(
+            trace["id"], {"type": "node_completed", "node_id": "late_writer"}
+        )
+    with pytest.raises(CandidateGateError, match="not active"):
+        repo.finish_dag_run(trace["id"], status="failed", final_state={})
+
+    restored = repo.get_dag_run(trace["id"])
+    assert restored["status"] == "completed"
+    assert restored["events"] == []
+
+
+def test_service_restart_cancels_active_candidate_and_dag_trace(candidates):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain()
+    )
+    trace = repo.start_dag_run(candidate.id, content_revision=0)
+
+    recovered = repo.recover_after_service_restart("novel-1")
+
+    assert recovered.state == GenerationRunState.STOPPED
+    assert recovered.current_candidate_id is None
+    assert recovered.generation_epoch == 1
+    assert repo.get_candidate(candidate.id).status == CandidateStatus.CANCELLED
+    assert db.fetch_one(
+        "SELECT status FROM candidate_dag_runs WHERE id = ?", (trace["id"],)
+    )["status"] == "cancelled"
+
+    with pytest.raises(CandidateGateError, match="not active"):
+        repo.finish_dag_run(trace["id"], status="completed", final_state={"content": "迟到"})
+
+    with pytest.raises(CandidateGateError, match="retired generation epoch"):
+        repo.set_generated_content(candidate.id, "迟到正文")
+
+
+def test_service_restart_preserves_candidate_waiting_for_author_review(candidates):
+    repo, _db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain(), llm_content="候选"
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    before = repo.get_run("novel-1")
+
+    recovered = repo.recover_after_service_restart("novel-1")
+
+    assert recovered.state == GenerationRunState.WAITING_REVIEW
+    assert recovered.current_candidate_id == candidate.id
+    assert recovered.generation_epoch == before.generation_epoch
+    assert repo.get_candidate(candidate.id).status == CandidateStatus.AWAITING_REVIEW
+
+
+def test_service_restart_marks_syncing_candidate_retryable_without_retiring_epoch(candidates):
+    repo, _db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain(), llm_content="候选"
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    repo.approve_for_commit(candidate.id, continue_after_commit=True)
+    repo.commit_formal(candidate.id)
+    before = repo.get_run("novel-1")
+
+    recovered = repo.recover_after_service_restart("novel-1")
+
+    assert recovered.state == GenerationRunState.PAUSED
+    assert recovered.canonical_sync_status == "failed"
+    assert recovered.next_action == "retry_sync"
+    assert recovered.generation_epoch == before.generation_epoch
+    assert repo.get_candidate(candidate.id).status == CandidateStatus.FAILED
+    assert repo.begin_sync_retry(candidate.id).status == CandidateStatus.SYNCING

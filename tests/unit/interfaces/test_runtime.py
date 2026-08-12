@@ -5,6 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 from application.core.config.config_loader import reload_config
+from domain.novel.candidate_chapter import CandidateStatus, GenerationRunState, RunMode
+from infrastructure.persistence.database.chapter_candidate_repository import (
+    ChapterCandidateRepository,
+)
+from infrastructure.persistence.database.connection import DatabaseConnection
 from interfaces import runtime_state
 from interfaces.runtime import AppRuntime, BackendLifecycle, get_backend_lifecycle_settings
 
@@ -154,6 +159,48 @@ def test_startup_reset_persists_restart_interruption_reason(tmp_path, monkeypatc
     connection.close()
 
     assert row == ("stopped", "service_restart_interrupted")
+
+
+def test_startup_reset_reconciles_candidate_state_with_real_sqlite(tmp_path, monkeypatch):
+    database_path = tmp_path / "candidate-runtime-reset.db"
+    database = DatabaseConnection(str(database_path))
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, autopilot_status, target_chapters) VALUES (?, ?, ?, 'running', ?)",
+        ("novel-candidate", "Candidate Novel", "candidate-runtime", 3),
+    )
+    conn.commit()
+    candidates = ChapterCandidateRepository(database)
+    candidates.start_run(
+        "novel-candidate", run_mode=RunMode.CONTINUOUS, target_chapters=3
+    )
+    candidate = candidates.create_streaming_candidate(
+        novel_id="novel-candidate",
+        chapter_number=1,
+        title="第一章",
+        outline_chain={},
+    )
+    trace = candidates.start_dag_run(candidate.id, content_revision=0)
+    monkeypatch.setattr("application.paths.get_db_path", lambda: database_path)
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_database",
+        lambda *_args: database,
+    )
+    lifecycle = BackendLifecycle(start_daemon=lambda: None, stop_daemon=lambda: None)
+
+    with __import__(
+        "infrastructure.persistence.database.write_dispatch", fromlist=["startup_sqlite_writes_bypass_queue"]
+    ).startup_sqlite_writes_bypass_queue():
+        lifecycle.stop_all_running_novels()
+
+    run = candidates.get_run("novel-candidate")
+    assert run.state == GenerationRunState.STOPPED
+    assert run.current_candidate_id is None
+    assert candidates.get_candidate(candidate.id).status == CandidateStatus.CANCELLED
+    assert database.fetch_one(
+        "SELECT status FROM candidate_dag_runs WHERE id = ?", (trace["id"],)
+    )["status"] == "cancelled"
+    database.close_all(skip_checkpoint=True)
 
 
 def test_backend_lifecycle_shutdown_orchestrates_cleanup(monkeypatch):

@@ -5,6 +5,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
+from collections.abc import Iterator
 
 from infrastructure.persistence.database.sqlite_retry import (
     get_sqlite_retry_settings,
@@ -105,30 +106,22 @@ def apply_migration_files(conn: sqlite3.Connection, migrations_dir: Path) -> Non
 
         try:
             migration_sql = migration_path.read_text(encoding="utf-8")
-            conn.executescript(migration_sql)
-            conn.execute(
-                "INSERT OR IGNORE INTO migrations_applied (migration_file) VALUES (?)",
-                (migration_file,),
-            )
-            conn.commit()
+            if not _apply_one_migration(conn, migration_file, migration_sql):
+                logger.warning(
+                    "Migration %s failed; remaining migrations will be retried after it is resolved",
+                    migration_file,
+                )
+                break
             logger.info("Applied migration: %s", migration_file)
             new_migrations += 1
-        except sqlite3.OperationalError as exc:
-            err = str(exc)
-            if "already exists" in err or "duplicate column" in err:
-                _mark_applied(conn, migration_file)
-                logger.debug("Migration %s already applied: %s", migration_file, exc)
-            elif "no such function" in err:
-                _mark_applied(conn, migration_file)
-                logger.warning(
-                    "Migration %s uses unsupported SQLite function, marking as applied: %s",
-                    migration_file,
-                    exc,
-                )
-            else:
-                logger.warning("Migration %s failed: %s", migration_file, exc)
+        except OSError as exc:
+            logger.warning("Failed to read migration %s: %s", migration_file, exc)
+            break
         except Exception as exc:
-            logger.warning("Failed to apply migration %s: %s", migration_file, exc)
+            # Keep startup fail-closed: a failed migration is retried on the
+            # next startup instead of being recorded as complete.
+            logger.warning("Migration %s failed: %s", migration_file, exc)
+            break
 
     if new_migrations == 0 and applied:
         logger.debug("All %d migrations already applied, skipped", len(applied))
@@ -149,26 +142,121 @@ def apply_migration_files_legacy(
         migration_file = migration_path.name
         try:
             migration_sql = migration_path.read_text(encoding="utf-8")
-            conn.executescript(migration_sql)
-            conn.commit()
+            if not _apply_one_migration(conn, migration_file, migration_sql, track=False):
+                logger.warning(
+                    "Migration %s failed; remaining legacy migrations will not run",
+                    migration_file,
+                )
+                break
             logger.info("Applied migration: %s", migration_file)
-        except sqlite3.OperationalError as exc:
-            if "already exists" in str(exc) or "duplicate column" in str(exc):
-                logger.debug("Migration %s already applied: %s", migration_file, exc)
-            else:
-                logger.warning("Migration %s failed: %s", migration_file, exc)
         except OSError as exc:
             logger.warning("Failed to read migration %s: %s", migration_file, exc)
+            break
         except Exception as exc:
             logger.warning("Failed to apply migration %s: %s", migration_file, exc)
+            break
 
 
-def _mark_applied(conn: sqlite3.Connection, migration_file: str) -> None:
+def _apply_one_migration(
+    conn: sqlite3.Connection,
+    migration_file: str,
+    migration_sql: str,
+    *,
+    track: bool = True,
+) -> bool:
+    """Apply one migration atomically, tolerating only duplicate definitions."""
+    savepoint = "migration_" + "".join(
+        char if char.isalnum() else "_" for char in migration_file
+    )
+    conn.execute(f"SAVEPOINT {savepoint}")
     try:
-        conn.execute(
-            "INSERT OR IGNORE INTO migrations_applied (migration_file) VALUES (?)",
-            (migration_file,),
-        )
-        conn.commit()
+        for statement in _iter_sql_statements(migration_sql):
+            if _is_diagnostic_statement(statement):
+                logger.debug("Skipping migration diagnostic statement in %s", migration_file)
+                continue
+            try:
+                conn.execute(statement)
+            except sqlite3.OperationalError as exc:
+                if _is_duplicate_definition_error(exc):
+                    logger.debug("Skipping duplicate statement in %s: %s", migration_file, exc)
+                    continue
+                raise
+        if track:
+            conn.execute(
+                "INSERT OR IGNORE INTO migrations_applied (migration_file) VALUES (?)",
+                (migration_file,),
+            )
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        if track:
+            conn.commit()
+        return True
     except Exception:
-        pass
+        try:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except sqlite3.Error:
+            logger.exception("Could not roll back migration savepoint %s", savepoint)
+        if track:
+            conn.commit()
+        return False
+
+
+def _iter_sql_statements(sql: str) -> Iterator[str]:
+    """Yield complete SQLite statements, including multi-line triggers."""
+    buffer: list[str] = []
+    for char in sql:
+        buffer.append(char)
+        candidate = "".join(buffer)
+        if sqlite3.complete_statement(candidate):
+            if candidate.strip().rstrip(";").strip():
+                yield candidate
+            buffer.clear()
+    if _strip_sql_comments("".join(buffer)).strip():
+        raise sqlite3.OperationalError("incomplete migration statement")
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove SQLite line/block comments for trailing-buffer validation."""
+    result: list[str] = []
+    index = 0
+    quote = ""
+    while index < len(sql):
+        char = sql[index]
+        next_char = sql[index + 1] if index + 1 < len(sql) else ""
+        if quote:
+            result.append(char)
+            if char == quote:
+                if next_char == quote:
+                    result.append(next_char)
+                    index += 1
+                else:
+                    quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            result.append(char)
+            index += 1
+            continue
+        if char == "-" and next_char == "-":
+            newline = sql.find("\n", index + 2)
+            index = len(sql) if newline < 0 else newline + 1
+            continue
+        if char == "/" and next_char == "*":
+            close = sql.find("*/", index + 2)
+            index = len(sql) if close < 0 else close + 2
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def _is_duplicate_definition_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "already exists" in message or "duplicate column" in message
+
+
+def _is_diagnostic_statement(statement: str) -> bool:
+    """Migration diagnostics may contain unbound query-plan placeholders."""
+    normalized = _strip_sql_comments(statement).lstrip()
+    return normalized.upper().startswith("EXPLAIN QUERY PLAN")

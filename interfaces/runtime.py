@@ -326,6 +326,8 @@ class BackendLifecycle:
                     self._logger.info("Startup: novels table is not present; skipping running-novel reset")
                     return
 
+                self._recover_candidate_generation_runs(db)
+
                 cnt_row = db.fetch_one(
                     "SELECT COUNT(*) AS c FROM novels WHERE autopilot_status = 'running'"
                 )
@@ -428,3 +430,31 @@ class BackendLifecycle:
             self._logger.info("DAG 节点注册表已初始化: %s", sorted(NodeRegistry.all_types()))
         except Exception as exc:
             self._logger.warning("DAG 节点注册表初始化失败（DAG 引擎将不可用）: %s", exc)
+
+    def _recover_candidate_generation_runs(self, db: Any) -> None:
+        """Reconcile candidate/DAG state before marking novels stopped."""
+        try:
+            candidate_tables = db.fetch_one(
+                """
+                SELECT 1 AS present
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'novel_generation_runs'
+                LIMIT 1
+                """
+            )
+            if not candidate_tables:
+                return
+            from infrastructure.persistence.database.chapter_candidate_repository import (
+                ChapterCandidateRepository,
+            )
+
+            recovered = ChapterCandidateRepository(db).recover_all_after_service_restart()
+            if recovered:
+                self._logger.info(
+                    "Startup: reconciled %s candidate generation runs after service restart",
+                    recovered,
+                )
+        except Exception as exc:
+            # Candidate recovery must not prevent legacy databases from
+            # starting; the durable run remains visible for manual recovery.
+            self._logger.warning("Startup: candidate generation recovery skipped: %s", exc)

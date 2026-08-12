@@ -296,10 +296,12 @@ class ChapterCandidateRepository:
 
         conn = self._connection()
         dag_run = conn.execute(
-            "SELECT candidate_id FROM candidate_dag_runs WHERE id = ?", (dag_run_id,)
+            "SELECT candidate_id, status FROM candidate_dag_runs WHERE id = ?", (dag_run_id,)
         ).fetchone()
         if dag_run is None:
             raise KeyError(f"candidate DAG run not found: {dag_run_id}")
+        if str(dag_run["status"]) != "running":
+            raise CandidateGateError("candidate DAG run is not active")
         candidate = self.get_candidate(str(dag_run["candidate_id"]))
         self._ensure_current_generation(candidate)
         event_type = str(event.get("type") or "")
@@ -379,6 +381,14 @@ class ChapterCandidateRepository:
             raise CandidateGateError("DAG run must finish as completed, failed, or cancelled")
         now = self._now()
         conn = self._connection()
+        dag_run = conn.execute(
+            "SELECT candidate_id, status FROM candidate_dag_runs WHERE id = ?", (dag_run_id,)
+        ).fetchone()
+        if dag_run is None:
+            raise KeyError(f"candidate DAG run not found: {dag_run_id}")
+        if str(dag_run["status"]) != "running":
+            raise CandidateGateError("candidate DAG run is not active")
+        self._ensure_current_generation(self.get_candidate(str(dag_run["candidate_id"])))
         conn.execute(
             """
             UPDATE candidate_dag_runs
@@ -700,6 +710,8 @@ class ChapterCandidateRepository:
 
         candidate = self.get_candidate(candidate_id)
         self._ensure_current_generation(candidate)
+        if candidate.formal_chapter_id:
+            raise CandidateGateError("a formal candidate must finish or retry canonical sync")
         if candidate.status not in {
             CandidateStatus.STREAMING,
             CandidateStatus.AUDITING,
@@ -711,20 +723,35 @@ class ChapterCandidateRepository:
             raise CandidateGateError("only an uncommitted candidate can be rejected")
         now = self._now()
         conn = self._connection()
-        conn.execute(
-            "UPDATE chapter_candidates SET status = 'rejected', updated_at = ? WHERE id = ?",
-            (now, candidate_id),
-        )
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET state = 'stopped', current_candidate_id = NULL, current_candidate_chapter = NULL,
-                next_action = 'idle', last_error = '', updated_at = ?
-            WHERE novel_id = ?
-            """,
-            (now, candidate.novel_id),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                "UPDATE chapter_candidates SET status = 'rejected', updated_at = ? WHERE id = ?",
+                (now, candidate_id),
+            )
+            conn.execute(
+                """
+                UPDATE candidate_dag_runs
+                SET status = 'cancelled', failure_reason = 'rejected_by_author',
+                    completed_at = ?, updated_at = ?
+                WHERE candidate_id = ? AND status = 'running'
+                """,
+                (now, now, candidate_id),
+            )
+            conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'stopped', generation_epoch = generation_epoch + 1,
+                    current_candidate_id = NULL, current_candidate_chapter = NULL,
+                    next_action = 'idle', last_error = '', updated_at = ?
+                WHERE novel_id = ?
+                """,
+                (now, candidate.novel_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return self.get_candidate(candidate_id)
 
     def stop_run(self, novel_id: str) -> GenerationRun:
@@ -768,6 +795,15 @@ class ChapterCandidateRepository:
                     )
                     conn.execute(
                         """
+                        UPDATE candidate_dag_runs
+                        SET status = 'cancelled', failure_reason = 'stopped_by_author',
+                            completed_at = ?, updated_at = ?
+                        WHERE candidate_id = ? AND status = 'running'
+                        """,
+                        (now, now, current.id),
+                    )
+                    conn.execute(
+                        """
                         UPDATE novel_generation_runs
                         SET state = 'stopped', generation_epoch = generation_epoch + 1,
                             current_candidate_id = NULL, current_candidate_chapter = NULL,
@@ -790,6 +826,136 @@ class ChapterCandidateRepository:
             conn.rollback()
             raise
         return self.get_run(novel_id)
+
+    def recover_after_service_restart(self, novel_id: str) -> GenerationRun:
+        """Reconcile a generation run left behind by a process restart.
+
+        Only token-consuming candidate states are retired and receive a new
+        epoch.  Review candidates remain actionable, while a formal chapter
+        awaiting canonical aftermath is kept intact and made retryable.
+        """
+        run = self.get_run(novel_id)
+        conn = self._connection()
+        candidate_row = None
+        if run.current_candidate_id:
+            candidate_row = conn.execute(
+                "SELECT * FROM chapter_candidates WHERE id = ?",
+                (run.current_candidate_id,),
+            ).fetchone()
+        now = self._now()
+        interruption = "service_restart_interrupted"
+        try:
+            conn.execute("BEGIN")
+            status = str(candidate_row["status"]) if candidate_row is not None else ""
+            candidate_id = str(candidate_row["id"]) if candidate_row is not None else ""
+
+            if status in {
+                CandidateStatus.STREAMING.value,
+                CandidateStatus.AUDITING.value,
+                CandidateStatus.REGENERATING.value,
+                CandidateStatus.COMMITTING.value,
+            }:
+                conn.execute(
+                    """
+                    UPDATE chapter_candidates
+                    SET status = 'cancelled', failure_reason = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (interruption, now, candidate_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE candidate_dag_runs
+                    SET status = 'cancelled', failure_reason = ?, completed_at = ?, updated_at = ?
+                    WHERE candidate_id = ? AND status = 'running'
+                    """,
+                    (interruption, now, now, candidate_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE novel_generation_runs
+                    SET state = 'stopped', generation_epoch = generation_epoch + 1,
+                        current_candidate_id = NULL, current_candidate_chapter = NULL,
+                        canonical_sync_status = 'ready', next_action = 'idle',
+                        last_error = ?, updated_at = ?
+                    WHERE novel_id = ?
+                    """,
+                    (interruption, now, novel_id),
+                )
+            elif status == CandidateStatus.AWAITING_REVIEW.value:
+                conn.execute(
+                    """
+                    UPDATE novel_generation_runs
+                    SET state = 'waiting_review', next_action = 'author_review_candidate',
+                        last_error = '', updated_at = ?
+                    WHERE novel_id = ?
+                    """,
+                    (now, novel_id),
+                )
+            elif status == CandidateStatus.SYNCING.value:
+                conn.execute(
+                    """
+                    UPDATE chapter_candidate_formal_commits
+                    SET sync_status = 'failed', failure_reason = ?
+                    WHERE candidate_id = ? AND sync_status = 'syncing'
+                    """,
+                    (interruption, candidate_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE chapter_candidates
+                    SET status = 'failed', failure_reason = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (interruption, now, candidate_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE novel_generation_runs
+                    SET state = 'paused', canonical_sync_status = 'failed',
+                        next_action = 'retry_sync', last_error = ?, updated_at = ?
+                    WHERE novel_id = ?
+                    """,
+                    (interruption, now, novel_id),
+                )
+            else:
+                # A run can be marked running just before its candidate row is
+                # created.  Stop that orphaned run without retiring an epoch.
+                conn.execute(
+                    """
+                    UPDATE novel_generation_runs
+                    SET state = 'stopped', current_candidate_id = NULL,
+                        current_candidate_chapter = NULL, next_action = 'idle',
+                        last_error = ?, updated_at = ?
+                    WHERE novel_id = ? AND state = 'running'
+                    """,
+                    (interruption, now, novel_id),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return self.get_run(novel_id)
+
+    def recover_all_after_service_restart(self) -> int:
+        """Reconcile every persisted generation run during backend startup."""
+        conn = self._connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT novel_id FROM novel_generation_runs
+                WHERE state = 'running' OR current_candidate_id IS NOT NULL
+                ORDER BY novel_id
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Older databases may not have candidate migrations yet.
+            return 0
+        recovered = 0
+        for row in rows:
+            self.recover_after_service_restart(str(row["novel_id"]))
+            recovered += 1
+        return recovered
 
     def fail_candidate(self, candidate_id: str, reason: str) -> ChapterCandidate:
         """Persist an expected worker failure and stop further token use."""

@@ -117,12 +117,31 @@ class _RetryWriterNode(BaseNode):
         return True
 
 
+class _ExplicitErrorNode(BaseNode):
+    meta = NodeMeta(
+        node_type="test_explicit_error",
+        display_name="explicit error",
+        category=NodeCategory.EXECUTION,
+    )
+
+    async def execute(self, inputs, context):
+        return NodeResult(
+            outputs={"partial_output": "must not be treated as success"},
+            status=NodeStatus.ERROR,
+            error="explicit node failure",
+        )
+
+    def validate_inputs(self, inputs):
+        return True
+
+
 NodeRegistry.register("test_route_source")(_RouteSourceNode)
 NodeRegistry.register("test_matched_branch")(_MatchedBranchNode)
 NodeRegistry.register("test_unmatched_branch")(_UnmatchedBranchNode)
 NodeRegistry.register("test_port_source")(_PortSourceNode)
 NodeRegistry.register("test_port_target")(_PortTargetNode)
 NodeRegistry.register("test_retry_writer")(_RetryWriterNode)
+NodeRegistry.register("test_explicit_error")(_ExplicitErrorNode)
 
 
 class TestDAGEngine:
@@ -256,6 +275,22 @@ class TestDAGEngine:
 
         result = await engine.run(dag, {"novel_id": "test_novel"})
         assert result.status in ("completed", "error")
+
+    @pytest.mark.asyncio
+    async def test_explicit_node_error_is_recorded_as_a_dag_failure(self):
+        engine = DAGEngine()
+        engine._use_langgraph = False
+        dag = DAGDefinition(
+            id="dag_explicit_error",
+            name="显式错误",
+            nodes=[NodeDefinition(id="error_node", type="test_explicit_error")],
+        )
+
+        result = await engine.run(dag, {"novel_id": "test_novel"})
+
+        assert result.status == "error"
+        assert result.error_count == 1
+        assert result.final_state["_errors"]["error_node"] == "explicit node failure"
 
     def test_default_dag_passes_its_own_validator(self):
         result = DAGValidator().validate(get_default_dag())

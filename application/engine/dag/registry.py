@@ -303,10 +303,7 @@ class NodeRegistry:
 
             # 校验输入
             if not instance.validate_inputs(resolved_inputs):
-                return {
-                    "status": "error",
-                    "error": f"节点 {node_id} 输入校验失败",
-                }
+                raise RuntimeError(f"节点 {node_id} 输入校验失败")
 
             # 应用用户配置覆盖
             node_configs = state.get("node_configs", {})
@@ -324,6 +321,12 @@ class NodeRegistry:
 
             # 执行
             result = await instance.execute(resolved_inputs, context)
+
+            # A NodeResult is the node boundary contract.  Do not flatten an
+            # explicit failure into outputs: the DAG runtime must stop before
+            # any downstream node can treat partial data as a successful run.
+            if result.status == NodeStatus.ERROR:
+                raise RuntimeError(result.error or f"节点 {node_id} 执行失败")
 
             # 返回输出（扁平化到 state）
             return result.outputs

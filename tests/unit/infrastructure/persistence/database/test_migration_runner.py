@@ -1,4 +1,5 @@
 import sqlite3
+from pathlib import Path
 
 from infrastructure.persistence.database.migration_runner import apply_migration_files
 
@@ -59,3 +60,182 @@ def test_apply_migration_files_orders_macro_diagnosis_table_before_its_patch(tmp
         conn.close()
 
     assert {"context_patch", "total_words_at_run"} <= columns
+
+
+def test_apply_migration_files_continues_after_a_known_duplicate_statement(tmp_path):
+    """A partially upgraded database still receives later statements."""
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "001_partial_upgrade.sql").write_text(
+        "CREATE TABLE existing_table (id INTEGER);\n"
+        "CREATE TABLE later_table (id INTEGER);\n",
+        encoding="utf-8",
+    )
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE existing_table (id INTEGER)")
+        apply_migration_files(conn, migrations)
+        marked = conn.execute(
+            "SELECT migration_file FROM migrations_applied"
+        ).fetchall()
+        later = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'later_table'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert marked == [("001_partial_upgrade.sql",)]
+    assert later == ("later_table",)
+
+
+def test_apply_migration_files_does_not_mark_a_migration_after_an_unrecoverable_error(tmp_path):
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "001_bad_upgrade.sql").write_text(
+        "SELECT unsupported_migration_function();\n"
+        "CREATE TABLE later_table (id INTEGER);\n",
+        encoding="utf-8",
+    )
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_migration_files(conn, migrations)
+        marked = conn.execute(
+            "SELECT migration_file FROM migrations_applied"
+        ).fetchall()
+        later = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'later_table'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert marked == []
+    assert later is None
+
+
+def test_apply_migration_files_stops_after_an_unrecoverable_migration(tmp_path):
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "001_bad_upgrade.sql").write_text(
+        "SELECT unsupported_migration_function();\n",
+        encoding="utf-8",
+    )
+    (migrations / "002_must_not_run.sql").write_text(
+        "CREATE TABLE later_table (id INTEGER);\n",
+        encoding="utf-8",
+    )
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_migration_files(conn, migrations)
+        later = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'later_table'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert later is None
+
+
+def test_apply_migration_files_stops_after_a_migration_file_cannot_be_read(tmp_path, monkeypatch):
+    """A missing migration body must block later migrations rather than skip its schema."""
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    blocked = migrations / "001_unreadable.sql"
+    blocked.write_text("CREATE TABLE blocked_table (id INTEGER);\n", encoding="utf-8")
+    (migrations / "002_must_not_run.sql").write_text(
+        "CREATE TABLE later_table (id INTEGER);\n",
+        encoding="utf-8",
+    )
+    read_text = Path.read_text
+
+    def raise_for_blocked_file(path, *args, **kwargs):
+        if path == blocked:
+            raise OSError("simulated read failure")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", raise_for_blocked_file)
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_migration_files(conn, migrations)
+        later = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'later_table'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert later is None
+
+
+def test_apply_migration_files_keeps_multiline_trigger_as_one_statement(tmp_path):
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "001_trigger.sql").write_text(
+        "CREATE TABLE sample (id INTEGER PRIMARY KEY, value TEXT);\n"
+        "CREATE TABLE audit (sample_id INTEGER, value TEXT);\n"
+        "CREATE TRIGGER sample_audit AFTER INSERT ON sample\n"
+        "BEGIN\n"
+        "  INSERT INTO audit (sample_id, value) VALUES (NEW.id, NEW.value);\n"
+        "END;\n",
+        encoding="utf-8",
+    )
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_migration_files(conn, migrations)
+        conn.execute("INSERT INTO sample (value) VALUES ('created')")
+        audit = conn.execute("SELECT sample_id, value FROM audit").fetchone()
+    finally:
+        conn.close()
+
+    assert audit == (1, "created")
+
+
+def test_apply_migration_files_accepts_a_trailing_comment_after_valid_sql(tmp_path):
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "001_comment.sql").write_text(
+        "CREATE TABLE sample (id INTEGER PRIMARY KEY);\n"
+        "-- the migration intentionally ends with a comment\n",
+        encoding="utf-8",
+    )
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_migration_files(conn, migrations)
+        marked = conn.execute("SELECT migration_file FROM migrations_applied").fetchall()
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sample'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert marked == [("001_comment.sql",)]
+    assert table == ("sample",)
+
+
+def test_apply_migration_files_skips_a_comment_prefixed_diagnostic_with_parameters(tmp_path):
+    """Query-plan diagnostics must not execute as part of a migration."""
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "001_diagnostic.sql").write_text(
+        "CREATE TABLE sample (id INTEGER PRIMARY KEY);\n"
+        "-- inspect the planned lookup without executing a parameterized query\n"
+        "EXPLAIN QUERY PLAN SELECT * FROM sample WHERE id = ?;\n"
+        "CREATE TABLE applied_after_diagnostic (id INTEGER PRIMARY KEY);\n",
+        encoding="utf-8",
+    )
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_migration_files(conn, migrations)
+        marked = conn.execute("SELECT migration_file FROM migrations_applied").fetchall()
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'applied_after_diagnostic'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert marked == [("001_diagnostic.sql",)]
+    assert table == ("applied_after_diagnostic",)
