@@ -107,6 +107,31 @@ class ChapterCandidateRepository:
             raise KeyError(f"generation run not found: {novel_id}")
         return self._run_from_row(row)
 
+    def formal_chapter_head(self, novel_id: str) -> int:
+        """Return the continuous Candidate-first Canonical chapter head."""
+
+        rows = self._connection().execute(
+            """
+            SELECT c.number
+            FROM chapter_candidate_formal_commits AS commit_record
+            JOIN chapter_candidates AS candidate ON candidate.id = commit_record.candidate_id
+            JOIN chapters AS c ON c.id = commit_record.chapter_id
+            WHERE commit_record.novel_id = ?
+              AND commit_record.sync_status = 'ready'
+              AND candidate.status = 'committed'
+              AND c.status = 'completed'
+              AND TRIM(COALESCE(c.content, '')) <> ''
+            ORDER BY c.number
+            """,
+            (novel_id,),
+        ).fetchall()
+        head = 0
+        for row in rows:
+            if int(row["number"]) != head + 1:
+                break
+            head += 1
+        return head
+
     def start_run(
         self,
         novel_id: str,
@@ -118,11 +143,7 @@ class ChapterCandidateRepository:
         existing = conn.execute(
             "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
         ).fetchone()
-        chapter_head = conn.execute(
-            "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE novel_id = ?",
-            (novel_id,),
-        ).fetchone()
-        persisted_chapter_head = int(chapter_head["max_number"] or 0)
+        persisted_chapter_head = self.formal_chapter_head(novel_id)
         if existing is not None:
             current = self._run_from_row(existing)
             if current.canonical_sync_status not in {"ready", ""}:
@@ -132,7 +153,7 @@ class ChapterCandidateRepository:
             if current.current_candidate_id:
                 raise CandidateGateError("cannot start a new run while a pending candidate exists")
             epoch = current.generation_epoch
-            current_formal_chapter = max(current.current_formal_chapter, persisted_chapter_head)
+            current_formal_chapter = persisted_chapter_head
         else:
             epoch = 0
             current_formal_chapter = persisted_chapter_head
@@ -148,8 +169,7 @@ class ChapterCandidateRepository:
                 run_mode = excluded.run_mode,
                 state = 'running',
                 target_chapters = excluded.target_chapters,
-                current_formal_chapter = MAX(novel_generation_runs.current_formal_chapter,
-                                             excluded.current_formal_chapter),
+                current_formal_chapter = excluded.current_formal_chapter,
                 max_pending_candidates = 1,
                 prefetch = 0,
                 canonical_sync_status = 'ready',
@@ -198,6 +218,177 @@ class ChapterCandidateRepository:
             (novel_id,),
         ).fetchone()
         return self._candidate_from_row(row) if row is not None else None
+
+    def start_dag_run(self, candidate_id: str, *, content_revision: int) -> dict[str, Any]:
+        """Create one durable DAG trace for a candidate content revision."""
+
+        candidate = self.get_candidate(candidate_id)
+        self._ensure_current_generation(candidate)
+        run_id = f"candidate-dag-{uuid4()}"
+        now = self._now()
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT INTO candidate_dag_runs
+                (id, candidate_id, content_revision, status, started_at, updated_at)
+            VALUES (?, ?, ?, 'running', ?, ?)
+            """,
+            (run_id, candidate_id, int(content_revision), now, now),
+        )
+        conn.commit()
+        return self.get_dag_run(run_id)
+
+    def get_dag_run(self, dag_run_id: str, *, after_sequence: int = 0) -> dict[str, Any]:
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT * FROM candidate_dag_runs WHERE id = ?", (dag_run_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"candidate DAG run not found: {dag_run_id}")
+        attempts = conn.execute(
+            """
+            SELECT node_id, node_type, status, duration_ms
+            FROM candidate_dag_node_attempts
+            WHERE dag_run_id = ?
+            ORDER BY started_at, attempt
+            """,
+            (dag_run_id,),
+        ).fetchall()
+        events = conn.execute(
+            """
+            SELECT sequence, event_json FROM candidate_dag_events
+            WHERE dag_run_id = ? AND sequence > ?
+            ORDER BY sequence
+            """,
+            (dag_run_id, int(after_sequence)),
+        ).fetchall()
+        return {
+            "id": str(row["id"]),
+            "candidate_id": str(row["candidate_id"]),
+            "content_revision": int(row["content_revision"]),
+            "status": str(row["status"]),
+            "current_node_id": str(row["current_node_id"] or ""),
+            "final_state": json.loads(row["final_state_json"] or "{}"),
+            "failure_reason": str(row["failure_reason"] or ""),
+            "node_attempts": [dict(item) for item in attempts],
+            "events": [
+                {"sequence": int(item["sequence"]), **json.loads(item["event_json"] or "{}")}
+                for item in events
+            ],
+        }
+
+    def get_latest_dag_run(
+        self, candidate_id: str, *, after_sequence: int = 0
+    ) -> Optional[dict[str, Any]]:
+        row = self._connection().execute(
+            """
+            SELECT id FROM candidate_dag_runs
+            WHERE candidate_id = ?
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (candidate_id,),
+        ).fetchone()
+        return self.get_dag_run(str(row["id"]), after_sequence=after_sequence) if row else None
+
+    def record_dag_event(self, dag_run_id: str, event: dict[str, Any]) -> None:
+        """Append one ordered event and maintain the node-attempt read model."""
+
+        conn = self._connection()
+        dag_run = conn.execute(
+            "SELECT candidate_id FROM candidate_dag_runs WHERE id = ?", (dag_run_id,)
+        ).fetchone()
+        if dag_run is None:
+            raise KeyError(f"candidate DAG run not found: {dag_run_id}")
+        candidate = self.get_candidate(str(dag_run["candidate_id"]))
+        self._ensure_current_generation(candidate)
+        event_type = str(event.get("type") or "")
+        node_id = str(event.get("node_id") or "")
+        node_type = str(event.get("node_type") or "")
+        now = self._now()
+        sequence_row = conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM candidate_dag_events WHERE dag_run_id = ?",
+            (dag_run_id,),
+        ).fetchone()
+        sequence = int(sequence_row["sequence"])
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                """
+                INSERT INTO candidate_dag_events (id, dag_run_id, sequence, event_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (f"candidate-dag-event-{uuid4()}", dag_run_id, sequence, json.dumps(event, ensure_ascii=False, sort_keys=True), now),
+            )
+            if node_id and event_type == "node_started":
+                attempt_row = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt), 0) + 1 AS attempt
+                    FROM candidate_dag_node_attempts WHERE dag_run_id = ? AND node_id = ?
+                    """,
+                    (dag_run_id, node_id),
+                ).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO candidate_dag_node_attempts
+                        (id, dag_run_id, node_id, node_type, attempt, status, started_at)
+                    VALUES (?, ?, ?, ?, ?, 'running', ?)
+                    """,
+                    (f"candidate-dag-attempt-{uuid4()}", dag_run_id, node_id, node_type, int(attempt_row["attempt"]), now),
+                )
+                conn.execute(
+                    "UPDATE candidate_dag_runs SET current_node_id = ?, updated_at = ? WHERE id = ?",
+                    (node_id, now, dag_run_id),
+                )
+            elif node_id and event_type in {"node_completed", "node_failed", "node_skipped"}:
+                status = {"node_completed": "completed", "node_failed": "failed", "node_skipped": "skipped"}[event_type]
+                conn.execute(
+                    """
+                    UPDATE candidate_dag_node_attempts
+                    SET status = ?, duration_ms = ?, outputs_json = ?, error = ?, completed_at = ?
+                    WHERE id = (
+                        SELECT id FROM candidate_dag_node_attempts
+                        WHERE dag_run_id = ? AND node_id = ?
+                        ORDER BY attempt DESC LIMIT 1
+                    )
+                    """,
+                    (
+                        status,
+                        int(event.get("duration_ms") or 0),
+                        json.dumps(event.get("outputs") or {}, ensure_ascii=False, sort_keys=True),
+                        str(event.get("error") or ""),
+                        now,
+                        dag_run_id,
+                        node_id,
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def finish_dag_run(
+        self,
+        dag_run_id: str,
+        *,
+        status: str,
+        final_state: dict[str, Any],
+        failure_reason: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"completed", "failed", "cancelled"}:
+            raise CandidateGateError("DAG run must finish as completed, failed, or cancelled")
+        now = self._now()
+        conn = self._connection()
+        conn.execute(
+            """
+            UPDATE candidate_dag_runs
+            SET status = ?, final_state_json = ?, failure_reason = ?, completed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, json.dumps(final_state, ensure_ascii=False, sort_keys=True), failure_reason, now, now, dag_run_id),
+        )
+        conn.commit()
+        return self.get_dag_run(dag_run_id)
 
     def _ensure_current_generation(self, candidate: ChapterCandidate) -> GenerationRun:
         """Reject delayed worker/review writes from a retired worldline epoch."""
@@ -470,6 +661,40 @@ class ChapterCandidateRepository:
         conn.commit()
         return self.get_candidate(candidate_id)
 
+    def begin_dag_revision(self, candidate_id: str, *, feedback: str = "") -> ChapterCandidate:
+        """Move an in-flight candidate to its next DAG-controlled revision.
+
+        This is intentionally not the author-facing regeneration transition:
+        the candidate has not yet entered review, and the bounded loop remains
+        inside one server-owned generation request.
+        """
+
+        candidate = self.get_candidate(candidate_id)
+        self._ensure_current_generation(candidate)
+        if candidate.status not in {CandidateStatus.STREAMING, CandidateStatus.REGENERATING}:
+            raise CandidateGateError("DAG revision can only continue an in-flight candidate")
+        now = self._now()
+        conn = self._connection()
+        conn.execute(
+            """
+            UPDATE chapter_candidates
+            SET status = 'regenerating', feedback = ?, audit_revision = 0,
+                commit_plan_content_revision = 0, updated_at = ?
+            WHERE id = ?
+            """,
+            (feedback, now, candidate_id),
+        )
+        conn.execute(
+            """
+            UPDATE novel_generation_runs
+            SET state = 'running', next_action = 'retry_candidate_revision', updated_at = ?
+            WHERE novel_id = ?
+            """,
+            (now, candidate.novel_id),
+        )
+        conn.commit()
+        return self.get_candidate(candidate_id)
+
     def reject_and_stop(self, candidate_id: str) -> ChapterCandidate:
         """Reject an uncommitted candidate and end this run without side effects."""
 
@@ -516,41 +741,50 @@ class ChapterCandidateRepository:
         conn = self._connection()
         try:
             conn.execute("BEGIN")
-            active = current is not None and current.status in {
-                CandidateStatus.STREAMING,
-                CandidateStatus.AUDITING,
-                CandidateStatus.REGENERATING,
-                CandidateStatus.COMMITTING,
-                CandidateStatus.SYNCING,
-            }
-            if active and current is not None:
-                conn.execute(
-                    """
-                    UPDATE chapter_candidates
-                    SET status = 'cancelled', failure_reason = 'stopped_by_author', updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (now, current.id),
-                )
+            if current is not None and current.status == CandidateStatus.SYNCING:
                 conn.execute(
                     """
                     UPDATE novel_generation_runs
-                    SET state = 'stopped', generation_epoch = generation_epoch + 1,
-                        current_candidate_id = NULL, current_candidate_chapter = NULL,
-                        next_action = 'idle', last_error = '', updated_at = ?
+                    SET state = 'paused', next_action = 'finish_sync_then_pause', updated_at = ?
                     WHERE novel_id = ?
                     """,
                     (now, novel_id),
                 )
             else:
-                conn.execute(
-                    """
-                    UPDATE novel_generation_runs
-                    SET state = 'stopped', next_action = 'idle', updated_at = ?
-                    WHERE novel_id = ?
-                    """,
-                    (now, novel_id),
-                )
+                active = current is not None and current.status in {
+                CandidateStatus.STREAMING,
+                CandidateStatus.AUDITING,
+                CandidateStatus.REGENERATING,
+                CandidateStatus.COMMITTING,
+                }
+                if active and current is not None:
+                    conn.execute(
+                        """
+                        UPDATE chapter_candidates
+                        SET status = 'cancelled', failure_reason = 'stopped_by_author', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, current.id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE novel_generation_runs
+                        SET state = 'stopped', generation_epoch = generation_epoch + 1,
+                            current_candidate_id = NULL, current_candidate_chapter = NULL,
+                            next_action = 'idle', last_error = '', updated_at = ?
+                        WHERE novel_id = ?
+                        """,
+                        (now, novel_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE novel_generation_runs
+                        SET state = 'stopped', next_action = 'idle', updated_at = ?
+                        WHERE novel_id = ?
+                        """,
+                        (now, novel_id),
+                    )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -753,9 +987,14 @@ class ChapterCandidateRepository:
         candidate = self.get_candidate(candidate_id)
         if candidate.status != CandidateStatus.SYNCING or not candidate.formal_chapter_id:
             raise CandidateGateError("candidate has no formal chapter awaiting sync")
-        self._ensure_current_generation(candidate)
-        next_state = GenerationRunState.RUNNING if candidate.continue_after_commit else GenerationRunState.PAUSED
-        next_action = "generate_candidate" if candidate.continue_after_commit else "resume_generation"
+        run = self._ensure_current_generation(candidate)
+        pause_after_sync = run.next_action == "finish_sync_then_pause"
+        next_state = (
+            GenerationRunState.PAUSED
+            if pause_after_sync or not candidate.continue_after_commit
+            else GenerationRunState.RUNNING
+        )
+        next_action = "resume_generation" if next_state == GenerationRunState.PAUSED else "generate_candidate"
         now = self._now()
         conn = self._connection()
         try:

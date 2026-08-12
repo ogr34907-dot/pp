@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from typing import AsyncIterator, Optional
@@ -26,7 +28,6 @@ from infrastructure.ai.url_utils import (
     normalize_openai_base_url,
 )
 
-_DEFAULT_CONFIG = GenerationConfig()
 logger = logging.getLogger(__name__)
 
 
@@ -85,17 +86,24 @@ class LLMProviderFactory:
         )
 
 
+def _stable_json(value: object) -> str:
+    return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _make_cache_key(profile: LLMProfile) -> str:
     """生成 Provider 缓存键，配置变化时自动重建 Provider。"""
     key_parts = [
         profile.protocol or "",
         (profile.base_url or "").rstrip("/"),
         (profile.model or "").strip(),
-        (profile.api_key or "")[:8],
+        hashlib.sha256((profile.api_key or "").encode("utf-8")).hexdigest(),
         str(profile.temperature),
         str(profile.max_tokens),
         str(profile.timeout_seconds),
         str(profile.use_legacy_chat_completions),
+        _stable_json(profile.extra_headers),
+        _stable_json(profile.extra_query),
+        _stable_json(profile.extra_body),
     ]
     settings = Settings(timeout_seconds=profile.timeout_seconds)
     key_parts.extend(
@@ -173,24 +181,30 @@ class DynamicLLMService(LLMService):
         if settings is None:
             return config
 
-        model = config.model
-        if not model or model == _DEFAULT_CONFIG.model:
-            model = settings.default_model
-
-        max_tokens = config.max_tokens
-        if max_tokens == _DEFAULT_CONFIG.max_tokens:
-            max_tokens = settings.default_max_tokens
-
-        temperature = config.temperature
-        if temperature == _DEFAULT_CONFIG.temperature:
-            temperature = settings.default_temperature
+        model = config.model or settings.default_model
+        max_tokens = config.max_tokens if config.is_explicit("max_tokens") else settings.default_max_tokens
+        temperature = config.temperature if config.is_explicit("temperature") else settings.default_temperature
+        timeout_seconds = config.timeout_seconds if config.is_explicit("timeout_seconds") else settings.timeout_seconds
 
         return GenerationConfig(
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
             response_format=config.response_format,
+            timeout_seconds=timeout_seconds,
+            reasoning_effort=config.reasoning_effort,
+            thinking=config.thinking,
         )
+
+    @staticmethod
+    def _usage_metadata(usage: object) -> dict[str, int]:
+        return {
+            "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+            "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+            "cache_hit_tokens": int(getattr(usage, "cache_hit_tokens", 0) or 0),
+            "cache_miss_tokens": int(getattr(usage, "cache_miss_tokens", 0) or 0),
+            "reasoning_tokens": int(getattr(usage, "reasoning_tokens", 0) or 0),
+        }
 
     @staticmethod
     def _request_metadata(
@@ -273,7 +287,11 @@ class DynamicLLMService(LLMService):
             token_input=getattr(usage, "input_tokens", None),
             token_output=getattr(usage, "output_tokens", None),
             latency_ms=int((time.perf_counter() - started) * 1000),
-            metadata={**request_metadata, "content_length": len(content)},
+            metadata={
+                **request_metadata,
+                **self._usage_metadata(usage),
+                "content_length": len(content),
+            },
         )
         return result
 

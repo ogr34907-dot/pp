@@ -173,6 +173,44 @@ def test_prepare_chapter_generation_reports_originating_context_budget(workflow)
     assert bundle["context_budget_tokens"] == 12345
 
 
+@pytest.mark.asyncio
+async def test_generate_candidate_draft_emits_buffered_prose_deltas_without_post_processing(
+    workflow,
+    mock_llm_service,
+):
+    """Candidate prose is observable before review, but never runs Canonical aftermath."""
+
+    call_count = 0
+
+    async def stream_generate(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        chunks = ["剧", "本"] if call_count == 1 else ["甲" * 200, "乙" * 200, "丙" * 10]
+        for chunk in chunks:
+            yield chunk
+
+    mock_llm_service.stream_generate = stream_generate
+    workflow.post_process_generated_chapter = AsyncMock()
+    events = []
+
+    result = await workflow.generate_candidate_draft(
+        novel_id="novel-1",
+        chapter_number=1,
+        chapter_title="第一章",
+        outline_chain={"chapter": {"payload": {"title": "第一章"}}},
+        outline_text="已发布章纲",
+        on_event=events.append,
+    )
+
+    assert result["script"] == "剧本"
+    assert result["content"] == "甲" * 200 + "乙" * 200 + "丙" * 10
+    assert events == [
+        {"type": "prose_delta", "text": "甲" * 200 + "乙" * 200},
+        {"type": "prose_delta", "text": "丙" * 10},
+    ]
+    workflow.post_process_generated_chapter.assert_not_awaited()
+
+
 class TestGenerateChapter:
     """测试 generate_chapter 方法"""
 

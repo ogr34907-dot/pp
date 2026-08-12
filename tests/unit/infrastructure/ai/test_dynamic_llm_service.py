@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 
 from application.ai.llm_control_service import LLMProfile
-from infrastructure.ai.provider_factory import DynamicLLMService
+from domain.ai.services.llm_service import DEFAULT_MAX_OUTPUT_TOKENS, GenerationConfig
+from infrastructure.ai.config.settings import Settings
+from infrastructure.ai.provider_factory import DynamicLLMService, _make_cache_key
 
 
 class _FakeControlService:
@@ -46,6 +48,16 @@ class _ProviderWithoutAclose:
     def __init__(self):
         self._http_client_sync = _FakeSyncClient()
         self._http_client = _FakeAsyncClient()
+
+
+class _ConfiguredProvider:
+    def __init__(self):
+        self.settings = Settings(
+            default_model="profile-model",
+            default_max_tokens=4096,
+            default_temperature=0.3,
+            timeout_seconds=75,
+        )
 
 
 class _FakeFactory:
@@ -126,3 +138,50 @@ async def test_dynamic_llm_service_close_fallback_handles_provider_clients_witho
     assert provider._http_client_sync.is_closed is True
     assert provider._http_client.closed is True
     assert service._cached_provider is None
+
+
+def test_provider_cache_key_changes_for_full_secret_and_extra_request_fields():
+    profile = _profile("p1", model="model-a").model_copy(
+        update={
+            "api_key": "abcdefgh-1",
+            "extra_headers": {"X-Tenant": "one"},
+            "extra_query": {"region": "cn"},
+            "extra_body": {"thinking": {"type": "enabled"}},
+        }
+    )
+    same_semantics = profile.model_copy(
+        update={
+            "extra_body": {"thinking": {"type": "enabled"}},
+            "extra_query": {"region": "cn"},
+            "extra_headers": {"X-Tenant": "one"},
+        }
+    )
+    changed_secret = profile.model_copy(update={"api_key": "abcdefgh-2"})
+    changed_body = profile.model_copy(update={"extra_body": {"thinking": {"type": "disabled"}}})
+
+    assert _make_cache_key(profile) == _make_cache_key(same_semantics)
+    assert _make_cache_key(profile) != _make_cache_key(changed_secret)
+    assert _make_cache_key(profile) != _make_cache_key(changed_body)
+
+
+def test_dynamic_merge_preserves_explicit_default_values():
+    provider = _ConfiguredProvider()
+
+    merged = DynamicLLMService._merge_config(
+        GenerationConfig(max_tokens=DEFAULT_MAX_OUTPUT_TOKENS, temperature=1.0),
+        provider,
+    )
+
+    assert merged.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+    assert merged.temperature == 1.0
+
+
+def test_dynamic_merge_applies_profile_defaults_only_to_omitted_values():
+    provider = _ConfiguredProvider()
+
+    merged = DynamicLLMService._merge_config(GenerationConfig(), provider)
+
+    assert merged.model == "profile-model"
+    assert merged.max_tokens == 4096
+    assert merged.temperature == 0.3
+    assert merged.timeout_seconds == 75

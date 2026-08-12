@@ -27,3 +27,26 @@ def test_token_usage_addition():
     assert total.input_tokens == 150
     assert total.output_tokens == 350
     assert total.total_tokens == 500
+
+
+def test_token_usage_preserves_cache_and_reasoning_breakdown():
+    usage1 = TokenUsage(
+        input_tokens=100,
+        output_tokens=200,
+        cache_hit_tokens=30,
+        cache_miss_tokens=70,
+        reasoning_tokens=80,
+    )
+    usage2 = TokenUsage(
+        input_tokens=50,
+        output_tokens=150,
+        cache_hit_tokens=10,
+        cache_miss_tokens=40,
+        reasoning_tokens=20,
+    )
+
+    total = usage1 + usage2
+
+    assert total.cache_hit_tokens == 40
+    assert total.cache_miss_tokens == 110
+    assert total.reasoning_tokens == 100

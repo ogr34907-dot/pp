@@ -1,4 +1,6 @@
 """AnthropicProvider 测试"""
+from types import SimpleNamespace
+
 import pytest
 from unittest.mock import AsyncMock, Mock
 from domain.ai.value_objects.prompt import Prompt
@@ -13,6 +15,22 @@ class _AsyncStreamCM:
 
     async def __aenter__(self):
         return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _EmptyHttpxResponse:
+    status_code = 200
+
+    async def aiter_text(self):
+        if False:
+            yield ""
+
+
+class _AsyncHttpxStreamCM:
+    async def __aenter__(self):
+        return _EmptyHttpxResponse()
 
     async def __aexit__(self, *args):
         return False
@@ -86,6 +104,62 @@ class TestAnthropicProvider:
         assert call_kwargs['model'] == "claude-3-opus-20240229"
         assert call_kwargs['temperature'] == 0.5
         assert call_kwargs['max_tokens'] == 2048
+
+    @pytest.mark.asyncio
+    async def test_generate_uses_single_request_builder_with_task_timeout(self, provider):
+        prompt = Prompt(system="You are helpful", user="Hello")
+        config = GenerationConfig(max_tokens=128, timeout_seconds=12)
+        provider.async_client.messages.create = AsyncMock(return_value=Mock(
+            content=[Mock(type="text", text="Response")],
+            usage=Mock(input_tokens=2, output_tokens=1),
+        ))
+
+        await provider.generate(prompt, config)
+
+        call_kwargs = provider.async_client.messages.create.call_args[1]
+        assert call_kwargs["timeout"] == 12
+
+    @pytest.mark.asyncio
+    async def test_generate_preserves_cache_and_thinking_usage_details(self, provider):
+        provider.async_client.messages.create = AsyncMock(return_value=SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="Response")],
+            usage=SimpleNamespace(
+                input_tokens=12,
+                output_tokens=7,
+                cache_read_input_tokens=30,
+                cache_creation_input_tokens=5,
+                output_tokens_details=SimpleNamespace(thinking_tokens=4),
+            ),
+        ))
+
+        result = await provider.generate(Prompt(system="s", user="u"), GenerationConfig())
+
+        assert result.token_usage.cache_hit_tokens == 30
+        assert result.token_usage.cache_miss_tokens == 17
+        assert result.token_usage.reasoning_tokens == 4
+
+    @pytest.mark.asyncio
+    async def test_httpx_stream_uses_normalized_base_url(self):
+        provider = AnthropicProvider(
+            Settings(api_key="test-api-key", base_url="https://gateway.example/v1")
+        )
+        captured = {}
+
+        def _stream(method, url, **kwargs):
+            captured["url"] = url
+            return _AsyncHttpxStreamCM()
+
+        provider._stream_http_client.stream = _stream
+        chunks = [
+            chunk
+            async for chunk in provider._stream_via_httpx(
+                Prompt(system="s", user="u"),
+                GenerationConfig(model="claude-test"),
+            )
+        ]
+
+        assert chunks == []
+        assert captured["url"] == "https://gateway.example/v1/messages"
 
     @pytest.mark.asyncio
     async def test_generate_accepts_text_blocks_without_type(self, provider):

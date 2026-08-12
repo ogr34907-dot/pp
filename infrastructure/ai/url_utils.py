@@ -20,6 +20,8 @@ def normalize_openai_base_url(url: Optional[str]) -> Optional[str]:
         (
             '/chat/completions',
             '/v1/chat/completions',
+            '/responses',
+            '/v1/responses',
             '/completions',
         ),
     )

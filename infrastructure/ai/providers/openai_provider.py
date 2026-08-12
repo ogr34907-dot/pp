@@ -1,5 +1,6 @@
 """OpenAI LLM 提供商实现"""
 import asyncio
+from dataclasses import replace
 import logging
 import openai
 import httpx
@@ -13,6 +14,7 @@ from domain.ai.value_objects.token_usage import TokenUsage
 from application.ai.llm_retry_policy import LLM_MAX_TOTAL_ATTEMPTS, is_retryable_llm_error
 from infrastructure.ai.config.settings import Settings
 from infrastructure.ai.http_timeout import build_httpx_timeout
+from infrastructure.ai.url_utils import normalize_openai_base_url
 from .base import BaseProvider
 from .model_resolution import require_resolved_model_id
 
@@ -27,28 +29,34 @@ class OpenAIProvider(BaseProvider):
     - True：走 Chat Completions API
     """
 
-    # 静态类级别缓存：记录哪些 base_url 不支持 Responses API，从而避免重复降级带来的延迟开销
-    _fallback_to_chat_cache: set[str] = set()
+    # Responses 与 json_schema 支持度会随网关和模型变化。
+    _fallback_to_chat_cache: set[tuple[str, str]] = set()
+    _json_schema_unsupported_cache: set[tuple[str, str]] = set()
 
     def __init__(self, settings: Settings):
-        super().__init__(settings)
+        normalized_base_url = normalize_openai_base_url(settings.base_url)
+        super().__init__(
+            replace(settings, base_url=normalized_base_url)
+            if normalized_base_url != settings.base_url
+            else settings
+        )
 
-        if not settings.api_key:
+        if not self.settings.api_key:
             raise ValueError("API key is required for OpenAIProvider")
 
         self._use_legacy = settings.use_legacy_chat_completions
 
         client_kwargs = {
             "api_key": settings.api_key,
-            "timeout": settings.timeout_seconds,
-            "default_headers": settings.extra_headers or None,
-            "default_query": settings.extra_query or None,
+            "timeout": self.settings.timeout_seconds,
+            "default_headers": self.settings.extra_headers or None,
+            "default_query": self.settings.extra_query or None,
         }
-        if settings.base_url:
-            client_kwargs["base_url"] = settings.base_url
+        if self.settings.base_url:
+            client_kwargs["base_url"] = self.settings.base_url
 
         self._http_client = httpx.AsyncClient(
-            timeout=build_httpx_timeout(settings.http_timeout_settings),
+            timeout=build_httpx_timeout(self.settings.http_timeout_settings),
             trust_env=False,
         )
         client_kwargs["http_client"] = self._http_client
@@ -60,22 +68,17 @@ class OpenAIProvider(BaseProvider):
         config: GenerationConfig
     ) -> GenerationResult:
         try:
-            base_url = self.settings.base_url or "https://api.openai.com/v1"
-            use_responses = not self._use_legacy and base_url not in self.__class__._fallback_to_chat_cache
+            capability_key = self._responses_capability_key(config)
+            use_responses = not self._use_legacy and capability_key not in self.__class__._fallback_to_chat_cache
 
             if use_responses:
                 try:
                     return await self._generate_via_responses(prompt, config)
-                except (openai.NotFoundError, openai.BadRequestError) as e:
-                    logger.info(f"Responses API unsupported for {base_url}, falling back to chat completions: {str(e)}")
-                    self.__class__._fallback_to_chat_cache.add(base_url)
                 except Exception as e:
-                    # 某些网关在路径错误时可能不抛严格的 404 而是抛出其他错误，如果消息含有明确路径错误也尝试降级
-                    if "404" in str(e) or "Not Found" in str(e) or "400" in str(e) or "Account invalid" in str(e) or "INVALID_ARGUMENT" in str(e):
-                        logger.info(f"Gateway returned error for Responses API ({base_url}), falling back: {str(e)}")
-                        self.__class__._fallback_to_chat_cache.add(base_url)
-                    else:
+                    if not self._responses_endpoint_is_unsupported(e):
                         raise
+                    logger.info("Responses endpoint unsupported for %s; using Chat Completions", capability_key)
+                    self.__class__._fallback_to_chat_cache.add(capability_key)
 
             # 使用降级的 Chat Completions API
             return await self._generate_via_chat(prompt, config)
@@ -102,15 +105,18 @@ class OpenAIProvider(BaseProvider):
             try:
                 try:
                     response = await self.async_client.chat.completions.create(**request_kwargs)
-                except (openai.BadRequestError, openai.NotFoundError) as e:
-                    # 🔥 json_schema 不支持时自动降级
-                    if config.response_format and config.response_format.get("type") == "json_schema":
-                        base_url = (self.settings.base_url or "").rstrip("/")
+                except Exception as e:
+                    if (
+                        config.response_format
+                        and config.response_format.get("type") == "json_schema"
+                        and self._json_schema_format_is_unsupported(e)
+                    ):
+                        capability_key = self._capability_key_for_model(request_kwargs["model"])
                         logger.info(
                             "json_schema 不支持，自动降级到 json_object: %s (错误: %s)",
-                            base_url, str(e)[:100]
+                            capability_key, str(e)[:100]
                         )
-                        self.__class__._json_schema_unsupported_cache.add(base_url)
+                        self.__class__._json_schema_unsupported_cache.add(capability_key)
                         request_kwargs["response_format"] = {"type": "json_object"}
                         response = await self.async_client.chat.completions.create(**request_kwargs)
                     else:
@@ -128,11 +134,9 @@ class OpenAIProvider(BaseProvider):
                     content, token_usage = await self._generate_via_stream(request_kwargs)
                     return GenerationResult(content=content, token_usage=token_usage)
 
-                input_tokens = response.usage.prompt_tokens if response.usage else 0
-                output_tokens = response.usage.completion_tokens if response.usage else 0
                 return GenerationResult(
                     content=content,
-                    token_usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+                    token_usage=self._token_usage_from_usage(getattr(response, "usage", None)),
                 )
             except Exception as exc:
                 last_error = exc
@@ -159,29 +163,37 @@ class OpenAIProvider(BaseProvider):
         config: GenerationConfig
     ) -> AsyncIterator[str]:
         try:
-            base_url = self.settings.base_url or "https://api.openai.com/v1"
-            use_responses = not self._use_legacy and base_url not in self.__class__._fallback_to_chat_cache
+            capability_key = self._responses_capability_key(config)
+            use_responses = not self._use_legacy and capability_key not in self.__class__._fallback_to_chat_cache
 
             if use_responses:
+                request_kwargs = self._build_responses_request_kwargs(prompt, config, stream=True)
                 try:
-                    # 尝试走 Responses 流式 API
-                    request_kwargs = self._build_responses_request_kwargs(prompt, config, stream=True)
                     stream = await self.async_client.responses.create(**request_kwargs)
+                except Exception as e:
+                    text_format = self._responses_text_format(config.response_format)
+                    if (
+                        text_format
+                        and text_format.get("type") == "json_schema"
+                        and self._json_schema_format_is_unsupported(e)
+                    ):
+                        self.__class__._json_schema_unsupported_cache.add(capability_key)
+                        request_kwargs["text"] = {"format": {"type": "json_object"}}
+                        stream = await self.async_client.responses.create(**request_kwargs)
+                    else:
+                        if not self._responses_endpoint_is_unsupported(e):
+                            raise
+                        self.__class__._fallback_to_chat_cache.add(capability_key)
+                        logger.info("Responses endpoint unsupported for %s; using Chat Completions", capability_key)
+                        stream = None
+                else:
+                    pass
+                if stream is not None:
                     async for chunk in stream:
                         content = self._extract_text_from_responses_chunk(chunk)
                         if content:
                             yield content
-                    return  # 正常完成则结束 generator
-                except (openai.NotFoundError, openai.BadRequestError):
-                    self.__class__._fallback_to_chat_cache.add(base_url)
-                    logger.info(f"Stream: Responses API unsupported for {base_url}, falling back.")
-                except Exception as e:
-                    if "404" in str(e) or "Not Found" in str(e) or "400" in str(e) or "Account invalid" in str(e) or "INVALID_ARGUMENT" in str(e):
-                        self.__class__._fallback_to_chat_cache.add(base_url)
-                        logger.info(f"Stream: Gateway returned error for Responses API ({base_url}), falling back.")
-                    else:
-                        logger.error(f"[Responses Stream] Failed: {e}")
-                        raise
+                    return
 
             # 降级：走原来的 Chat Completions 流式 API
             messages = self._build_messages(prompt)
@@ -202,8 +214,109 @@ class OpenAIProvider(BaseProvider):
             {"role": "user", "content": prompt.user}
         ]
 
-    # 🔥 记录已知不支持 json_schema 的 base_url（避免每次重试）
-    _json_schema_unsupported_cache: set[str] = set()
+    def _capability_key_for_model(self, model_id: str) -> tuple[str, str]:
+        base_url = normalize_openai_base_url(self.settings.base_url) or "https://api.openai.com/v1"
+        return base_url.rstrip("/").lower(), model_id
+
+    def _responses_capability_key(self, config: GenerationConfig) -> tuple[str, str]:
+        return self._capability_key_for_model(
+            require_resolved_model_id(
+                config.model,
+                self.settings.default_model,
+                provider_label="OpenAI 兼容",
+            )
+        )
+
+    @staticmethod
+    def _responses_endpoint_is_unsupported(exc: Exception) -> bool:
+        response = getattr(exc, "response", None)
+        if getattr(response, "status_code", None) != 404:
+            return False
+        message = str(exc).lower()
+        return "responses" in message and any(
+            marker in message for marker in ("not found", "unsupported", "does not support")
+        )
+
+    @staticmethod
+    def _json_schema_format_is_unsupported(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            ("json_schema" in message or "json schema" in message)
+            and any(marker in message for marker in ("not supported", "unsupported", "does not support"))
+        )
+
+    @staticmethod
+    def _responses_text_format(response_format: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not response_format:
+            return None
+        if response_format.get("type") == "json_object":
+            return {"type": "json_object"}
+        if response_format.get("type") != "json_schema":
+            return None
+        schema_config = response_format.get("json_schema") or {}
+        schema = schema_config.get("schema")
+        if not isinstance(schema, dict):
+            return None
+        result: dict[str, Any] = {
+            "type": "json_schema",
+            "name": str(schema_config.get("name") or "response"),
+            "schema": schema,
+        }
+        if "strict" in schema_config:
+            result["strict"] = bool(schema_config["strict"])
+        return result
+
+    def _request_timeout(self, config: GenerationConfig) -> float:
+        return float(config.timeout_seconds or self.settings.timeout_seconds)
+
+    def _is_deepseek_model(self, model_id: str) -> bool:
+        return "deepseek" in model_id.lower() or "deepseek" in (self.settings.base_url or "").lower()
+
+    @staticmethod
+    def _usage_field(source: Any, name: str, default: Any = None) -> Any:
+        if isinstance(source, dict):
+            return source.get(name, default)
+        return getattr(source, name, default)
+
+    @classmethod
+    def _token_usage_from_usage(cls, usage: Any) -> TokenUsage:
+        def number(value: Any) -> int:
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        input_tokens = number(cls._usage_field(usage, "input_tokens", None))
+        if not input_tokens:
+            input_tokens = number(cls._usage_field(usage, "prompt_tokens", 0))
+        output_tokens = number(cls._usage_field(usage, "output_tokens", None))
+        if not output_tokens:
+            output_tokens = number(cls._usage_field(usage, "completion_tokens", 0))
+
+        input_details = cls._usage_field(usage, "input_tokens_details", None)
+        if input_details is None:
+            input_details = cls._usage_field(usage, "prompt_tokens_details", None)
+        output_details = cls._usage_field(usage, "output_tokens_details", None)
+        if output_details is None:
+            output_details = cls._usage_field(usage, "completion_tokens_details", None)
+
+        cache_hit_tokens = number(cls._usage_field(input_details, "cached_tokens", None))
+        if not cache_hit_tokens:
+            cache_hit_tokens = number(cls._usage_field(usage, "prompt_cache_hit_tokens", 0))
+        cache_miss_value = cls._usage_field(usage, "prompt_cache_miss_tokens", None)
+        if cache_miss_value is None:
+            cache_miss_value = cls._usage_field(usage, "cache_miss_tokens", None)
+        cache_miss_tokens = number(cache_miss_value)
+        if cache_miss_value is None:
+            cache_miss_tokens = max(0, input_tokens - cache_hit_tokens)
+        reasoning_tokens = number(cls._usage_field(output_details, "reasoning_tokens", None))
+        if not reasoning_tokens:
+            reasoning_tokens = number(cls._usage_field(usage, "reasoning_tokens", 0))
+
+        return TokenUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_hit_tokens=cache_hit_tokens,
+            cache_miss_tokens=cache_miss_tokens,
+            reasoning_tokens=reasoning_tokens,
+        )
 
     def _build_chat_request_kwargs(
         self,
@@ -217,6 +330,15 @@ class OpenAIProvider(BaseProvider):
             self.settings.default_model,
             provider_label="OpenAI 兼容",
         )
+        extra_body = dict(self.settings.extra_body or {})
+        if self._is_deepseek_model(model_id) and config.is_explicit("thinking") and config.thinking is not None:
+            if isinstance(config.thinking, dict):
+                extra_body["thinking"] = config.thinking
+            elif isinstance(config.thinking, bool):
+                extra_body["thinking"] = {"type": "enabled" if config.thinking else "disabled"}
+            else:
+                extra_body["thinking"] = {"type": str(config.thinking)}
+
         kwargs: dict[str, Any] = {
             "model": model_id,
             "messages": messages,
@@ -224,9 +346,11 @@ class OpenAIProvider(BaseProvider):
             "max_tokens": config.max_tokens,
             "extra_headers": self.settings.extra_headers or None,
             "extra_query": self.settings.extra_query or None,
-            "extra_body": self.settings.extra_body or None,
-            "timeout": self.settings.timeout_seconds,
+            "extra_body": extra_body or None,
+            "timeout": self._request_timeout(config),
         }
+        if config.is_explicit("reasoning_effort") and config.reasoning_effort:
+            kwargs["reasoning_effort"] = config.reasoning_effort
 
         # 🔥 response_format 自适应降级策略
         # 不同网关对 response_format 的支持程度不同：
@@ -237,11 +361,11 @@ class OpenAIProvider(BaseProvider):
         #   智谱/GLM:     json_schema ❌ | json_object ✅
         if config.response_format:
             fmt = config.response_format
-            base_url = (self.settings.base_url or "").rstrip("/")
+            capability_key = self._capability_key_for_model(model_id)
 
-            if fmt.get("type") == "json_schema" and base_url in self.__class__._json_schema_unsupported_cache:
+            if fmt.get("type") == "json_schema" and capability_key in self.__class__._json_schema_unsupported_cache:
                 # 已知不支持 json_schema，自动降级到 json_object
-                logger.debug("json_schema 已知不支持，降级到 json_object: %s", base_url)
+                logger.debug("json_schema 已知不支持，降级到 json_object: %s", capability_key)
                 kwargs["response_format"] = {"type": "json_object"}
             else:
                 kwargs["response_format"] = fmt
@@ -268,9 +392,16 @@ class OpenAIProvider(BaseProvider):
             "input": [{"role": "user", "content": prompt.user}],
             "temperature": config.temperature,
             "max_output_tokens": config.max_tokens,
+            "extra_headers": self.settings.extra_headers or None,
+            "extra_query": self.settings.extra_query or None,
+            "extra_body": self.settings.extra_body or None,
+            "timeout": self._request_timeout(config),
         }
-        if self.settings.extra_body:
-             kwargs.update(self.settings.extra_body)
+        text_format = self._responses_text_format(config.response_format)
+        if text_format is not None:
+            kwargs["text"] = {"format": text_format}
+        if config.is_explicit("reasoning_effort") and config.reasoning_effort:
+            kwargs["reasoning"] = {"effort": config.reasoning_effort}
 
         if stream:
             kwargs["stream"] = True
@@ -279,7 +410,20 @@ class OpenAIProvider(BaseProvider):
     async def _generate_via_responses(self, prompt: Prompt, config: GenerationConfig) -> GenerationResult:
         """Responses API 非流式生成"""
         request_kwargs = self._build_responses_request_kwargs(prompt, config)
-        response = await self.async_client.responses.create(**request_kwargs)
+        try:
+            response = await self.async_client.responses.create(**request_kwargs)
+        except Exception as exc:
+            text_format = self._responses_text_format(config.response_format)
+            if not (
+                text_format
+                and text_format.get("type") == "json_schema"
+                and self._json_schema_format_is_unsupported(exc)
+            ):
+                raise
+            capability_key = self._capability_key_for_model(str(request_kwargs["model"]))
+            self.__class__._json_schema_unsupported_cache.add(capability_key)
+            request_kwargs["text"] = {"format": {"type": "json_object"}}
+            response = await self.async_client.responses.create(**request_kwargs)
 
         output = getattr(response, "output", None)
         content_parts: list[str] = []
@@ -295,12 +439,9 @@ class OpenAIProvider(BaseProvider):
         if not content:
             raise RuntimeError("Responses API returned empty content")
 
-        input_tokens = response.usage.prompt_tokens if response.usage else 0
-        output_tokens = response.usage.completion_tokens if response.usage else 0
-
         return GenerationResult(
             content=content,
-            token_usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+            token_usage=self._token_usage_from_usage(getattr(response, "usage", None))
         )
 
     @staticmethod

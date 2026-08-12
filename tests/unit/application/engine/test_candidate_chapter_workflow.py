@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import pytest
 
 from application.engine.services.candidate_chapter_workflow import CandidateChapterWorkflowService
+from application.engine.dag.engine import DAGEngine
+from application.engine.dag.models import DAGRunResult, NodeResult, get_default_dag
 from domain.novel.candidate_chapter import CandidateStatus, GenerationRunState, RunMode
 from infrastructure.persistence.database.chapter_candidate_repository import ChapterCandidateRepository
 from infrastructure.persistence.database.connection import DatabaseConnection
@@ -55,13 +57,46 @@ class _DraftGenerator:
         return {"content": self.text, "script": f"第{chapter_number}章剧本"}
 
 
+class _StreamingDraftGenerator(_DraftGenerator):
+    async def generate_candidate_draft(self, *, chapter_number: int, on_event=None, **_kwargs):
+        self.calls.append(chapter_number)
+        if callable(on_event):
+            on_event({"type": "prose_delta", "text": "候选正文片段"})
+        return {"content": self.text, "script": f"第{chapter_number}章剧本"}
+
+
 class _Aftermath:
     def __init__(self):
         self.calls: list[int] = []
+        self.kwargs: list[dict] = []
 
     async def run_after_chapter_saved(self, novel_id, chapter_number, content, **_kwargs):
         self.calls.append(chapter_number)
+        self.kwargs.append(dict(_kwargs))
         return {"narrative_sync_ok": True, "memory_engine_ok": True}
+
+
+class _DAG:
+    def __init__(self, states):
+        self.states = list(states)
+        self.calls = []
+
+    async def run(self, _dag, initial_state, thread_id=""):
+        self.calls.append((dict(initial_state), thread_id))
+        state = self.states.pop(0)
+        return DAGRunResult(
+            dag_run_id=initial_state["dag_run_id"],
+            novel_id=initial_state["novel_id"],
+            status="completed",
+            node_results={"workflow": NodeResult(outputs=state)},
+        )
+
+
+class _RuntimeAwareDAG(_DAG):
+    async def run(self, _dag, initial_state, thread_id="", *, observer=None, runtime_context=None):
+        self.observer = observer
+        self.runtime_context = runtime_context
+        return await super().run(_dag, initial_state, thread_id)
 
 
 @pytest.fixture
@@ -99,6 +134,26 @@ async def test_review_mode_has_exactly_one_candidate_and_no_next_llm_call_until_
     candidate_two = await service.generate_next("novel-1")
     assert candidate_two.chapter_number == 2
     assert drafts.calls == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_canonical_sync_uses_author_final_commit_plan_not_original_outline(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    service = CandidateChapterWorkflowService(repo, _Outlines(), drafts, aftermath)
+
+    candidate = await service.generate_next("novel-1")
+    revised_plan = {
+        "chapter_summary": "作者确认的最终摘要",
+        "timeline_events": ["作者改写后的事件"],
+        "next_chapter_handoff": ["下一章从雨夜追捕开始"],
+    }
+    repo.update_commit_plan(candidate.id, revised_plan)
+
+    committed = await service.accept_candidate(candidate.id, continue_after_commit=False)
+
+    assert committed.status == CandidateStatus.COMMITTED
+    assert aftermath.kwargs[-1]["outline"] == "作者确认的最终摘要\n作者改写后的事件\n下一章从雨夜追捕开始"
 
 
 @pytest.mark.asyncio
@@ -165,3 +220,178 @@ async def test_author_regeneration_and_reaudit_use_the_same_candidate_without_fo
     assert reaudited.audit_is_current is True
     assert reaudited.commit_plan_is_current is True
     assert drafts.calls == [1, 1]  # Re-audit never consumes prose-generation tokens.
+
+
+@pytest.mark.asyncio
+async def test_candidate_generation_uses_dag_state_as_the_single_draft_and_audit_authority(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    dag = _DAG([
+        {
+            "content": "主角作出选择，代价随之而来。",
+            "script": "DAG 剧本",
+            "drift_alert": False,
+            "breaker_status": "closed",
+            "approved": True,
+            "candidate_proposals": {"summary": "候选提案"},
+        },
+    ])
+    service = CandidateChapterWorkflowService(
+        repo, _Outlines(), drafts, aftermath, dag_engine=dag, dag_factory=lambda: object()
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert candidate.llm_content == "主角作出选择，代价随之而来。"
+    assert candidate.audit["dag"]["approved"] is True
+    assert candidate.commit_plan["dag_proposals"] == {"summary": "候选提案"}
+    assert drafts.calls == []
+    trace = repo.get_latest_dag_run(candidate.id)
+    assert trace["status"] == "completed"
+    assert trace["final_state"]["content"] == candidate.llm_content
+
+
+@pytest.mark.asyncio
+async def test_candidate_dag_retry_creates_a_bounded_new_content_revision(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    dag = _DAG([
+        {
+            "content": "第一版正文",
+            "retry_requested": True,
+            "retry_feedback": "改正文风",
+        },
+        {
+            "content": "第二版正文，主角作出选择。",
+            "breaker_status": "closed",
+            "approved": True,
+        },
+    ])
+    service = CandidateChapterWorkflowService(
+        repo, _Outlines(), drafts, aftermath, dag_engine=dag, dag_factory=lambda: object(), max_candidate_revisions=2
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert candidate.content_revision == 2
+    assert candidate.llm_content == "第二版正文，主角作出选择。"
+    assert [version["content"] for version in repo.list_versions(candidate.id)] == ["第二版正文，主角作出选择。", "第一版正文"]
+    assert len(dag.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_exhausted_candidate_dag_retry_waits_for_author_in_continuous_mode(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    dag = _DAG([{
+        "content": "最终候选稿，主角作出选择。",
+        "retry_requested": False,
+        "retry_exhausted": True,
+        "review_required": True,
+        "approved": False,
+    }])
+    service = CandidateChapterWorkflowService(
+        repo, _Outlines(), drafts, aftermath, dag_engine=dag, dag_factory=lambda: object(), max_candidate_revisions=0
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert candidate.audit["dag"]["retry_exhausted"] is True
+    assert aftermath.calls == []
+
+
+@pytest.mark.asyncio
+async def test_candidate_dag_receives_isolated_runtime_generator_and_observer(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    dag = _RuntimeAwareDAG([{"content": "候选 DAG 正文", "approved": True}])
+    service = CandidateChapterWorkflowService(
+        repo, _Outlines(), drafts, aftermath, dag_engine=dag, dag_factory=lambda: object()
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.llm_content == "候选 DAG 正文"
+    assert dag.runtime_context["candidate_draft_generator"] is drafts
+    assert dag.runtime_context["outline_chain"]["chapter"]["payload"]["title"] == "第1章：候选"
+    assert dag.runtime_context["content_revision"] == 1
+    assert dag.observer is not None
+    assert getattr(dag, "_observer", None) is None
+
+
+@pytest.mark.asyncio
+async def test_real_dag_v2_persists_candidate_trace_without_serializing_runtime_services(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    drafts.text = "主角作出选择，带着证物赶往港口。"
+    service = CandidateChapterWorkflowService(
+        repo,
+        _Outlines(),
+        drafts,
+        aftermath,
+        dag_engine=DAGEngine(),
+        dag_factory=get_default_dag,
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert candidate.llm_content == drafts.text
+    trace = repo.get_latest_dag_run(candidate.id)
+    assert trace["status"] == "completed"
+    assert "_runtime_context" not in trace["final_state"]
+    assert {event["node_id"] for event in trace["events"] if event.get("node_id")} >= {
+        "exec_writer",
+        "val_narrative",
+        "gw_review",
+    }
+
+
+@pytest.mark.asyncio
+async def test_real_dag_v2_persists_buffered_candidate_prose_events(workflow):
+    _db, repo, _drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    drafts = _StreamingDraftGenerator("主角作出选择，带着证物赶往港口。")
+    service = CandidateChapterWorkflowService(
+        repo,
+        _Outlines(),
+        drafts,
+        aftermath,
+        dag_engine=DAGEngine(),
+        dag_factory=get_default_dag,
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    trace = repo.get_latest_dag_run(candidate.id)
+    prose_events = [event for event in trace["events"] if event["type"] == "prose_delta"]
+    assert len(prose_events) == 1
+    assert prose_events[0]["node_id"] == "exec_writer"
+    assert prose_events[0]["text"] == "候选正文片段"
+
+
+@pytest.mark.asyncio
+async def test_real_dag_v2_clean_continuous_candidate_commits_after_machine_approval(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    drafts.text = "主角作出选择，带着证物赶往港口。"
+    service = CandidateChapterWorkflowService(
+        repo,
+        _Outlines(),
+        drafts,
+        aftermath,
+        dag_engine=DAGEngine(),
+        dag_factory=get_default_dag,
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.COMMITTED
+    assert candidate.audit["dag"]["approved"] is True
+    assert aftermath.calls == [1]

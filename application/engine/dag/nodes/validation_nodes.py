@@ -33,6 +33,69 @@ from infrastructure.ai.prompt_keys import (
 logger = logging.getLogger(__name__)
 
 
+def _candidate_scope(context: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Return the immutable candidate scope, or ``None`` for canonical runs."""
+
+    if not context.get("candidate_mode"):
+        return None
+    candidate_id = str(context.get("candidate_id") or "").strip()
+    revision = context.get("content_revision")
+    if revision is None:
+        # Retry count is only a compatibility fallback for direct node callers;
+        # production workflow always supplies the persisted content revision.
+        revision = context.get("candidate_revision", 0)
+    try:
+        revision = int(revision)
+    except (TypeError, ValueError):
+        revision = 0
+    return {"candidate_id": candidate_id, "content_revision": revision}
+
+
+def _as_text_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, dict):
+        values: list[str] = []
+        for item in value.values():
+            values.extend(_as_text_list(item))
+        return values
+    return []
+
+
+def _chapter_payload(context: Dict[str, Any]) -> Dict[str, Any]:
+    chain = context.get("outline_chain") or {}
+    chapter = chain.get("chapter") if isinstance(chain, dict) else {}
+    payload = chapter.get("payload") if isinstance(chapter, dict) else {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _candidate_narrative_proposal(content: str, context: Dict[str, Any]) -> dict[str, Any]:
+    text = str(content or "").strip()
+    return {
+        "summary": text[:1000],
+        "events": [sentence.strip() for sentence in text.replace("！", "。")
+                    .replace("？", "。").split("。") if sentence.strip()][:20],
+        "triples": [],
+        "causal_edges": [],
+        "status": "candidate_only",
+        "scope": _candidate_scope(context),
+    }
+
+
+def _candidate_foreshadowing_proposal(content: str, context: Dict[str, Any]) -> dict[str, Any]:
+    expected = _as_text_list(_chapter_payload(context).get("foreshadowing"))
+    text = str(content or "")
+    matched = [item for item in expected if item in text]
+    return {
+        "matched": matched,
+        "pending": [item for item in expected if item not in matched],
+        "status": "candidate_only",
+        "scope": _candidate_scope(context),
+    }
+
+
 # ─── val_style: 文风警报器 ───
 
 
@@ -69,6 +132,13 @@ class StyleNode(BaseNode):
         content = inputs.get("content", "")
         drift_score = 0.0
         drift_alert = False
+
+        if _candidate_scope(context) is not None:
+            return NodeResult(
+                outputs={"drift_score": drift_score, "drift_alert": drift_alert},
+                status=NodeStatus.SUCCESS,
+                duration_ms=int((time.time() - start) * 1000),
+            )
 
         try:
             try:
@@ -137,6 +207,20 @@ class TensionNode(BaseNode):
         content = inputs.get("content", "")
 
         try:
+            if _candidate_scope(context) is not None:
+                # Candidate audits must stay read-only and token-free. Canonical
+                # scoring remains exclusively in the post-commit pipeline.
+                return NodeResult(
+                    outputs={
+                        "plot_tension": 50.0,
+                        "emotional_tension": 50.0,
+                        "pacing_tension": 50.0,
+                        "composite": 50.0,
+                    },
+                    status=NodeStatus.SUCCESS,
+                    metrics={"composite": 50.0},
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             plot_tension = 0.0
             emotional_tension = 0.0
             pacing_tension = 0.0
@@ -145,13 +229,17 @@ class TensionNode(BaseNode):
             try:
                 from application.analyst.services.tension_scoring_service import TensionScoringService
                 novel_id = context.get("novel_id", "")
-                svc = TensionScoringService()
-                result = await svc.score(novel_id, content)
+                from interfaces.api.dependencies import get_llm_service
+
+                svc = TensionScoringService(get_llm_service())
+                result = await svc.score_chapter(
+                    content, int(context.get("chapter_number") or 0)
+                )
                 if result:
                     plot_tension = getattr(result, "plot_tension", 0.0)
                     emotional_tension = getattr(result, "emotional_tension", 0.0)
                     pacing_tension = getattr(result, "pacing_tension", 0.0)
-                    composite = getattr(result, "composite", 0.0)
+                    composite = getattr(result, "composite_score", 0.0)
             except Exception as e:
                 logger.warning(f"TensionScoringService 调用失败: {e}")
 
@@ -215,17 +303,33 @@ class AntiAINode(BaseNode):
 
             try:
                 from application.audit.services.cliche_scanner import ClicheScanner
+                from application.audit.services.anti_ai_audit import AntiAIAuditor
+
                 scanner = ClicheScanner()
-                result = scanner.scan(content)
-                if result:
-                    severity_score = getattr(result, "severity_score", 0.0)
-                    hits = getattr(result, "hits", [])
-                    recommendations = getattr(result, "recommendations", [])
+                hits = scanner.scan_cliches(content)
+                metrics = AntiAIAuditor()._calculate_metrics("candidate", hits, content)
+                severity_score = metrics.severity_score
+                recommendations = [
+                    hit.replacement_hint for hit in hits
+                    if getattr(hit, "replacement_hint", "")
+                ][:5]
             except Exception as e:
                 logger.warning(f"ClicheScanner 调用失败: {e}")
 
             return NodeResult(
-                outputs={"severity_score": severity_score, "hits": hits, "recommendations": recommendations},
+                outputs={
+                    "severity_score": severity_score,
+                    "hits": [
+                        {
+                            "pattern": hit.pattern,
+                            "text": hit.text,
+                            "severity": hit.severity,
+                            "category": hit.category,
+                        }
+                        for hit in hits
+                    ],
+                    "recommendations": recommendations,
+                },
                 status=NodeStatus.SUCCESS,
                 metrics={"severity_score": severity_score},
                 duration_ms=int((time.time() - start) * 1000),
@@ -273,19 +377,38 @@ class ForeshadowCheckNode(BaseNode):
         start = time.time()
 
         try:
+            candidate_proposal = _candidate_foreshadowing_proposal(
+                inputs.get("content", ""), context
+            ) if _candidate_scope(context) is not None else None
+            if candidate_proposal is not None:
+                return NodeResult(
+                    outputs={
+                        "recovered": len(candidate_proposal["matched"]),
+                        "pending": len(candidate_proposal["pending"]),
+                        "recovery_rate": (
+                            len(candidate_proposal["matched"])
+                            / max(1, len(candidate_proposal["matched"]) + len(candidate_proposal["pending"]))
+                            * 100
+                        ),
+                        "candidate_foreshadowing_proposal": candidate_proposal,
+                    },
+                    status=NodeStatus.SUCCESS,
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             recovered = 0
             pending = 0
             recovery_rate = 0.0
 
             try:
-                from domain.novel.repositories.foreshadowing_repository import ForeshadowingRepository
-                from infrastructure.persistence.database.connection import get_database
-                db = get_database()
-                repo = ForeshadowingRepository(db)
+                from domain.novel.value_objects.novel_id import NovelId
+                from interfaces.api.dependencies import get_foreshadowing_repository
+
+                repo = get_foreshadowing_repository()
                 novel_id = inputs.get("novel_id") or context.get("novel_id", "")
-                all_f = repo.find_by_novel(novel_id)
-                recovered = len([f for f in all_f if getattr(f, 'status', '') == 'recovered'])
-                pending = len([f for f in all_f if getattr(f, 'status', '') == 'pending'])
+                registry = repo.get_by_novel_id(NovelId(str(novel_id)))
+                all_f = list(getattr(registry, "foreshadowings", []) or [])
+                recovered = len([f for f in all_f if str(getattr(f, "status", "")) == "ForeshadowingStatus.RESOLVED" or getattr(getattr(f, "status", None), "value", "") == "resolved"])
+                pending = len([f for f in all_f if getattr(getattr(f, "status", None), "value", "") == "planted"])
                 total = recovered + pending
                 recovery_rate = (recovered / total * 100) if total > 0 else 0.0
             except Exception as e:
@@ -341,6 +464,19 @@ class NarrativeNode(BaseNode):
         content = inputs.get("content", "")
 
         try:
+            proposal = _candidate_narrative_proposal(content, context)
+            if _candidate_scope(context) is not None:
+                return NodeResult(
+                    outputs={
+                        "summary": proposal["summary"],
+                        "events": proposal["events"],
+                        "triples": proposal["triples"],
+                        "causal_edges": proposal["causal_edges"],
+                        "candidate_narrative_proposal": proposal,
+                    },
+                    status=NodeStatus.SUCCESS,
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             summary = ""
             events = []
             triples = []
@@ -349,13 +485,11 @@ class NarrativeNode(BaseNode):
             try:
                 from application.engine.services.chapter_aftermath_pipeline import ChapterAftermathPipeline
                 novel_id = context.get("novel_id", "")
-                pipeline = ChapterAftermathPipeline()
-                result = await pipeline.run_narrative_sync(novel_id, content)
-                if result:
-                    summary = getattr(result, "summary", "")
-                    events = getattr(result, "events", [])
-                    triples = getattr(result, "triples", [])
-                    causal_edges = getattr(result, "causal_edges", [])
+                # Legacy non-candidate DAGs retain a best-effort read-only
+                # projection. Canonical writes belong to the saved-chapter path.
+                result = _candidate_narrative_proposal(content, context)
+                summary = result["summary"]
+                events = result["events"]
             except Exception as e:
                 logger.warning(f"ChapterAftermathPipeline 调用失败: {e}")
 
@@ -405,14 +539,25 @@ class KGInferNode(BaseNode):
         start = time.time()
 
         try:
+            if _candidate_scope(context) is not None:
+                narrative = context.get("shared_state", {}).get("candidate_narrative_proposal", {})
+                foreshadowing = context.get("shared_state", {}).get("candidate_foreshadowing_proposal", {})
+                proposal = {
+                    "scope": _candidate_scope(context),
+                    "narrative": narrative if isinstance(narrative, dict) else {},
+                    "foreshadowing": foreshadowing if isinstance(foreshadowing, dict) else {},
+                    "knowledge_graph": {"status": "candidate_only", "triples": []},
+                }
+                return NodeResult(
+                    outputs={"inferred_triples": [], "candidate_proposals": proposal},
+                    status=NodeStatus.SUCCESS,
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             inferred_triples = []
 
             try:
-                from application.world.services.knowledge_graph_service import KnowledgeGraphService
-                novel_id = inputs.get("novel_id") or context.get("novel_id", "")
-                chapter_number = inputs.get("chapter_number") or context.get("chapter_number", 0)
-                svc = KnowledgeGraphService()
-                inferred_triples = await svc.infer_from_chapter(novel_id, chapter_number)
+                # Canonical KG inference is deliberately post-commit only.
+                inferred_triples = []
             except Exception as e:
                 logger.warning(f"KnowledgeGraphService 调用失败: {e}")
 

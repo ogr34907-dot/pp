@@ -83,10 +83,69 @@ class OutlinePayload:
     ending_hook: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
+    @staticmethod
+    def _text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            return "\n".join(OutlinePayload._text(item) for item in value.values() if OutlinePayload._text(item))
+        if isinstance(value, (list, tuple, set)):
+            return "\n".join(OutlinePayload._text(item) for item in value if OutlinePayload._text(item))
+        return str(value).strip()
+
+    @classmethod
+    def _strings(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            value = list(value.values())
+        if not isinstance(value, (list, tuple, set)):
+            value = (value,)
+        return [text for item in value if (text := cls._text(item))]
+
+    @classmethod
+    def _mapping_of_string_lists(cls, value: Any) -> dict[str, list[str]]:
+        if not isinstance(value, dict):
+            items = cls._strings(value)
+            return {"items": items} if items else {}
+        return {
+            str(key): cls._strings(items)
+            for key, items in value.items()
+            if cls._strings(items)
+        }
+
+    @staticmethod
+    def _optional_int(value: Any) -> Optional[int]:
+        try:
+            return int(value) if value is not None and str(value).strip() else None
+        except (TypeError, ValueError):
+            return None
+
     def canonical_dict(self) -> dict[str, Any]:
         """Return a stable, JSON-safe plan representation for revisions."""
 
         return asdict(self)
+
+    def sibling_continuity_blockers(self) -> tuple[str, ...]:
+        """Return the minimum handoff facts required after a sibling exists.
+
+        Natural-language state cannot be compared mechanically, so the
+        contract requires the fields that let the following unit explicitly
+        carry the story forward.  Range continuity is checked where sibling
+        identity and ordering are available in the repository.
+        """
+
+        required = {
+            "creative_goal": self.creative_goal,
+            "entry_state": self.entry_state,
+            "exit_state": self.exit_state,
+            "conflicts": self.conflicts,
+            "state_changes": self.state_changes,
+            "handoff_conditions": self.handoff_conditions,
+        }
+        return tuple(f"{name}:missing" for name, value in required.items() if not value)
 
     @property
     def digest(self) -> str:
@@ -100,6 +159,26 @@ class OutlinePayload:
         data = dict(raw or {})
         known = {field_name for field_name in cls.__dataclass_fields__}
         values = {name: data.pop(name) for name in tuple(data) if name in known}
+        for name in (
+            "title", "narrative_text", "creative_goal", "entry_state", "exit_state",
+            "pov", "ending_hook",
+        ):
+            if name in values:
+                values[name] = cls._text(values[name])
+        for name in (
+            "required_events", "forbidden_events", "handoff_conditions", "scenes", "beats", "conflicts",
+        ):
+            if name in values:
+                values[name] = cls._strings(values[name])
+        if "foreshadowing" in values:
+            values["foreshadowing"] = cls._mapping_of_string_lists(values["foreshadowing"])
+        if not isinstance(values.get("state_changes", {}), dict):
+            values["state_changes"] = {}
+        if not isinstance(values.get("extra", {}), dict):
+            values["extra"] = {"raw_extra": values["extra"]}
+        for name in ("chapter_start", "chapter_end", "word_budget"):
+            if name in values:
+                values[name] = cls._optional_int(values[name])
         if data:
             values["extra"] = {**dict(values.get("extra") or {}), **data}
         return cls(**values)
@@ -122,6 +201,7 @@ class OutlineContract:
     author_locked: bool = False
     has_author_edits: bool = False
     published_digest: str = ""
+    previous_sibling_digest: str = ""
 
     def __post_init__(self) -> None:
         if isinstance(self.level, str):

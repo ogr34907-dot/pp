@@ -34,6 +34,14 @@ export interface CandidateGenerationProgress {
   steps: CandidateGenerationProgressStep[]
 }
 
+type CandidateProseEvent = { sequence?: unknown; type?: unknown; text?: unknown }
+
+export interface CandidateProseSnapshot {
+  dagRunId: string
+  cursor: number
+  prose: string
+}
+
 const stepBlueprint: Array<Pick<CandidateGenerationProgressStep, 'key' | 'label' | 'detail'>> = [
   { key: 'draft', label: '候选生成', detail: '正文仅保存在候选稿中' },
   { key: 'audit', label: '机器审校', detail: '核对大纲、连续性与提交清单' },
@@ -67,6 +75,38 @@ function activeResult(
   tone: GenerationPresentationTone = 'brand',
 ): Pick<CandidateGenerationProgress, 'steps' | 'activeStep' | 'label' | 'detail' | 'tone' | 'isActive'> {
   return { steps: makeSteps(states), activeStep, label, detail, tone, isActive: tone === 'brand' }
+}
+
+export function appendCandidateProseDeltas(current: string, events: readonly CandidateProseEvent[]): string {
+  return `${current}${events
+    .filter(event => event.type === 'prose_delta' && typeof event.text === 'string')
+    .map(event => event.text)
+    .join('')}`
+}
+
+export function getCandidateProsePreview(prose: string, maxChars = 220): string {
+  if (prose.length <= maxChars) return prose
+  return `...${prose.slice(-maxChars)}`
+}
+
+export function applyCandidateProseEvents(
+  current: CandidateProseSnapshot,
+  dagRunId: string,
+  events: readonly CandidateProseEvent[],
+): CandidateProseSnapshot {
+  const base = current.dagRunId === dagRunId
+    ? current
+    : { dagRunId, cursor: 0, prose: '' }
+  const cursor = events.reduce((latest, event) => (
+    typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+      ? Math.max(latest, Math.floor(event.sequence))
+      : latest
+  ), base.cursor)
+  return {
+    dagRunId,
+    cursor,
+    prose: appendCandidateProseDeltas(base.prose, events),
+  }
 }
 
 /**

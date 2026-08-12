@@ -74,3 +74,41 @@ def test_prose_requires_the_complete_synced_five_level_chain_without_conflict():
     chain.contract_for(OutlineLevel.ACT).status = OutlineStatus.CONFLICT
     assert chain.ready_for_prose is False
     assert chain.blockers == ("act:conflict",)
+
+
+def test_payload_normalizes_malformed_llm_list_and_mapping_fields():
+    payload = OutlinePayload.from_dict(
+        {
+            "title": ["总纲", "误返回数组"],
+            "required_events": "主角离开故乡",
+            "forbidden_events": {"first": "提前解决冲突"},
+            "foreshadowing": ["雨夜的信"],
+            "state_changes": "人物关系改变",
+            "chapter_start": "3",
+            "chapter_end": "not-a-number",
+        }
+    )
+
+    assert payload.title == "总纲\n误返回数组"
+    assert payload.required_events == ["主角离开故乡"]
+    assert payload.forbidden_events == ["提前解决冲突"]
+    assert payload.foreshadowing == {"items": ["雨夜的信"]}
+    assert payload.state_changes == {}
+    assert payload.chapter_start == 3
+    assert payload.chapter_end is None
+
+
+def test_later_sibling_payload_requires_a_complete_narrative_handoff():
+    payload = OutlinePayload(
+        creative_goal="推进下一阶段",
+        entry_state="承接上一阶段结局",
+        exit_state="留下新的危机",
+        conflicts=["新的冲突"],
+        state_changes={"protagonist": [{"change": "承担后果"}]},
+        handoff_conditions=["下一阶段必须回应危机"],
+    )
+
+    assert payload.sibling_continuity_blockers() == ()
+
+    payload.handoff_conditions = []
+    assert payload.sibling_continuity_blockers() == ("handoff_conditions:missing",)

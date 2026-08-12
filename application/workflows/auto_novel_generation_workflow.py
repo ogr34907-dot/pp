@@ -758,6 +758,7 @@ class AutoNovelGenerationWorkflow:
         chapter_title: str,
         outline_chain: Dict[str, Any],
         outline_text: str,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Generate a chapter draft without applying any formal aftermath.
 
@@ -783,20 +784,38 @@ class AutoNovelGenerationWorkflow:
         plan_context = json.dumps(outline_chain, ensure_ascii=False, sort_keys=True)
         context = f"{bundle['context']}\n\n=== PUBLISHED FIVE-LEVEL OUTLINE CONTRACT ===\n{plan_context}"
         target_words = self._resolve_target_chapter_words(novel_id)
-        script = await self._generate_script(
+        script_parts: list[str] = []
+        async for piece in self._generate_script_stream(
             context=context,
             outline=outline_text,
             target_words=target_words,
             storyline_context=bundle["storyline_context"],
             plot_tension=bundle["plot_tension"],
             style_summary=bundle["style_summary"],
-        )
-        prose = await self._generate_prose_from_script(
+        ):
+            script_parts.append(piece)
+        script = "".join(script_parts)
+
+        prose_parts: list[str] = []
+        prose_buffer: list[str] = []
+        buffered_chars = 0
+        async for piece in self._generate_prose_from_script_stream(
             script=script,
             outline=outline_text,
             target_words=target_words,
-        )
-        content = self._finalize_chapter_body_text(novel_id, prose)
+            context=context,
+        ):
+            prose_parts.append(piece)
+            prose_buffer.append(piece)
+            buffered_chars += len(piece)
+            if on_event is not None and buffered_chars >= 384:
+                on_event({"type": "prose_delta", "text": "".join(prose_buffer)})
+                prose_buffer = []
+                buffered_chars = 0
+        if on_event is not None and prose_buffer:
+            on_event({"type": "prose_delta", "text": "".join(prose_buffer)})
+
+        content = self._finalize_chapter_body_text(novel_id, "".join(prose_parts))
         if not content.strip():
             raise RuntimeError("candidate prose generation returned empty content")
         return {

@@ -45,9 +45,13 @@ class CircuitNode(BaseNode):
         input_ports=[
             NodePort(name="error_count", data_type=PortDataType.SCORE, required=False, default=0),
             NodePort(name="max_errors", data_type=PortDataType.SCORE, required=False, default=3),
+            NodePort(name="drift_alert", data_type=PortDataType.BOOLEAN, required=False, default=False),
+            NodePort(name="severity_score", data_type=PortDataType.SCORE, required=False, default=0),
+            NodePort(name="composite", data_type=PortDataType.SCORE, required=False, default=50),
         ],
         output_ports=[
             NodePort(name="breaker_status", data_type=PortDataType.TEXT),
+            NodePort(name="review_required", data_type=PortDataType.BOOLEAN),
         ],
         prompt_variables=[],
         is_configurable=False,
@@ -63,14 +67,24 @@ class CircuitNode(BaseNode):
         start = time.time()
 
         try:
-            error_count = inputs.get("error_count", 0)
+            error_count = int(inputs.get("error_count", 0) or 0)
             thresholds = self._config.thresholds if self._config else {}
             max_errors = thresholds.get("max_errors", inputs.get("max_errors", 3))
-
-            breaker_status = "open" if error_count >= max_errors else "closed"
+            anti_ai_limit = thresholds.get("anti_ai_max_severity", 1)
+            tension_floor = thresholds.get("tension_floor", 30)
+            drift_alert = bool(inputs.get("drift_alert", False))
+            severity_score = float(inputs.get("severity_score", 0) or 0)
+            composite = float(inputs.get("composite", 50) or 0)
+            review_required = (
+                error_count >= int(max_errors)
+                or drift_alert
+                or severity_score >= float(anti_ai_limit)
+                or composite < float(tension_floor)
+            )
+            breaker_status = "open" if review_required else "closed"
 
             return NodeResult(
-                outputs={"breaker_status": breaker_status},
+                outputs={"breaker_status": breaker_status, "review_required": review_required},
                 status=NodeStatus.WARNING if breaker_status == "open" else NodeStatus.SUCCESS,
                 metrics={"error_count": float(error_count)},
                 duration_ms=int((time.time() - start) * 1000),
@@ -98,6 +112,8 @@ class ReviewNode(BaseNode):
         input_ports=[
             NodePort(name="content", data_type=PortDataType.TEXT, required=False),
             NodePort(name="metrics", data_type=PortDataType.JSON, required=False),
+            NodePort(name="review_required", data_type=PortDataType.BOOLEAN, required=False, default=False),
+            NodePort(name="run_mode", data_type=PortDataType.TEXT, required=False, default="chapter_review"),
         ],
         output_ports=[
             NodePort(name="approved", data_type=PortDataType.BOOLEAN),
@@ -117,7 +133,7 @@ class ReviewNode(BaseNode):
 
         try:
             # 检查是否自动审批模式
-            approved = True  # 默认自动审批
+            approved = not bool(inputs.get("review_required", False))
 
             # 如果有关键指标异常，不自动审批
             metrics = inputs.get("metrics", {})
@@ -127,8 +143,11 @@ class ReviewNode(BaseNode):
                 if metrics.get("breaker_status") == "open":
                     approved = False
 
+            if str(inputs.get("run_mode") or context.get("run_mode") or "chapter_review") != "continuous":
+                approved = False
+
             return NodeResult(
-                outputs={"approved": approved},
+                outputs={"approved": approved, "review_required": not approved},
                 status=NodeStatus.SUCCESS,
                 duration_ms=int((time.time() - start) * 1000),
             )
@@ -204,7 +223,13 @@ class ConditionNode(BaseNode):
 
 @NodeRegistry.register("gw_retry")
 class RetryNode(BaseNode):
-    """重试网关 — 文风检查失败时触发重写"""
+    """Emit a bounded candidate-revision retry request.
+
+    The retry is intentionally terminal for one acyclic DAG run.  The
+    candidate workflow creates the next content revision and invokes the DAG
+    again; a graph back-edge would block its initial writer run and cannot
+    persist revision state safely.
+    """
 
     meta = NodeMeta(
         node_type="gw_retry",
@@ -213,11 +238,13 @@ class RetryNode(BaseNode):
         icon="",
         color="#8b5cf6",
         input_ports=[
-            NodePort(name="input", data_type=PortDataType.JSON, required=True),
+            NodePort(name="breaker_status", data_type=PortDataType.TEXT, required=False),
             NodePort(name="max_attempts", data_type=PortDataType.SCORE, required=False, default=2),
         ],
         output_ports=[
-            NodePort(name="output", data_type=PortDataType.JSON),
+            NodePort(name="retry_requested", data_type=PortDataType.BOOLEAN),
+            NodePort(name="retry_exhausted", data_type=PortDataType.BOOLEAN),
+            NodePort(name="retry_feedback", data_type=PortDataType.TEXT),
             NodePort(name="attempts_used", data_type=PortDataType.SCORE),
         ],
         prompt_variables=["content"],
@@ -226,7 +253,7 @@ class RetryNode(BaseNode):
         default_timeout_seconds=10,
         cpms_node_key=RETRY_GATEWAY,
         description="文风检查失败时触发重写的重试网关",
-        default_edges=["exec_writer"],
+        default_edges=["gw_review"],
     )
 
     async def execute(self, inputs: Dict[str, Any], context: Dict[str, Any]) -> NodeResult:
@@ -234,32 +261,39 @@ class RetryNode(BaseNode):
         start = time.time()
 
         try:
-            input_data = inputs.get("input", {})
             max_attempts = inputs.get("max_attempts", 2)
             if self._config and self._config.max_retries:
                 max_attempts = self._config.max_retries
 
             # 检查当前重试次数
-            retry_count = context.get("shared_state", {}).get("retry_count", 0) if isinstance(context, dict) else 0
+            retry_count = context.get("shared_state", {}).get("candidate_revision", 0) if isinstance(context, dict) else 0
 
             if retry_count < max_attempts:
-                # 允许重试
                 return NodeResult(
-                    outputs={"output": input_data, "attempts_used": retry_count + 1},
+                    outputs={
+                        "retry_requested": True,
+                        "retry_exhausted": False,
+                        "retry_feedback": "候选稿未通过文风或安全审查，请按审查结果重写。",
+                        "attempts_used": retry_count + 1,
+                    },
                     status=NodeStatus.SUCCESS,
                     metrics={"retry_count": float(retry_count + 1)},
                     duration_ms=int((time.time() - start) * 1000),
                 )
             else:
-                # 超出重试次数，标记警告但继续
                 return NodeResult(
-                    outputs={"output": input_data, "attempts_used": retry_count},
+                    outputs={
+                        "retry_requested": False,
+                        "retry_exhausted": True,
+                        "retry_feedback": "候选稿重写次数已用尽，转入人工审核。",
+                        "attempts_used": retry_count,
+                    },
                     status=NodeStatus.WARNING,
                     metrics={"retry_count": float(retry_count)},
                     duration_ms=int((time.time() - start) * 1000),
                 )
         except Exception as e:
-            return NodeResult(outputs={"output": inputs.get("input"), "attempts_used": 0}, status=NodeStatus.ERROR, duration_ms=int((time.time() - start) * 1000), error=str(e))
+            return NodeResult(outputs={"retry_requested": False, "retry_feedback": str(e), "attempts_used": 0}, status=NodeStatus.ERROR, duration_ms=int((time.time() - start) * 1000), error=str(e))
 
     def validate_inputs(self, inputs: Dict[str, Any]) -> bool:
-        return "input" in inputs
+        return True

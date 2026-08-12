@@ -459,7 +459,7 @@ class LLMControlService:
             )
             config = GenerationConfig(
                 model=resolved.model,
-                max_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                max_tokens=32,
                 temperature=0,
             )
             result = await llm_service.generate(prompt, config)
@@ -514,7 +514,6 @@ class LLMControlService:
                         'base_url': profile.base_url.strip(),
                         'api_key': profile.api_key.strip(),
                         'model': profile.model.strip(),
-                        'max_tokens': DEFAULT_MAX_OUTPUT_TOKENS,
                     }
                 )
             )

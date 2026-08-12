@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from domain.novel.candidate_chapter import RunMode
@@ -17,6 +17,12 @@ from application.engine.services.candidate_chapter_workflow import (
     CandidateChapterWorkflowService,
     CandidateWorkflowError,
 )
+from application.engine.services.generation_start_preflight import (
+    GenerationStartPreflight,
+    GenerationStartPreflightError,
+)
+from application.engine.dag.engine import DAGEngine
+from application.engine.dag.models import get_default_dag
 from infrastructure.persistence.database.chapter_candidate_repository import (
     CandidateGateError,
     ChapterCandidateRepository,
@@ -64,6 +70,22 @@ def get_candidate_workflow_service() -> CandidateChapterWorkflowService:
         ),
         api_dependencies.get_auto_workflow(),
         api_dependencies.get_chapter_aftermath_pipeline(),
+        dag_engine=DAGEngine(),
+        dag_factory=get_default_dag,
+    )
+
+
+def get_generation_start_preflight(
+    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
+) -> GenerationStartPreflight:
+    db = api_dependencies.get_database()
+    return GenerationStartPreflight(
+        db,
+        repository,
+        OutlineContractService(
+            contract_repository=OutlineContractRepository(db),
+            story_node_repository=api_dependencies.get_story_node_repository(),
+        ),
     )
 
 
@@ -119,6 +141,8 @@ def _raise_candidate_error(exc: Exception) -> None:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if isinstance(exc, CandidateWorkflowError):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(exc, GenerationStartPreflightError):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     raise exc
@@ -129,12 +153,14 @@ def start_generation_run(
     novel_id: str,
     body: StartGenerationRequest,
     repository: ChapterCandidateRepository = Depends(get_candidate_repository),
+    preflight: GenerationStartPreflight = Depends(get_generation_start_preflight),
 ):
     try:
         try:
             mode = RunMode(body.run_mode)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="run_mode must be continuous or chapter_review") from exc
+        preflight.ensure_startable(novel_id)
         run = repository.start_run(novel_id, run_mode=mode, target_chapters=body.target_chapters)
         return {"success": True, "data": _run_to_dict(run)}
     except HTTPException:
@@ -154,6 +180,26 @@ def get_generation_state(
         return {
             "success": True,
             "data": {**_run_to_dict(run), "candidate": _candidate_to_dict(candidate) if candidate else None},
+        }
+    except KeyError:
+        return {
+            "success": True,
+            "data": {
+                "novel_id": novel_id,
+                "run_mode": RunMode.CONTINUOUS.value,
+                "state": "idle",
+                "generation_epoch": 0,
+                "target_chapters": 0,
+                "current_formal_chapter": 0,
+                "current_candidate_id": None,
+                "current_candidate_chapter": None,
+                "canonical_sync_status": "ready",
+                "next_action": "select_run_mode",
+                "last_error": "",
+                "max_pending_candidates": 1,
+                "prefetch": 0,
+                "candidate": None,
+            },
         }
     except Exception as exc:
         _raise_candidate_error(exc)
@@ -179,6 +225,86 @@ def list_candidate_versions(
 
     try:
         return {"success": True, "data": repository.list_versions(candidate_id)}
+    except Exception as exc:
+        _raise_candidate_error(exc)
+
+
+def _candidate_dag_continuation(candidate, dag_run: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Describe the only safe next step without reissuing an LLM request."""
+
+    candidate_status = candidate.status.value
+    if dag_run is not None and dag_run["status"] == "running":
+        return {
+            "action": "observe_dag_run",
+            "safe_to_start": False,
+            "reason": "dag_run_still_running",
+        }
+    if candidate_status == "awaiting_review":
+        return {
+            "action": "author_review_candidate",
+            "safe_to_start": False,
+            "reason": "candidate_awaiting_author_review",
+        }
+    if candidate_status == "failed" and candidate.formal_chapter_id:
+        return {
+            "action": "retry_canonical_sync",
+            "safe_to_start": True,
+            "reason": "formal_candidate_sync_failed",
+        }
+    if candidate_status in {"streaming", "regenerating", "failed", "stale"}:
+        return {
+            "action": "restart_candidate_generation",
+            "safe_to_start": True,
+            "reason": "terminal_or_missing_dag_run_requires_a_fresh_candidate_generation",
+        }
+    return {
+        "action": "inspect_candidate",
+        "safe_to_start": False,
+        "reason": "candidate_state_does_not_support_dag_continuation",
+    }
+
+
+@router.get("/candidates/{candidate_id}/dag-runs/latest")
+def get_latest_candidate_dag_run(
+    candidate_id: str,
+    after_sequence: int = Query(0),
+    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
+):
+    """Read the durable candidate DAG trace after an ordered SQLite cursor."""
+
+    try:
+        repository.get_candidate(candidate_id)
+        if after_sequence < 0:
+            raise ValueError("after_sequence must be greater than or equal to zero")
+        return {
+            "success": True,
+            "data": repository.get_latest_dag_run(
+                candidate_id,
+                after_sequence=after_sequence,
+            ),
+        }
+    except Exception as exc:
+        _raise_candidate_error(exc)
+
+
+@router.post("/candidates/{candidate_id}/dag-runs/latest/resume")
+def resume_latest_candidate_dag_run(
+    candidate_id: str,
+    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
+):
+    """Reconcile a client with a durable trace without replaying candidate prose."""
+
+    try:
+        candidate = repository.get_candidate(candidate_id)
+        dag_run = repository.get_latest_dag_run(candidate_id)
+        return {
+            "success": True,
+            "data": {
+                "candidate": _candidate_to_dict(candidate),
+                "dag_run": dag_run,
+                "continuation": _candidate_dag_continuation(candidate, dag_run),
+            },
+        }
     except Exception as exc:
         _raise_candidate_error(exc)
 

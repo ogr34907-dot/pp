@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from hashlib import sha256
 from typing import Any, AsyncIterator, Protocol
 
 from domain.ai.services.llm_service import GenerationConfig
@@ -42,29 +44,69 @@ class OutlineDraftGenerationService:
         content = str(getattr(result, "content", result) or "")
         return self._save_generated(slot, content)
 
-    async def stream_generate_draft(self, contract_id: str) -> AsyncIterator[dict[str, Any]]:
-        """SSE-friendly token stream; draft persistence happens only at done."""
+    async def stream_generate_draft(
+        self, contract_id: str, *, retry_attempt_id: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Persist each stream event so reconnecting authors see the real attempt."""
 
         slot = self.repository.get_slot(contract_id)
         prompt = self._build_prompt(slot)
-        yield {"type": "phase", "phase": "outline_generation", "level": slot.level.value}
-        chunks: list[str] = []
-        async for chunk in self.llm_service.stream_generate(prompt, GenerationConfig(temperature=0.7)):
-            text = str(chunk or "")
-            if text:
-                chunks.append(text)
-                yield {"type": "chunk", "text": text, "level": slot.level.value}
-        drafted = self._save_generated(slot, "".join(chunks))
-        yield {
-            "type": "done",
-            "contract_id": drafted.id,
-            "level": drafted.level.value,
-            "revision": drafted.draft.revision if drafted.draft else None,
-            "payload": drafted.draft.payload.canonical_dict() if drafted.draft else {},
-        }
+        snapshot = {"system": prompt.system, "user": prompt.user}
+        context_digest = sha256(
+            json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        attempt = self.repository.start_generation_attempt(
+            slot.id,
+            prompt_snapshot=snapshot,
+            context_digest=context_digest,
+            retry_of_attempt_id=retry_attempt_id,
+        )
+        attempt_id = attempt["id"]
+        terminal = False
+        try:
+            yield {
+                "type": "started",
+                "attempt_id": attempt_id,
+                "retry_of_attempt_id": attempt["retry_of_attempt_id"],
+                "contract_id": slot.id,
+                "level": slot.level.value,
+            }
+            async for chunk in self.llm_service.stream_generate(prompt, GenerationConfig(temperature=0.7)):
+                text = str(chunk or "")
+                if text:
+                    self.repository.append_generation_attempt_delta(attempt_id, text)
+                    yield {"type": "delta", "attempt_id": attempt_id, "text": text, "level": slot.level.value}
+            persisted = self.repository.get_generation_attempt(attempt_id)
+            drafted = self._save_generated(slot, persisted["accumulated_text"])
+            completed = self.repository.complete_generation_attempt(
+                attempt_id, draft_revision=drafted.draft.revision if drafted.draft else 0
+            )
+            terminal = True
+            yield {
+                "type": "completed",
+                "attempt_id": attempt_id,
+                "contract_id": drafted.id,
+                "level": drafted.level.value,
+                "revision": completed["draft_revision"],
+                "payload": drafted.draft.payload.canonical_dict() if drafted.draft else {},
+            }
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                self.repository.cancel_generation_attempt(attempt_id)
+                terminal = True
+                raise
+            self.repository.fail_generation_attempt(attempt_id, str(exc))
+            terminal = True
+            yield {"type": "error", "attempt_id": attempt_id, "message": str(exc), "level": slot.level.value}
+        finally:
+            if not terminal:
+                self.repository.cancel_generation_attempt(attempt_id)
 
     def _build_prompt(self, slot: OutlineContractSlot) -> Prompt:
         parent_context = self._published_parent_context(slot)
+        sibling_context = self._previous_sibling_context(slot)
         novel = self.db.get_connection().execute(
             "SELECT title, premise, target_chapters FROM novels WHERE id = ?", (slot.novel_id,)
         ).fetchone()
@@ -87,6 +129,7 @@ class OutlineDraftGenerationService:
             f"目标章节数：{novel['target_chapters'] or 0}\n"
             f"现在只生成：{level_label}\n"
             f"已发布父级契约：{json.dumps(parent_context, ensure_ascii=False, sort_keys=True)}\n\n"
+            f"上一同级已发布交接：{json.dumps(sibling_context, ensure_ascii=False, sort_keys=True)}\n\n"
             "JSON 至少包含 title、narrative_text、creative_goal、entry_state、exit_state、"
             "required_events、forbidden_events、state_changes、foreshadowing、chapter_start、"
             "chapter_end、word_budget、handoff_conditions；章纲额外给 pov、scenes、beats、conflicts、ending_hook。"
@@ -116,6 +159,22 @@ class OutlineDraftGenerationService:
             )
             parent_id = parent.parent_contract_id
         return list(reversed(chain))
+
+    def _previous_sibling_context(self, slot: OutlineContractSlot) -> dict[str, Any]:
+        previous = self.repository.previous_synced_sibling(slot.id)
+        if previous is None:
+            return {}
+        return {
+            "level": previous.level.value,
+            "contract_id": previous.id,
+            "revision": previous.revision,
+            "digest": previous.published_digest or previous.digest,
+            "chapter_end": previous.payload.chapter_end,
+            "exit_state": previous.payload.exit_state,
+            "state_changes": previous.payload.state_changes,
+            "handoff_conditions": previous.payload.handoff_conditions,
+            "ending_hook": previous.payload.ending_hook,
+        }
 
     def _save_generated(self, slot: OutlineContractSlot, raw: str) -> OutlineContractSlot:
         payload = OutlinePayload.from_dict(self._parse_json_object(raw))

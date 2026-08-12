@@ -30,6 +30,29 @@ class TestGenerationConfig:
         assert config.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
         assert config.temperature == 1.0
 
+    def test_generation_config_tracks_explicit_default_values(self):
+        config = GenerationConfig(max_tokens=DEFAULT_MAX_OUTPUT_TOKENS, temperature=1.0)
+
+        assert config.is_explicit("max_tokens") is True
+        assert config.is_explicit("temperature") is True
+
+    def test_generation_config_leaves_omitted_values_unset_for_profile_merge(self):
+        config = GenerationConfig()
+
+        assert config.is_explicit("max_tokens") is False
+        assert config.is_explicit("temperature") is False
+
+    def test_generation_config_accepts_task_overrides(self):
+        config = GenerationConfig(
+            timeout_seconds=45,
+            reasoning_effort="high",
+            thinking="enabled",
+        )
+
+        assert config.timeout_seconds == 45
+        assert config.reasoning_effort == "high"
+        assert config.thinking == "enabled"
+
     def test_generation_config_temperature_below_zero_raises_error(self):
         """测试温度小于 0 抛出异常"""
         with pytest.raises(ValueError, match="Temperature must be between 0.0 and 2.0"):

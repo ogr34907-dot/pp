@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -234,13 +234,16 @@ async def generate_outline_draft(
 @router.get("/contracts/{contract_id}/generate-draft-stream")
 async def stream_outline_draft_generation(
     contract_id: str,
+    retry_attempt_id: Optional[str] = None,
     service: OutlineDraftGenerationService = Depends(get_outline_draft_generation_service),
 ):
     """Stream a single level's draft text, then persist its parsed draft revision."""
 
     async def events():
         try:
-            async for event in service.stream_generate_draft(contract_id):
+            async for event in service.stream_generate_draft(
+                contract_id, retry_attempt_id=retry_attempt_id
+            ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
@@ -250,6 +253,36 @@ async def stream_outline_draft_generation(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/contracts/{contract_id}/generation-attempts/latest")
+def get_latest_outline_generation_attempt(
+    contract_id: str,
+    after_sequence: int = Query(default=0, ge=0),
+    service: OutlineContractService = Depends(get_outline_service),
+):
+    try:
+        attempt = service.contract_repository.get_latest_generation_attempt(
+            contract_id, after_sequence=after_sequence
+        )
+        return {"success": True, "data": attempt}
+    except Exception as exc:
+        _raise_contract_error(exc)
+
+
+@router.post("/contracts/{contract_id}/generation-attempts/{attempt_id}/cancel")
+def cancel_outline_generation_attempt(
+    contract_id: str,
+    attempt_id: str,
+    service: OutlineContractService = Depends(get_outline_service),
+):
+    try:
+        attempt = service.contract_repository.get_generation_attempt(attempt_id)
+        if attempt["contract_id"] != contract_id:
+            raise OutlineGateError("outline generation attempt belongs to another contract")
+        return {"success": True, "data": service.contract_repository.cancel_generation_attempt(attempt_id)}
+    except Exception as exc:
+        _raise_contract_error(exc)
 
 
 @router.get("/novels/{novel_id}/chapters/{chapter_node_id}/published-context")

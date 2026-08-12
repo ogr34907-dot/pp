@@ -31,6 +31,23 @@ from infrastructure.ai.prompt_keys import (
 logger = logging.getLogger(__name__)
 
 
+def _candidate_payload(context: Dict[str, Any]) -> Dict[str, Any]:
+    chain = context.get("outline_chain") or {}
+    chapter = chain.get("chapter") if isinstance(chain, dict) else {}
+    payload = chapter.get("payload") if isinstance(chapter, dict) else {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _candidate_items(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, dict):
+        return [str(item).strip() for item in value.values() if str(item).strip()]
+    return []
+
+
 # ─── ctx_blueprint: 剧本基建 ───
 
 
@@ -67,6 +84,16 @@ class BlueprintNode(BaseNode):
         novel_id = inputs.get("novel_id") or context.get("novel_id", "")
 
         try:
+            if context.get("candidate_mode"):
+                return NodeResult(
+                    outputs={
+                        "world_rules": str(context.get("outline_text") or ""),
+                        "taboos": "",
+                        "atmosphere": "",
+                    },
+                    status=NodeStatus.SUCCESS,
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             world_rules = ""
             taboos = ""
             atmosphere = ""
@@ -153,6 +180,13 @@ class ForeshadowNode(BaseNode):
         novel_id = inputs.get("novel_id") or context.get("novel_id", "")
 
         try:
+            if context.get("candidate_mode"):
+                items = _candidate_items(_candidate_payload(context).get("foreshadowing"))
+                return NodeResult(
+                    outputs={"foreshadowing_block": "\n".join(f"【待推进】{item}" for item in items)},
+                    status=NodeStatus.SUCCESS,
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             foreshadowing_block = ""
 
             try:
@@ -222,6 +256,12 @@ class VoiceNode(BaseNode):
         novel_id = inputs.get("novel_id") or context.get("novel_id", "")
 
         try:
+            if context.get("candidate_mode"):
+                return NodeResult(
+                    outputs={"voice_block": "", "nervous_habits": ""},
+                    status=NodeStatus.SUCCESS,
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             voice_block = ""
             nervous_habits = ""
 
@@ -287,6 +327,12 @@ class MemoryNode(BaseNode):
         )
 
         try:
+            if context.get("candidate_mode"):
+                return NodeResult(
+                    outputs={"fact_lock": str(context.get("outline_text") or ""), "entity_memory": ""},
+                    status=NodeStatus.SUCCESS,
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             shared_state = context.get("shared_state") or {}
             memory_engine = context.get("memory_engine") or shared_state.get("memory_engine")
             if memory_engine is None:
@@ -357,6 +403,12 @@ class DebtNode(BaseNode):
         novel_id = inputs.get("novel_id") or context.get("novel_id", "")
 
         try:
+            if context.get("candidate_mode"):
+                return NodeResult(
+                    outputs={"debt_due_block": ""},
+                    status=NodeStatus.SUCCESS,
+                    duration_ms=int((time.time() - start) * 1000),
+                )
             debt_due_block = ""
 
             try:

@@ -24,6 +24,64 @@ def _client() -> TestClient:
     return TestClient(app, raise_server_exceptions=False)
 
 
+def test_invocation_config_keeps_omitted_profile_fields_unspecified():
+    config = ai_invocation_routes._config_from_dict(
+        {"operation": "setup.main_plot_options"}
+    )
+
+    assert config is not None
+    assert not config.is_explicit("max_tokens")
+    assert not config.is_explicit("temperature")
+
+
+def test_invocation_config_preserves_explicit_default_values():
+    config = ai_invocation_routes._config_from_dict(
+        {"max_tokens": 120000, "temperature": 1.0}
+    )
+
+    assert config is not None
+    assert config.max_tokens == 120000
+    assert config.temperature == 1.0
+    assert config.is_explicit("max_tokens")
+    assert config.is_explicit("temperature")
+
+
+def test_invocation_config_passes_explicit_runtime_controls_including_false():
+    config = ai_invocation_routes._config_from_dict(
+        {
+            "temperature": 0,
+            "timeout_seconds": 42,
+            "reasoning_effort": "low",
+            "thinking": False,
+        }
+    )
+
+    assert config is not None
+    assert config.temperature == 0
+    assert config.timeout_seconds == 42
+    assert config.reasoning_effort == "low"
+    assert config.thinking is False
+    assert config.is_explicit("temperature")
+    assert config.is_explicit("timeout_seconds")
+    assert config.is_explicit("reasoning_effort")
+    assert config.is_explicit("thinking")
+
+
+def test_invocation_config_applies_outline_floor_only_to_explicit_budget():
+    implicit = ai_invocation_routes._config_from_dict(
+        {"operation": "setup.plot_outline"}
+    )
+    explicit = ai_invocation_routes._config_from_dict(
+        {"operation": "setup.plot_outline", "max_tokens": 1024}
+    )
+
+    assert implicit is not None
+    assert not implicit.is_explicit("max_tokens")
+    assert explicit is not None
+    assert explicit.max_tokens == 8192
+    assert explicit.is_explicit("max_tokens")
+
+
 @pytest.mark.parametrize(("operation", "node_key"), LEGACY_DIRECT_PROSE_OPERATIONS)
 def test_public_invocation_creation_rejects_legacy_direct_prose_before_repository_access(
     monkeypatch,
@@ -46,7 +104,7 @@ def test_public_invocation_creation_rejects_legacy_direct_prose_before_repositor
     )
 
     assert response.status_code == 410
-    assert "/api/v1/generation/novels/{novel_id}/start" in response.json()["detail"]
+    assert response.json()["detail"] == "candidate_first_required"
 
 
 def _legacy_session(operation: str) -> InvocationSession:
@@ -84,4 +142,4 @@ def test_existing_legacy_prose_sessions_cannot_advance_to_generation_or_commit(
     response = _client().post(f"/ai-invocations/{session.id}/{action}", json=payload)
 
     assert response.status_code == 410
-    assert "/api/v1/generation/novels/{novel_id}/start" in response.json()["detail"]
+    assert response.json()["detail"] == "candidate_first_required"

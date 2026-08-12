@@ -155,10 +155,12 @@
               打开世界线重生成
             </n-button>
           </section>
-          <section v-if="streamText || streaming" class="inspector-block inspector-block--stream" aria-live="polite">
+          <section v-if="streamText || streaming || streamAttempt" class="inspector-block inspector-block--stream" aria-live="polite">
             <h3>AI 草稿流</h3>
-            <p>{{ streaming ? '正在接收流式草稿…' : '草稿已解析，已写入当前节点的草稿版本。' }}</p>
+            <p>{{ streamStatus }}</p>
             <pre>{{ streamText || '正在准备…' }}</pre>
+            <n-button v-if="streaming && streamAttempt" secondary size="small" @click="cancelDraftStream">取消本次生成</n-button>
+            <n-button v-else-if="streamAttempt?.status === 'failed' || streamAttempt?.status === 'cancelled'" secondary size="small" @click="retryDraftStream">复用上下文重试</n-button>
           </section>
         </template>
         <div v-else class="outline-inspector__empty">选择一个节点后，可在此查看父级链、版本和发布影响。</div>
@@ -184,9 +186,11 @@ import {
   consumeOutlineDraftStream,
   outlineApi,
   type OutlineContract,
+  type OutlineGenerationAttempt,
   type OutlinePayload,
   type OutlineTreeNode,
 } from '@/api/generation'
+import { outlineLines, outlineStringLists, outlineText } from '@/domain/outlinePresentation'
 
 type FlattenedNode = { node: OutlineTreeNode; depth: number; parent?: OutlineTreeNode }
 type FormState = {
@@ -210,6 +214,7 @@ const publishing = ref(false)
 const binding = ref(false)
 const streaming = ref(false)
 const streamText = ref('')
+const streamAttempt = ref<OutlineGenerationAttempt | null>(null)
 const error = ref('')
 let streamController: AbortController | null = null
 
@@ -237,27 +242,27 @@ function nodeStatus(node: OutlineTreeNode) { return String(node.outline_contract
 function nodeStatusLabel(node: OutlineTreeNode) {
   return ({ synced: '已发布 · 已同步', syncing: '发布同步中', published: '已发布', draft: '草稿待发布', stale: '需要重新校验', conflict: '需要处理冲突', missing: '等待父级开放' } as Record<string, string>)[nodeStatus(node)] || '等待配置'
 }
-function toLines(value?: string[]) { return (value || []).join('\n') }
+function toLines(value: unknown) { return outlineLines(value).join('\n') }
 function fromLines(value: string) { return value.split(/\r?\n/).map(item => item.trim()).filter(Boolean) }
 function payloadToForm(payload?: OutlinePayload | null) {
   const data = payload || {}
-  form.title = data.title || ''
-  form.narrative_text = data.narrative_text || ''
-  form.creative_goal = data.creative_goal || ''
-  form.entry_state = data.entry_state || ''
-  form.exit_state = data.exit_state || ''
+  form.title = outlineText(data.title)
+  form.narrative_text = outlineText(data.narrative_text)
+  form.creative_goal = outlineText(data.creative_goal)
+  form.entry_state = outlineText(data.entry_state)
+  form.exit_state = outlineText(data.exit_state)
   form.requiredEventsText = toLines(data.required_events)
   form.forbiddenEventsText = toLines(data.forbidden_events)
   form.handoffText = toLines(data.handoff_conditions)
-  form.foreshadowText = Object.values(data.foreshadowing || {}).flat().join('\n')
+  form.foreshadowText = Object.values(outlineStringLists(data.foreshadowing)).flat().join('\n')
   form.chapter_start = data.chapter_start ?? null
   form.chapter_end = data.chapter_end ?? null
   form.word_budget = data.word_budget ?? null
-  form.pov = data.pov || ''
+  form.pov = outlineText(data.pov)
   form.scenesText = toLines(data.scenes)
   form.beatsText = toLines(data.beats)
   form.conflictsText = toLines(data.conflicts)
-  form.ending_hook = data.ending_hook || ''
+  form.ending_hook = outlineText(data.ending_hook)
 }
 function formToPayload(): OutlinePayload {
   return {
@@ -271,6 +276,14 @@ function formToPayload(): OutlinePayload {
   }
 }
 function idempotencyKey(prefix: string) { return `${prefix}-${crypto.randomUUID()}` }
+const streamStatus = computed(() => {
+  const attempt = streamAttempt.value
+  if (streaming.value) return attempt ? `正在接收流式草稿（尝试 ${attempt.id.slice(-8)}）…` : '正在建立流式草稿尝试…'
+  if (attempt?.status === 'completed') return '草稿已通过结构校验并写入当前节点的草稿版本。'
+  if (attempt?.status === 'cancelled') return '本次流式草稿已取消；可复用原上下文重试。'
+  if (attempt?.status === 'failed') return attempt.error || '本次流式草稿失败；可复用原上下文重试。'
+  return '正在恢复已持久化的草稿流…'
+})
 
 async function loadTree() {
   if (!novelId.value) return
@@ -292,6 +305,7 @@ async function selectNode(node: OutlineTreeNode) {
   if (!contractId) { selectedContract.value = null; return }
   try {
     selectedContract.value = await outlineApi.getContract(contractId)
+    await recoverDraftAttempt(contractId)
     payloadToForm(selectedContract.value.draft?.payload || selectedContract.value.active?.payload)
   } catch (cause) {
     selectedContract.value = null
@@ -341,21 +355,64 @@ async function generateDraftStream() {
   streamController = new AbortController()
   streaming.value = true
   streamText.value = ''
+  streamAttempt.value = null
   error.value = ''
   try {
     await consumeOutlineDraftStream(selectedContract.value.id, async event => {
-      if (event.type === 'chunk') streamText.value += event.text || ''
-      if (event.type === 'done') {
+      if (event.type === 'started') streamAttempt.value = { id: event.attempt_id || '', contract_id: selectedContract.value!.id, status: 'running', retry_of_attempt_id: event.retry_of_attempt_id, accumulated_text: '', error: '', events: [] }
+      if (event.type === 'delta') streamText.value += event.text || ''
+      if (event.type === 'completed') {
         payloadToForm(event.payload)
         selectedContract.value = await outlineApi.getContract(selectedContract.value!.id)
         await loadTree()
       }
       if (event.type === 'error') error.value = event.message || 'AI 大纲生成失败'
     }, streamController.signal)
+    await recoverDraftAttempt(selectedContract.value.id)
   } catch (cause) {
     if (!(cause instanceof DOMException && cause.name === 'AbortError')) {
       error.value = cause instanceof Error ? cause.message : 'AI 大纲生成失败'
     }
+  } finally { streaming.value = false }
+}
+
+async function recoverDraftAttempt(contractId: string) {
+  const attempt = await outlineApi.getLatestGenerationAttempt(contractId)
+  streamAttempt.value = attempt
+  if (attempt) streamText.value = attempt.accumulated_text || streamText.value
+}
+
+async function cancelDraftStream() {
+  const attempt = streamAttempt.value
+  if (!selectedContract.value || !attempt) return
+  streamController?.abort()
+  try {
+    streamAttempt.value = await outlineApi.cancelGenerationAttempt(selectedContract.value.id, attempt.id)
+  } catch (cause) { error.value = cause instanceof Error ? cause.message : '取消大纲生成失败' }
+}
+
+async function retryDraftStream() {
+  const previous = streamAttempt.value
+  if (!selectedContract.value || !previous || streaming.value) return
+  streamController?.abort()
+  streamController = new AbortController()
+  streaming.value = true
+  streamText.value = ''
+  error.value = ''
+  try {
+    await consumeOutlineDraftStream(selectedContract.value.id, async event => {
+      if (event.type === 'started') streamAttempt.value = { id: event.attempt_id || '', contract_id: selectedContract.value!.id, status: 'running', retry_of_attempt_id: event.retry_of_attempt_id, accumulated_text: '', error: '', events: [] }
+      if (event.type === 'delta') streamText.value += event.text || ''
+      if (event.type === 'completed') {
+        payloadToForm(event.payload)
+        selectedContract.value = await outlineApi.getContract(selectedContract.value!.id)
+        await loadTree()
+      }
+      if (event.type === 'error') error.value = event.message || 'AI 大纲生成失败'
+    }, streamController.signal, previous.id)
+    await recoverDraftAttempt(selectedContract.value.id)
+  } catch (cause) {
+    if (!(cause instanceof DOMException && cause.name === 'AbortError')) error.value = cause instanceof Error ? cause.message : 'AI 大纲生成失败'
   } finally { streaming.value = false }
 }
 

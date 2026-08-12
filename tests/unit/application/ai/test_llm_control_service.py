@@ -1,4 +1,6 @@
-from application.ai.llm_control_service import LLMControlService, LLMProfile
+import pytest
+
+from application.ai.llm_control_service import LLMControlConfig, LLMControlService, LLMProfile
 from infrastructure.ai.llm_environment import ARK_DEFAULT_BASE_URL
 
 
@@ -106,3 +108,29 @@ def test_row_to_profile_preserves_explicit_max_tokens():
     profile = LLMControlService()._row_to_profile(row)
 
     assert profile.max_tokens == 2048
+
+
+def test_sanitize_config_preserves_profile_max_tokens():
+    config = LLMControlConfig(
+        profiles=[LLMProfile(id="p", name="Profile", max_tokens=8192)],
+    )
+
+    sanitized = LLMControlService()._sanitize_config(config)
+
+    assert sanitized.profiles[0].max_tokens == 8192
+
+
+@pytest.mark.asyncio
+async def test_profile_connection_check_uses_small_fixed_output_budget():
+    captured = {}
+
+    class _Service:
+        async def generate(self, prompt, config):
+            captured["config"] = config
+            return type("Result", (), {"content": "连接成功"})()
+
+    profile = LLMProfile(id="p", name="Profile", api_key="key", model="model", max_tokens=8192)
+    result = await LLMControlService().test_profile_model(profile, lambda _: _Service())
+
+    assert result.ok is True
+    assert captured["config"].max_tokens == 32

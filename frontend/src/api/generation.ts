@@ -1,4 +1,4 @@
-import { apiRootPath, apiRoutes } from './endpoints'
+import { apiRootPath, apiRoutes, withQuery } from './endpoints'
 import { fetchJson, fetchUrl, HttpError } from './http'
 
 export type RunMode = 'continuous' | 'chapter_review'
@@ -104,6 +104,34 @@ export interface CandidateVersion {
   created_at: string
 }
 
+export interface CandidateDagNodeAttempt {
+  node_id: string
+  node_type: string
+  status: 'running' | 'completed' | 'failed' | 'skipped' | string
+  duration_ms?: number | null
+}
+
+export interface CandidateDagEvent {
+  sequence: number
+  type: string
+  node_id?: string
+  node_type?: string
+  duration_ms?: number
+  error?: string
+  text?: string
+}
+
+export interface CandidateDagRun {
+  id: string
+  candidate_id: string
+  content_revision: number
+  status: 'running' | 'completed' | 'failed' | 'cancelled' | string
+  current_node_id: string
+  failure_reason: string
+  node_attempts: CandidateDagNodeAttempt[]
+  events: CandidateDagEvent[]
+}
+
 export interface GenerationRun {
   novel_id: string
   run_mode: RunMode
@@ -203,6 +231,14 @@ export const generationApi = {
     unwrap<ChapterCandidate>(apiRoutes.generation.candidateRetrySync(candidateId), { method: 'POST' }),
   reject: (candidateId: string) =>
     unwrap<ChapterCandidate>(apiRoutes.generation.candidateReject(candidateId), { method: 'POST' }),
+  getLatestDagRun: (candidateId: string, afterSequence = 0) =>
+    unwrap<CandidateDagRun | null>(apiRoutes.generation.candidateDagLatest(candidateId, {
+      after_sequence: afterSequence,
+    })),
+  resumeLatestDagRun: (candidateId: string) =>
+    unwrap<{ candidate: ChapterCandidate; dag_run: CandidateDagRun | null; continuation: Record<string, unknown> }>(
+      apiRoutes.generation.candidateDagResume(candidateId), { method: 'POST' },
+    ),
 }
 
 /** A novel has no generation run until the author explicitly starts one. */
@@ -232,13 +268,42 @@ export const outlineApi = {
     unwrap<OutlineContract>(apiRoutes.outline.generateDraft(contractId), { method: 'POST' }),
   bindNode: (novelId: string, nodeId: string) =>
     unwrap<OutlineContract>(apiRootPath('outline', 'novels', novelId, 'story-nodes', nodeId, 'contract'), { method: 'POST' }),
-  draftStreamUrl: (contractId: string) => fetchUrl(apiRoutes.outline.generateDraftStream(contractId)),
+  draftStreamUrl: (contractId: string, retryAttemptId?: string) => fetchUrl(withQuery(
+    apiRoutes.outline.generateDraftStream(contractId),
+    retryAttemptId ? { retry_attempt_id: retryAttemptId } : {},
+  )),
+  getLatestGenerationAttempt: (contractId: string, afterSequence = 0) =>
+    unwrap<OutlineGenerationAttempt | null>(apiRoutes.outline.generationAttemptLatest(contractId, {
+      after_sequence: afterSequence,
+    })),
+  cancelGenerationAttempt: (contractId: string, attemptId: string) =>
+    unwrap<OutlineGenerationAttempt>(apiRoutes.outline.generationAttemptCancel(contractId, attemptId), { method: 'POST' }),
+}
+
+export interface OutlineGenerationAttemptEvent {
+  sequence: number
+  type: 'started' | 'delta' | 'completed' | 'cancelled' | 'error' | string
+  text?: string
+  message?: string
+  draft_revision?: number
+}
+
+export interface OutlineGenerationAttempt {
+  id: string
+  contract_id: string
+  status: 'running' | 'completed' | 'failed' | 'cancelled' | string
+  retry_of_attempt_id?: string | null
+  accumulated_text: string
+  draft_revision?: number | null
+  error: string
+  events: OutlineGenerationAttemptEvent[]
 }
 
 export interface OutlineDraftStreamEvent {
-  type: 'phase' | 'chunk' | 'done' | 'error'
+  type: 'started' | 'delta' | 'completed' | 'error'
+  attempt_id?: string
+  retry_of_attempt_id?: string | null
   level?: string
-  phase?: string
   text?: string
   contract_id?: string
   revision?: number
@@ -246,13 +311,14 @@ export interface OutlineDraftStreamEvent {
   message?: string
 }
 
-/** Consume the existing outline SSE endpoint without introducing a second API. */
+/** Consume the durable outline attempt stream. */
 export async function consumeOutlineDraftStream(
   contractId: string,
   onEvent: (event: OutlineDraftStreamEvent) => void,
   signal?: AbortSignal,
+  retryAttemptId?: string,
 ): Promise<void> {
-  const response = await fetch(outlineApi.draftStreamUrl(contractId), {
+  const response = await fetch(outlineApi.draftStreamUrl(contractId, retryAttemptId), {
     headers: { Accept: 'text/event-stream', 'Cache-Control': 'no-cache' }, signal,
   })
   if (!response.ok || !response.body) {

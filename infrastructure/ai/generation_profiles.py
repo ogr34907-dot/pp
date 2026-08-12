@@ -59,9 +59,14 @@ def generation_config_from_profile(
     """从画像构造 GenerationConfig，可用 overrides 覆盖。"""
     profile = get_generation_profile(name)
     profile.update({k: v for k, v in overrides.items() if v is not None})
+    config_kwargs: dict[str, Any] = {
+        "model": model or str(profile.get("model", "")),
+        "max_tokens": int(profile.get("max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)),
+        "temperature": float(profile.get("temperature", 1.0)),
+        "response_format": dict(response_format) if response_format is not None else profile.get("response_format"),
+    }
+    if profile.get("timeout_seconds") is not None:
+        config_kwargs["timeout_seconds"] = profile["timeout_seconds"]
     return GenerationConfig(
-        model=model or str(profile.get("model", "")),
-        max_tokens=int(profile.get("max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)),
-        temperature=float(profile.get("temperature", 1.0)),
-        response_format=dict(response_format) if response_format is not None else profile.get("response_format"),
+        **config_kwargs,
     )

@@ -73,7 +73,7 @@
           :generation-prefs="generationPrefs"
           @select-chapter="handleChapterClick"
           @plan-act="handlePlanAct"
-          @open-plan-modal="showMacroPlan = true"
+          @open-outline-studio="openOutlineStudio"
           @tree-loaded="handleTreeLoaded"
         />
       </div>
@@ -87,17 +87,12 @@
     </div>
   </aside>
 
-  <MacroPlanModal
-    v-model:show="showMacroPlan"
-    :novel-id="slug"
-    @confirmed="emit('refresh')"
-  />
 </template>
 
 <script setup lang="ts">
 import { ref, computed, type ComponentPublicInstance } from 'vue'
+import { useRouter } from 'vue-router'
 import StoryStructureTree from '@/components/StoryStructureTree.vue'
-import MacroPlanModal from '@/components/workbench/MacroPlanModal.vue'
 import { runtimePerformance } from '@/config/performance'
 import type { GenerationPrefsDTO } from '@/api/novel'
 import { narrativeOrdinalLabel, narrativeUnitNoun } from '@/utils/narrativeUnitLabel'
@@ -135,6 +130,7 @@ const emit = defineEmits<{
   refresh: []
   planAct: [actId: string, actTitle: string]
 }>()
+const router = useRouter()
 
 const viewMode = ref('tree')
 const viewModeOptions = [
@@ -150,7 +146,6 @@ function loadMoreChapters() {
   visibleCount.value += LOAD_MORE_STEP
 }
 
-const showMacroPlan = ref(false)
 const hasStructure = ref(true)
 
 const storyTreeRef = ref<ComponentPublicInstance<{ loadTree: () => Promise<void> }> | null>(null)
@@ -176,6 +171,10 @@ const handleChapterClick = (id: number, title = '') => {
 
 const handleBack = () => {
   emit('back')
+}
+
+const openOutlineStudio = () => {
+  void router.push(`/book/${props.slug}/outline`)
 }
 
 const handlePlanAct = (id: string, title: string) => {

@@ -27,7 +27,7 @@ from application.ai_invocation.dtos import (
     prompt_hash,
     stable_hash,
 )
-from domain.ai.services.llm_service import DEFAULT_MAX_OUTPUT_TOKENS, GenerationConfig
+from domain.ai.services.llm_service import GenerationConfig
 from application.ai_invocation.gateway import AIInvocationGateway
 from application.ai_invocation.input_materialization import context_key_for_scope, materialize_input_variables
 from application.ai_invocation.prompt_assembler import CPMSPromptAssembler, PromptAssemblyError
@@ -130,28 +130,41 @@ _CANDIDATE_GENERATION_ENTRYPOINT = "/api/v1/generation/novels/{novel_id}/start"
 def _reject_legacy_direct_prose_operation(operation: str) -> None:
     if str(operation or "").strip() not in _LEGACY_DIRECT_PROSE_OPERATIONS:
         return
-    raise HTTPException(
-        status_code=410,
-        detail=(
-            "legacy direct prose invocation is disabled; use "
-            f"{_CANDIDATE_GENERATION_ENTRYPOINT}"
-        ),
-    )
+    raise HTTPException(status_code=410, detail="candidate_first_required")
 
 
 def _config_from_dict(raw: Mapping[str, Any] | None) -> GenerationConfig | None:
     if not raw:
         return None
-    max_tokens = int(raw.get("max_tokens") or DEFAULT_MAX_OUTPUT_TOKENS)
     operation = str(raw.get("operation") or raw.get("invocation_operation") or "")
-    if operation in {"setup.main_plot_options", "setup.plot_outline"}:
-        max_tokens = max(max_tokens, 8192)
-    return GenerationConfig(
-        model=str(raw.get("model") or ""),
-        max_tokens=max_tokens,
-        temperature=float(raw.get("temperature") if raw.get("temperature") is not None else 1.0),
-        response_format=raw.get("response_format"),
-    )
+    kwargs: dict[str, Any] = {}
+    for name in (
+        "model",
+        "max_tokens",
+        "temperature",
+        "response_format",
+        "timeout_seconds",
+        "reasoning_effort",
+    ):
+        if name not in raw or raw[name] is None:
+            continue
+        value = raw[name]
+        if name == "max_tokens":
+            value = int(value)
+        elif name in {"temperature", "timeout_seconds"}:
+            value = float(value)
+        kwargs[name] = value
+
+    # False is an intentional provider instruction, so key presence matters.
+    if "thinking" in raw and raw["thinking"] is not None:
+        kwargs["thinking"] = raw["thinking"]
+
+    if (
+        operation in {"setup.main_plot_options", "setup.plot_outline"}
+        and "max_tokens" in kwargs
+    ):
+        kwargs["max_tokens"] = max(kwargs["max_tokens"], 8192)
+    return GenerationConfig(**kwargs)
 
 
 def _repositories():

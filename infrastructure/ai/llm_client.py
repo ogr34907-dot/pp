@@ -1,7 +1,7 @@
 """LLM 客户端包装器"""
 from typing import AsyncIterator
 
-from domain.ai.services.llm_service import DEFAULT_MAX_OUTPUT_TOKENS, GenerationConfig
+from domain.ai.services.llm_service import GenerationConfig
 from domain.ai.value_objects.prompt import Prompt
 from infrastructure.ai.provider_factory import DynamicLLMService
 
@@ -19,11 +19,20 @@ class LLMClient:
 
     def _build_config(self, **kwargs) -> GenerationConfig:
         settings = getattr(self.provider, "settings", None)
-        return GenerationConfig(
-            model=kwargs.get("model", getattr(settings, "default_model", None)),
-            max_tokens=kwargs.get("max_tokens", getattr(settings, "default_max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)),
-            temperature=kwargs.get("temperature", getattr(settings, "default_temperature", 1.0)),
-        )
+        config_kwargs = {
+            name: kwargs[name]
+            for name in ("model", "max_tokens", "temperature", "response_format", "timeout_seconds", "reasoning_effort", "thinking")
+            if name in kwargs
+        }
+        if settings is not None:
+            for name, setting_name in (
+                ("model", "default_model"),
+                ("max_tokens", "default_max_tokens"),
+                ("temperature", "default_temperature"),
+            ):
+                if name not in config_kwargs:
+                    config_kwargs[name] = getattr(settings, setting_name)
+        return GenerationConfig(**config_kwargs)
 
     async def generate(self, prompt: str, **kwargs) -> str:
         """生成文本

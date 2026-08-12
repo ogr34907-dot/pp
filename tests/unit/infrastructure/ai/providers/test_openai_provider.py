@@ -2,6 +2,8 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
+import openai
 import pytest
 
 from domain.ai.services.llm_service import GenerationConfig
@@ -22,6 +24,11 @@ class _FakeStream:
             return next(self._chunks)
         except StopIteration as exc:
             raise StopAsyncIteration from exc
+
+
+def _api_error(error_type, status_code: int, message: str):
+    request = httpx.Request("POST", "https://gateway.example/v1/responses")
+    return error_type(message, response=httpx.Response(status_code, request=request), body=None)
 
 
 class TestOpenAIProviderLegacy:
@@ -190,6 +197,14 @@ class TestOpenAIProviderLegacy:
 class TestOpenAIProviderResponses:
     """use_legacy_chat_completions=False（默认）→ Responses API"""
 
+    @pytest.fixture(autouse=True)
+    def _clear_capability_caches(self):
+        OpenAIProvider._fallback_to_chat_cache.clear()
+        OpenAIProvider._json_schema_unsupported_cache.clear()
+        yield
+        OpenAIProvider._fallback_to_chat_cache.clear()
+        OpenAIProvider._json_schema_unsupported_cache.clear()
+
     @pytest.fixture
     def settings(self):
         return Settings(api_key="test-api-key", use_legacy_chat_completions=False)
@@ -306,6 +321,199 @@ class TestOpenAIProviderResponses:
 
             with pytest.raises(RuntimeError, match="empty content"):
                 await provider.generate(prompt, config)
+
+    @pytest.mark.anyio
+    async def test_chat_json_schema_does_not_downgrade_on_unrelated_bad_request(self):
+        provider = OpenAIProvider(
+            Settings(api_key="test-api-key", use_legacy_chat_completions=True)
+        )
+        config = GenerationConfig(
+            model="gpt-4o",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "payload", "schema": {"type": "object"}},
+            },
+        )
+        error = _api_error(openai.BadRequestError, 400, "max_tokens is invalid")
+
+        with patch.object(provider.async_client.chat.completions, "create", new_callable=AsyncMock) as create:
+            create.side_effect = error
+
+            with pytest.raises(RuntimeError, match="max_tokens is invalid"):
+                await provider.generate(Prompt(system="s", user="u"), config)
+
+        assert create.await_count == 1
+
+    @pytest.mark.anyio
+    async def test_responses_uses_native_usage_and_structured_output_format(self, provider):
+        prompt = Prompt(system="You are helpful", user="Hello")
+        config = GenerationConfig(
+            model="gpt-4o",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "payload", "schema": {"type": "object"}},
+            },
+        )
+        response = SimpleNamespace(
+            output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="text", text="{}")])],
+            usage=SimpleNamespace(
+                input_tokens=8,
+                output_tokens=4,
+                input_tokens_details=SimpleNamespace(cached_tokens=3),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=2),
+            ),
+        )
+
+        with patch.object(provider.async_client.responses, "create", new_callable=AsyncMock) as mock_create:
+            mock_create.return_value = response
+            result = await provider.generate(prompt, config)
+
+        assert result.token_usage.input_tokens == 8
+        assert result.token_usage.output_tokens == 4
+        assert result.token_usage.cache_hit_tokens == 3
+        assert result.token_usage.cache_miss_tokens == 5
+        assert result.token_usage.reasoning_tokens == 2
+        assert mock_create.call_args.kwargs["text"] == {
+            "format": {
+                "type": "json_schema",
+                "name": "payload",
+                "schema": {"type": "object"},
+            }
+        }
+
+    @pytest.mark.anyio
+    async def test_responses_bad_request_does_not_fallback_to_chat(self, provider):
+        prompt = Prompt(system="You are helpful", user="Hello")
+        config = GenerationConfig(model="gpt-4o")
+        OpenAIProvider._fallback_to_chat_cache.clear()
+
+        with (
+            patch.object(provider.async_client.responses, "create", new_callable=AsyncMock) as responses_create,
+            patch.object(provider.async_client.chat.completions, "create", new_callable=AsyncMock) as chat_create,
+        ):
+            responses_create.side_effect = _api_error(openai.BadRequestError, 400, "invalid reasoning parameter")
+
+            with pytest.raises(RuntimeError, match="invalid reasoning parameter"):
+                await provider.generate(prompt, config)
+
+        chat_create.assert_not_called()
+        assert not OpenAIProvider._fallback_to_chat_cache
+
+    @pytest.mark.anyio
+    async def test_responses_json_schema_falls_back_only_for_explicit_format_unsupported(self, provider):
+        prompt = Prompt(system="You are helpful", user="Hello")
+        config = GenerationConfig(
+            model="gpt-4o",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "payload", "schema": {"type": "object"}},
+            },
+        )
+        response = SimpleNamespace(
+            output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="text", text="{}")])],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+        error = _api_error(openai.BadRequestError, 400, "json_schema format is not supported")
+
+        with patch.object(provider.async_client.responses, "create", new_callable=AsyncMock) as create:
+            create.side_effect = [error, response]
+            result = await provider.generate(prompt, config)
+
+        assert result.content == "{}"
+        assert create.await_count == 2
+        assert create.await_args_list[1].kwargs["text"] == {"format": {"type": "json_object"}}
+
+    @pytest.mark.anyio
+    async def test_responses_passes_profile_extra_body_through_sdk_argument(self):
+        provider = OpenAIProvider(
+            Settings(
+                api_key="test-api-key",
+                extra_body={"provider_option": {"enabled": True}},
+            )
+        )
+        response = SimpleNamespace(
+            output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="text", text="ok")])],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+
+        with patch.object(provider.async_client.responses, "create", new_callable=AsyncMock) as create:
+            create.return_value = response
+            await provider.generate(Prompt(system="s", user="u"), GenerationConfig(model="gpt-4o"))
+
+        kwargs = create.await_args.kwargs
+        assert kwargs["extra_body"] == {"provider_option": {"enabled": True}}
+        assert "provider_option" not in kwargs
+
+    @pytest.mark.anyio
+    async def test_responses_capability_cache_isolated_by_model(self, provider):
+        prompt = Prompt(system="You are helpful", user="Hello")
+        config_a = GenerationConfig(model="gateway-model-a")
+        config_b = GenerationConfig(model="gateway-model-b")
+        OpenAIProvider._fallback_to_chat_cache.clear()
+        fallback_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="chat fallback"))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+        responses_response = SimpleNamespace(
+            output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="text", text="responses")])],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+
+        try:
+            with (
+                patch.object(provider.async_client.responses, "create", new_callable=AsyncMock) as responses_create,
+                patch.object(provider.async_client.chat.completions, "create", new_callable=AsyncMock) as chat_create,
+            ):
+                responses_create.side_effect = [
+                    _api_error(openai.NotFoundError, 404, "Responses API endpoint not found"),
+                    responses_response,
+                ]
+                chat_create.return_value = fallback_response
+
+                assert (await provider.generate(prompt, config_a)).content == "chat fallback"
+                assert (await provider.generate(prompt, config_b)).content == "responses"
+
+            assert responses_create.await_count == 2
+            assert chat_create.await_count == 1
+        finally:
+            OpenAIProvider._fallback_to_chat_cache.clear()
+
+    def test_openai_request_applies_explicit_reasoning_and_deepseek_thinking(self):
+        provider = OpenAIProvider(
+            Settings(api_key="test-api-key", base_url="https://api.deepseek.com/v1")
+        )
+        config = GenerationConfig(
+            model="deepseek-v4-pro",
+            reasoning_effort="high",
+            thinking="enabled",
+        )
+
+        chat_kwargs = provider._build_chat_request_kwargs([], config)
+        responses_kwargs = provider._build_responses_request_kwargs(Prompt(system="s", user="u"), config)
+
+        assert chat_kwargs["reasoning_effort"] == "high"
+        assert chat_kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+        assert responses_kwargs["reasoning"] == {"effort": "high"}
+
+    def test_openai_request_does_not_add_reasoning_controls_when_omitted(self):
+        provider = OpenAIProvider(Settings(api_key="test-api-key"))
+        config = GenerationConfig(model="gpt-4o")
+
+        chat_kwargs = provider._build_chat_request_kwargs([], config)
+        responses_kwargs = provider._build_responses_request_kwargs(Prompt(system="s", user="u"), config)
+
+        assert "reasoning_effort" not in chat_kwargs
+        assert "reasoning" not in responses_kwargs
+
+    def test_responses_capability_key_normalizes_responses_endpoint_suffix(self):
+        provider = OpenAIProvider(
+            Settings(api_key="test-api-key", base_url="https://gateway.example/v1/responses")
+        )
+
+        assert provider._capability_key_for_model("model") == (
+            "https://gateway.example/v1",
+            "model",
+        )
 
 
 class TestProfilePassthrough:

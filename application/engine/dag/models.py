@@ -55,6 +55,7 @@ class EdgeCondition(str, Enum):
     ON_BREAKER_CLOSED = "on_breaker_closed"
     ON_REVIEW_APPROVED = "on_review_approved"
     ON_REVIEW_REJECTED = "on_review_rejected"
+    ON_RETRY_EXHAUSTED = "on_retry_exhausted"
     ALWAYS = "always"
 
 
@@ -325,6 +326,7 @@ class DAGRunResult(BaseModel):
     node_results: Dict[str, NodeResult] = Field(default_factory=dict)
     total_duration_ms: int = 0
     error_count: int = 0
+    final_state: Dict[str, Any] = Field(default_factory=dict)
     started_at: str = ""
     completed_at: str = ""
 
@@ -468,7 +470,12 @@ def _merge_registered_default_slots(dag: DAGDefinition) -> DAGDefinition:
             tup = (src, iid, "", EdgeCondition.ALWAYS)
             if tup not in edge_keys:
                 merged_edges.append(
-                    EdgeDefinition(id=fresh_edge("in"), source=src, target=iid),
+                EdgeDefinition(
+                    id=fresh_edge("in"),
+                    source=src,
+                    target=iid,
+                    target_port="outline",
+                ),
                 )
                 edge_keys.add(tup)
 
@@ -483,7 +490,13 @@ def _merge_registered_default_slots(dag: DAGDefinition) -> DAGDefinition:
             tup = (iid, tgt, "", EdgeCondition.ALWAYS)
             if tup not in edge_keys:
                 merged_edges.append(
-                    EdgeDefinition(id=fresh_edge("out"), source=iid, target=tgt),
+                EdgeDefinition(
+                    id=fresh_edge("out"),
+                    source=iid,
+                    source_port="chapter_plan_json",
+                    target=tgt,
+                    target_port="chapter_plan_json",
+                ),
                 )
                 edge_keys.add(tup)
 
@@ -522,7 +535,7 @@ def get_default_dag() -> DAGDefinition:
             NodeDefinition(id="val_anti_ai", type="val_anti_ai", label="Anti-AI 审计", position={"x": 1200, "y": 500}),
             NodeDefinition(
                 id="gw_circuit", type="gw_circuit", label="熔断保护", position={"x": 1500, "y": 300},
-                config=NodeConfig(thresholds={"max_errors": 3}),
+                config=NodeConfig(thresholds={"max_errors": 3, "anti_ai_max_severity": 1, "tension_floor": 30}),
             ),
             NodeDefinition(id="val_narrative", type="val_narrative", label="叙事同步", position={"x": 1800, "y": 200}),
             NodeDefinition(id="val_foreshadow", type="val_foreshadow", label="伏笔雷达", position={"x": 1800, "y": 400}),
@@ -536,24 +549,31 @@ def get_default_dag() -> DAGDefinition:
             ),
         ],
         edges=[
-            EdgeDefinition(id="edge_01", source="ctx_blueprint", target="exec_beat", source_port="world_rules"),
-            EdgeDefinition(id="edge_02", source="ctx_memory", target="exec_beat", source_port="fact_lock"),
-            EdgeDefinition(id="edge_03", source="ctx_foreshadow", target="exec_writer", source_port="foreshadowing_block"),
-            EdgeDefinition(id="edge_04", source="ctx_voice", target="exec_writer", source_port="voice_block"),
-            EdgeDefinition(id="edge_05", source="ctx_debt", target="exec_writer", source_port="debt_due_block"),
-            EdgeDefinition(id="edge_06", source="exec_beat", target="exec_writer", source_port="beats"),
-            EdgeDefinition(id="edge_07", source="exec_writer", target="val_style", source_port="content"),
-            EdgeDefinition(id="edge_08", source="exec_writer", target="val_tension", source_port="content"),
-            EdgeDefinition(id="edge_09", source="exec_writer", target="val_anti_ai", source_port="content"),
-            EdgeDefinition(id="edge_10", source="val_style", target="gw_circuit", condition=EdgeCondition.ON_NO_DRIFT),
-            EdgeDefinition(id="edge_11", source="val_style", target="gw_retry", condition=EdgeCondition.ON_DRIFT_ALERT, animated=True),
-            EdgeDefinition(id="edge_12", source="val_tension", target="gw_circuit"),
-            EdgeDefinition(id="edge_13", source="val_anti_ai", target="gw_circuit"),
+            EdgeDefinition(id="edge_01", source="ctx_blueprint", source_port="world_rules", target="exec_beat", target_port="outline"),
+            EdgeDefinition(id="edge_02", source="ctx_memory", source_port="fact_lock", target="exec_beat", target_port="outline"),
+            EdgeDefinition(id="edge_03", source="ctx_foreshadow", source_port="foreshadowing_block", target="exec_writer", target_port="foreshadowing_block"),
+            EdgeDefinition(id="edge_04", source="ctx_voice", source_port="voice_block", target="exec_writer", target_port="voice_block"),
+            EdgeDefinition(id="edge_05", source="ctx_debt", source_port="debt_due_block", target="exec_writer", target_port="debt_due_block"),
+            EdgeDefinition(id="edge_06", source="exec_beat", source_port="beats", target="exec_writer", target_port="beats"),
+            EdgeDefinition(id="edge_07", source="exec_writer", source_port="content", target="val_style", target_port="content"),
+            EdgeDefinition(id="edge_08", source="exec_writer", source_port="content", target="val_tension", target_port="content"),
+            EdgeDefinition(id="edge_09", source="exec_writer", source_port="content", target="val_anti_ai", target_port="content"),
+            EdgeDefinition(id="edge_10", source="val_style", source_port="drift_alert", target="gw_circuit", target_port="drift_alert"),
+            EdgeDefinition(id="edge_12", source="val_tension", source_port="composite", target="gw_circuit", target_port="composite"),
+            EdgeDefinition(id="edge_13", source="val_anti_ai", source_port="severity_score", target="gw_circuit", target_port="severity_score"),
             EdgeDefinition(id="edge_14", source="gw_circuit", target="val_narrative", condition=EdgeCondition.ON_BREAKER_CLOSED),
-            EdgeDefinition(id="edge_15", source="gw_retry", target="exec_writer", animated=True),
-            EdgeDefinition(id="edge_16", source="val_narrative", target="val_foreshadow"),
-            EdgeDefinition(id="edge_17", source="val_foreshadow", target="val_kg_infer"),
-            EdgeDefinition(id="edge_18", source="val_kg_infer", target="gw_review"),
+            EdgeDefinition(id="edge_15", source="gw_circuit", source_port="breaker_status", target="gw_retry", target_port="breaker_status", condition=EdgeCondition.ON_BREAKER_OPEN, animated=True),
+            EdgeDefinition(
+                id="edge_16",
+                source="gw_retry",
+                source_port="retry_exhausted",
+                target="gw_review",
+                target_port="review_required",
+                condition=EdgeCondition.ON_RETRY_EXHAUSTED,
+            ),
+            EdgeDefinition(id="edge_17", source="val_narrative", source_port="summary", target="val_foreshadow", target_port="content"),
+            EdgeDefinition(id="edge_18", source="val_foreshadow", target="val_kg_infer", target_port="chapter_number"),
+            EdgeDefinition(id="edge_19", source="val_kg_infer", source_port="inferred_triples", target="gw_review", target_port="metrics"),
         ],
     )
     return _merge_registered_default_slots(base)

@@ -260,6 +260,20 @@ class ChapterAftermathPipeline:
             )
             return out
 
+        if not self._is_canonical_chapter(novel_id, chapter_number):
+            out.update(
+                {
+                    "discarded_uncommitted": True,
+                    "failure_reason": "candidate_first_required",
+                }
+            )
+            logger.info(
+                "discard uncommitted aftermath job novel=%s ch=%s",
+                novel_id,
+                chapter_number,
+            )
+            return out
+
         if not content or not str(content).strip():
             logger.debug("aftermath 跳过：正文为空 novel=%s ch=%s", novel_id, chapter_number)
             return out
@@ -920,6 +934,48 @@ class ChapterAftermathPipeline:
         except Exception:
             logger.exception(
                 "chapter version check failed; discard aftermath novel=%s ch=%s",
+                novel_id,
+                chapter_number,
+            )
+            return False
+
+    def _is_canonical_chapter(self, novel_id: str, chapter_number: int) -> bool:
+        """Candidate runs admit Canonical work only for their formal commit records."""
+
+        repository = self._chapter_repository
+        if repository is None:
+            return True
+        try:
+            from domain.novel.value_objects.novel_id import NovelId
+
+            current = repository.get_by_novel_and_number(
+                NovelId(novel_id), int(chapter_number)
+            )
+            status = str(
+                getattr(getattr(current, "status", ""), "value", getattr(current, "status", ""))
+            )
+            if status != "completed":
+                return False
+            db = getattr(repository, "db", None)
+            if db is None:
+                return True
+            run = db.fetch_one(
+                "SELECT 1 FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+            )
+            if run is None:
+                return True
+            commit_record = db.fetch_one(
+                """
+                SELECT 1
+                FROM chapter_candidate_formal_commits
+                WHERE novel_id = ? AND chapter_number = ? AND chapter_id = ?
+                """,
+                (novel_id, int(chapter_number), str(getattr(current, "id", "") or "")),
+            )
+            return commit_record is not None
+        except Exception:
+            logger.exception(
+                "canonical chapter check failed; discard aftermath novel=%s ch=%s",
                 novel_id,
                 chapter_number,
             )

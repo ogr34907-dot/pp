@@ -381,35 +381,8 @@ async def save_chapter_review(
     chapter_number: int = Path(..., gt=0, description="章节编号"),
     service: ChapterService = Depends(get_chapter_service)
 ):
-    """保存章节审阅
-
-    Args:
-        novel_id: 小说 ID
-        chapter_number: 章节号
-        request: 审阅请求
-        service: Chapter 服务
-
-    Returns:
-        保存后的审阅信息
-
-    Raises:
-        HTTPException: 如果章节不存在
-    """
-    try:
-        review = service.save_chapter_review(
-            novel_id,
-            chapter_number,
-            request.status,
-            request.memo
-        )
-        return ChapterReviewResponse(
-            status=review.status,
-            memo=review.memo,
-            created_at=review.created_at.isoformat(),
-            updated_at=review.updated_at.isoformat()
-        )
-    except EntityNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    """Retired: candidate approval is the only formal writing review path."""
+    raise HTTPException(status_code=410, detail="candidate_first_required")
 
 
 @router.post("/{novel_id}/chapters/{chapter_number}/review-ai")
@@ -433,6 +406,8 @@ async def ai_review_chapter(
     Raises:
         HTTPException: 如果章节不存在或内容为空
     """
+    if request.save:
+        raise HTTPException(status_code=410, detail="candidate_first_required")
     try:
         # 获取章节
         chapter = service.get_chapter_by_novel_and_number(novel_id, chapter_number)
@@ -450,20 +425,11 @@ async def ai_review_chapter(
             chapter_outline="",
             generation_hint=getattr(chapter, "generation_hint", "") or "",
         )
-        saved = False
-        if request.save:
-            service.save_chapter_review(
-                novel_id,
-                chapter_number,
-                result.status,
-                result.memo,
-            )
-            saved = True
         return ChapterAIReviewResponse(
             ok=True,
             status=result.status,
             memo=result.memo,
-            saved=saved,
+            saved=False,
             score=result.score,
             suggestions=result.suggestions,
         )

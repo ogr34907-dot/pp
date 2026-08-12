@@ -268,7 +268,13 @@ class NodeRegistry:
         return node_cls(config=config)
 
     @classmethod
-    def create_executor(cls, node_type: str, node_id: str, config: Optional[NodeConfig] = None):
+    def create_executor(
+        cls,
+        node_type: str,
+        node_id: str,
+        config: Optional[NodeConfig] = None,
+        inputs: Optional[Dict[str, Any]] = None,
+    ):
         """创建 LangGraph 可用的执行函数
 
         Args:
@@ -289,11 +295,14 @@ class NodeRegistry:
                 logger.info(f"节点 {node_id} 已禁用，跳过 (bypass)")
                 return {"status": "bypassed"}
 
-            # 收集输入
-            inputs = _collect_inputs(state, meta.input_ports, node_id)
+            # DAGEngine has already resolved explicit edge port mappings.  Direct
+            # callers retain the historical flat-state input behavior.
+            resolved_inputs = _collect_inputs(state, meta.input_ports, node_id)
+            if inputs:
+                resolved_inputs.update(inputs)
 
             # 校验输入
-            if not instance.validate_inputs(inputs):
+            if not instance.validate_inputs(resolved_inputs):
                 return {
                     "status": "error",
                     "error": f"节点 {node_id} 输入校验失败",
@@ -311,9 +320,10 @@ class NodeRegistry:
                 "shared_state": state,
                 "config_overrides": config_overrides,
             }
+            context.update(dict(state.get("_runtime_context") or {}))
 
             # 执行
-            result = await instance.execute(inputs, context)
+            result = await instance.execute(resolved_inputs, context)
 
             # 返回输出（扁平化到 state）
             return result.outputs

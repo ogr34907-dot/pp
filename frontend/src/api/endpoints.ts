@@ -88,6 +88,10 @@ export const apiRoutes = {
     candidateApprove: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'approve-and-commit'),
     candidateRetrySync: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'retry-sync'),
     candidateReject: (candidateId: string) => apiRootPath('generation', 'candidates', candidateId, 'reject'),
+    candidateDagLatest: (candidateId: string, params?: QueryParams) =>
+      withQuery(apiRootPath('generation', 'candidates', candidateId, 'dag-runs', 'latest'), params),
+    candidateDagResume: (candidateId: string) =>
+      apiRootPath('generation', 'candidates', candidateId, 'dag-runs', 'latest', 'resume'),
   },
   outline: {
     tree: (novelId: string) => apiRootPath('outline', 'novels', novelId, 'tree'),
@@ -96,6 +100,10 @@ export const apiRoutes = {
     publish: (contractId: string) => apiRootPath('outline', 'contracts', contractId, 'publish'),
     generateDraft: (contractId: string) => apiRootPath('outline', 'contracts', contractId, 'generate-draft'),
     generateDraftStream: (contractId: string) => apiRootPath('outline', 'contracts', contractId, 'generate-draft-stream'),
+    generationAttemptLatest: (contractId: string, params?: QueryParams) =>
+      withQuery(apiRootPath('outline', 'contracts', contractId, 'generation-attempts', 'latest'), params),
+    generationAttemptCancel: (contractId: string, attemptId: string) =>
+      apiRootPath('outline', 'contracts', contractId, 'generation-attempts', attemptId, 'cancel'),
     chapterContext: (novelId: string, chapterNodeId: string) =>
       apiRootPath('outline', 'novels', novelId, 'chapters', chapterNodeId, 'published-context'),
   },

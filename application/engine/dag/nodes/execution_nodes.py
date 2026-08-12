@@ -170,6 +170,35 @@ class WriterNode(BaseNode):
             content = ""
             word_count = 0
             novel_id = context.get("novel_id", "")
+            candidate_generator = context.get("candidate_draft_generator")
+
+            if candidate_generator is not None:
+                event_sink = context.get("candidate_event_sink")
+
+                def on_candidate_event(event: Dict[str, Any]) -> None:
+                    if callable(event_sink) and isinstance(event, dict):
+                        event_sink({"node_id": "exec_writer", **event})
+
+                result = await candidate_generator.generate_candidate_draft(
+                    novel_id=novel_id,
+                    chapter_number=int(context.get("chapter_number") or 0),
+                    chapter_title=str(context.get("chapter_title") or ""),
+                    outline_chain=dict(context.get("outline_chain") or {}),
+                    outline_text=str(context.get("outline_text") or inputs.get("outline") or ""),
+                    on_event=on_candidate_event if callable(event_sink) else None,
+                )
+                content = str(result.get("content") or "") if isinstance(result, dict) else str(result or "")
+                if not content.strip():
+                    raise RuntimeError("candidate draft generator returned empty prose")
+                outputs = {"content": content, "word_count": len(content)}
+                if isinstance(result, dict) and result.get("script"):
+                    outputs["script"] = str(result["script"])
+                return NodeResult(
+                    outputs=outputs,
+                    status=NodeStatus.SUCCESS,
+                    metrics={"word_count": float(len(content))},
+                    duration_ms=int((time.time() - start) * 1000),
+                )
 
             # 收集上下文变量
             beats = inputs.get("beats", []) or []
@@ -316,6 +345,69 @@ class BeatNode(BaseNode):
             except (TypeError, ValueError):
                 tw = 2500
             nid = context.get("novel_id") if isinstance(context, dict) else None
+
+            if context.get("candidate_mode"):
+                from application.engine.dag.plan.schema import (
+                    ChapterExecutionPlan,
+                    PlanAtomSpec,
+                    PlanningEnvelope,
+                )
+                from application.engine.services.beat_projection import (
+                    beats_from_execution_plan,
+                )
+
+                payload = context.get("outline_chain", {}).get("chapter", {}).get("payload", {})
+                payload = payload if isinstance(payload, dict) else {}
+                events = payload.get("required_events")
+                if isinstance(events, str):
+                    events = [events]
+                events = [str(item).strip() for item in (events or []) if str(item).strip()]
+                if not events and str(payload.get("creative_goal") or "").strip():
+                    events = [str(payload["creative_goal"]).strip()]
+                handoff = str((payload.get("handoff_conditions") or [""])[0] or "")
+                conflict = str(payload.get("creative_goal") or "")
+                forbidden = payload.get("forbidden_events")
+                if isinstance(forbidden, str):
+                    forbidden = [forbidden]
+                forbidden = [str(item).strip() for item in (forbidden or []) if str(item).strip()]
+                atoms = [
+                    PlanAtomSpec(
+                        id=f"published-b{index}",
+                        intent=event,
+                        weight=1.0,
+                        extensions={
+                            "function": "setup",
+                            "visible_action": event,
+                            "conflict": conflict,
+                            "delta": event,
+                            "handoff_to_next": handoff,
+                            "must_include": [event],
+                            "must_not_include": forbidden,
+                        },
+                    )
+                    for index, event in enumerate(events, 1)
+                ]
+                plan = ChapterExecutionPlan(
+                    envelope=PlanningEnvelope(
+                        novel_id=str(nid) if nid else None,
+                        chapter_number=chap,
+                        target_chapter_words=tw,
+                    ),
+                    atoms=atoms,
+                    provenance={"mode": "published_chapter_outline"},
+                )
+                beats_raw = beats_from_execution_plan(
+                    plan,
+                    outline=outline,
+                    target_chapter_words=tw,
+                    infer_focus=lambda _outline: "setup",
+                    build_expansion_hints=lambda _focus, _target: [],
+                )
+                return NodeResult(
+                    outputs={"beats": planned_micro_beats_from_beats(beats_raw)},
+                    status=NodeStatus.SUCCESS,
+                    duration_ms=int((time.time() - start) * 1000),
+                )
 
             sheet = inputs.get("beat_sheet_json")
             beat_sheet_json: Optional[Dict[str, Any]] = None

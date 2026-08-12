@@ -17,6 +17,10 @@ from .model_resolution import require_resolved_model_id
 logger = logging.getLogger(__name__)
 
 
+def _usage_int(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
 def _json_response_instruction(response_format: dict[str, Any]) -> str:
     """Build prompt-side JSON constraints for Anthropic Messages API."""
     fmt_type = response_format.get("type")
@@ -100,10 +104,15 @@ class AnthropicProvider(BaseProvider):
         base = settings.base_url.rstrip("/") if settings.base_url else None
         if base and base.endswith("/v1"):
             base = base[:-3]
+        self._messages_base_url = (
+            (settings.base_url or "https://api.anthropic.com").rstrip("/")
+        )
+        if self._messages_base_url.endswith("/v1"):
+            self._messages_base_url = self._messages_base_url[:-3]
 
         official_client_kw = {
             "api_key": settings.api_key,
-            "timeout": 300.0,  # 5 分钟超时
+            "timeout": settings.timeout_seconds,
             "max_retries": 2,
             "default_headers": {
                 "User-Agent": "claude-cli/2.1.87 (external, cli)",
@@ -147,29 +156,9 @@ class AnthropicProvider(BaseProvider):
             RuntimeError: 当 API 调用失败或返回空内容时
         """
         try:
-            model_id = require_resolved_model_id(
-                config.model,
-                self.settings.default_model,
-                provider_label="Anthropic / Claude",
-            )
-            # 构建请求参数
-            create_kwargs = {
-                "model": model_id,
-                "temperature": config.temperature,
-                "max_tokens": config.max_tokens,
-                "system": prompt.system,
-                "messages": [{"role": "user", "content": prompt.user}],
-            }
-            # Anthropic Messages API does not accept OpenAI-style response_format.
-            # Keep structured output provider-agnostic by moving the constraint into
-            # the prompt; structured_json_pipeline will parse and validate it.
-            if config.response_format:
-                fmt = config.response_format
-                instruction = _json_response_instruction(fmt)
-                if instruction:
-                    create_kwargs["system"] = create_kwargs["system"] + instruction
-
-            # 使用 async_client 避免阻塞 asyncio 事件循环
+            _, create_kwargs = self._build_message_request(prompt, config)
+            create_kwargs["timeout"] = self._request_timeout(config)
+            create_kwargs["extra_body"] = self.settings.extra_body or None
             response = await self.async_client.messages.create(**create_kwargs)
 
             # 防御性检查：验证 content 列表非空
@@ -186,10 +175,18 @@ class AnthropicProvider(BaseProvider):
             if not content:
                 raise RuntimeError("API returned no text content")
 
-            # 创建 token 使用统计
+            usage = response.usage
+            output_details = getattr(usage, "output_tokens_details", None)
+            input_tokens = _usage_int(getattr(usage, "input_tokens", 0))
+            output_tokens = _usage_int(getattr(usage, "output_tokens", 0))
+            cache_hit_tokens = _usage_int(getattr(usage, "cache_read_input_tokens", 0))
+            cache_creation_tokens = _usage_int(getattr(usage, "cache_creation_input_tokens", 0))
             token_usage = TokenUsage(
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_hit_tokens=cache_hit_tokens,
+                cache_miss_tokens=input_tokens + cache_creation_tokens,
+                reasoning_tokens=_usage_int(getattr(output_details, "thinking_tokens", 0)),
             )
 
             return GenerationResult(content=content, token_usage=token_usage)
@@ -221,8 +218,14 @@ class AnthropicProvider(BaseProvider):
         }
         if stream:
             payload["stream"] = True
-        payload.update(self.settings.extra_body or {})
+        if config.response_format:
+            instruction = _json_response_instruction(config.response_format)
+            if instruction:
+                payload["system"] += instruction
         return model_id, payload
+
+    def _request_timeout(self, config: GenerationConfig) -> float:
+        return float(config.timeout_seconds or self.settings.timeout_seconds)
 
     @staticmethod
     def _format_stream_error(exc: BaseException) -> str:
@@ -237,8 +240,7 @@ class AnthropicProvider(BaseProvider):
         config: GenerationConfig,
     ) -> AsyncIterator[str]:
         """通过 httpx 直接解析 SSE，兼容部分网关的非标准流式响应。"""
-        base_url = self.settings.base_url or "https://api.anthropic.com"
-        url = f"{base_url}/v1/messages"
+        url = f"{self._messages_base_url}/v1/messages"
         logger.debug("[Stream] Using httpx endpoint: %s", url)
 
         headers = {
@@ -250,6 +252,7 @@ class AnthropicProvider(BaseProvider):
             **(self.settings.extra_headers or {}),
         }
         _, payload = self._build_message_request(prompt, config, stream=True)
+        payload.update(self.settings.extra_body or {})
 
         logger.debug("[Stream] Calling %s", url)
         async with self._stream_http_client.stream(
@@ -258,6 +261,7 @@ class AnthropicProvider(BaseProvider):
             headers=headers,
             params=self.settings.extra_query or None,
             json=payload,
+            timeout=self._request_timeout(config),
         ) as response:
             if response.status_code != 200:
                 error_body = await response.aread()
@@ -291,7 +295,11 @@ class AnthropicProvider(BaseProvider):
         """通过官方 SDK 流式读取，网关断开 raw SSE 时作为回退。"""
         model_id, payload = self._build_message_request(prompt, config, stream=False)
         logger.info("[Stream] Falling back to SDK stream for model=%s", model_id)
-        async with self.async_client.messages.stream(**payload) as stream:
+        async with self.async_client.messages.stream(
+            **payload,
+            extra_body=self.settings.extra_body or None,
+            timeout=self._request_timeout(config),
+        ) as stream:
             async for text in stream.text_stream:
                 if text:
                     yield text

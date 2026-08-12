@@ -46,8 +46,10 @@ class DAGEngine:
     - 两种路径共享相同的节点注册表和输入收集逻辑
     """
 
-    def __init__(self, checkpointer=None):
+    def __init__(self, checkpointer=None, observer=None):
         self._checkpointer = checkpointer
+        self._observer = observer
+        self._node_started_at: Dict[str, float] = {}
         self._use_langgraph = _is_langgraph_available()
 
         if self._use_langgraph:
@@ -62,6 +64,9 @@ class DAGEngine:
         dag: DAGDefinition,
         initial_state: Dict[str, Any],
         thread_id: str = "",
+        *,
+        observer: Any = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
     ) -> DAGRunResult:
         """执行完整的 DAG
 
@@ -75,6 +80,11 @@ class DAGEngine:
         """
         start_time = time.time()
         dag_run_id = initial_state.get("dag_run_id", f"run_{int(time.time()*1000)}")
+        state = dict(initial_state)
+        if runtime_context:
+            state["_runtime_context"] = dict(runtime_context)
+        run_observer = observer if observer is not None else self._observer
+        run_started_at: Optional[Dict[str, float]] = {} if run_observer is not None else None
 
         # 运行时状态追踪
         node_states: Dict[str, NodeRunState] = {}
@@ -82,20 +92,27 @@ class DAGEngine:
             node_states[node.id] = NodeRunState(node_id=node.id)
 
         try:
-            if self._use_langgraph:
-                result_state = await self._run_with_langgraph(dag, initial_state, thread_id)
-            else:
-                result_state = await self._run_with_topological_sort(dag, initial_state)
+            # The native runtime is the execution authority.  It is deliberately
+            # used even when LangGraph is installed so branch, fan-in and explicit
+            # port contracts have identical local behavior.
+            result_state = await self._run_with_topological_sort(
+                dag, state, observer=run_observer, node_started_at=run_started_at
+            )
+            # Runtime services are intentionally available to nodes only.  A
+            # DAG result is persisted by callers, so it must never expose them.
+            result_state.pop("_runtime_context", None)
 
             # 收集结果
             total_ms = int((time.time() - start_time) * 1000)
+            failed = bool(result_state.get("_errors")) or result_state.get("status") == "error"
             return DAGRunResult(
                 dag_run_id=dag_run_id,
                 novel_id=initial_state.get("novel_id", ""),
-                status="completed",
+                status="error" if failed else "completed",
                 node_results={nid: NodeResult(outputs=res) for nid, res in result_state.items() if isinstance(res, dict)},
                 total_duration_ms=total_ms,
-                error_count=0,
+                error_count=len(result_state.get("_errors", {})) if isinstance(result_state.get("_errors"), dict) else int(failed),
+                final_state=result_state,
             )
 
         except DAGExecutionError as e:
@@ -220,48 +237,110 @@ class DAGEngine:
         self,
         dag: DAGDefinition,
         initial_state: Dict[str, Any],
+        *,
+        observer: Any = None,
+        node_started_at: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
-        """使用自研拓扑排序执行器（LangGraph 不可用时的降级方案）
+        """Execute the enabled portion of a DAG with real edge semantics.
 
-        优化：
-        1. 同层无依赖节点并行执行（asyncio.gather）
-        2. Context 节点层内并行，减少上下文组装耗时
-        3. 验证节点层内并行，审计不再串行等待
-        4. 快速路径：如果只有单个链式依赖，跳过并行调度开销
+        A node becomes runnable only after every *active* incoming edge has a
+        completed source.  Conditional edges that do not match are inactive, so
+        they do not strand downstream fan-in nodes.  Explicit source/target ports
+        are mapped before a node validates its inputs.
         """
         state = dict(initial_state)
 
-        # 获取拓扑层级
-        layers = self._topological_layers(dag)
-        logger.info(f"DAG 拓扑层级: {[len(l) for l in layers]}")
+        nodes = {node.id: node for node in dag.nodes if node.enabled}
+        incoming: Dict[str, List[Any]] = defaultdict(list)
+        outgoing: Dict[str, List[Any]] = defaultdict(list)
+        for edge in dag.edges:
+            if edge.source in nodes and edge.target in nodes:
+                incoming[edge.target].append(edge)
+                outgoing[edge.source].append(edge)
 
-        for layer_idx, layer in enumerate(layers):
-            layer_node_ids = [n.id for n in layer]
-            layer_types = [n.type for n in layer]
-            logger.info(f"执行层级 {layer_idx}: {layer_node_ids} (types: {layer_types})")
+        active_edges: Dict[str, Optional[bool]] = {
+            edge.id: None for edge in dag.edges
+            if edge.source in nodes and edge.target in nodes
+        }
+        completed: Set[str] = set()
+        skipped: Set[str] = set()
 
-            if len(layer) == 1:
-                # 串行节点
-                node_def = layer[0]
-                result = await self._execute_node(node_def, state)
-                state.update(result)
-            else:
-                # 并行节点 — 同层无依赖节点并发执行
-                # 使用共享 state 的只读快照，避免并发写入冲突
-                state_snapshot = dict(state)
-                tasks = [self._execute_node(n, state_snapshot) for n in layer]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+        while True:
+            for node_id in nodes:
+                if node_id in completed or node_id in skipped:
+                    continue
+                edges = incoming.get(node_id, [])
+                if edges and all(
+                    edge.source in completed or edge.source in skipped
+                    for edge in edges
+                ) and not any(active_edges.get(edge.id) is True for edge in edges):
+                    skipped.add(node_id)
+                    for edge in outgoing[node_id]:
+                        active_edges[edge.id] = False
+                    self._notify("on_node_bypassed", state, nodes[node_id], observer=observer)
 
-                for node_def, result in zip(layer, results):
-                    if isinstance(result, Exception):
-                        logger.error(f"节点 {node_def.id} 执行失败: {result}")
-                        state.setdefault("_errors", {})[node_def.id] = str(result)
-                    else:
-                        state.update(result)
+            ready = [
+                node for node in nodes.values()
+                if node.id not in completed
+                and node.id not in skipped
+                and self._node_ready(node.id, incoming, active_edges, completed, skipped)
+            ]
+            if not ready:
+                break
+
+            state_snapshot = dict(state)
+            execute_kwargs = (
+                {"observer": observer, "node_started_at": node_started_at}
+                if observer is not None or node_started_at is not None
+                else {}
+            )
+            results = await asyncio.gather(
+                *[
+                    self._execute_node(node, state_snapshot, self._collect_edge_inputs(
+                        node.id, incoming, active_edges, state_snapshot
+                    ), **execute_kwargs)
+                    for node in ready
+                ],
+                return_exceptions=True,
+            )
+
+            for node, result in zip(ready, results):
+                completed.add(node.id)
+                if isinstance(result, Exception):
+                    logger.error("节点 %s 执行失败: %s", node.id, result)
+                    state.setdefault("_errors", {})[node.id] = str(result)
+                    state["status"] = "error"
+                    self._notify("on_node_error", state, node, result, observer=observer)
+                else:
+                    state.update(result)
+                    self._notify(
+                        "on_node_complete", state, node, result,
+                        observer=observer, node_started_at=node_started_at,
+                    )
+
+                for edge in outgoing[node.id]:
+                    active_edges[edge.id] = self._edge_matches(edge.condition, state)
+
+        for node_id in nodes:
+            if node_id not in completed and node_id not in skipped:
+                logger.info("节点 %s 没有活跃输入路径，跳过", node_id)
+                skipped.add(node_id)
+                self._notify("on_node_bypassed", state, nodes[node_id], observer=observer)
+
+        if state.get("_errors"):
+            state["status"] = "error"
 
         return state
 
-    async def _execute_node(self, node_def: NodeDefinition, state: Dict[str, Any]) -> Dict[str, Any]:
+    async def _execute_node(
+        self,
+        node_def: NodeDefinition,
+        state: Dict[str, Any],
+        inputs: Optional[Dict[str, Any]] = None,
+        *,
+        observer: Any = None,
+        node_started_at: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
         """执行单个节点"""
         if not node_def.enabled:
             logger.info(f"节点 {node_def.id} 已禁用，跳过")
@@ -271,8 +350,92 @@ class DAGEngine:
             logger.warning(f"跳过未注册的节点类型: {node_def.type}")
             return {}
 
-        executor = NodeRegistry.create_executor(node_def.type, node_def.id, node_def.config)
+        self._notify(
+            "on_node_start", state, node_def,
+            observer=observer, node_started_at=node_started_at,
+        )
+        executor = NodeRegistry.create_executor(
+            node_def.type, node_def.id, node_def.config, inputs=inputs
+        )
         return await executor(state)
+
+    def _notify(
+        self,
+        method: str,
+        state: Dict[str, Any],
+        node: NodeDefinition,
+        result: Any = None,
+        *,
+        observer: Any = None,
+        node_started_at: Optional[Dict[str, float]] = None,
+    ) -> None:
+        active_observer = observer if observer is not None else self._observer
+        callback = getattr(active_observer, method, None) if active_observer else None
+        if not callable(callback):
+            return
+        try:
+            novel_id = str(state.get("novel_id") or "")
+            if method == "on_node_start":
+                (node_started_at if node_started_at is not None else self._node_started_at)[node.id] = time.perf_counter()
+                callback(novel_id, node.id, node.type)
+            elif method == "on_node_complete":
+                timings = node_started_at if node_started_at is not None else self._node_started_at
+                started_at = timings.pop(node.id, time.perf_counter())
+                callback(
+                    novel_id,
+                    node.id,
+                    NodeResult(
+                        outputs=dict(result or {}),
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                    ),
+                )
+            elif method == "on_node_error":
+                (node_started_at if node_started_at is not None else self._node_started_at).pop(node.id, None)
+                callback(novel_id, node.id, result)
+            else:
+                callback(novel_id, node.id)
+        except Exception:
+            logger.exception("DAG observer callback failed: %s", method)
+
+    @staticmethod
+    def _edge_matches(condition: EdgeCondition, state: Dict[str, Any]) -> bool:
+        return _make_condition_function(condition, "")(state)
+
+    @staticmethod
+    def _node_ready(
+        node_id: str,
+        incoming: Dict[str, List[Any]],
+        active_edges: Dict[str, Optional[bool]],
+        completed: Set[str],
+        skipped: Set[str],
+    ) -> bool:
+        edges = incoming.get(node_id, [])
+        if not edges:
+            return True
+        if any(edge.source not in completed and edge.source not in skipped for edge in edges):
+            return False
+        return any(
+            active_edges.get(edge.id) is True and edge.source in completed
+            for edge in edges
+        )
+
+    @staticmethod
+    def _collect_edge_inputs(
+        node_id: str,
+        incoming: Dict[str, List[Any]],
+        active_edges: Dict[str, Optional[bool]],
+        state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        inputs = {}
+        for edge in incoming.get(node_id, []):
+            if active_edges.get(edge.id) is not True:
+                continue
+            source_port = edge.source_port or ""
+            target_port = edge.target_port or source_port
+            if source_port and target_port and source_port in state:
+                inputs[target_port] = state[source_port]
+
+        return inputs
 
     def _topological_layers(self, dag: DAGDefinition) -> List[List[NodeDefinition]]:
         """Kahn 算法分层 — 同层节点无依赖可并行"""
@@ -387,6 +550,8 @@ def _make_condition_function(condition: EdgeCondition, target: str):
             return state.get("review_approved", False)
         elif condition == EdgeCondition.ON_REVIEW_REJECTED:
             return not state.get("review_approved", False)
+        elif condition == EdgeCondition.ON_RETRY_EXHAUSTED:
+            return bool(state.get("retry_exhausted", False))
         return True
 
     return condition_fn

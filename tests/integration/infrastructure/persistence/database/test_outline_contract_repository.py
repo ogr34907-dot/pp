@@ -15,6 +15,8 @@ from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
     OutlineGateError,
 )
+from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+from domain.structure.story_node import NodeType, StoryNode
 
 
 @pytest.fixture
@@ -35,6 +37,33 @@ def _payload(title: str) -> OutlinePayload:
         creative_goal="让主角在代价下完成选择",
         required_events=["选择必须改变关系"],
         forbidden_events=["不得无代价化解冲突"],
+    )
+
+
+def _continuity_payload(title: str, *, chapter_start: int, chapter_end: int) -> OutlinePayload:
+    return OutlinePayload(
+        title=title,
+        narrative_text="故事沿时间向前推进。",
+        creative_goal="让主角在代价下完成本阶段目标",
+        entry_state="承接前一阶段留下的处境",
+        exit_state="将变化交给下一阶段",
+        required_events=["主角做出不可逆选择"],
+        conflicts=["外部压力迫使主角选择"],
+        state_changes={"protagonist": [{"change": "从逃避转为承担"}]},
+        handoff_conditions=["下一阶段必须回应本阶段留下的危机"],
+        chapter_start=chapter_start,
+        chapter_end=chapter_end,
+    )
+
+
+def _part_node(node_id: str, number: int) -> StoryNode:
+    return StoryNode(
+        id=node_id,
+        novel_id="novel-1",
+        node_type=NodeType.PART,
+        number=number,
+        title=f"第{number}部",
+        order_index=number,
     )
 
 
@@ -112,3 +141,47 @@ def test_publishing_a_parent_marks_non_locked_children_stale_and_locked_children
 
     assert outline_repo.get_slot(disposable_part.id).active.status == OutlineStatus.STALE
     assert outline_repo.get_slot(locked_part.id).active.status == OutlineStatus.CONFLICT
+
+
+def test_later_sibling_must_continue_the_previous_synced_plan(outline_repo):
+    db = outline_repo._db
+    story_nodes = StoryNodeRepository(db)
+    first_node = _part_node("part-1", 1)
+    second_node = _part_node("part-2", 2)
+    story_nodes.save_sync(first_node)
+    story_nodes.save_sync(second_node)
+
+    root = outline_repo.ensure_root("novel-1")
+    root_draft = outline_repo.save_draft(root.id, _payload("总纲"), source=OutlineSource.AUTHOR)
+    outline_repo.publish_and_sync(root.id, expected_revision=root_draft.draft.revision)
+
+    first = outline_repo.create_contract(
+        novel_id="novel-1",
+        level=OutlineLevel.PART,
+        parent_contract_id=root.id,
+        story_node_id=first_node.id,
+    )
+    first_draft = outline_repo.save_draft(
+        first.id, _continuity_payload("第一部", chapter_start=1, chapter_end=3)
+    )
+    outline_repo.publish_and_sync(first.id, expected_revision=first_draft.draft.revision)
+
+    second = outline_repo.create_contract(
+        novel_id="novel-1",
+        level=OutlineLevel.PART,
+        parent_contract_id=root.id,
+        story_node_id=second_node.id,
+    )
+    broken = outline_repo.save_draft(
+        second.id, _continuity_payload("第二部", chapter_start=5, chapter_end=7)
+    )
+
+    with pytest.raises(OutlineGateError, match="sibling continuity"):
+        outline_repo.publish_and_sync(second.id, expected_revision=broken.draft.revision)
+
+    repaired = outline_repo.save_draft(
+        second.id, _continuity_payload("第二部", chapter_start=4, chapter_end=7)
+    )
+    published = outline_repo.publish_and_sync(second.id, expected_revision=repaired.draft.revision)
+    first_published = outline_repo.get_slot(first.id)
+    assert published.active.previous_sibling_digest == first_published.active.published_digest

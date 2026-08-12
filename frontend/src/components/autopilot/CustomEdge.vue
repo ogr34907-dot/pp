@@ -35,6 +35,7 @@ const conditionLabel = computed(() => {
     on_breaker_closed: '正常',
     on_review_approved: '审批通过',
     on_review_rejected: '审批拒绝',
+    on_retry_exhausted: '重试用尽',
   }
   return labels[condition] || condition
 })

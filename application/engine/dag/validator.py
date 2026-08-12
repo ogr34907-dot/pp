@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 
 COMPATIBLE_TYPES: Dict[str, Set[str]] = {
     "text": {"text", "prompt"},
-    "json": {"json", "list"},
+    # Gateway pass-through payloads may be rendered into a textual prompt by
+    # the next node; keep that conversion explicit in the shared contract.
+    "json": {"json", "list", "text", "object"},
     "score": {"score", "json"},
     "boolean": {"boolean", "json"},
     "list": {"list", "json"},

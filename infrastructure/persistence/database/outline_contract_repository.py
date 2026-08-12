@@ -62,6 +62,10 @@ class OutlineContractRepository:
         return get_database(self.db_path).get_connection()
 
     @staticmethod
+    def _now() -> str:
+        return datetime.now().isoformat()
+
+    @staticmethod
     def _as_mapping(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         return dict(row)
 
@@ -87,6 +91,7 @@ class OutlineContractRepository:
             author_locked=bool(contract_row.get("author_locked")),
             has_author_edits=bool(contract_row.get("has_author_edits")),
             published_digest=str(values["digest"] or ""),
+            previous_sibling_digest=str(values.get("previous_sibling_digest") or ""),
         )
 
     def _slot_from_row(self, row: sqlite3.Row) -> OutlineContractSlot:
@@ -239,6 +244,72 @@ class OutlineContractRepository:
         conn.commit()
         return self.get_slot(contract_id)
 
+    def _previous_synced_sibling(self, slot: OutlineContractSlot) -> Optional[OutlineContract]:
+        """Return the preceding physical sibling's active plan, if one exists."""
+
+        if not slot.parent_contract_id or not slot.story_node_id:
+            return None
+        conn = self._connection()
+        node = conn.execute(
+            "SELECT parent_id, order_index, number FROM story_nodes WHERE id = ?",
+            (slot.story_node_id,),
+        ).fetchone()
+        if node is None:
+            return None
+        previous = conn.execute(
+            """
+            SELECT c.*
+            FROM story_nodes AS n
+            JOIN outline_contracts AS c ON c.story_node_id = n.id AND c.novel_id = ?
+            WHERE n.novel_id = ?
+              AND COALESCE(n.parent_id, '') = COALESCE(?, '')
+              AND n.node_type = ?
+              AND (n.order_index < ? OR (n.order_index = ? AND n.number < ?))
+            ORDER BY n.order_index DESC, n.number DESC, n.id DESC
+            LIMIT 1
+            """,
+            (
+                slot.novel_id,
+                slot.novel_id,
+                node["parent_id"],
+                slot.level.value,
+                int(node["order_index"]),
+                int(node["order_index"]),
+                int(node["number"]),
+            ),
+        ).fetchone()
+        if previous is None:
+            return None
+        sibling = self._slot_from_row(previous)
+        if sibling.active is None or sibling.active.status != OutlineStatus.SYNCED:
+            raise OutlineGateError("previous sibling must be synced before publishing this outline")
+        return sibling.active
+
+    def previous_synced_sibling(self, contract_id: str) -> Optional[OutlineContract]:
+        """Expose the immediate published sibling handoff for draft prompting."""
+
+        return self._previous_synced_sibling(self.get_slot(contract_id))
+
+    @staticmethod
+    def _validate_sibling_continuity(
+        draft: OutlineContract, previous: Optional[OutlineContract]
+    ) -> str:
+        if previous is None:
+            return ""
+        blockers = draft.payload.sibling_continuity_blockers()
+        if blockers:
+            raise OutlineGateError("sibling continuity requires " + ", ".join(blockers))
+        previous_end = previous.payload.chapter_end
+        next_start = draft.payload.chapter_start
+        if previous_end is not None and next_start is not None and next_start != previous_end + 1:
+            raise OutlineGateError(
+                f"sibling continuity requires chapter_start {previous_end + 1}, got {next_start}"
+            )
+        if previous_end is not None and draft.payload.chapter_end is not None:
+            if draft.payload.chapter_end < previous_end + 1:
+                raise OutlineGateError("sibling continuity requires a forward chapter range")
+        return previous.published_digest or previous.digest
+
     def publish_and_sync(
         self,
         contract_id: str,
@@ -280,6 +351,10 @@ class OutlineContractRepository:
             if draft.parent_revision_digest != parent_digest:
                 raise OutlineGateError("parent outline changed; regenerate or reconcile this child draft")
 
+        previous_sibling_digest = self._validate_sibling_continuity(
+            draft, self._previous_synced_sibling(slot)
+        )
+
         now = datetime.now().isoformat()
         locked_value = slot.author_locked if author_locked is None else bool(author_locked)
         try:
@@ -292,6 +367,10 @@ class OutlineContractRepository:
             conn.execute(
                 "UPDATE outline_contract_versions SET status = 'syncing', updated_at = ? WHERE id = ?",
                 (now, self._draft_version_id(contract_id)),
+            )
+            conn.execute(
+                "UPDATE outline_contract_versions SET previous_sibling_digest = ? WHERE id = ?",
+                (previous_sibling_digest, self._draft_version_id(contract_id)),
             )
             conn.execute(
                 """
@@ -447,3 +526,210 @@ class OutlineContractRepository:
             }
             for row in rows
         ]
+
+    def start_generation_attempt(
+        self,
+        contract_id: str,
+        *,
+        prompt_snapshot: dict[str, Any],
+        context_digest: str,
+        retry_of_attempt_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create one durable streamed-draft attempt before calling an LLM."""
+
+        self.get_slot(contract_id)
+        snapshot = dict(prompt_snapshot or {})
+        if retry_of_attempt_id:
+            previous = self.get_generation_attempt(retry_of_attempt_id)
+            if previous["contract_id"] != contract_id:
+                raise OutlineGateError("retry attempt belongs to another outline contract")
+            if previous["status"] not in {"failed", "cancelled"}:
+                raise OutlineGateError("only failed or cancelled outline attempts can be retried")
+            if previous["context_digest"] != context_digest:
+                raise OutlineGateError("outline context changed; start a new generation attempt")
+            snapshot = dict(previous["prompt_snapshot"])
+
+        attempt_id = f"outline-attempt-{uuid4()}"
+        now = self._now()
+        conn = self._connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO outline_generation_attempts
+                    (id, contract_id, status, retry_of_attempt_id, context_digest,
+                     prompt_snapshot_json, created_at, updated_at)
+                VALUES (?, ?, 'running', ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    contract_id,
+                    retry_of_attempt_id,
+                    context_digest,
+                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise OutlineGateError("an outline generation attempt is already running") from exc
+        self._append_generation_attempt_event(
+            attempt_id,
+            {"type": "started", "contract_id": contract_id, "retry_of_attempt_id": retry_of_attempt_id},
+        )
+        return self.get_generation_attempt(attempt_id)
+
+    def _append_generation_attempt_event(
+        self, attempt_id: str, event: dict[str, Any]
+    ) -> None:
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT 1 FROM outline_generation_attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outline generation attempt not found: {attempt_id}")
+        sequence = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence "
+                "FROM outline_generation_attempt_events WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()["sequence"]
+        )
+        conn.execute(
+            """
+            INSERT INTO outline_generation_attempt_events
+                (id, attempt_id, sequence, event_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                f"outline-attempt-event-{uuid4()}",
+                attempt_id,
+                sequence,
+                json.dumps(event, ensure_ascii=False, sort_keys=True),
+                self._now(),
+            ),
+        )
+        conn.commit()
+
+    def append_generation_attempt_delta(self, attempt_id: str, text: str) -> dict[str, Any]:
+        """Persist a streamed delta before it is exposed to a reconnecting client."""
+
+        if not text:
+            return self.get_generation_attempt(attempt_id)
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT status FROM outline_generation_attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outline generation attempt not found: {attempt_id}")
+        if row["status"] != "running":
+            raise OutlineGateError("outline generation attempt is no longer running")
+        conn.execute(
+            """
+            UPDATE outline_generation_attempts
+            SET accumulated_text = accumulated_text || ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (text, self._now(), attempt_id),
+        )
+        conn.commit()
+        self._append_generation_attempt_event(attempt_id, {"type": "delta", "text": text})
+        return self.get_generation_attempt(attempt_id)
+
+    def complete_generation_attempt(
+        self, attempt_id: str, *, draft_revision: int
+    ) -> dict[str, Any]:
+        return self._finish_generation_attempt(
+            attempt_id,
+            status="completed",
+            draft_revision=draft_revision,
+        )
+
+    def fail_generation_attempt(self, attempt_id: str, error: str) -> dict[str, Any]:
+        return self._finish_generation_attempt(attempt_id, status="failed", error=error)
+
+    def cancel_generation_attempt(self, attempt_id: str) -> dict[str, Any]:
+        return self._finish_generation_attempt(attempt_id, status="cancelled")
+
+    def _finish_generation_attempt(
+        self,
+        attempt_id: str,
+        *,
+        status: str,
+        draft_revision: Optional[int] = None,
+        error: str = "",
+    ) -> dict[str, Any]:
+        if status not in {"completed", "failed", "cancelled"}:
+            raise ValueError("invalid outline generation attempt status")
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT status FROM outline_generation_attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outline generation attempt not found: {attempt_id}")
+        if row["status"] != "running":
+            return self.get_generation_attempt(attempt_id)
+        now = self._now()
+        conn.execute(
+            """
+            UPDATE outline_generation_attempts
+            SET status = ?, draft_revision = ?, error = ?, completed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, draft_revision, error, now, now, attempt_id),
+        )
+        conn.commit()
+        event = {"type": "completed" if status == "completed" else ("cancelled" if status == "cancelled" else "error")}
+        if draft_revision is not None:
+            event["draft_revision"] = draft_revision
+        if error:
+            event["message"] = error
+        self._append_generation_attempt_event(attempt_id, event)
+        return self.get_generation_attempt(attempt_id)
+
+    def get_generation_attempt(
+        self, attempt_id: str, *, after_sequence: int = 0
+    ) -> dict[str, Any]:
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT * FROM outline_generation_attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outline generation attempt not found: {attempt_id}")
+        events = conn.execute(
+            """
+            SELECT sequence, event_json FROM outline_generation_attempt_events
+            WHERE attempt_id = ? AND sequence > ?
+            ORDER BY sequence
+            """,
+            (attempt_id, int(after_sequence)),
+        ).fetchall()
+        return {
+            "id": str(row["id"]),
+            "contract_id": str(row["contract_id"]),
+            "status": str(row["status"]),
+            "retry_of_attempt_id": row["retry_of_attempt_id"],
+            "context_digest": str(row["context_digest"] or ""),
+            "prompt_snapshot": json.loads(row["prompt_snapshot_json"] or "{}"),
+            "accumulated_text": str(row["accumulated_text"] or ""),
+            "draft_revision": row["draft_revision"],
+            "error": str(row["error"] or ""),
+            "events": [
+                {"sequence": int(event["sequence"]), **json.loads(event["event_json"] or "{}")}
+                for event in events
+            ],
+        }
+
+    def get_latest_generation_attempt(
+        self, contract_id: str, *, after_sequence: int = 0
+    ) -> Optional[dict[str, Any]]:
+        row = self._connection().execute(
+            """
+            SELECT id FROM outline_generation_attempts
+            WHERE contract_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (contract_id,),
+        ).fetchone()
+        return self.get_generation_attempt(str(row["id"]), after_sequence=after_sequence) if row else None

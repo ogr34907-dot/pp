@@ -22,6 +22,21 @@
       <span><n-icon :component="ClipboardOutline" aria-hidden="true" />{{ progress.modeLabel }}</span>
     </div>
 
+    <div v-if="dagRun" class="candidate-progress__dag" aria-live="polite">
+      <span class="candidate-progress__dag-label">DAG V2</span>
+      <strong>{{ dagNodeLabel }}</strong>
+      <span>{{ dagDetail }}</span>
+      <span v-if="retryCount" class="candidate-progress__dag-retry">重试 {{ retryCount }} 次</span>
+    </div>
+
+    <div v-if="candidateProse" class="candidate-progress__prose" aria-live="polite">
+      <div class="candidate-progress__prose-head">
+        <span>正文流</span>
+        <strong>{{ candidateProse.length }} 字</strong>
+      </div>
+      <p>{{ candidateProsePreview }}</p>
+    </div>
+
     <div
       class="candidate-progress__book-bar"
       role="progressbar"
@@ -58,7 +73,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, type Component } from 'vue'
+import { computed, onBeforeUnmount, ref, watch, type Component } from 'vue'
 import {
   AlertCircleOutline,
   CheckmarkOutline,
@@ -70,8 +85,10 @@ import {
   ShieldCheckmarkOutline,
   SyncOutline,
 } from '@vicons/ionicons5'
-import type { GenerationRun } from '@/api/generation'
+import { generationApi, type CandidateDagRun, type GenerationRun } from '@/api/generation'
 import {
+  applyCandidateProseEvents,
+  getCandidateProsePreview,
   getCandidateGenerationProgress,
   type CandidateGenerationProgressStep,
 } from '@/domain/candidateGenerationProgress'
@@ -79,6 +96,11 @@ import {
 const props = defineProps<{ run: GenerationRun | null }>()
 
 const progress = computed(() => getCandidateGenerationProgress(props.run))
+const dagRun = ref<CandidateDagRun | null>(null)
+const candidateProse = ref('')
+let dagTimer: number | null = null
+let dagCursor = 0
+let dagRefreshInFlight = false
 const formalChapterLabel = computed(() => {
   if (!progress.value.targetChapters) return `正式书稿 ${progress.value.formalChapters} 章`
   return `正式书稿 ${progress.value.formalChapters} / ${progress.value.targetChapters} 章`
@@ -98,6 +120,75 @@ const stepIcons: Record<CandidateGenerationProgressStep['key'], Component> = {
 function stepIcon(key: CandidateGenerationProgressStep['key']): Component {
   return stepIcons[key]
 }
+
+const dagNodeLabel = computed(() => {
+  const node = dagRun.value?.current_node_id || ''
+  return node ? node.replace(/_/g, ' ') : '正在初始化节点'
+})
+const retryCount = computed(() => Math.max(0, (dagRun.value?.node_attempts || []).length - new Set(
+  (dagRun.value?.node_attempts || []).map(item => item.node_id),
+).size))
+const dagDetail = computed(() => {
+  const run = dagRun.value
+  if (!run) return ''
+  if (run.status === 'failed') return run.failure_reason || '节点执行失败，可从审稿台重新生成候选稿。'
+  const active = run.node_attempts.find(item => item.status === 'running')
+  if (active) return `正在执行 ${active.node_type.replace(/_/g, ' ')}`
+  const completed = run.node_attempts.filter(item => item.status === 'completed')
+  const totalMs = completed.reduce((sum, item) => sum + Number(item.duration_ms || 0), 0)
+  return totalMs ? `已完成 ${completed.length} 个节点，用时 ${(totalMs / 1000).toFixed(1)} 秒` : `已记录 ${completed.length} 个节点`
+})
+const candidateProsePreview = computed(() => getCandidateProsePreview(candidateProse.value))
+
+async function refreshDagTrace() {
+  const candidateId = props.run?.current_candidate_id
+  if (!candidateId) { dagRun.value = null; candidateProse.value = ''; dagCursor = 0; return }
+  if (dagRefreshInFlight) return
+  dagRefreshInFlight = true
+  try {
+    let next = await generationApi.getLatestDagRun(candidateId, dagCursor)
+    if (candidateId !== props.run?.current_candidate_id) return
+    if (!next) { dagRun.value = null; dagCursor = 0; return }
+    if (dagRun.value?.id && dagRun.value.id !== next.id && dagCursor > 0) {
+      next = await generationApi.getLatestDagRun(candidateId, 0)
+      if (candidateId !== props.run?.current_candidate_id || !next) return
+    }
+    const previousDagRunId = dagRun.value?.id || ''
+    dagRun.value = next
+    const events = next.events || []
+    const nextProse = applyCandidateProseEvents(
+      { dagRunId: previousDagRunId, cursor: dagCursor, prose: candidateProse.value },
+      next.id,
+      events,
+    )
+    candidateProse.value = nextProse.prose
+    dagCursor = nextProse.cursor
+  } catch {
+    // The broad generation state remains authoritative when a trace has not been created yet.
+  } finally {
+    dagRefreshInFlight = false
+  }
+}
+
+function startDagPolling() {
+  if (dagTimer !== null) return
+  void refreshDagTrace()
+  dagTimer = window.setInterval(() => void refreshDagTrace(), 1500)
+}
+
+function stopDagPolling() {
+  if (dagTimer !== null) window.clearInterval(dagTimer)
+  dagTimer = null
+}
+
+watch(() => props.run?.current_candidate_id, () => {
+  dagRun.value = null
+  candidateProse.value = ''
+  dagCursor = 0
+  if (props.run?.current_candidate_id) startDagPolling()
+  else stopDagPolling()
+}, { immediate: true })
+onBeforeUnmount(stopDagPolling)
 </script>
 
 <style scoped>
@@ -190,6 +281,59 @@ function stepIcon(key: CandidateGenerationProgressStep['key']): Component {
 .candidate-progress__meta :deep(.n-icon) {
   color: var(--app-text-muted);
   font-size: 14px;
+}
+
+.candidate-progress__dag {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-height: 32px;
+  padding: 7px 10px;
+  border-left: 3px solid var(--color-brand);
+  color: var(--app-text-secondary);
+  background: var(--app-surface-subtle);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.candidate-progress__dag-label {
+  color: var(--color-brand);
+  font-weight: 700;
+}
+
+.candidate-progress__dag strong { color: var(--app-text-primary); text-transform: none; }
+.candidate-progress__dag-retry { color: var(--color-warning); }
+
+.candidate-progress__prose {
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--app-border);
+}
+
+.candidate-progress__prose-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--app-text-secondary);
+  font-size: 12px;
+}
+
+.candidate-progress__prose-head strong { color: var(--color-brand); }
+
+.candidate-progress__prose p {
+  display: -webkit-box;
+  max-height: 5.4em;
+  margin: 6px 0 0;
+  overflow: hidden;
+  color: var(--app-text-secondary);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .candidate-progress__book-bar {

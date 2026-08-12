@@ -47,6 +47,7 @@ class GeminiProvider(BaseProvider):
             params=query,
             headers=self._build_headers(stream=False),
             json=payload,
+            timeout=config.timeout_seconds or self.settings.timeout_seconds,
         )
         response.raise_for_status()
         data = response.json()
@@ -56,9 +57,14 @@ class GeminiProvider(BaseProvider):
             raise RuntimeError('Gemini returned empty content')
 
         usage = data.get('usageMetadata') or {}
+        input_tokens = int(usage.get('promptTokenCount') or 0)
+        cache_hit_tokens = int(usage.get('cachedContentTokenCount') or 0)
         token_usage = TokenUsage(
-            input_tokens=int(usage.get('promptTokenCount') or 0),
+            input_tokens=input_tokens,
             output_tokens=int(usage.get('candidatesTokenCount') or 0),
+            cache_hit_tokens=cache_hit_tokens,
+            cache_miss_tokens=max(0, input_tokens - cache_hit_tokens),
+            reasoning_tokens=int(usage.get('thoughtsTokenCount') or 0),
         )
         return GenerationResult(content=content, token_usage=token_usage)
 
@@ -78,6 +84,7 @@ class GeminiProvider(BaseProvider):
             params=query,
             headers=self._build_headers(stream=True),
             json=payload,
+            timeout=config.timeout_seconds or self.settings.timeout_seconds,
         ) as response:
             response.raise_for_status()
             buffer = ''

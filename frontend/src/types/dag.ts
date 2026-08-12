@@ -14,7 +14,7 @@
 
 export type NodeCategory = 'context' | 'execution' | 'validation' | 'gateway'
 export type NodeStatus = 'idle' | 'pending' | 'running' | 'success' | 'warning' | 'error' | 'bypassed' | 'disabled' | 'completed'
-export type EdgeCondition = 'on_success' | 'on_error' | 'on_drift_alert' | 'on_no_drift' | 'on_breaker_open' | 'on_breaker_closed' | 'on_review_approved' | 'on_review_rejected' | 'always'
+export type EdgeCondition = 'on_success' | 'on_error' | 'on_drift_alert' | 'on_no_drift' | 'on_breaker_open' | 'on_breaker_closed' | 'on_review_approved' | 'on_review_rejected' | 'on_retry_exhausted' | 'always'
 export type PortDataType = 'text' | 'json' | 'score' | 'boolean' | 'list' | 'prompt'
 
 // ─── 端口 ───

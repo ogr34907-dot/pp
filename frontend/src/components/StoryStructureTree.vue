@@ -82,12 +82,12 @@
               v-if="!loading && !autopilotEmptyMode"
               type="primary"
               size="small"
-              @click="emit('openPlanModal')"
+              @click="emit('openOutlineStudio')"
             >
-              生成叙事骨架
+              规划五级大纲
             </n-button>
             <n-alert v-if="!autopilotEmptyMode" type="info" :show-icon="false" style="font-size: 12px; max-width: 240px; text-align: center;">
-              <strong>提示</strong>：可在正文区直接生成正文
+              请先发布五级大纲，再开始候选写作。
             </n-alert>
           </n-space>
         </template>
@@ -161,7 +161,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   selectChapter: [id: number, title: string]
   planAct: [actId: string, actTitle: string]
-  openPlanModal: []
+  openOutlineStudio: []
   treeLoaded: [hasData: boolean]
 }>()
 
