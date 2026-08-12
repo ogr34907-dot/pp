@@ -63,6 +63,50 @@ class WorldlineRebuildService:
         if current_epoch != expected_epoch:
             raise WorldlineRebuildCancelled(current_epoch)
 
+    @staticmethod
+    def _retained_formal_chapters(conn, novel_id: str):
+        """Return the contiguous formal prefix that is safe to replay."""
+
+        has_candidate_commits = conn.execute(
+            "SELECT 1 FROM chapter_candidate_formal_commits WHERE novel_id = ? LIMIT 1",
+            (novel_id,),
+        ).fetchone()
+        if has_candidate_commits is None:
+            # Existing worldline archives predate candidate-first authority.
+            rows = conn.execute(
+                """
+                SELECT number, content, content_sha256, content_revision, outline
+                FROM chapters
+                WHERE novel_id = ? AND status = 'completed'
+                  AND TRIM(COALESCE(content, '')) <> ''
+                ORDER BY number
+                """,
+                (novel_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT c.number, c.content, c.content_sha256, c.content_revision, c.outline
+                FROM chapter_candidate_formal_commits AS commit_record
+                JOIN chapter_candidates AS candidate ON candidate.id = commit_record.candidate_id
+                JOIN chapters AS c ON c.id = commit_record.chapter_id
+                WHERE commit_record.novel_id = ?
+                  AND commit_record.sync_status = 'ready'
+                  AND candidate.status = 'committed'
+                  AND c.status = 'completed'
+                  AND TRIM(COALESCE(c.content, '')) <> ''
+                ORDER BY c.number
+                """,
+                (novel_id,),
+            ).fetchall()
+
+        prefix = []
+        for row in rows:
+            if int(row["number"]) != len(prefix) + 1:
+                break
+            prefix.append(row)
+        return prefix
+
     async def rebuild(self, novel_id: str) -> dict[str, Any]:
         conn = self._connection()
         run = conn.execute(
@@ -92,13 +136,7 @@ class WorldlineRebuildService:
             ("", now, novel_id),
         )
         conn.commit()
-        rows = conn.execute(
-            """
-            SELECT number, content, content_sha256, content_revision, outline
-            FROM chapters WHERE novel_id = ? ORDER BY number
-            """,
-            (novel_id,),
-        ).fetchall()
+        rows = self._retained_formal_chapters(conn, novel_id)
         try:
             for chapter in rows:
                 self._ensure_epoch(conn, novel_id, epoch)

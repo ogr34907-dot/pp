@@ -217,6 +217,7 @@ def setup_logging(
     root_logger = logging.getLogger()
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
+        handler.close()
 
     root_logger.setLevel(parsed_level)
 
@@ -333,12 +334,16 @@ def _add_file_handler(
 def _configure_framework_loggers(level: int, use_color: bool) -> None:
     for name in FRAMEWORK_LOGGERS:
         logger = logging.getLogger(name)
-        logger.handlers.clear()
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
         logger.propagate = True
         logger.setLevel(level)
 
     access_logger = logging.getLogger("uvicorn.access")
-    access_logger.handlers.clear()
+    for handler in access_logger.handlers[:]:
+        access_logger.removeHandler(handler)
+        handler.close()
     access_logger.propagate = False
     access_logger.setLevel(level)
     access_handler = SafeConsoleHandler()

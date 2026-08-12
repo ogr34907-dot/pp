@@ -5,7 +5,9 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Iterable, Optional
+from uuid import uuid4
 
 from application.core.async_bridge import run_coroutine_sync
 from application.manuscript.reindex_job import reindex_chapter_entity_mentions
@@ -215,6 +217,9 @@ class ChapterRewriteCoordinator:
 
         with sqlite_writes_bypass_queue():
             with self._db.transaction() as conn:
+                self._ensure_no_downstream_pending_sync(
+                    conn, novel_id, chapter_number
+                )
                 source = conn.execute(
                     "SELECT content, content_sha256, content_revision FROM chapters WHERE id = ?",
                     (chapter_id,),
@@ -247,9 +252,29 @@ class ChapterRewriteCoordinator:
 
                 changed_ids = self._chapter_ids_from(conn, novel_id, chapter_number)
                 self._invalidate_downstream(conn, novel_id, chapter_number, changed_ids)
+                self._retire_downstream_candidates(conn, novel_id, chapter_number)
                 self._pause_mainline(conn, novel_id)
 
         return self._load_chapter(novel_id, chapter_number, chapter)
+
+    def _ensure_no_downstream_pending_sync(
+        self, conn: Any, novel_id: str, chapter_number: int
+    ) -> None:
+        """Do not rewrite an upstream chapter while a later formal commit syncs."""
+
+        if not self._table_columns(conn, "chapter_candidate_formal_commits"):
+            return
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM chapter_candidate_formal_commits
+            WHERE novel_id = ? AND chapter_number > ? AND sync_status != 'ready'
+            LIMIT 1
+            """,
+            (novel_id, chapter_number),
+        ).fetchone()
+        if row is not None:
+            raise ChapterRewriteConflictError("pending canonical sync")
 
     def _chapter_head(self, novel_id: str) -> int:
         row = self._db.fetch_one(
@@ -629,12 +654,126 @@ class ChapterRewriteCoordinator:
             assignments.append("current_stage = 'paused_for_review'")
         if "active_pipeline_step" in columns:
             assignments.append("active_pipeline_step = ''")
+        if "active_pipeline_run_id" in columns:
+            assignments.append("active_pipeline_run_id = ''")
+        if "autopilot_run_epoch" in columns:
+            assignments.append("autopilot_run_epoch = autopilot_run_epoch + 1")
         if "updated_at" in columns:
             assignments.append("updated_at = CURRENT_TIMESTAMP")
         if assignments:
             conn.execute(
                 f"UPDATE novels SET {', '.join(assignments)} WHERE id = ?", (novel_id,)
             )
+
+    def _retire_downstream_candidates(
+        self, conn: Any, novel_id: str, chapter_number: int
+    ) -> None:
+        """Make pre-rewrite candidate work unusable until Canonical replay finishes."""
+
+        run_columns = self._table_columns(conn, "novel_generation_runs")
+        candidate_columns = self._table_columns(conn, "chapter_candidates")
+        if not {"novel_id", "generation_epoch"} <= run_columns or not candidate_columns:
+            return
+        run = conn.execute(
+            "SELECT generation_epoch FROM novel_generation_runs WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        if run is None:
+            return
+
+        now = datetime.now().isoformat()
+        # Only candidates after the rewritten formal chapter depend on its old
+        # Canonical context. A committed source chapter remains the formal head.
+        active_statuses = (
+            "streaming",
+            "auditing",
+            "awaiting_review",
+            "committing",
+            "syncing",
+            "regenerating",
+            "failed",
+        )
+        placeholders = ", ".join("?" for _ in active_statuses)
+        candidate_ids = [
+            str(row[0])
+            for row in conn.execute(
+                f"""
+                SELECT id FROM chapter_candidates
+                WHERE novel_id = ? AND chapter_number > ? AND status IN ({placeholders})
+                """,
+                (novel_id, chapter_number, *active_statuses),
+            ).fetchall()
+        ]
+        if candidate_ids:
+            candidate_placeholders = ", ".join("?" for _ in candidate_ids)
+            conn.execute(
+                f"""
+                UPDATE chapter_candidates
+                SET status = 'stale', audit_revision = 0, commit_plan_content_revision = 0,
+                    failure_reason = 'chapter_rewritten', updated_at = ?
+                WHERE id IN ({candidate_placeholders})
+                """,
+                (now, *candidate_ids),
+            )
+            if self._table_columns(conn, "candidate_dag_runs"):
+                conn.execute(
+                    f"""
+                    UPDATE candidate_dag_runs
+                    SET status = 'cancelled', failure_reason = 'chapter_rewritten',
+                        completed_at = ?, updated_at = ?
+                    WHERE candidate_id IN ({candidate_placeholders}) AND status = 'running'
+                    """,
+                    (now, now, *candidate_ids),
+                )
+            if self._table_columns(conn, "chapter_candidate_formal_commits"):
+                conn.execute(
+                    f"""
+                    UPDATE chapter_candidate_formal_commits
+                    SET sync_status = 'failed', failure_reason = 'chapter_rewritten'
+                    WHERE candidate_id IN ({candidate_placeholders}) AND sync_status = 'syncing'
+                    """,
+                    tuple(candidate_ids),
+                )
+
+        new_epoch = int(run[0] or 0) + 1
+        conn.execute(
+            """
+            UPDATE novel_generation_runs
+            SET state = 'paused', generation_epoch = ?, current_candidate_id = NULL,
+                current_candidate_chapter = NULL, canonical_sync_status = 'rebuilding',
+                next_action = 'rebuild_worldline', last_error = 'chapter_rewritten', updated_at = ?
+            WHERE novel_id = ?
+            """,
+            (new_epoch, now, novel_id),
+        )
+        if self._table_columns(conn, "worldline_generation_filters"):
+            conn.execute(
+                """
+                INSERT INTO worldline_generation_filters (novel_id, active_generation_epoch, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(novel_id) DO UPDATE SET
+                    active_generation_epoch = excluded.active_generation_epoch,
+                    updated_at = excluded.updated_at
+                """,
+                (novel_id, new_epoch, now),
+            )
+        if self._table_columns(conn, "worldline_rebuild_jobs"):
+            for job_type in (
+                "canonical_facts",
+                "memory",
+                "vectors",
+                "foreshadowing",
+                "macro_summaries",
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO worldline_rebuild_jobs
+                        (id, novel_id, generation_epoch, job_type, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                    ON CONFLICT(novel_id, generation_epoch, job_type) DO NOTHING
+                    """,
+                    (f"worldline-job-{uuid4()}", novel_id, new_epoch, job_type, now, now),
+                )
 
     def _invalidate_vectors(self, novel_id: str, chapter_number: int) -> None:
         if self._vectors is None:

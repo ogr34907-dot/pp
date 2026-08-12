@@ -39,3 +39,27 @@ def test_setup_logging_uses_injected_file_rotation_settings(tmp_path):
     assert handlers
     assert handlers[0].maxBytes == 1234
     assert handlers[0].backupCount == 2
+
+
+def test_setup_logging_closes_handlers_from_a_previous_configuration(tmp_path):
+    first_log = tmp_path / "first.log"
+    second_log = tmp_path / "second.log"
+    environment = LoggingEnvironmentSettings(color_mode="never")
+
+    try:
+        logging_config.setup_logging(log_file=str(first_log), environment=environment)
+        first_handler = next(
+            h for h in logging.getLogger().handlers if isinstance(h, RotatingFileHandler)
+        )
+        logging_config.setup_logging(log_file=str(second_log), environment=environment)
+        assert first_handler.stream is None
+        first_log.unlink()
+    finally:
+        root = logging.getLogger()
+        for handler in root.handlers[:]:
+            root.removeHandler(handler)
+            handler.close()
+        access = logging.getLogger("uvicorn.access")
+        for handler in access.handlers[:]:
+            access.removeHandler(handler)
+            handler.close()

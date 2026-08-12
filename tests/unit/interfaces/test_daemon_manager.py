@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 from interfaces.api.settings import BackendSettings
@@ -10,6 +11,7 @@ from interfaces.daemon_manager import (
     DaemonStatus,
     cleanup_orphan_python_processes,
     is_expected_daemon_shutdown_exception,
+    run_autopilot_daemon_process,
 )
 
 
@@ -83,6 +85,68 @@ def test_daemon_manager_start_respects_disable_auto_daemon():
     assert manager.process is None
 
 
+def test_daemon_manager_binds_the_api_state_publisher_to_the_v1_consumer(
+    monkeypatch,
+):
+    """API routes must reuse the queue that the startup consumer drains."""
+
+    events = []
+    queue = type(
+        "PersistenceQueue",
+        (),
+        {"is_consumer_running": lambda self: True, "start_consumer": lambda self: None},
+    )()
+    process = FakeProcess(alive=True)
+    manager = AutopilotDaemonManager(
+        log_level=20,
+        log_file="logs/test.log",
+        shared_state_provider=lambda: {},
+        settings_provider=lambda: BackendSettings(disable_auto_daemon=False),
+        process_factory=lambda **_kwargs: process,
+        event_factory=FakeEvent,
+    )
+
+    monkeypatch.setenv("DISABLE_ORPHAN_CLEANUP", "1")
+    monkeypatch.setattr(
+        "interfaces.daemon_manager.multiprocessing.set_executable", lambda _path: None
+    )
+    monkeypatch.setattr(
+        "interfaces.daemon_manager._write_daemon_pid_registry", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        "application.engine.services.streaming_bus.init_streaming_bus", lambda: object()
+    )
+    monkeypatch.setattr(
+        "application.engine.services.shared_state_repository.init_shared_state_repository",
+        lambda _shared: "shared-repository",
+    )
+    monkeypatch.setattr(
+        "application.engine.services.state_bootstrap.bootstrap_state", lambda: {}
+    )
+    monkeypatch.setattr(
+        "application.engine.services.query_service.init_query_service", lambda _repo: None
+    )
+    monkeypatch.setattr(
+        "application.engine.services.persistence_queue.initialize_persistence_queue",
+        lambda: queue,
+    )
+    monkeypatch.setattr(
+        "application.engine.services.persistence_queue.register_persistence_handlers",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "application.engine.services.persistence_queue.get_persistence_queue", lambda: queue
+    )
+    monkeypatch.setattr(
+        "application.engine.services.state_publisher.init_state_publisher",
+        lambda shared, persistence: events.append((shared, persistence)),
+    )
+
+    manager.start()
+
+    assert events == [("shared-repository", queue)]
+
+
 def test_daemon_manager_stop_signals_and_terminates_stuck_process(monkeypatch):
     process = FakeProcess(alive=True)
     event = FakeEvent()
@@ -106,6 +170,93 @@ def test_daemon_manager_stop_signals_and_terminates_stuck_process(monkeypatch):
     assert process.join_calls == [0.25, 0.5]
     assert manager.process is None
     assert manager.stop_event is None
+
+
+def test_daemon_process_binds_the_injected_queue_before_initializing_state_publisher(
+    monkeypatch,
+):
+    """The child must not construct an unconsumed V2 queue before V1 injection."""
+
+    events = []
+    injected_queue = object()
+    consumer_queue = object()
+
+    class StopEvent:
+        def is_set(self):
+            return True
+
+        def wait(self, timeout=None):
+            return True
+
+    class FakeDaemon:
+        poll_interval = 0
+
+        def _get_active_novels(self):
+            return []
+
+    monkeypatch.setattr(
+        "interfaces.api.middleware.logging_config.setup_logging",
+        lambda **_kwargs: events.append("logging"),
+    )
+    monkeypatch.setattr(
+        "application.engine.services.streaming_bus.inject_stream_queue",
+        lambda _queue: events.append("stream"),
+    )
+    shared_module = __import__(
+        "application.engine.services.shared_state_repository", fromlist=["*"]
+    )
+    monkeypatch.setattr(
+        shared_module,
+        "inject_shared_dict",
+        lambda _shared: events.append("shared"),
+    )
+    monkeypatch.setattr(shared_module, "get_shared_state_repository", lambda: "repo")
+    state_module = __import__(
+        "application.engine.services.state_publisher", fromlist=["*"]
+    )
+    monkeypatch.setattr(
+        state_module,
+        "init_state_publisher",
+        lambda shared, queue: events.append(("publisher", shared, queue)),
+    )
+    monkeypatch.setattr(
+        state_module,
+        "get_state_publisher",
+        lambda: (_ for _ in ()).throw(AssertionError("default publisher is unsafe")),
+    )
+    persistence_module = __import__(
+        "application.engine.services.persistence_queue", fromlist=["*"]
+    )
+    monkeypatch.setattr(
+        persistence_module,
+        "inject_persistence_queue",
+        lambda queue: events.append(("persistence", queue)),
+    )
+    monkeypatch.setattr(
+        persistence_module,
+        "get_persistence_queue",
+        lambda: consumer_queue,
+    )
+    monkeypatch.setattr(
+        "application.engine.services.novel_stop_signal.inject_novel_stop_events",
+        lambda: None,
+    )
+    fake_start_daemon = types.ModuleType("scripts.start_daemon")
+    fake_start_daemon.build_daemon = lambda: FakeDaemon()
+    monkeypatch.setitem(sys.modules, "scripts.start_daemon", fake_start_daemon)
+
+    run_autopilot_daemon_process(
+        StopEvent(),
+        20,
+        "logs/test.log",
+        stream_queue=object(),
+        shared_state={},
+        persistence_queue=injected_queue,
+    )
+
+    assert events.index(("persistence", injected_queue)) < events.index(
+        ("publisher", "repo", consumer_queue)
+    )
 
 
 def test_orphan_cleanup_does_not_kill_other_workspace_backend(monkeypatch):

@@ -207,11 +207,6 @@ def run_autopilot_daemon_process(
 
             inject_shared_dict(shared_state)
             process_logger.info("守护进程：共享状态字典已注入")
-
-            from application.engine.services.state_publisher import get_state_publisher
-
-            get_state_publisher()
-            process_logger.info("守护进程：状态发布器已初始化")
         except Exception as exc:
             process_logger.warning("共享状态注入失败（可忽略）: %s", exc)
 
@@ -223,6 +218,28 @@ def run_autopilot_daemon_process(
             process_logger.info("守护进程：持久化队列已注入")
         except Exception as exc:
             process_logger.warning("持久化队列注入失败（可忽略）: %s", exc)
+
+    if shared_state is not None:
+        try:
+            from application.engine.services.shared_state_repository import (
+                get_shared_state_repository,
+            )
+            from application.engine.services.state_publisher import init_state_publisher
+
+            if persistence_queue is not None:
+                from application.engine.services.persistence_queue import get_persistence_queue
+
+                queue_for_publisher = get_persistence_queue()
+                init_state_publisher(
+                    get_shared_state_repository(), queue_for_publisher
+                )
+            else:
+                from application.engine.services.state_publisher import get_state_publisher
+
+                get_state_publisher()
+            process_logger.info("守护进程：状态发布器已初始化")
+        except Exception as exc:
+            process_logger.warning("状态发布器初始化失败（可忽略）: %s", exc)
 
     try:
         from application.engine.services.novel_stop_signal import inject_novel_stop_events
@@ -562,6 +579,11 @@ class AutopilotDaemonManager:
             self._logger.info("持久化消费者线程已启动（单一写入者模式）")
         else:
             self._logger.debug("持久化消费者已在启动早期就绪（守护进程阶段不重复启动）")
+
+        from application.engine.services.state_publisher import init_state_publisher
+
+        init_state_publisher(shared_state_repo, queue)
+        self._logger.info("状态发布器已绑定到持久化消费者队列")
 
         self.stop_event = self._event_factory()
         self.process = self._process_factory(

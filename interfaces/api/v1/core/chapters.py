@@ -6,6 +6,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Path
 from pydantic import BaseModel, Field
 
 from application.core.services.chapter_service import ChapterService
+from application.core.services.chapter_rewrite_coordinator import (
+    ChapterRewriteConflictError,
+)
 from application.core.services.novel_service import NovelService
 from application.core.dtos.chapter_dto import ChapterDTO
 from application.core.dtos.novel_dto import NovelDTO
@@ -293,6 +296,8 @@ async def update_chapter(
         )
     except EntityNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ChapterRewriteConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
     content = request.content
     micro_beats_dicts: Optional[List[Dict[str, Any]]] = None
