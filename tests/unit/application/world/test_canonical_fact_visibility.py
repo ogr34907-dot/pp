@@ -4,13 +4,14 @@ from unittest.mock import AsyncMock
 import pytest
 
 from application.world.services.chapter_narrative_sync import (
+    _sync_chapter_narrative_after_save_once,
     sync_chapter_narrative_after_save,
 )
 from application.core.services.chapter_rewrite_coordinator import (
     ChapterRewriteCoordinator,
 )
 from application.world.services.knowledge_service import KnowledgeService
-from domain.novel.entities.chapter import Chapter
+from domain.novel.entities.chapter import Chapter, ChapterStatus
 from domain.novel.value_objects.novel_id import NovelId
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_causal_edge_repository import (
@@ -51,6 +52,112 @@ def _chapter_services(tmp_path, content: str):
     )
     chapter_repo.save(chapter)
     return db, chapter_repo, chapter, KnowledgeService(SqliteKnowledgeRepository(db))
+
+
+def test_repository_rejects_direct_save_after_canonical_commit(tmp_path):
+    """Formal canonical chapters must be rewritten through the coordinator."""
+    db = DatabaseConnection(str(tmp_path / "chapter-save-guard.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    )
+    chapter_repo = SqliteChapterRepository(db)
+    chapter_repo.save(
+        Chapter(
+            id="chapter-1",
+            novel_id=NovelId("novel-1"),
+            number=1,
+            title="Chapter",
+            content="正式旧正文",
+            status=ChapterStatus.COMPLETED,
+        )
+    )
+    source = db.fetch_one(
+        "SELECT content_sha256, content_revision FROM chapters "
+        "WHERE novel_id = 'novel-1' AND number = 1"
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status) VALUES (?, ?, ?, ?, ?, 'committed')",
+        (
+            "novel-1",
+            1,
+            source["content_sha256"],
+            "chapter-narrative-sync:v1",
+            source["content_revision"],
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="ChapterRewriteCoordinator"):
+        chapter_repo.save(
+            Chapter(
+                id="chapter-1",
+                novel_id=NovelId("novel-1"),
+                number=1,
+                title="Chapter",
+                content="旁路新正文",
+                status=ChapterStatus.COMPLETED,
+            )
+        )
+
+    row = db.fetch_one(
+        "SELECT content FROM chapters WHERE novel_id = 'novel-1' AND number = 1"
+    )
+    assert row["content"] == "正式旧正文"
+
+
+def test_repository_allows_new_empty_and_uncommitted_draft_updates(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "chapter-draft-save.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    )
+    chapter_repo = SqliteChapterRepository(db)
+
+    chapter_repo.save(
+        Chapter(
+            id="chapter-1",
+            novel_id=NovelId("novel-1"),
+            number=1,
+            title="Chapter",
+            content="",
+        )
+    )
+    chapter_repo.save(
+        Chapter(
+            id="chapter-1",
+            novel_id=NovelId("novel-1"),
+            number=1,
+            title="Chapter",
+            content="首段草稿",
+        )
+    )
+    chapter_repo.save(
+        Chapter(
+            id="chapter-1",
+            novel_id=NovelId("novel-1"),
+            number=1,
+            title="Chapter",
+            content="首段草稿\n\n追加草稿",
+        )
+    )
+    chapter_repo.save(
+        Chapter(
+            id="chapter-2",
+            novel_id=NovelId("novel-1"),
+            number=2,
+            title="Chapter 2",
+            content="新章草稿",
+        )
+    )
+
+    rows = db.fetch_all(
+        "SELECT number, content, content_revision FROM chapters "
+        "WHERE novel_id = 'novel-1' ORDER BY number"
+    )
+    assert [(row["number"], row["content"], row["content_revision"]) for row in rows] == [
+        (1, "首段草稿\n\n追加草稿", 3),
+        (2, "新章草稿", 1),
+    ]
 
 
 @pytest.mark.asyncio
@@ -853,6 +960,174 @@ async def test_failed_canonical_aftermath_does_not_expose_partial_facts(
     assert "城门坍塌后的追查伏笔" not in allocator._get_pending_foreshadowings(
         "novel-1", 2
     )
+
+
+@pytest.mark.asyncio
+async def test_changed_chapter_hides_old_and_failed_revision_facts_until_new_commit(
+    tmp_path, monkeypatch
+):
+    """A changed chapter must not expose facts from either revision.
+
+    The canonical rows intentionally have no revision column.  Once ordinary
+    chapter saving moves the source to revision 2, revision 1 must therefore
+    be hidden as well as the revision-2 partial rows until revision 2 commits.
+    """
+    old_content = "甲在旧修订正文中失去身份。"
+    new_content = "甲在新修订半成品正文中改写了选择。"
+    db, chapter_repo, _chapter, knowledge = _chapter_services(tmp_path, old_content)
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_database",
+        lambda *args, **kwargs: db,
+    )
+
+    def bundle(fact: str, *, causal: bool = False) -> dict:
+        return {
+            "summary": fact,
+            "key_events": fact,
+            "open_threads": "继续处理甲的后果",
+            "relation_triples": [
+                {
+                    "subject": "甲",
+                    "predicate": "修订状态",
+                    "object": fact,
+                    "evidence_text": fact,
+                }
+            ],
+            "foreshadow_hints": [],
+            "consumed_foreshadows": [],
+            "storyline_progress": [],
+            "dialogues": [],
+            "timeline_events": [],
+            "causal_edges": (
+                [
+                    {
+                        "source_event": fact,
+                        "target_event": "甲继续行动",
+                        "causal_type": "causes",
+                        "state_change": "甲的选择发生变化",
+                        "involved_characters": ["甲"],
+                        "evidence_text": fact,
+                    }
+                ]
+                if causal
+                else []
+            ),
+            "character_mutations": [],
+            "character_states": [],
+        }
+
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=bundle("旧修订事实")),
+    )
+    first = await sync_chapter_narrative_after_save(
+        "novel-1",
+        1,
+        old_content,
+        knowledge,
+        None,
+        SimpleNamespace(),
+        triple_repository=TripleRepository(db),
+        chapter_repository=chapter_repo,
+        causal_edge_repository=SqliteCausalEdgeRepository(db),
+    )
+    assert first.commit_status == "committed", first.failure_reason
+
+    chapter = chapter_repo.get_by_novel_and_number(NovelId("novel-1"), 1)
+    ChapterRewriteCoordinator(db=db, chapter_repository=chapter_repo).rewrite(
+        chapter,
+        new_content,
+    )
+    source = db.fetch_one(
+        "SELECT content_sha256, content_revision FROM chapters "
+        "WHERE novel_id = 'novel-1' AND number = 1"
+    )
+    assert source["content_revision"] == 2
+
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=bundle(new_content.rstrip("。"), causal=True)),
+    )
+
+    class FailingCausalRepository:
+        def save(self, _edge):
+            raise RuntimeError("causal write failed")
+
+    second = await _sync_chapter_narrative_after_save_once(
+        "novel-1",
+        1,
+        new_content,
+        knowledge,
+        None,
+        SimpleNamespace(),
+        triple_repository=TripleRepository(db),
+        chapter_repository=chapter_repo,
+        causal_edge_repository=FailingCausalRepository(),
+    )
+    assert second.commit_status == "failed"
+
+    commits = db.fetch_all(
+        "SELECT content_revision, status FROM chapter_narrative_commits "
+        "WHERE novel_id = 'novel-1' AND chapter_number = 1 "
+        "ORDER BY content_revision"
+    )
+    assert [(row["content_revision"], row["status"]) for row in commits] == [
+        (1, "stale"),
+        (2, "failed"),
+    ]
+
+    knowledge_view = knowledge.get_knowledge("novel-1")
+    knowledge_text = "\n".join(
+        f"{fact.subject} {fact.predicate} {fact.object}"
+        for fact in knowledge_view.facts
+    )
+    assert "旧修订事实" not in knowledge_text
+    assert "新修订半成品" not in knowledge_text
+
+    bible = _fact_lock_bible()
+    memory = MemoryEngine(
+        llm_service=object(),
+        bible_repository=SimpleNamespace(get_by_novel_id=lambda _novel_id: bible),
+        db_connection=db,
+    )
+    fact_lock = memory.build_fact_lock_section(
+        "novel-1", 2, "第2章，甲处理新修订后的身份后果。"
+    )
+    assert "旧修订事实" not in fact_lock
+    assert "新修订半成品" not in fact_lock
+
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=bundle("成功修订事实", causal=True)),
+    )
+    retry = await sync_chapter_narrative_after_save(
+        "novel-1",
+        1,
+        new_content,
+        knowledge,
+        None,
+        SimpleNamespace(),
+        triple_repository=TripleRepository(db),
+        chapter_repository=chapter_repo,
+        causal_edge_repository=SqliteCausalEdgeRepository(db),
+    )
+    assert retry.commit_status == "committed", retry.failure_reason
+
+    retry_knowledge = knowledge.get_knowledge("novel-1")
+    retry_text = "\n".join(
+        f"{fact.subject} {fact.predicate} {fact.object}"
+        for fact in retry_knowledge.facts
+    )
+    assert "旧修订事实" not in retry_text
+    assert "新修订半成品" not in retry_text
+    assert "成功修订事实" in retry_text
+
+    retry_fact_lock = memory.build_fact_lock_section(
+        "novel-1", 2, "第2章，甲处理成功修订后的身份后果。"
+    )
+    assert "旧修订事实" not in retry_fact_lock
+    assert "新修订半成品" not in retry_fact_lock
+    assert "成功修订事实" in retry_fact_lock
 
 
 @pytest.mark.asyncio

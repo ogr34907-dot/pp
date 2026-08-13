@@ -140,6 +140,14 @@ class ChapterCandidateRepository:
         target_chapters: int,
     ) -> GenerationRun:
         conn = self._connection()
+        novel = conn.execute(
+            "SELECT target_chapters FROM novels WHERE id = ?", (novel_id,)
+        ).fetchone()
+        if novel is None:
+            raise KeyError(f"novel not found: {novel_id}")
+        target_chapters = int(novel["target_chapters"] or 0)
+        if target_chapters < 1:
+            raise CandidateGateError("novel target_chapters must be at least 1")
         existing = conn.execute(
             "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
         ).fetchone()
@@ -1053,6 +1061,11 @@ class ChapterCandidateRepository:
             raise CandidateGateError("candidate is not awaiting author review")
         if not candidate.audit_is_current or not candidate.commit_plan_is_current:
             raise CandidateGateError("re-audit is required before formal commit")
+        audit = candidate.audit or {}
+        if audit.get("hard_blocks"):
+            raise CandidateGateError("candidate has hard block(s); formal commit is blocked")
+        if audit.get("required_events_complete") is False:
+            raise CandidateGateError("required event is incomplete; formal commit is blocked")
         now = self._now()
         conn = self._connection()
         conn.execute(

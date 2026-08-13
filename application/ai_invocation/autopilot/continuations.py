@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 from typing import Any, Mapping
 
 from application.ai.llm_json_extract import extract_outer_json_value, repair_json, strip_json_fences
@@ -195,7 +196,8 @@ def _write_chapter_draft(
         db = get_database(get_db_path())
         with sqlite_writes_bypass_queue():
             row = db.fetch_one(
-                "SELECT id, title, outline, content, status FROM chapters WHERE novel_id = ? AND number = ?",
+                "SELECT id, title, outline, content, status, content_sha256, content_revision "
+                "FROM chapters WHERE novel_id = ? AND number = ?",
                 (novel_id, chapter_number),
             )
             prior = str((row or {}).get("content") or "").strip()
@@ -227,6 +229,22 @@ def _write_chapter_draft(
                     "duplicate_content": False,
                     "completed_transition": False,
                 }
+            if (
+                row is not None
+                and prior
+                and merged != prior
+                and (
+                    prior_status == "completed"
+                    or db.fetch_one(
+                        "SELECT 1 FROM chapter_narrative_commits "
+                        "WHERE novel_id = ? AND chapter_number = ? LIMIT 1",
+                        (novel_id, chapter_number),
+                    )
+                )
+            ):
+                raise RuntimeError(
+                    "Formal or canonical chapter content changes require ChapterRewriteCoordinator"
+                )
             word_count = len(merged)
             if duplicate_content and row is not None and (append or prior_status == status):
                 return {
@@ -238,13 +256,15 @@ def _write_chapter_draft(
                     "status": prior_status,
                 }
             if row is None:
+                content_sha256 = hashlib.sha256(merged.encode("utf-8")).hexdigest()
                 db.execute(
                     """
                     INSERT INTO chapters (
-                        id, novel_id, number, title, content, outline, status, word_count,
+                        id, novel_id, number, title, content, content_sha256, content_revision,
+                        outline, status, word_count,
                         tension_score, plot_tension, emotional_tension, pacing_tension,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     (
                         f"autopilot:{novel_id}:{chapter_number}",
@@ -252,6 +272,7 @@ def _write_chapter_draft(
                         chapter_number,
                         f"第{chapter_number}章",
                         merged,
+                        content_sha256,
                         "",
                         status,
                         word_count,
@@ -259,13 +280,27 @@ def _write_chapter_draft(
                 )
                 action = "inserted"
             else:
+                content_sha256 = hashlib.sha256(merged.encode("utf-8")).hexdigest()
                 db.execute(
                     """
                     UPDATE chapters
-                    SET content = ?, status = ?, word_count = ?, updated_at = CURRENT_TIMESTAMP
+                    SET content = ?, content_sha256 = ?,
+                        content_revision = CASE
+                            WHEN content_sha256 = ? THEN MAX(content_revision, 1)
+                            ELSE MAX(content_revision + 1, 1)
+                        END,
+                        status = ?, word_count = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE novel_id = ? AND number = ?
                     """,
-                    (merged, status, word_count, novel_id, chapter_number),
+                    (
+                        merged,
+                        content_sha256,
+                        content_sha256,
+                        status,
+                        word_count,
+                        novel_id,
+                        chapter_number,
+                    ),
                 )
                 action = "updated"
             db.commit()

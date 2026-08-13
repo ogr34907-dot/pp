@@ -97,6 +97,21 @@ def test_start_run_resumes_formal_cursor_after_synced_candidate_commits(tmp_path
     assert candidate.chapter_number == 3
 
 
+def test_start_run_uses_persisted_novel_target_chapters(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "persisted-target.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-target", "Target Novel", "target-novel", 20),
+    )
+    db.get_connection().commit()
+
+    run = ChapterCandidateRepository(db).start_run(
+        "novel-target", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3
+    )
+
+    assert run.target_chapters == 20
+
+
 def test_start_run_ignores_empty_and_uncommitted_draft_chapters(tmp_path):
     """Draft placeholders must never move the durable formal cursor."""
 
@@ -185,6 +200,33 @@ def test_author_edit_stales_audit_and_commit_plan_until_reaudited(candidates):
     assert committed.status == CandidateStatus.COMMITTED
     assert repo.get_run("novel-1").state == GenerationRunState.RUNNING
     assert repo.get_run("novel-1").current_formal_chapter == 1
+
+
+def test_approve_for_commit_rejects_current_audit_hard_blocks(candidates):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="正文没有发生必发生事件",
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(
+        candidate.id,
+        audit={
+            "hard_blocks": [{"type": "forbidden_event", "event": "不得杀人"}],
+            "required_events_complete": False,
+        },
+        commit_plan={"timeline_events": ["正文没有发生的必发生事件"]},
+    )
+
+    with pytest.raises(CandidateGateError):
+        repo.approve_for_commit(candidate.id, continue_after_commit=True)
+
+    assert db.fetch_one(
+        "SELECT status FROM chapter_candidates WHERE id = ?", (candidate.id,)
+    )["status"] == "awaiting_review"
 
 
 def test_retired_generation_cannot_apply_late_candidate_worker_writes(candidates):

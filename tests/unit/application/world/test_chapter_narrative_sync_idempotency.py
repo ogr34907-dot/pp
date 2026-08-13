@@ -20,6 +20,7 @@ from application.world.services.chapter_narrative_sync import (
     update_narrative_debts,
 )
 from application.world.services.knowledge_service import KnowledgeService
+from application.core.services.chapter_rewrite_coordinator import ChapterRewriteCoordinator
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_chapter_repository import (
     SqliteChapterRepository,
@@ -125,6 +126,13 @@ def _canonical_bundle(summary="章末摘要"):
         "character_mutations": [],
         "character_states": [],
     }
+
+
+def _rewrite(chapter_repo, chapter, content):
+    return ChapterRewriteCoordinator(
+        db=chapter_repo.db,
+        chapter_repository=chapter_repo,
+    ).rewrite(chapter, content, rewrite_mode="safe_snapshot").chapter
 
 
 def _canonical_services(tmp_path, content="第一版正文"):
@@ -307,8 +315,7 @@ async def test_canonical_sync_reuses_same_version_and_claims_changed_content(
         chapter_repository=chapter_repo,
     )
 
-    chapter.update_content("第二版正文")
-    chapter_repo.save(chapter)
+    chapter = _rewrite(chapter_repo, chapter, "第二版正文")
     changed = await sync_chapter_narrative_after_save(
         "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
         chapter_repository=chapter_repo,
@@ -328,7 +335,7 @@ async def test_canonical_sync_reuses_same_version_and_claims_changed_content(
         {
             "content_sha256": hashlib.sha256("第一版正文".encode("utf-8")).hexdigest(),
             "content_revision": 1,
-            "status": "committed",
+            "status": "stale",
             "attempt_count": 1,
         },
         {
@@ -414,14 +421,12 @@ async def test_returning_to_prior_hash_reclaims_claim_for_current_revision(
         "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
         chapter_repository=chapter_repo,
     )
-    chapter.update_content("第二版正文")
-    chapter_repo.save(chapter)
+    chapter = _rewrite(chapter_repo, chapter, "第二版正文")
     second = await sync_chapter_narrative_after_save(
         "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
         chapter_repository=chapter_repo,
     )
-    chapter.update_content("第一版正文")
-    chapter_repo.save(chapter)
+    chapter = _rewrite(chapter_repo, chapter, "第一版正文")
     returned = await sync_chapter_narrative_after_save(
         "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
         chapter_repository=chapter_repo,
@@ -479,10 +484,8 @@ def test_stale_failure_cannot_poison_reclaimed_hash_revision(tmp_path):
         content_sha256=content_sha256,
         pipeline_version="chapter-narrative-sync:v1",
     )
-    chapter.update_content("第二版正文")
-    chapter_repo.save(chapter)
-    chapter.update_content("第一版正文")
-    chapter_repo.save(chapter)
+    chapter = _rewrite(chapter_repo, chapter, "第二版正文")
+    chapter = _rewrite(chapter_repo, chapter, "第一版正文")
     reclaimed = repository.claim(
         novel_id="novel-1",
         chapter_number=1,
@@ -539,8 +542,7 @@ async def test_current_version_readiness_requires_exact_committed_hash_and_revis
         pipeline_version=committed.pipeline_version,
     ) is True
 
-    chapter.update_content("第二版正文")
-    chapter_repo.save(chapter)
+    chapter = _rewrite(chapter_repo, chapter, "第二版正文")
 
     assert commit_repo.is_current_version_ready(
         novel_id="novel-1",
@@ -1351,8 +1353,7 @@ async def test_canonical_sync_retries_same_version_exactly_three_times(
 
     extract.side_effect = None
     extract.return_value = _canonical_bundle()
-    chapter.update_content("changed content")
-    chapter_repo.save(chapter)
+    chapter = _rewrite(chapter_repo, chapter, "changed content")
     changed = await sync_chapter_narrative_after_save(
         "novel-1", 1, chapter.content, knowledge, None, SimpleNamespace(),
         chapter_repository=chapter_repo,
@@ -1463,8 +1464,7 @@ async def test_stale_extraction_cannot_replace_the_newer_canonical_summary(
     )
     await old_started.wait()
 
-    chapter.update_content("第二版正文")
-    chapter_repo.save(chapter)
+    chapter = _rewrite(chapter_repo, chapter, "第二版正文")
     newer = await sync_chapter_narrative_after_save(
         "novel-1",
         1,

@@ -9,6 +9,7 @@ from application.blueprint.services.outline_draft_generation_service import (
     OutlineDraftGenerationError,
     OutlineDraftGenerationService,
 )
+from application.engine.dag.plan.schema import chapter_rhythm_from_outline_payload
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.outline_contract_repository import OutlineContractRepository
@@ -70,7 +71,7 @@ async def test_ai_draft_is_json_normalized_and_uses_only_synced_parent_context(t
     assert drafted.draft.payload.title == "AI 总纲"
     assert drafted.draft.source == OutlineSource.AI
     assert "总纲" in llm.prompts[0].user
-    assert "rhythm" in llm.prompts[0].user
+    assert "chapter_function" not in llm.prompts[0].user
 
     repo.publish_and_sync(root.id, expected_revision=drafted.draft.revision)
     child = repo.create_contract(
@@ -93,6 +94,68 @@ async def test_outline_draft_requires_a_json_object(tmp_path):
 
     with pytest.raises(OutlineDraftGenerationError, match="requires_json_object"):
         await service.generate_draft(root.id)
+
+
+@pytest.mark.asyncio
+async def test_ai_chapter_outline_requires_a_rhythm_contract(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "outline-chapter-rhythm-required.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', '节奏小说', 'rhythm-required')"
+    )
+    db.get_connection().commit()
+    repo = OutlineContractRepository(db)
+    parent = repo.ensure_root("novel-1")
+    parent_payload = OutlinePayload(
+        title="已发布父级",
+        narrative_text="承接并推进",
+        creative_goal="推进人物选择",
+        entry_state="当前状态",
+        exit_state="新的状态",
+        required_events=[],
+        state_changes={},
+        handoff_conditions=["承接下一章"],
+        chapter_start=1,
+        chapter_end=1,
+    )
+    for level in (
+        OutlineLevel.PART,
+        OutlineLevel.VOLUME,
+        OutlineLevel.ACT,
+        OutlineLevel.CHAPTER,
+    ):
+        parent = repo.save_draft(parent.id, parent_payload, source=OutlineSource.AUTHOR)
+        repo.publish_and_sync(parent.id, expected_revision=parent.draft.revision)
+        parent = repo.create_contract(
+            novel_id="novel-1", level=level, parent_contract_id=parent.id
+        )
+
+    llm = _LLM(
+            '{"title":"第一章","narrative_text":"主角进入雨夜",'
+            '"creative_goal":"推进选择","entry_state":"等待消息",'
+            '"exit_state":"决定出城","required_events":[],"forbidden_events":[],'
+            '"state_changes":{},"foreshadowing":{},"chapter_start":1,'
+            '"chapter_end":1,"word_budget":3000,"handoff_conditions":["承接出城"]}'
+    )
+    service = OutlineDraftGenerationService(repo, llm, db)
+
+    with pytest.raises(OutlineDraftGenerationError):
+        await service.generate_draft(parent.id)
+
+    assert repo.get_slot(parent.id).draft is None
+
+    llm.content = (
+        '{"title":"第一章","narrative_text":"主角进入雨夜",'
+        '"creative_goal":"推进选择","entry_state":"等待消息",'
+        '"exit_state":"决定出城","required_events":[],"forbidden_events":[],'
+        '"state_changes":{},"foreshadowing":{},"chapter_start":1,'
+        '"chapter_end":1,"word_budget":3000,"handoff_conditions":["承接出城"],'
+        '"rhythm":{"chapter_function":"setup","intensity_curve":["low","medium"],'
+        '"chapter_goal":"找到出城路线","chapter_delta":"获得路线",'
+        '"ending_hook":"城门即将关闭"}}'
+    )
+    drafted = await service.generate_draft(parent.id)
+    assert drafted.draft.payload.extra["rhythm"]["chapter_function"] == "setup"
+    assert chapter_rhythm_from_outline_payload(drafted.draft.payload).chapter_function == "setup"
 
 
 @pytest.mark.asyncio

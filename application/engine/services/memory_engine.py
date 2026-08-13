@@ -230,9 +230,14 @@ class FactLockBuilder:
         def committed_clause(alias: str, chapter_column: str) -> str:
             return (
                 "EXISTS (SELECT 1 FROM chapter_narrative_commits c "
+                "JOIN chapters source_chapter "
+                "ON source_chapter.novel_id = c.novel_id "
+                "AND source_chapter.number = c.chapter_number "
                 f"WHERE c.novel_id = {alias}.novel_id "
                 f"AND c.chapter_number = {alias}.{chapter_column} "
-                "AND c.status = 'committed')"
+                "AND c.status = 'committed' "
+                "AND c.content_sha256 = source_chapter.content_sha256 "
+                "AND c.content_revision = source_chapter.content_revision)"
             )
 
         def bounded_rows(rows: list[dict], limit: int = 200) -> list[dict]:

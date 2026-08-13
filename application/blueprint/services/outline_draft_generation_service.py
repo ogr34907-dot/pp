@@ -11,6 +11,7 @@ from typing import Any, AsyncIterator, Protocol
 from domain.ai.services.llm_service import GenerationConfig
 from domain.ai.value_objects.prompt import Prompt
 from domain.structure.outline_contract import OutlinePayload, OutlineSource, OutlineStatus
+from application.engine.dag.plan.schema import chapter_rhythm_from_outline_payload
 from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
     OutlineContractSlot,
@@ -133,11 +134,17 @@ class OutlineDraftGenerationService:
             "JSON 至少包含 title、narrative_text、creative_goal、entry_state、exit_state、"
             "required_events、forbidden_events、state_changes、foreshadowing、chapter_start、"
             "chapter_end、word_budget、handoff_conditions；章纲额外给 pov、scenes、beats、conflicts、ending_hook。"
-            "如果章纲明确了叙事职责，可额外给 rhythm 对象，字段可选："
-            "chapter_function（setup/transition/escalation/reversal/climax/aftermath/payoff/recovery/reveal）、"
-            "intensity_curve（low/medium/high/peak 的短数组）、chapter_goal、decisive_choice、"
-            "cost_or_risk、chapter_delta、turn_or_payoff、ending_hook；不确定时省略，不要臆造。"
         )
+        if slot.level.value == "chapter":
+            user += (
+                "章纲必须额外包含 rhythm 对象，且不得省略："
+                "chapter_function、intensity_curve、chapter_goal、chapter_delta、ending_hook。"
+                "chapter_function 可为 setup/transition/escalation/reversal/climax/aftermath/payoff/recovery/reveal。"
+                "escalation/reversal 还必须有 decisive_choice、cost_or_risk；"
+                "climax/payoff 还必须有 turn_or_payoff、cost_or_risk。"
+                "transition/aftermath/recovery 不强造大冲突，但 chapter_delta 与 ending_hook 必须体现关系、信息、资源、目标或情绪债的可见推进与自然交接；"
+                "setup/reveal 必须有可观察推进，不能只解释设定。"
+            )
         return Prompt(system=system, user=user)
 
     def _published_parent_context(self, slot: OutlineContractSlot) -> list[dict[str, Any]]:
@@ -182,6 +189,30 @@ class OutlineDraftGenerationService:
 
     def _save_generated(self, slot: OutlineContractSlot, raw: str) -> OutlineContractSlot:
         payload = OutlinePayload.from_dict(self._parse_json_object(raw))
+        if slot.level.value == "chapter":
+            rhythm = chapter_rhythm_from_outline_payload(payload)
+            if rhythm is None or not rhythm.chapter_function:
+                raise OutlineDraftGenerationError("chapter_outline_requires_rhythm_contract")
+            missing = [
+                name
+                for name in ("intensity_curve", "chapter_goal", "chapter_delta", "ending_hook")
+                if not getattr(rhythm, name)
+            ]
+            function = rhythm.chapter_function
+            if function in {"escalation", "reversal"}:
+                missing.extend(
+                    name for name in ("decisive_choice", "cost_or_risk")
+                    if not getattr(rhythm, name)
+                )
+            if function in {"climax", "payoff"}:
+                missing.extend(
+                    name for name in ("turn_or_payoff", "cost_or_risk")
+                    if not getattr(rhythm, name)
+                )
+            if missing:
+                raise OutlineDraftGenerationError(
+                    "chapter_outline_rhythm_missing:" + ",".join(missing)
+                )
         return self.repository.save_draft(slot.id, payload, source=OutlineSource.AI)
 
     @staticmethod

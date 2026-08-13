@@ -114,6 +114,22 @@ def test_start_accepts_a_complete_published_five_level_outline(client, db, test_
     assert response.json()["data"]["state"] == "running"
 
 
+def test_start_uses_novel_target_chapters_instead_of_request_target(client, db, test_novel_id):
+    _publish_next_chapter_chain(db, test_novel_id)
+    db.execute(
+        "UPDATE novels SET target_chapters = 500 WHERE id = ?", (test_novel_id,)
+    )
+    db.get_connection().commit()
+
+    response = client.post(
+        f"/api/v1/generation/novels/{test_novel_id}/start",
+        json={"run_mode": "chapter_review", "target_chapters": 100},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["target_chapters"] == 500
+
+
 def test_start_rejects_an_active_full_canonical_resync(client, db, test_novel_id):
     _publish_next_chapter_chain(db, test_novel_id)
     db.execute(

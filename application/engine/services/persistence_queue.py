@@ -481,6 +481,33 @@ def register_persistence_handlers() -> None:
                 str(content or "").encode("utf-8")
             ).hexdigest()
 
+            existing = db.fetch_one(
+                """
+                SELECT content, status,
+                       EXISTS(
+                           SELECT 1 FROM chapter_narrative_commits c
+                           WHERE c.novel_id = chapters.novel_id
+                             AND c.chapter_number = chapters.number
+                       ) AS has_canonical_state
+                FROM chapters
+                WHERE novel_id = ? AND number = ?
+                LIMIT 1
+                """,
+                (novel_id, chapter_number),
+            )
+            if (
+                existing
+                and str(existing["content"] or "")
+                and str(existing["content"] or "") != str(content or "")
+                and (
+                    str(existing["status"] or "") == "completed"
+                    or bool(existing["has_canonical_state"])
+                )
+            ):
+                raise RuntimeError(
+                    "Formal or canonical chapter content changes require ChapterRewriteCoordinator"
+                )
+
             # 使用轻量 SQL 更新
             db.execute(
                 """INSERT INTO chapters (

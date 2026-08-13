@@ -6,6 +6,7 @@ import pytest
 
 import application.engine.services.chapter_aftermath_pipeline as aftermath_pipeline_module
 from application.engine.services.chapter_aftermath_pipeline import ChapterAftermathPipeline
+from application.core.services.chapter_rewrite_coordinator import ChapterRewriteCoordinator
 from application.engine.services.memory_engine import MemoryEngine
 from domain.novel.entities.chapter import Chapter, ChapterStatus
 from domain.novel.value_objects.novel_id import NovelId
@@ -640,16 +641,14 @@ async def test_midflight_rewrite_cannot_merge_stale_memory(monkeypatch, tmp_path
         )
     )
     await started.wait()
-    chapter_repository.save(
-        Chapter(
-            id="chapter-1",
-            novel_id=NovelId("novel-1"),
-            number=1,
-            title="Chapter",
-            content="rewritten prose",
-            status=ChapterStatus.COMPLETED,
-        )
-    )
+    rewritten = ChapterRewriteCoordinator(
+        db=db,
+        chapter_repository=chapter_repository,
+    ).rewrite(
+        chapter,
+        "rewritten prose",
+    ).chapter
+    assert rewritten.content == "rewritten prose"
     release.set()
 
     result = await task

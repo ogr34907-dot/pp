@@ -401,7 +401,6 @@ class CandidateChapterWorkflowService:
             }
             for event in required_events
         ]
-        unresolved = [item["event"] for item in required if item["status"] != "completed"]
         raw_semantic_review = (
             generation_result.get("semantic_review")
             if isinstance(generation_result, dict)
@@ -417,18 +416,20 @@ class CandidateChapterWorkflowService:
             if isinstance(raw_semantic_review, dict)
             else await self._review_candidate_semantics(candidate, chapter, required_events)
         )
-        if unresolved:
-            coverage = {
-                str(item.get("event") or ""): item
-                for item in semantic_review.get("event_coverage", [])
-                if isinstance(item, dict)
-            }
-            for item in required:
-                reviewed = coverage.get(item["event"])
-                if reviewed and reviewed.get("status") == "completed":
-                    evidence = str(reviewed.get("evidence") or "").strip()
-                    if evidence and evidence in content:
-                        item.update(status="completed", evidence=evidence)
+        coverage = {
+            str(item.get("event") or ""): item
+            for item in semantic_review.get("event_coverage", [])
+            if isinstance(item, dict)
+        }
+        for item in required:
+            reviewed = coverage.get(item["event"])
+            if not reviewed:
+                continue
+            evidence = str(reviewed.get("evidence") or "").strip()
+            if reviewed.get("status") == "completed" and evidence and evidence in content:
+                item.update(status="completed", evidence=evidence)
+            else:
+                item.update(status="unverified", evidence="")
         required_events_complete = all(
             item["status"] == "completed" for item in required
         )

@@ -266,9 +266,14 @@ class SqliteKnowledgeRepository:
                     OR EXISTS (
                         SELECT 1
                         FROM chapter_narrative_commits AS commit_record
+                        JOIN chapters AS source_chapter
+                          ON source_chapter.novel_id = commit_record.novel_id
+                         AND source_chapter.number = commit_record.chapter_number
                         WHERE commit_record.novel_id = triples.novel_id
                           AND commit_record.chapter_number = triples.chapter_number
                           AND commit_record.status = 'committed'
+                          AND commit_record.content_sha256 = source_chapter.content_sha256
+                          AND commit_record.content_revision = source_chapter.content_revision
                     )
               )
             ORDER BY created_at ASC

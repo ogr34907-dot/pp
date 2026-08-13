@@ -64,6 +64,89 @@ class SqliteChapterNarrativeCommitRepository:
     def __init__(self, db: DatabaseConnection):
         self._db = db
 
+    def prepare_worldline_replay(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        content_revision: int,
+        pipeline_version: str,
+    ) -> str:
+        """Re-open the current canonical version for an ordered worldline replay."""
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite_writes_bypass_queue():
+            with self._db.transaction() as conn:
+                source = conn.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (novel_id, chapter_number),
+                ).fetchone()
+                if source is None:
+                    return "invalid"
+                actual_hash = hashlib.sha256((source[0] or "").encode("utf-8")).hexdigest()
+                if (
+                    actual_hash != content_sha256
+                    or str(source[1] or "") != content_sha256
+                    or int(source[2] or 0) != int(content_revision)
+                ):
+                    return "invalid"
+
+                row = conn.execute(
+                    "SELECT status FROM chapter_narrative_commits "
+                    "WHERE novel_id = ? AND chapter_number = ? "
+                    "AND content_sha256 = ? AND pipeline_version = ? "
+                    "AND content_revision = ?",
+                    (
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                    ),
+                ).fetchone()
+                if row is None:
+                    return "prepared"
+                status = str(row[0] or "")
+                if status == "in_progress":
+                    return "busy"
+                if status not in {"committed", "failed", "stale"}:
+                    return "invalid"
+
+                update_cursor = conn.execute(
+                    "UPDATE chapter_narrative_commits "
+                    "SET status = 'stale', failure_reason = '', updated_at = ? "
+                    "WHERE novel_id = ? AND chapter_number = ? "
+                    "AND content_sha256 = ? AND pipeline_version = ? "
+                    "AND content_revision = ? AND status = ?",
+                    (
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                        status,
+                    ),
+                )
+                if update_cursor.rowcount != 1:
+                    return "busy"
+                conn.execute(
+                    "UPDATE chapter_summaries SET sync_status = 'stale', updated_at = ? "
+                    "WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id = ?) "
+                    "AND chapter_number = ? AND source_content_sha256 = ? "
+                    "AND source_content_revision = ? AND pipeline_version = ?",
+                    (
+                        now,
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        int(content_revision),
+                        pipeline_version,
+                    ),
+                )
+                return "prepared"
+
     def claim_full_resync(
         self, *, novel_id: str, run_id: str, lease_seconds: int = 600
     ) -> bool:

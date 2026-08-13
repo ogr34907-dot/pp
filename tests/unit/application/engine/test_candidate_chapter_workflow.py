@@ -297,6 +297,55 @@ async def test_candidate_audit_reuses_dag_semantic_evidence_without_a_second_rev
 
 
 @pytest.mark.asyncio
+async def test_negative_required_event_cannot_pass_from_literal_text_when_semantic_review_is_unverified(
+    workflow,
+):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    drafts.text = "沈岚没有交出证据。"
+
+    class _NegativeEventOutlines(_Outlines):
+        def next_published_chapter_context(self, novel_id, *, after_chapter):
+            node, chain = super().next_published_chapter_context(
+                novel_id, after_chapter=after_chapter
+            )
+            chain["chapter"]["payload"]["required_events"] = ["交出证据"]
+            return node, chain
+
+    dag = _DAG(
+        [
+            {
+                "content": drafts.text,
+                "approved": True,
+                "review_required": False,
+                "semantic_review": {
+                    "status": "approved",
+                    "issues": [],
+                    "event_coverage": [
+                        {"event": "交出证据", "status": "unverified", "evidence": ""}
+                    ],
+                },
+            }
+        ]
+    )
+    service = CandidateChapterWorkflowService(
+        repo,
+        _NegativeEventOutlines(),
+        drafts,
+        aftermath,
+        dag_engine=dag,
+        dag_factory=lambda: object(),
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert candidate.commit_plan["timeline_events"] == []
+    assert aftermath.calls == []
+
+
+@pytest.mark.asyncio
 async def test_direct_candidate_path_runs_full_semantic_review_without_required_events(workflow):
     _db, repo, drafts, aftermath = workflow
     repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)

@@ -84,8 +84,78 @@ def test_upsert_chapter_handler_commits_hash_and_revision(tmp_path, monkeypatch)
     }
 
 
+def test_upsert_chapter_handler_allows_uncommitted_draft_update(tmp_path, monkeypatch):
+    db = DatabaseConnection(str(tmp_path / "queue-draft.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    )
+    queue = PersistenceQueue()
+    monkeypatch.setattr(persistence_queue_module, "_persistence_queue", queue)
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_database",
+        lambda *args, **kwargs: db,
+    )
+    register_persistence_handlers()
+    handler = queue._handlers[PersistenceCommandType.UPSERT_CHAPTER.value]
+
+    for content in ("首段草稿", "首段草稿\n\n追加草稿"):
+        handler(
+            {
+                "chapter_id": "chapter-1",
+                "novel_id": "novel-1",
+                "chapter_number": 1,
+                "content": content,
+                "status": "draft",
+            }
+        )
+
+    row = db.fetch_one(
+        "SELECT content, content_revision FROM chapters "
+        "WHERE novel_id = 'novel-1' AND number = 1"
+    )
+    assert dict(row) == {"content": "首段草稿\n\n追加草稿", "content_revision": 2}
+
+
+def test_upsert_chapter_handler_rejects_formal_overwrite(tmp_path, monkeypatch):
+    db = DatabaseConnection(str(tmp_path / "queue-guard.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    )
+    queue = PersistenceQueue()
+    monkeypatch.setattr(persistence_queue_module, "_persistence_queue", queue)
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_database",
+        lambda *args, **kwargs: db,
+    )
+    register_persistence_handlers()
+    handler = queue._handlers[PersistenceCommandType.UPSERT_CHAPTER.value]
+    handler(
+        {
+            "chapter_id": "chapter-1",
+            "novel_id": "novel-1",
+            "chapter_number": 1,
+            "content": "正式正文",
+            "status": "completed",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="ChapterRewriteCoordinator"):
+        handler(
+            {
+                "chapter_id": "chapter-1",
+                "novel_id": "novel-1",
+                "chapter_number": 1,
+                "content": "旁路覆盖",
+                "status": "completed",
+            }
+        )
+
+
 def test_upsert_chapter_handler_propagates_non_lock_failure(monkeypatch):
     class _FailingDatabase:
+        def fetch_one(self, *args, **kwargs):
+            return None
+
         def execute(self, *args, **kwargs):
             raise RuntimeError("disk unavailable")
 

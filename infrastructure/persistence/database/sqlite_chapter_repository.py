@@ -23,7 +23,37 @@ class SqliteChapterRepository(ChapterRepository):
         self.db = db
 
     def save(self, chapter: Chapter) -> None:
-        """保存章节"""
+        """保存章节；已进入正式/章后派生链的正文必须经 Coordinator 改写。"""
+        chapter_id = chapter.id.value if hasattr(chapter.id, 'value') else chapter.id
+        novel_id = chapter.novel_id.value if hasattr(chapter.novel_id, 'value') else chapter.novel_id
+        content_sha256 = hashlib.sha256((chapter.content or "").encode("utf-8")).hexdigest()
+        existing = self.db.fetch_one(
+            """
+            SELECT content, status,
+                   EXISTS(
+                       SELECT 1 FROM chapter_narrative_commits c
+                       WHERE c.novel_id = chapters.novel_id
+                         AND c.chapter_number = chapters.number
+                   ) AS has_canonical_state
+            FROM chapters
+            WHERE id = ? OR (novel_id = ? AND number = ?)
+            LIMIT 1
+            """,
+            (chapter_id, novel_id, chapter.number),
+        )
+        if (
+            existing
+            and str(existing["content"] or "")
+            and str(existing["content"] or "") != str(chapter.content or "")
+            and (
+                str(existing["status"] or "") == "completed"
+                or bool(existing["has_canonical_state"])
+            )
+        ):
+            raise RuntimeError(
+                "Formal or canonical chapter content changes require ChapterRewriteCoordinator"
+            )
+
         sql = """
             INSERT INTO chapters (id, novel_id, number, title, content,
                                   content_sha256, content_revision, outline, status,
@@ -49,10 +79,7 @@ class SqliteChapterRepository(ChapterRepository):
                 updated_at = excluded.updated_at
         """
         now = datetime.now(timezone.utc).isoformat()
-        chapter_id = chapter.id.value if hasattr(chapter.id, 'value') else chapter.id
-        novel_id = chapter.novel_id.value if hasattr(chapter.novel_id, 'value') else chapter.novel_id
         status = chapter.status.value if hasattr(chapter.status, 'value') else chapter.status
-        content_sha256 = hashlib.sha256((chapter.content or "").encode("utf-8")).hexdigest()
         self.db.execute(sql, (
             chapter_id,
             novel_id,

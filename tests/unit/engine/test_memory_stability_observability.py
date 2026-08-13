@@ -13,6 +13,7 @@ import pytest
 
 from application.ai_invocation.dtos import InvocationPolicy, InvocationSessionStatus
 from application.analyst.services.chapter_indexing_service import ChapterIndexingService
+from application.core.services.chapter_rewrite_coordinator import ChapterRewriteCoordinator
 from application.engine.services.chapter_aftermath_pipeline import ChapterAftermathPipeline
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
 from application.engine.services.memory_engine import MemoryEngine
@@ -350,6 +351,19 @@ class _ChapterRepository:
         )
         self._connection.commit()
 
+    def rewrite(self, chapter, content):
+        rewritten = ChapterRewriteCoordinator(
+            db=self.db,
+            chapter_repository=self._repository,
+        ).rewrite(chapter, content).chapter
+        self.chapters[rewritten.number] = rewritten
+        self._connection.execute(
+            "UPDATE chapter_snapshots SET content = ?, status = ? WHERE chapter_number = ?",
+            (rewritten.content, rewritten.status.value, rewritten.number),
+        )
+        self._connection.commit()
+        return rewritten
+
 
 class _NovelRepository:
     def __init__(self, target_chapters: int):
@@ -656,8 +670,7 @@ async def _run_memory_stability_regression(
             assert result.success is False
             recovered_content = f"{context.chapter_content}\n人工修复后的补充。"
             chapter = chapter_repository.chapters[chapter_number]
-            chapter.update_content(recovered_content)
-            chapter_repository.save(chapter)
+            chapter_repository.rewrite(chapter, recovered_content)
             persisted_recovery_chapter = chapter_repository.chapters[chapter_number]
             assert persisted_recovery_chapter.content_sha256 == hashlib.sha256(
                 recovered_content.encode("utf-8")
@@ -681,8 +694,9 @@ async def _run_memory_stability_regression(
             assert llm.extraction_failures == 3
 
         if chapter_number == 20:
-            chapter_repository.chapters[10].update_content("第10章重写后的正文")
-            chapter_repository.save(chapter_repository.chapters[10])
+            chapter_repository.rewrite(
+                chapter_repository.chapters[10], "第10章重写后的正文"
+            )
             rewrite_result = await aftermath.run_after_chapter_saved(
                 "memory-stability", 10, "第10章重写后的正文"
             )
@@ -747,11 +761,21 @@ async def _run_memory_stability_regression(
         assert "钟楼暗门伏笔" in foreshadows
     bridge_calls = [item for item in aftermath_calls if item[0] == "bridge"]
     auxiliary_calls = [item for item in aftermath_calls if item[0] == "auxiliary"]
-    assert len(bridge_calls) == chapter_count + (chapter_count >= 17) + (chapter_count >= 20)
-    assert len(auxiliary_calls) == chapter_count + (chapter_count >= 17)
+    # Chapter 20 rewrites chapter 10.  The next chapter first replays the
+    # invalidated canonical history (10..20), then continues with 21..N.
+    expected_bridge_numbers = list(range(1, min(chapter_count, 20) + 1))
     if chapter_count >= 17:
-        assert len([item for item in bridge_calls if item[1] == 17]) == 2
-        assert len([item for item in auxiliary_calls if item[1] == 17]) == 1
+        expected_bridge_numbers.insert(17, 17)
+    if chapter_count >= 20:
+        expected_bridge_numbers.extend(range(10, chapter_count + 1))
+    assert [row[1] for row in bridge_calls] == expected_bridge_numbers
+    expected_auxiliary_numbers = list(range(1, min(chapter_count, 20) + 1))
+    if chapter_count >= 20:
+        expected_auxiliary_numbers.extend(range(10, chapter_count + 1))
+    assert [row[1] for row in auxiliary_calls] == expected_auxiliary_numbers
+    if chapter_count >= 17:
+        assert len([item for item in bridge_calls if item[1] == 17]) == 3
+        assert len([item for item in auxiliary_calls if item[1] == 17]) == 2
     if chapter_count >= 20:
         assert dict(persisted_chapters)[10] == "第10章重写后的正文"
         assert vector_store.records["memory-stability_ch10_summary"]["text"] == "第10章重写后的正文已被重新抽取"

@@ -1,6 +1,10 @@
+import hashlib
 import sqlite3
 
-from application.ai_invocation.autopilot.continuations import register_autopilot_continuations
+from application.ai_invocation.autopilot.continuations import (
+    _write_chapter_draft,
+    register_autopilot_continuations,
+)
 from application.ai_invocation.continuation import ContinuationContext, execute_continuation
 from application.ai_invocation.dtos import (
     AdoptionDecision,
@@ -23,6 +27,8 @@ class _Db:
                 number INTEGER NOT NULL,
                 title TEXT,
                 content TEXT,
+                content_sha256 TEXT DEFAULT '',
+                content_revision INTEGER DEFAULT 0,
                 outline TEXT,
                 status TEXT DEFAULT 'draft',
                 word_count INTEGER DEFAULT 0,
@@ -33,6 +39,12 @@ class _Db:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(novel_id, number)
+            );
+            CREATE TABLE chapter_narrative_commits (
+                novel_id TEXT NOT NULL,
+                chapter_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (novel_id, chapter_number)
             );
             CREATE TABLE novels (
                 id TEXT PRIMARY KEY,
@@ -94,6 +106,14 @@ def test_autopilot_beat_prose_commit_is_idempotent(monkeypatch):
     novel = db.fetch_one("SELECT current_stage, current_beat_index FROM novels WHERE id = ?", ("novel-1",))
     assert chapter == {"content": "第一段正文。", "status": "draft", "word_count": 6}
     assert novel == {"current_stage": "writing", "current_beat_index": 1}
+    assert db.fetch_one(
+        "SELECT content_sha256, content_revision FROM chapters "
+        "WHERE novel_id = ? AND number = ?",
+        ("novel-1", 1),
+    ) == {
+        "content_sha256": hashlib.sha256("第一段正文。".encode("utf-8")).hexdigest(),
+        "content_revision": 1,
+    }
 
 
 def test_autopilot_full_chapter_accept_completes_once_and_moves_to_audit(monkeypatch):
@@ -134,6 +154,44 @@ def test_autopilot_full_chapter_accept_completes_once_and_moves_to_audit(monkeyp
         "current_chapter_in_act": 1,
         "current_beat_index": 0,
     }
+
+
+def test_autopilot_draft_write_allows_draft_and_rejects_formal_bypass(monkeypatch):
+    db = _Db()
+    _patch_db(monkeypatch, db)
+
+    inserted = _write_chapter_draft(
+        "novel-1", 10, "首段草稿", append=False, status="draft"
+    )
+    appended = _write_chapter_draft(
+        "novel-1", 10, "追加草稿", append=True, status="draft"
+    )
+    assert inserted["skipped"] is False
+    assert appended["skipped"] is False
+    assert db.fetch_one(
+        "SELECT content, content_revision FROM chapters "
+        "WHERE novel_id = ? AND number = ?",
+        ("novel-1", 10),
+    ) == {"content": "首段草稿\n\n追加草稿", "content_revision": 2}
+
+    db.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, content, content_sha256, content_revision, status) "
+        "VALUES ('chapter-11', 'novel-1', 11, '正式正文', 'hash', 1, 'completed')"
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, status) VALUES ('novel-1', 11, 'committed')"
+    )
+    result = _write_chapter_draft(
+        "novel-1", 11, "旁路覆盖", append=False, status="completed"
+    )
+    assert result["skipped"] is True
+    assert "ChapterRewriteCoordinator" in result["reason"]
+    assert db.fetch_one(
+        "SELECT content FROM chapters WHERE novel_id = ? AND number = ?",
+        ("novel-1", 11),
+    )["content"] == "正式正文"
 
 
 def test_story_pipeline_full_chapter_continuation_does_not_write_formal_chapter(monkeypatch):
