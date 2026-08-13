@@ -260,6 +260,17 @@ class SqliteKnowledgeRepository:
                    COALESCE(is_starred, 0) AS is_starred
             FROM triples
             WHERE novel_id = ?
+              AND (
+                    chapter_number IS NULL
+                    OR LOWER(TRIM(COALESCE(triples.source_type, ''))) <> 'autopilot_extract'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM chapter_narrative_commits AS commit_record
+                        WHERE commit_record.novel_id = triples.novel_id
+                          AND commit_record.chapter_number = triples.chapter_number
+                          AND commit_record.status = 'committed'
+                    )
+              )
             ORDER BY created_at ASC
         """
         triples_rows = self.db.fetch_all(triples_sql, (novel_id_str,))
@@ -330,7 +341,10 @@ class SqliteKnowledgeRepository:
 
     @staticmethod
     def _chapter_number_from_fact(triple: Dict[str, Any]) -> Optional[int]:
-        v = triple.get("chapter_number")
+        # ``get_knowledge`` exposes the domain name ``chapter_id`` while
+        # extraction writes the persistence name ``chapter_number``.  Keep
+        # both paths lossless when a chapter summary re-saves the graph.
+        v = triple.get("chapter_number", triple.get("chapter_id"))
         if v is None:
             return None
         try:

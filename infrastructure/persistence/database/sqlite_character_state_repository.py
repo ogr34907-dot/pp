@@ -19,7 +19,7 @@ class SqliteCharacterStateRepository(CharacterStateRepository):
         """保存人物状态"""
         self.db.execute("""
             INSERT OR REPLACE INTO character_states
-            (character_id, novel_id, base_traits, scars, motivations, emotional_arc,
+             (character_id, novel_id, base_traits, scars, motivations, emotional_arc,
              current_state_summary, last_updated_chapter, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         """, (

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict
 
@@ -132,6 +133,7 @@ class ReviewNode(BaseNode):
         start = time.time()
 
         try:
+            semantic_review: dict[str, Any] = {}
             # 检查是否自动审批模式
             approved = not bool(inputs.get("review_required", False))
 
@@ -146,8 +148,18 @@ class ReviewNode(BaseNode):
             if str(inputs.get("run_mode") or context.get("run_mode") or "chapter_review") != "continuous":
                 approved = False
 
+            if context.get("candidate_mode"):
+                semantic_review, semantic_approved = await self._review_candidate(
+                    str(inputs.get("content") or ""), context
+                )
+                approved = approved and semantic_approved
+
             return NodeResult(
-                outputs={"approved": approved, "review_required": not approved},
+                outputs={
+                    "approved": approved,
+                    "review_required": not approved,
+                    "semantic_review": semantic_review,
+                },
                 status=NodeStatus.SUCCESS,
                 duration_ms=int((time.time() - start) * 1000),
             )
@@ -156,6 +168,88 @@ class ReviewNode(BaseNode):
 
     def validate_inputs(self, inputs: Dict[str, Any]) -> bool:
         return True
+
+    @staticmethod
+    async def _review_candidate(content: str, context: Dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        reviewer = context.get("candidate_semantic_reviewer")
+        if reviewer is None or not content.strip():
+            return {
+                "status": "unavailable",
+                "machine_review_failed": True,
+                "issues": [],
+                "suggestions": [],
+            }, False
+
+        chain = context.get("outline_chain")
+        chapter = chain.get("chapter", {}) if isinstance(chain, dict) else {}
+        payload = chapter.get("payload", {}) if isinstance(chapter, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        from application.engine.dag.plan.schema import (
+            chapter_rhythm_from_outline_payload,
+            serialize_chapter_rhythm,
+        )
+        from application.audit.services.chapter_ai_review_service import (
+            serialize_chapter_ai_review_result,
+        )
+
+        chapter_rhythm = context.get("chapter_rhythm")
+        if not chapter_rhythm:
+            chapter_rhythm = serialize_chapter_rhythm(
+                chapter_rhythm_from_outline_payload(payload)
+            )
+        required_events = [
+            str(item).strip()
+            for item in payload.get("required_events", [])
+            if str(item).strip()
+        ]
+        try:
+            result = await reviewer.review(
+                chapter_number=int(context.get("chapter_number") or 0),
+                chapter_title=str(context.get("chapter_title") or ""),
+                chapter_content=content,
+                chapter_outline=json.dumps(
+                    {
+                        "creative_goal": payload.get("creative_goal", ""),
+                        "entry_state": payload.get("entry_state", ""),
+                        "exit_state": payload.get("exit_state", ""),
+                        "required_events": required_events,
+                        "forbidden_events": payload.get("forbidden_events", []),
+                        "handoff_conditions": payload.get("handoff_conditions", []),
+                        "chapter_rhythm": chapter_rhythm,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                generation_hint=(
+                    "审查人物、时间线、世界规则、已发生事件、伏笔、AI味和商业节奏。"
+                    "过渡章可以舒缓，但必须承担承接或推进；高潮章必须有升级、代价或兑现。"
+                ),
+                required_events=required_events,
+            )
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "machine_review_failed": True,
+                "error": str(exc),
+                "issues": [],
+                "suggestions": [],
+            }, False
+
+        issues = list(getattr(result, "issues", []) or [])
+        critical = any(str(getattr(issue, "severity", "")).lower() == "critical" for issue in issues)
+        status = str(getattr(result, "status", "reviewed") or "reviewed")
+        rhythm_assessment = dict(getattr(result, "rhythm_assessment", {}) or {})
+        if chapter_rhythm and rhythm_assessment.get("status") != "complete":
+            critical = True
+            status = "draft"
+            rhythm_assessment.setdefault("status", "incomplete")
+        review = serialize_chapter_ai_review_result(result)
+        review["status"] = status
+        review["rhythm_assessment"] = rhythm_assessment
+        review["machine_review_incomplete"] = bool(
+            chapter_rhythm and rhythm_assessment.get("status") != "complete"
+        )
+        return review, status == "approved" and not critical
 
 
 # ─── gw_condition: 条件路由 ───

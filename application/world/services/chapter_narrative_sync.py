@@ -40,6 +40,31 @@ logger = logging.getLogger(__name__)
 CHAPTER_NARRATIVE_PIPELINE_VERSION = "chapter-narrative-sync:v1"
 
 
+def _has_final_text_evidence(content: str, item: Any, *terms: str) -> bool:
+    """Allow a derived fact only when its candidate text appears in final正文."""
+    if not content:
+        return True
+    candidates: list[str] = []
+    if isinstance(item, dict):
+        evidence = str(item.get("evidence_text") or "").strip()
+        if evidence:
+            candidates.append(evidence)
+    candidates.extend(str(term).strip() for term in terms if str(term).strip())
+    return any(candidate in content for candidate in candidates)
+
+
+def _final_text_evidence(content: str, item: Any, *terms: str) -> str:
+    if isinstance(item, dict):
+        evidence = str(item.get("evidence_text") or "").strip()
+        if evidence and evidence in content:
+            return evidence[:500]
+    for term in terms:
+        candidate = str(term).strip()
+        if candidate and candidate in content:
+            return candidate[:500]
+    return ""
+
+
 @dataclass(frozen=True)
 class AftermathCommitResult(Mapping[str, Any]):
     """Canonical outcome with a dict-compatible projection for existing callers."""
@@ -508,6 +533,7 @@ def persist_bundle_triples_and_foreshadows(
     foreshadowing_repo: Any,
     *,
     strict: bool = False,
+    content: str = "",
 ) -> None:
     """将 bundle 中的三元组与伏笔写入表，并处理伏笔消费状态更新。
     
@@ -553,6 +579,11 @@ def persist_bundle_triples_and_foreshadows(
                     "entity_type": "character",
                     "note": "",
                 }
+                if content and not _has_final_text_evidence(content, actual_item, s, p, o):
+                    continue
+                evidence = _final_text_evidence(content, actual_item, s, p, o)
+                if evidence:
+                    row["attributes"] = {"evidence_text": evidence}
                 try:
                     kr.save_triple(novel_id, row)
                 except Exception as e:
@@ -644,6 +675,8 @@ def persist_bundle_triples_and_foreshadows(
                         suggested_resolve,
                         importance_val,
                     )
+                    if content and not _has_final_text_evidence(content, h, desc):
+                        continue
                     registry.register(
                         Foreshadowing(
                             id=stable_id,
@@ -744,6 +777,7 @@ def persist_causal_edges(
     causal_edge_repository: Any,
     *,
     strict: bool = False,
+    content: str = "",
 ) -> int:
     """将 bundle 中的因果边写入 causal_edges 表，并检测已有因果边的闭环。
 
@@ -792,6 +826,10 @@ def persist_causal_edges(
             involved = [involved]
 
         state_change = str(item.get("state_change", "")).strip()
+        if content and not _has_final_text_evidence(
+            content, item, source_event, target_event, state_change
+        ):
+            continue
 
         edge = CausalEdge(
             id=_stable_artifact_id(
@@ -899,6 +937,7 @@ def persist_character_mutations(
     bible_repository: Any = None,
     *,
     strict: bool = False,
+    content: str = "",
 ) -> int:
     """将 bundle 中的 character_mutations 写入 character_states 表。
 
@@ -953,6 +992,10 @@ def persist_character_mutations(
         source_event = str(item.get("source_event", "")).strip()
         impact_or_desc = str(item.get("impact_or_description", "")).strip()
         if not (source_event or impact_or_desc):
+            continue
+        if content and not _has_final_text_evidence(
+            content, item, character_name, source_event, impact_or_desc
+        ):
             continue
 
         # 解析强度
@@ -1110,6 +1153,7 @@ def persist_character_end_states(
     bible_repository: Any = None,
     *,
     strict: bool = False,
+    content: str = "",
 ) -> int:
     """将 bundle 中的 character_states（章末心理状态快照）写入 character_states 表。
 
@@ -1149,6 +1193,8 @@ def persist_character_end_states(
             continue
 
         character_id = name_to_id.get(character_name, character_name)
+        if content and not _has_final_text_evidence(content, item, character_name, mental_state):
+            continue
 
         state = character_state_repository.get(character_id, novel_id)
         if not state:
@@ -2012,6 +2058,7 @@ def persist_bundle_extras(
     narrative_event_repository: Any = None,
     *,
     require_durable: bool = False,
+    content: str = "",
 ) -> bool:
     """将 bundle 中的故事线进展、张力值、对话写入表，并自动生成剧情点、推进里程碑、调整故事线范围。
 
@@ -2239,7 +2286,7 @@ def persist_bundle_extras(
     if timeline_events:
         try:
             from infrastructure.persistence.database.connection import get_database
-            db = get_database()
+            db = getattr(chapter_repository, "db", None) or get_database()
             conn = db.get_connection()
             cursor = conn.cursor()
 
@@ -2253,12 +2300,37 @@ def persist_bundle_extras(
                 if not event:
                     continue
 
+                if content and not _has_final_text_evidence(content, evt, event, description):
+                    continue
+
                 # 写入 bible_timeline_notes 表
-                note_id = f"tl-{uuid.uuid4()}"
+                note_id = _stable_artifact_id(
+                    "timeline",
+                    novel_id,
+                    chapter_number,
+                    time_point,
+                    event,
+                    description,
+                )
                 cursor.execute("""
-                    INSERT INTO bible_timeline_notes (id, novel_id, time_point, event, description)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (note_id, novel_id, time_point or f"第{chapter_number}章", event, description))
+                    INSERT INTO bible_timeline_notes
+                    (id, novel_id, time_point, event, description, source_type,
+                     chapter_number)
+                    VALUES (?, ?, ?, ?, ?, 'chapter_aftermath', ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        time_point = excluded.time_point,
+                        event = excluded.event,
+                        description = excluded.description,
+                        source_type = excluded.source_type,
+                        chapter_number = excluded.chapter_number
+                """, (
+                    note_id,
+                    novel_id,
+                    time_point or f"第{chapter_number}章",
+                    event,
+                    description,
+                    chapter_number,
+                ))
 
             conn.commit()
             logger.info("时间轴事件提取完成 novel=%s ch=%s count=%d", novel_id, chapter_number, len(timeline_events))
@@ -2420,6 +2492,17 @@ async def _sync_chapter_narrative_after_save_once(
             memory_status=claim.memory_status,
             flags=flags,
         )
+
+    try:
+        from application.engine.services.worldline_generation_guard import active_generation_epoch
+
+        generation_epoch = active_generation_epoch(
+            novel_id,
+            getattr(chapter_repository, "db", None)
+            or getattr(commit_repository, "_db", None),
+        )
+    except Exception as e:
+        return failed_result(str(e) or "generation_epoch_unavailable")
 
     def stale_claim_result() -> AftermathCommitResult | None:
         """Fail closed when a long-running extraction lost its source version."""
@@ -2649,6 +2732,7 @@ async def _sync_chapter_narrative_after_save_once(
                     triple_repository,
                     foreshadowing_repo,
                     strict=True,
+                    content=content,
                 )
             if triple_repository is not None:
                 flags["triples_extracted"] = True
@@ -2675,6 +2759,7 @@ async def _sync_chapter_narrative_after_save_once(
                 plot_arc_repository,
                 narrative_event_repository,
                 require_durable=True,
+                content=content,
             )
             if not extras_persisted:
                 return failed_result("critical_bundle_write_failed")
@@ -2702,6 +2787,7 @@ async def _sync_chapter_narrative_after_save_once(
                     bundle,
                     causal_edge_repository,
                     strict=True,
+                    content=content,
                 )
             if saved_edges > 0:
                 flags["causal_edges_stored"] = True
@@ -2729,6 +2815,7 @@ async def _sync_chapter_narrative_after_save_once(
                     character_state_repository,
                     bible_repository,
                     strict=True,
+                    content=content,
                 )
             if saved_mutations > 0:
                 flags["character_mutations_stored"] = True
@@ -2750,6 +2837,7 @@ async def _sync_chapter_narrative_after_save_once(
                     character_state_repository,
                     bible_repository,
                     strict=True,
+                    content=content,
                 )
         except Exception as e:
             logger.warning(

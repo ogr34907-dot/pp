@@ -6,16 +6,28 @@
 
 from application.engine.dag.plan.outline_beat_planner import render_cpms_outline_partition_prompts
 from application.engine.dag.plan.schema import (
+    ChapterFunction,
     ChapterExecutionPlan,
+    ChapterRhythmContract,
+    IntensityLevel,
     PlanningEnvelope,
     PlanAtomSpec,
+    chapter_rhythm_from_outline_payload,
+    render_chapter_rhythm_block,
+    serialize_chapter_rhythm,
 )
 from application.engine.dag.plan.planning_node_base import AbstractPlanningNode
 
 __all__ = [
     "AbstractPlanningNode",
     "ChapterExecutionPlan",
+    "ChapterFunction",
+    "ChapterRhythmContract",
+    "IntensityLevel",
     "PlanningEnvelope",
     "PlanAtomSpec",
+    "chapter_rhythm_from_outline_payload",
+    "render_chapter_rhythm_block",
+    "serialize_chapter_rhythm",
     "render_cpms_outline_partition_prompts",
 ]

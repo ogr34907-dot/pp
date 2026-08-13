@@ -84,6 +84,8 @@ class BibleMapper:
                     "event": note.event,
                     "time_point": note.time_point,
                     "description": note.description
+                    ,"source_type": getattr(note, "source_type", "bible")
+                    ,"chapter_number": getattr(note, "chapter_number", None)
                 }
                 for note in bible.timeline_notes
             ],
@@ -200,7 +202,9 @@ class BibleMapper:
                     id=note_data["id"],
                     event=note_data["event"],
                     time_point=note_data.get("time_point", ""),
-                    description=note_data.get("description", "")
+                    description=note_data.get("description", ""),
+                    source_type=note_data.get("source_type", "bible"),
+                    chapter_number=note_data.get("chapter_number"),
                 )
                 bible.add_timeline_note(note)
 

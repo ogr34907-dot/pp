@@ -2,7 +2,7 @@
 
 import pytest
 
-from application.engine.dag.nodes.execution_nodes import BeatNode
+from application.engine.dag.nodes.execution_nodes import BeatNode, WriterNode
 
 
 @pytest.mark.asyncio
@@ -26,6 +26,13 @@ async def test_candidate_beat_node_projects_published_chapter_without_replanning
                         "required_events": ["主角赴约", "交出证物"],
                         "forbidden_events": ["提前揭晓真相"],
                         "handoff_conditions": ["留下追兵逼近的危机"],
+                        "rhythm": {
+                            "chapter_function": "transition",
+                            "intensity_curve": ["low", "medium"],
+                            "chapter_goal": "完成交接并改变双方关系",
+                            "chapter_delta": "双方暂时合作",
+                            "ending_hook": "追兵逼近",
+                        },
                     }
                 }
             },
@@ -40,3 +47,58 @@ async def test_candidate_beat_node_projects_published_chapter_without_replanning
     assert all(beat["handoff_to_next"] == "留下追兵逼近的危机" for beat in beats)
     assert [beat["must_include"] for beat in beats] == [["主角赴约"], ["交出证物"]]
     assert all(beat["must_not_include"] == ["提前揭晓真相"] for beat in beats)
+    assert result.outputs["chapter_rhythm"] == {
+        "chapter_function": "transition",
+        "intensity_curve": ["low", "medium"],
+        "chapter_goal": "完成交接并改变双方关系",
+        "chapter_delta": "双方暂时合作",
+        "ending_hook": "追兵逼近",
+    }
+    assert all("chapter_rhythm" not in beat for beat in beats)
+
+
+@pytest.mark.asyncio
+async def test_candidate_writer_passes_projected_beats_to_the_real_draft_generator():
+    class _Generator:
+        def __init__(self):
+            self.kwargs = {}
+
+        async def generate_candidate_draft(self, **kwargs):
+            self.kwargs = kwargs
+            return {"content": "主角赴约后交出证物。", "script": "剧本"}
+
+    generator = _Generator()
+    beats = [
+        {
+            "description": "主角赴约",
+            "conflict": "追兵逼近",
+            "handoff_to_next": "交出证物",
+        }
+    ]
+
+    result = await WriterNode().execute(
+        {
+            "outline": "已发布章纲",
+            "beats": beats,
+            "chapter_rhythm": {
+                "chapter_function": "transition",
+                "chapter_delta": "双方暂时合作",
+            },
+        },
+        {
+            "candidate_mode": True,
+            "candidate_draft_generator": generator,
+            "novel_id": "novel-1",
+            "chapter_number": 3,
+            "chapter_title": "雨夜赴约",
+            "outline_chain": {"chapter": {"payload": {}}},
+            "outline_text": "已发布章纲",
+        },
+    )
+
+    assert result.outputs["content"] == "主角赴约后交出证物。"
+    assert generator.kwargs["beats"] == beats
+    assert generator.kwargs["chapter_rhythm"] == {
+        "chapter_function": "transition",
+        "chapter_delta": "双方暂时合作",
+    }

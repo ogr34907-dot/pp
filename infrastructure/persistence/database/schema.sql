@@ -456,6 +456,8 @@ CREATE TABLE IF NOT EXISTS bible_timeline_notes (
     time_point TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
     sort_order INTEGER NOT NULL DEFAULT 0,
+    source_type TEXT NOT NULL DEFAULT 'bible',
+    chapter_number INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE

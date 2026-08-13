@@ -349,7 +349,9 @@ class NovelWorkflowState(BaseModel):
 
     # Execution 节点输出
     outline: str = ""
+    outline_payload: Optional[Dict[str, Any]] = None
     chapter_plan_json: Optional[Dict[str, Any]] = None
+    chapter_rhythm: Optional[Dict[str, Any]] = None
     beats: List[Dict[str, Any]] = Field(default_factory=list)
     content: str = ""
     word_count: int = 0
@@ -555,6 +557,7 @@ def get_default_dag() -> DAGDefinition:
             EdgeDefinition(id="edge_04", source="ctx_voice", source_port="voice_block", target="exec_writer", target_port="voice_block"),
             EdgeDefinition(id="edge_05", source="ctx_debt", source_port="debt_due_block", target="exec_writer", target_port="debt_due_block"),
             EdgeDefinition(id="edge_06", source="exec_beat", source_port="beats", target="exec_writer", target_port="beats"),
+            EdgeDefinition(id="edge_06_rhythm", source="exec_beat", source_port="chapter_rhythm", target="exec_writer", target_port="chapter_rhythm"),
             EdgeDefinition(id="edge_07", source="exec_writer", source_port="content", target="val_style", target_port="content"),
             EdgeDefinition(id="edge_08", source="exec_writer", source_port="content", target="val_tension", target_port="content"),
             EdgeDefinition(id="edge_09", source="exec_writer", source_port="content", target="val_anti_ai", target_port="content"),

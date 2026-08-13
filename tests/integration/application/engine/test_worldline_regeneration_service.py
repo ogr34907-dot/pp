@@ -1,5 +1,6 @@
 """Tail regeneration archives all chapter-derived facts before a new epoch starts."""
 
+import json
 import pytest
 
 from infrastructure.persistence.database.connection import DatabaseConnection
@@ -40,9 +41,30 @@ def _seed(db):
     conn.commit()
 
 
+def _seed_canonical_tail(db):
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO bible_timeline_notes "
+        "(id, novel_id, event, time_point, description, source_type, chapter_number) "
+        "VALUES ('timeline-2', 'novel-1', '旧时间线', '第2章', '旧事实', 'chapter_aftermath', 2)"
+    )
+    conn.execute(
+        "INSERT INTO bible_timeline_notes "
+        "(id, novel_id, event, time_point, description, source_type, chapter_number) "
+        "VALUES ('timeline-authored-2', 'novel-1', '作者设定', '第2章', '固定背景', 'bible', 2)"
+    )
+    conn.execute(
+        "INSERT INTO character_states "
+        "(character_id, novel_id, current_state_summary, last_updated_chapter) "
+        "VALUES ('hero', 'novel-1', '旧状态', 2)"
+    )
+    conn.commit()
+
+
 def test_regenerate_from_any_chapter_archives_tail_and_preserves_prefix_hash(tmp_path):
     db = DatabaseConnection(str(tmp_path / "worldline.db"))
     _seed(db)
+    _seed_canonical_tail(db)
     service = WorldlineRegenerationService(db)
 
     preview = service.preview("novel-1", start_chapter=2, target_chapters=6)
@@ -64,6 +86,24 @@ def test_regenerate_from_any_chapter_archives_tail_and_preserves_prefix_hash(tmp
     assert conn.execute("SELECT COUNT(*) FROM chapters WHERE novel_id = 'novel-1'").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM narrative_events WHERE novel_id = 'novel-1'").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE novel_id = 'novel-1'").fetchone()[0] == 1
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT id, source_type FROM bible_timeline_notes WHERE novel_id = 'novel-1'"
+        ).fetchall()
+    ] == [("timeline-authored-2", "bible")]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM character_states WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 0
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT source_table, COUNT(*) FROM worldline_archive_entries "
+            "WHERE archive_id = ? AND source_table IN ('bible_timeline_notes', 'character_states') "
+            "GROUP BY source_table ORDER BY source_table",
+            (result.archive_id,),
+        ).fetchall()
+    ] == [("bible_timeline_notes", 1), ("character_states", 1)]
     assert conn.execute(
         "SELECT COUNT(*) FROM worldline_archive_entries WHERE archive_id = ? AND source_table = 'chapters'",
         (result.archive_id,),
@@ -76,6 +116,57 @@ def test_regenerate_from_any_chapter_archives_tail_and_preserves_prefix_hash(tmp
         """
     ).fetchone()
     assert tuple(run) == (1, "paused", "chapter_review", 1, "rebuilding", "rebuild_worldline")
+
+
+def test_regeneration_preserves_prefix_foreshadows_in_registry(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-foreshadow-prefix.db"))
+    _seed(db)
+    db.execute(
+        "INSERT INTO novel_foreshadow_registry (novel_id, payload) VALUES (?, ?)",
+        (
+            "novel-1",
+            json.dumps(
+                {
+                    "id": "registry-1",
+                    "novel_id": "novel-1",
+                    "foreshadowings": [
+                        {
+                            "id": "manual-prefix",
+                            "planted_in_chapter": 1,
+                            "description": "作者 Bible 中的开篇暗线",
+                            "importance": 4,
+                            "status": "planted",
+                            "suggested_resolve_chapter": 8,
+                            "resolved_in_chapter": None,
+                        },
+                        {
+                            "id": "auto-tail",
+                            "planted_in_chapter": 2,
+                            "description": "重写点之后自动种下的暗线",
+                            "importance": 2,
+                            "status": "planted",
+                            "suggested_resolve_chapter": 5,
+                            "resolved_in_chapter": None,
+                        },
+                    ],
+                    "subtext_entries": [],
+                },
+                ensure_ascii=False,
+            ),
+        ),
+    )
+    db.commit()
+
+    service = WorldlineRegenerationService(db)
+    preview = service.preview("novel-1", start_chapter=2, target_chapters=6)
+    service.execute("novel-1", preview_token=preview.token, run_mode="chapter_review")
+
+    payload = json.loads(
+        db.fetch_one(
+            "SELECT payload FROM novel_foreshadow_registry WHERE novel_id = 'novel-1'"
+        )["payload"]
+    )
+    assert [item["id"] for item in payload["foreshadowings"]] == ["manual-prefix"]
 
 
 def test_regeneration_target_must_include_the_restart_chapter(tmp_path):

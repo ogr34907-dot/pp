@@ -9,6 +9,8 @@ class TimelineNote:
     event: str
     time_point: str  # 时间点描述，如 "第一章"、"三年后"
     description: str
+    source_type: str = "bible"
+    chapter_number: int | None = None
 
     def __post_init__(self):
         """验证实体"""

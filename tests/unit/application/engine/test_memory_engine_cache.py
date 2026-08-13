@@ -7,6 +7,7 @@ from application.engine.services.context_budget_allocator import ContextBudgetAl
 from application.engine.services.memory_engine import (
     CompletedBeatItem,
     MemoryEngine,
+    MemoryStateUnavailableError,
     MemoryState,
     RevealedClueItem,
 )
@@ -105,6 +106,59 @@ def test_memory_engine_state_cache_can_be_disabled(monkeypatch):
     assert calls == ["n1", "n1"]
     assert engine._cache == {}
     assert engine._cache_loaded_at == {}
+
+
+def test_memory_engine_allows_an_empty_state_only_after_a_successful_db_read(tmp_path):
+    from infrastructure.persistence.database.connection import DatabaseConnection
+
+    database = DatabaseConnection(str(tmp_path / "memory-empty.db"))
+    engine = MemoryEngine(
+        llm_service=object(),
+        bible_repository=object(),
+        db_connection=database,
+    )
+
+    assert engine.get_completed_beats_section("new-novel") == ""
+    assert engine.get_revealed_clues_section("new-novel") == ""
+
+
+def test_memory_engine_does_not_treat_a_database_read_failure_as_empty_history():
+    class BrokenDatabase:
+        def execute(self, *_args, **_kwargs):
+            raise OSError("memory database is unavailable")
+
+        def commit(self):
+            raise OSError("memory database is unavailable")
+
+    engine = MemoryEngine(
+        llm_service=object(),
+        bible_repository=object(),
+        db_connection=BrokenDatabase(),
+    )
+
+    with pytest.raises(MemoryStateUnavailableError, match="memory_state_unavailable"):
+        engine.get_completed_beats_section("novel-1")
+
+
+def test_memory_engine_does_not_treat_invalid_persisted_json_as_empty_history(tmp_path):
+    from infrastructure.persistence.database.connection import DatabaseConnection
+
+    database = DatabaseConnection(str(tmp_path / "memory-invalid-json.db"))
+    engine = MemoryEngine(
+        llm_service=object(),
+        bible_repository=object(),
+        db_connection=database,
+    )
+    database.execute(
+        "INSERT INTO memory_engine_state "
+        "(novel_id, state_json, last_updated_chapter, updated_at) "
+        "VALUES (?, ?, ?, datetime('now'))",
+        ("novel-1", "{not valid json", 12),
+    )
+    database.commit()
+
+    with pytest.raises(MemoryStateUnavailableError, match="memory_state_unavailable"):
+        engine.get_revealed_clues_section("novel-1")
 
 
 def test_completed_beats_render_recent_entries_within_the_context_slot_budget():
@@ -241,5 +295,4 @@ async def test_memory_engine_reports_persistence_failure_without_caching_uncommi
 
     assert result["errors"]
     cached = engine._get_cached_state("n1")
-    assert cached is not None
-    assert cached.completed_beats == []
+    assert cached is None

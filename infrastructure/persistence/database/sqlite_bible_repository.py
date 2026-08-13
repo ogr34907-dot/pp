@@ -35,7 +35,11 @@ class SqliteBibleRepository(BibleRepository):
 
     def _clear_children(self, conn, novel_id: str) -> None:
         conn.execute("DELETE FROM bible_style_notes WHERE novel_id = ?", (novel_id,))
-        conn.execute("DELETE FROM bible_timeline_notes WHERE novel_id = ?", (novel_id,))
+        conn.execute(
+            "DELETE FROM bible_timeline_notes WHERE novel_id = ? "
+            "AND COALESCE(source_type, 'bible') = 'bible'",
+            (novel_id,),
+        )
         conn.execute("DELETE FROM bible_locations WHERE novel_id = ?", (novel_id,))
         conn.execute("DELETE FROM bible_world_settings WHERE novel_id = ?", (novel_id,))
         conn.execute("DELETE FROM unified_characters WHERE novel_id = ?", (novel_id,))
@@ -93,8 +97,9 @@ class SqliteBibleRepository(BibleRepository):
                 conn.execute(
                     """
                     INSERT INTO bible_timeline_notes
-                    (id, novel_id, event, time_point, description, sort_order, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, novel_id, event, time_point, description, sort_order,
+                     source_type, chapter_number, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         note.id,
@@ -103,6 +108,8 @@ class SqliteBibleRepository(BibleRepository):
                         note.time_point or "",
                         note.description or "",
                         order,
+                        getattr(note, "source_type", "bible") or "bible",
+                        getattr(note, "chapter_number", None),
                         now,
                         now,
                     ),
@@ -317,7 +324,7 @@ class SqliteBibleRepository(BibleRepository):
     def _timeline_notes(self, novel_id: str) -> List[Dict[str, Any]]:
         rows = self.db.fetch_all(
             """
-            SELECT id, event, time_point, description
+            SELECT id, event, time_point, description, source_type, chapter_number
             FROM bible_timeline_notes
             WHERE novel_id = ?
             ORDER BY sort_order, id
@@ -330,6 +337,8 @@ class SqliteBibleRepository(BibleRepository):
                 "event": r["event"] or "",
                 "time_point": r["time_point"] or "",
                 "description": r["description"] or "",
+                "source_type": r["source_type"] or "bible",
+                "chapter_number": r["chapter_number"],
             }
             for r in rows
         ]

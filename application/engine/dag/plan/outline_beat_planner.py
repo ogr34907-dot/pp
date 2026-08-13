@@ -19,9 +19,11 @@ from pydantic import BaseModel, Field
 
 from application.engine.dag.plan.schema import (
     ChapterExecutionPlan,
+    ChapterRhythmContract,
     PlanAtomSpec,
     PlanDecompositionMode,
     PlanningEnvelope,
+    chapter_rhythm_from_outline_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -360,6 +362,8 @@ async def build_chapter_execution_plan_async(
     decomposition_label: str = "planning_outline_partition",
     emit_llm_delta: OutlinePartitionEmitDelta = None,
     llm_service: Any = None,
+    outline_payload: Optional[Dict[str, Any]] = None,
+    rhythm: Optional[ChapterRhythmContract | Dict[str, Any]] = None,
 ) -> ChapterExecutionPlan:
     """构建章前执行计划。LLM 默认经 CPMS outline-beat-partition；可传 llm_system / llm_user 覆写。"""
     raw = (outline or "").strip()
@@ -370,12 +374,24 @@ async def build_chapter_execution_plan_async(
         source_outline_hash=outline_fingerprint(raw) if raw else None,
     )
     prov: Dict[str, Any] = {"node_hint": decomposition_label}
+    chapter_rhythm = (
+        rhythm
+        if isinstance(rhythm, ChapterRhythmContract)
+        else chapter_rhythm_from_outline_payload(
+            {"rhythm": rhythm} if isinstance(rhythm, dict) else outline_payload
+        )
+    )
 
     atoms: Optional[List[PlanAtomSpec]] = None
     mode = PlanDecompositionMode.RAW_OUTLINE_SINGLE.value
 
     if not raw:
-        return ChapterExecutionPlan(envelope=env, atoms=[], provenance={**prov, "mode": PlanDecompositionMode.EMPTY_OUTLINE.value})
+        return ChapterExecutionPlan(
+            envelope=env,
+            atoms=[],
+            rhythm=chapter_rhythm,
+            provenance={**prov, "mode": PlanDecompositionMode.EMPTY_OUTLINE.value},
+        )
 
     if beat_sheet_json and isinstance(beat_sheet_json, dict):
         atoms = atoms_from_beat_sheet_dict(beat_sheet_json)
@@ -414,7 +430,12 @@ async def build_chapter_execution_plan_async(
         mode = PlanDecompositionMode.RAW_OUTLINE_SINGLE.value
 
     provenance = {**prov, "mode": mode, "atom_count": len(atoms)}
-    return ChapterExecutionPlan(envelope=env, atoms=atoms, provenance=provenance)
+    return ChapterExecutionPlan(
+        envelope=env,
+        atoms=atoms,
+        rhythm=chapter_rhythm,
+        provenance=provenance,
+    )
 
 
 def build_chapter_execution_plan_sync(
@@ -425,6 +446,8 @@ def build_chapter_execution_plan_sync(
     chapter_number: Optional[int] = None,
     beat_sheet_json: Optional[Dict[str, Any]] = None,
     decomposition_label: str = "context_builder_sync",
+    outline_payload: Optional[Dict[str, Any]] = None,
+    rhythm: Optional[ChapterRhythmContract | Dict[str, Any]] = None,
 ) -> ChapterExecutionPlan:
     """Build a deterministic ChapterExecutionPlan without LLM.
 
@@ -440,6 +463,13 @@ def build_chapter_execution_plan_sync(
         source_outline_hash=outline_fingerprint(raw) if raw else None,
     )
     prov: Dict[str, Any] = {"node_hint": decomposition_label}
+    chapter_rhythm = (
+        rhythm
+        if isinstance(rhythm, ChapterRhythmContract)
+        else chapter_rhythm_from_outline_payload(
+            {"rhythm": rhythm} if isinstance(rhythm, dict) else outline_payload
+        )
+    )
 
     atoms: Optional[List[PlanAtomSpec]] = None
     mode = PlanDecompositionMode.RAW_OUTLINE_SINGLE.value
@@ -473,5 +503,6 @@ def build_chapter_execution_plan_sync(
     return ChapterExecutionPlan(
         envelope=env,
         atoms=atoms,
+        rhythm=chapter_rhythm,
         provenance={**prov, "mode": mode, "atom_count": len(atoms)},
     )

@@ -133,6 +133,7 @@ class WriterNode(BaseNode):
             NodePort(name="outline", data_type=PortDataType.TEXT, required=False),
             NodePort(name="voice_block", data_type=PortDataType.TEXT, required=False),
             NodePort(name="beats", data_type=PortDataType.LIST, required=False),
+            NodePort(name="chapter_rhythm", data_type=PortDataType.JSON, required=False),
             NodePort(name="foreshadowing_block", data_type=PortDataType.TEXT, required=False),
             NodePort(name="debt_due_block", data_type=PortDataType.TEXT, required=False),
             NodePort(name="fact_lock", data_type=PortDataType.TEXT, required=False),
@@ -146,7 +147,7 @@ class WriterNode(BaseNode):
             NodePort(name="content", data_type=PortDataType.TEXT),
             NodePort(name="word_count", data_type=PortDataType.SCORE),
         ],
-        prompt_variables=["context", "outline", "voice_block", "fact_lock", "foreshadowing_block", "behavior_protocol", "character_state_lock", "allowlist_block", "nervous_habits"],
+        prompt_variables=["context", "outline", "voice_block", "fact_lock", "foreshadowing_block", "behavior_protocol", "character_state_lock", "allowlist_block", "nervous_habits", "chapter_rhythm"],
         is_configurable=True,
         can_disable=False,
         default_timeout_seconds=300,
@@ -185,6 +186,8 @@ class WriterNode(BaseNode):
                     chapter_title=str(context.get("chapter_title") or ""),
                     outline_chain=dict(context.get("outline_chain") or {}),
                     outline_text=str(context.get("outline_text") or inputs.get("outline") or ""),
+                    beats=list(inputs.get("beats") or []),
+                    chapter_rhythm=inputs.get("chapter_rhythm"),
                     on_event=on_candidate_event if callable(event_sink) else None,
                 )
                 content = str(result.get("content") or "") if isinstance(result, dict) else str(result or "")
@@ -215,6 +218,7 @@ class WriterNode(BaseNode):
                 "character_state_lock": inputs.get("character_state_lock", ""),
                 "allowlist_block": inputs.get("allowlist_block", ""),
                 "nervous_habits": inputs.get("nervous_habits", ""),
+                "chapter_rhythm": inputs.get("chapter_rhythm") or "",
                 "beat_extra": "",
                 "beat_section": "",
                 "prose_discipline": build_prose_discipline_block(
@@ -312,6 +316,13 @@ class BeatNode(BaseNode):
                 default=None,
                 description="可选 BeatSheet JSON；仅作为 ChapterExecutionPlan 构建输入，不直接投影为 runtime beats",
             ),
+            NodePort(
+                name="outline_payload",
+                data_type=PortDataType.JSON,
+                required=False,
+                default=None,
+                description="已发布五级章纲 payload；仅用于读取显式 rhythm",
+            ),
         ],
         output_ports=[
             NodePort(name="beats", data_type=PortDataType.LIST),
@@ -332,6 +343,7 @@ class BeatNode(BaseNode):
 
         try:
             beats_out: List[Dict[str, Any]] = []
+            chapter_rhythm = None
             outline = str(inputs.get("outline", "") or "")
 
             chap_raw = context.get("chapter_number") or inputs.get("chapter_number") or 1
@@ -351,6 +363,8 @@ class BeatNode(BaseNode):
                     ChapterExecutionPlan,
                     PlanAtomSpec,
                     PlanningEnvelope,
+                    chapter_rhythm_from_outline_payload,
+                    serialize_chapter_rhythm,
                 )
                 from application.engine.services.beat_projection import (
                     beats_from_execution_plan,
@@ -358,6 +372,7 @@ class BeatNode(BaseNode):
 
                 payload = context.get("outline_chain", {}).get("chapter", {}).get("payload", {})
                 payload = payload if isinstance(payload, dict) else {}
+                chapter_rhythm = chapter_rhythm_from_outline_payload(payload)
                 events = payload.get("required_events")
                 if isinstance(events, str):
                     events = [events]
@@ -394,6 +409,7 @@ class BeatNode(BaseNode):
                         target_chapter_words=tw,
                     ),
                     atoms=atoms,
+                    rhythm=chapter_rhythm,
                     provenance={"mode": "published_chapter_outline"},
                 )
                 beats_raw = beats_from_execution_plan(
@@ -404,7 +420,10 @@ class BeatNode(BaseNode):
                     build_expansion_hints=lambda _focus, _target: [],
                 )
                 return NodeResult(
-                    outputs={"beats": planned_micro_beats_from_beats(beats_raw)},
+                    outputs={
+                        "beats": planned_micro_beats_from_beats(beats_raw),
+                        "chapter_rhythm": serialize_chapter_rhythm(chapter_rhythm),
+                    },
                     status=NodeStatus.SUCCESS,
                     duration_ms=int((time.time() - start) * 1000),
                 )
@@ -424,11 +443,14 @@ class BeatNode(BaseNode):
 
             raw_plan = inputs.get("chapter_plan_json")
             chapter_plan = None
-            if isinstance(raw_plan, dict) and raw_plan.get("atoms"):
+            if isinstance(raw_plan, dict) and (
+                "atoms" in raw_plan or raw_plan.get("rhythm") is not None
+            ):
                 try:
                     from application.engine.dag.plan.schema import ChapterExecutionPlan
 
                     chapter_plan = ChapterExecutionPlan.model_validate(raw_plan)
+                    chapter_rhythm = chapter_plan.rhythm
                 except Exception as e:
                     logger.warning("exec_beat: chapter_plan_json 无效，将重新规划: %s", e)
 
@@ -440,7 +462,7 @@ class BeatNode(BaseNode):
 
                 builder = _dag_context_builder()
                 if builder:
-                    if not (chapter_plan is not None and bool(chapter_plan.atoms)):
+                    if chapter_plan is None or not chapter_plan.atoms:
                         try:
                             chapter_plan = await build_chapter_execution_plan_async(
                                 outline,
@@ -449,6 +471,9 @@ class BeatNode(BaseNode):
                                 chapter_number=chap,
                                 beat_sheet_json=beat_sheet_json,
                                 use_llm=True,
+                                outline_payload=inputs.get("outline_payload")
+                                or context.get("outline_payload"),
+                                rhythm=chapter_plan.rhythm if chapter_plan is not None else None,
                             )
                         except Exception as plan_err:
                             logger.warning("章前执行计划（exec_beat）异步构建失败，转同步 ChapterExecutionPlan：%s", plan_err)
@@ -459,6 +484,9 @@ class BeatNode(BaseNode):
                                 chapter_number=chap,
                                 beat_sheet_json=beat_sheet_json,
                                 decomposition_label="dag_exec_beat_sync_fallback",
+                                outline_payload=inputs.get("outline_payload")
+                                or context.get("outline_payload"),
+                                rhythm=chapter_plan.rhythm if chapter_plan is not None else None,
                             )
 
                     beats_raw = builder.magnify_outline_to_beats(
@@ -469,18 +497,31 @@ class BeatNode(BaseNode):
                         beat_sheet=None,
                     )
                     beats_out = planned_micro_beats_from_beats(beats_raw)
+                    chapter_rhythm = chapter_plan.rhythm if chapter_plan is not None else None
                 elif outline:
                     logger.warning("exec_beat: ContextBuilder 不可用，无法从 ChapterExecutionPlan 投影 beats")
             except Exception as e:
                 logger.warning(f"ContextBuilder.magnify_outline_to_beats 调用失败: {e}")
 
             return NodeResult(
-                outputs={"beats": beats_out},
+                outputs={
+                    "beats": beats_out,
+                    "chapter_rhythm": (
+                        chapter_rhythm.model_dump(mode="json", exclude_none=True)
+                        if chapter_rhythm is not None
+                        else None
+                    ),
+                },
                 status=NodeStatus.SUCCESS,
                 duration_ms=int((time.time() - start) * 1000),
             )
         except Exception as e:
-            return NodeResult(outputs={"beats": []}, status=NodeStatus.ERROR, duration_ms=int((time.time() - start) * 1000), error=str(e))
+            return NodeResult(
+                outputs={"beats": [], "chapter_rhythm": None},
+                status=NodeStatus.ERROR,
+                duration_ms=int((time.time() - start) * 1000),
+                error=str(e),
+            )
 
     def validate_inputs(self, inputs: Dict[str, Any]) -> bool:
         return True

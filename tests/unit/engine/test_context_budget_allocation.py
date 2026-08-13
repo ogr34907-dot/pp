@@ -9,6 +9,7 @@ from application.engine.services.context_budget_allocator import (
     ContextBudgetExceededError,
 )
 from application.engine.services.context_budget_models import ContextSlot, PriorityTier
+from application.engine.services.memory_engine import MemoryStateUnavailableError
 
 
 def _slot(name: str, tier: PriorityTier, content: str, tokens: int, priority: int = 1):
@@ -114,6 +115,24 @@ def test_allocator_propagates_configured_memory_engine_fact_lock_failure(monkeyp
     monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 100)
 
     with pytest.raises(RuntimeError, match="configured fact lock unavailable"):
+        allocator.allocate("novel-1", 2, "outline", total_budget=1000)
+
+
+def test_allocator_stops_when_completed_beats_cannot_be_read(monkeypatch):
+    class BrokenMemoryEngine:
+        def build_fact_lock_section(self, _novel_id, _chapter_number):
+            return "FACT_LOCK"
+
+        def get_completed_beats_section(self, _novel_id):
+            raise MemoryStateUnavailableError("memory_state_unavailable: database read failed")
+
+        def get_revealed_clues_section(self, _novel_id):
+            return ""
+
+    allocator = ContextBudgetAllocator(memory_engine=BrokenMemoryEngine())
+    monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 100)
+
+    with pytest.raises(RuntimeError, match="memory_state_unavailable"):
         allocator.allocate("novel-1", 2, "outline", total_budget=1000)
 
 

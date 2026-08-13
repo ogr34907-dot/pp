@@ -6,6 +6,7 @@ import pytest
 from application.workflows.auto_novel_generation_workflow import (
     AutoNovelGenerationWorkflow,
 )
+from application.engine.services.memory_engine import MemoryStateUnavailableError
 
 
 class _CountingLLM:
@@ -180,6 +181,33 @@ async def test_generate_chapter_stream_blocks_before_context_or_llm_when_require
     assert llm_service.calls == 0
     assert context_builder.build_calls == 0
     assert events == [{"type": "error", "message": expected_reason}]
+
+
+@pytest.mark.asyncio
+async def test_candidate_generation_stops_before_the_prose_llm_when_memory_state_is_unavailable():
+    workflow, context_builder, llm_service = _workflow(memory_mode="ready")
+    configured_memory = SimpleNamespace(
+        bible_repository=object(),
+        llm_service=llm_service,
+    )
+    workflow.memory_engine = configured_memory
+    context_builder.budget_allocator.memory_engine = configured_memory
+
+    def unavailable_context(**_kwargs):
+        raise MemoryStateUnavailableError("memory_state_unavailable: database read failed")
+
+    context_builder.build_structured_context = unavailable_context
+
+    with pytest.raises(MemoryStateUnavailableError, match="memory_state_unavailable"):
+        await workflow.generate_candidate_draft(
+            novel_id="novel-1",
+            chapter_number=2,
+            chapter_title="第二章",
+            outline_chain={"chapter": {"payload": {"title": "第二章"}}},
+            outline_text="已发布的第二章大纲",
+        )
+
+    assert llm_service.calls == 0
 
 
 @pytest.mark.asyncio

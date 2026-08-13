@@ -211,6 +211,70 @@ async def test_generate_candidate_draft_emits_buffered_prose_deltas_without_post
     workflow.post_process_generated_chapter.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_generate_candidate_draft_injects_dag_beats_into_script_and_prose_prompts(
+    workflow,
+    mock_llm_service,
+):
+    prompts = []
+    call_count = 0
+
+    async def stream_generate(prompt, _config):
+        nonlocal call_count
+        call_count += 1
+        prompts.append(prompt)
+        yield "剧本" if call_count == 1 else "正文"
+
+    mock_llm_service.stream_generate = stream_generate
+    beats = [
+        {
+            "description": "主角赴约",
+            "conflict": "追兵正在逼近",
+            "delta": "主角失去退路",
+            "handoff_to_next": "交出证物",
+            "must_include": ["主角赴约"],
+            "must_not_include": ["提前揭晓真相"],
+        }
+    ]
+
+    result = await workflow.generate_candidate_draft(
+        novel_id="novel-1",
+        chapter_number=1,
+        chapter_title="雨夜赴约",
+        outline_chain={
+            "chapter": {
+                "payload": {
+                    "title": "雨夜赴约",
+                    "rhythm": {
+                        "chapter_function": "transition",
+                        "chapter_goal": "完成交接并改变关系",
+                        "chapter_delta": "双方暂时合作",
+                        "ending_hook": "追兵逼近",
+                    },
+                }
+            }
+        },
+        outline_text="已发布章纲",
+        beats=beats,
+    )
+
+    assert result["content"] == "正文"
+    assert len(prompts) == 2
+    assert all("DAG CHAPTER BEATS" in f"{prompt.system}\n{prompt.user}" for prompt in prompts)
+    assert all("DAG CHAPTER RHYTHM" not in f"{prompt.system}\n{prompt.user}" for prompt in prompts)
+    assert all("主角赴约" in f"{prompt.system}\n{prompt.user}" for prompt in prompts)
+    assert all("CHAPTER RHYTHM CONTRACT" in f"{prompt.system}\n{prompt.user}" for prompt in prompts)
+    assert all("双方暂时合作" in f"{prompt.system}\n{prompt.user}" for prompt in prompts)
+    assert all(
+        f"{prompt.system}\n{prompt.user}".count("CHAPTER RHYTHM CONTRACT") == 1
+        for prompt in prompts
+    )
+    assert all(
+        f'{prompt.system}\n{prompt.user}'.count('"chapter_function": "transition"') == 1
+        for prompt in prompts
+    )
+
+
 class TestGenerateChapter:
     """测试 generate_chapter 方法"""
 

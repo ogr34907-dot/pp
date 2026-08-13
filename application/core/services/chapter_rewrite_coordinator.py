@@ -136,6 +136,10 @@ class ChapterRewriteCoordinator:
             head,
         )
         self._invalidate_vectors(novel_id, chapter_number)
+        memory_engine = getattr(self._aftermath, "_memory_engine", None)
+        invalidate_memory_cache = getattr(memory_engine, "invalidate_cached_state", None)
+        if callable(invalidate_memory_cache):
+            invalidate_memory_cache(novel_id)
 
         if rewrite_mode == RETAIN_PROSE:
             self._replay_retained_prose(novel_id, chapter_number, head)
@@ -382,6 +386,14 @@ class ChapterRewriteCoordinator:
             ("causal_edges",),
             chapter_columns=("source_chapter", "target_chapter", "chapter_number"),
         )
+        timeline_columns = self._table_columns(conn, "bible_timeline_notes")
+        if {"novel_id", "source_type", "chapter_number"} <= timeline_columns:
+            conn.execute(
+                "DELETE FROM bible_timeline_notes "
+                "WHERE novel_id = ? AND source_type = 'chapter_aftermath' "
+                "AND COALESCE(chapter_number, 0) >= ?",
+                (novel_id, chapter_number),
+            )
         self._invalidate_character_state(conn, novel_id, chapter_number)
         self._invalidate_debts(conn, novel_id, chapter_number)
         self._invalidate_foreshadows(conn, novel_id, chapter_number)

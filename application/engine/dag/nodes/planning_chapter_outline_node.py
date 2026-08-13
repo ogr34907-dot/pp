@@ -48,6 +48,13 @@ class PlanningOutlinePartitionNode(AbstractPlanningNode):
             ),
             NodePort(name="beat_sheet_json", data_type=PortDataType.JSON, required=False, default=None),
             NodePort(
+                name="outline_payload",
+                data_type=PortDataType.JSON,
+                required=False,
+                default=None,
+                description="已发布五级章纲 payload；只用于投影显式 rhythm，不推断旧数据",
+            ),
+            NodePort(
                 name="use_llm",
                 data_type=PortDataType.BOOLEAN,
                 required=False,
@@ -124,6 +131,8 @@ class PlanningOutlinePartitionNode(AbstractPlanningNode):
                 beat_sheet_json=beat_sheet_json,
                 use_llm=use_llm_bool,
                 decomposition_label="planning_outline_partition",
+                outline_payload=inputs.get("outline_payload")
+                or (context.get("outline_payload") if isinstance(context, dict) else None),
             )
 
             duration_ms = int((time.perf_counter() - started) * 1000)

@@ -20,8 +20,8 @@ class SqliteCausalEdgeRepository(CausalEdgeRepository):
         self.db.execute("""
             INSERT OR REPLACE INTO causal_edges
             (id, novel_id, source_event_summary, source_chapter, causal_type,
-             target_event_summary, target_chapter, strength, confidence,
-             state_change, involved_characters, is_resolved, resolved_chapter,
+            target_event_summary, target_chapter, strength, confidence,
+            state_change, involved_characters, is_resolved, resolved_chapter,
              created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     COALESCE((SELECT created_at FROM causal_edges WHERE id = ?), datetime('now')),

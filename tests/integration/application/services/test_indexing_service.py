@@ -2,6 +2,9 @@
 import pytest
 from unittest.mock import AsyncMock, Mock
 from application.services.indexing_service import IndexingService
+from application.engine.services.worldline_generation_guard import (
+    GenerationEpochUnavailableError,
+)
 
 
 @pytest.fixture
@@ -80,6 +83,25 @@ async def test_index_chapter_flow(indexing_service, mock_summarizer, mock_embedd
             "generation_epoch": 0,
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_index_chapter_stops_before_any_side_effect_when_worldline_epoch_is_unavailable(
+    indexing_service, mock_summarizer, mock_embedding_service, mock_vector_store, monkeypatch,
+):
+    from application.analyst.services import indexing_service as indexing_module
+
+    def unavailable_epoch(_novel_id):
+        raise GenerationEpochUnavailableError("generation_epoch_unavailable: database read failed")
+
+    monkeypatch.setattr(indexing_module, "active_generation_epoch", unavailable_epoch)
+
+    with pytest.raises(GenerationEpochUnavailableError, match="generation_epoch_unavailable"):
+        await indexing_service.index_chapter("novel123", 5, "正文")
+
+    mock_summarizer.summarize.assert_not_called()
+    mock_embedding_service.embed.assert_not_called()
+    mock_vector_store.insert.assert_not_called()
 
 
 @pytest.mark.asyncio

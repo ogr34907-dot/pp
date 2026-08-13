@@ -157,13 +157,34 @@ class _DeterministicLLM:
         memory_chapter = re.search(r"第\s*(\d+)\s*章", body)
         if "【待分析的章节】" in body and memory_chapter:
             chapter_number = int(memory_chapter.group(1))
+            chapter_content_match = re.search(
+                r"正文如下：\s*(.*?)(?:\n━━━|\Z)",
+                body,
+                flags=re.DOTALL,
+            )
+            chapter_content = chapter_content_match.group(1) if chapter_content_match else body
+            durable_markers = [
+                marker
+                for marker in (
+                    "沈青得知内鬼秘密",
+                    "林澈死亡",
+                    "沈青与陆宁从敌对转为合作",
+                    "钟楼暗门伏笔",
+                    "苍梧城毁灭",
+                )
+                if marker in chapter_content
+            ]
+            durable_suffix = "；".join(durable_markers)
             return GenerationResult(
                 json.dumps(
                     {
                         "completed_beats": [
                             {
                                 "beat_id": f"ch{chapter_number}-durable-beat",
-                                "summary": f"第{chapter_number}章完成的记忆节拍",
+                                "summary": (
+                                    f"第{chapter_number}章完成的记忆节拍"
+                                    + (f"；{durable_suffix}" if durable_suffix else "")
+                                ),
                                 "chapter": chapter_number,
                                 "characters_involved": ["沈青"],
                             }
@@ -171,7 +192,10 @@ class _DeterministicLLM:
                         "revealed_clues": [
                             {
                                 "clue_id": f"ch{chapter_number}-durable-clue",
-                                "content": f"第{chapter_number}章揭露的记忆线索",
+                                "content": (
+                                    f"第{chapter_number}章揭露的记忆线索"
+                                    + (f"；{durable_suffix}" if durable_suffix else "")
+                                ),
                                 "revealed_at_chapter": chapter_number,
                                 "category": "truth",
                                 "is_still_valid": True,
@@ -189,7 +213,19 @@ class _DeterministicLLM:
             raise RuntimeError("injected extraction failure for chapter 17")
         markers = [
             marker
-            for marker in ("林澈死亡", "赤铜钥匙", "钟楼", "内鬼秘密", "钟楼暗门伏笔", "卷一结束", "卷二开始", "幕二转场")
+            for marker in (
+                "林澈死亡",
+                "赤铜钥匙",
+                "钟楼",
+                "内鬼秘密",
+                "钟楼暗门伏笔",
+                "卷一结束",
+                "卷二开始",
+                "幕二转场",
+                "沈青得知内鬼秘密",
+                "沈青与陆宁从敌对转为合作",
+                "苍梧城毁灭",
+            )
             if marker in body
         ]
         summary = "；".join(markers) or "常规推进"
@@ -200,16 +236,37 @@ class _DeterministicLLM:
             "key_events": summary,
             "open_threads": "钟楼暗门伏笔" if "钟楼暗门伏笔" in markers else "",
             "relation_triples": [
-                {"subject": marker, "predicate": "已发生", "object": marker}
+                {
+                    "subject": marker,
+                    "predicate": "已发生",
+                    "object": marker,
+                    "evidence_text": marker,
+                }
                 for marker in markers
             ],
             "foreshadow_hints": (
-                [{"description": "钟楼暗门伏笔", "suggested_resolve_offset": 5, "importance": "high"}]
+                [
+                    {
+                        "description": "钟楼暗门伏笔",
+                        "suggested_resolve_offset": 5,
+                        "importance": "high",
+                        "evidence_text": "钟楼暗门伏笔",
+                    }
+                ]
                 if "钟楼暗门伏笔" in markers
                 else []
             ),
             "character_mutations": (
-                [{"character_name": "沈青", "mutation_type": "scar", "source_event": "林澈死亡", "impact_or_description": "目睹林澈死亡", "intensity": 8}]
+                [
+                    {
+                        "character_name": "沈青",
+                        "mutation_type": "scar",
+                        "source_event": "林澈死亡",
+                        "impact_or_description": "目睹林澈死亡",
+                        "intensity": 8,
+                        "evidence_text": "林澈死亡",
+                    }
+                ]
                 if "林澈死亡" in markers
                 else []
             ),
@@ -237,6 +294,11 @@ class _DeterministicComposer:
             11: "卷二开始",
             17: "[EXTRACTION_FAIL]",
             20: "幕二转场",
+            25: "沈青得知内鬼秘密",
+            70: "林澈死亡",
+            120: "沈青与陆宁从敌对转为合作",
+            200: "钟楼暗门伏笔",
+            350: "苍梧城毁灭",
         }.get(request.chapter_number, "常规推进")
         return ProseCompositionResult(
             content=(
@@ -264,6 +326,12 @@ class _ChapterRepository:
         self.chapters[number] = chapter
         return chapter
 
+    def list_by_novel(self, novel_id):
+        chapters = self._repository.list_by_novel(novel_id)
+        for chapter in chapters:
+            self.chapters[chapter.number] = chapter
+        return sorted(self.chapters.values(), key=lambda chapter: chapter.number)
+
     def save(self, chapter):
         self._repository.save(chapter)
         self.db.commit()
@@ -284,8 +352,9 @@ class _ChapterRepository:
 
 
 class _NovelRepository:
-    def __init__(self):
+    def __init__(self, target_chapters: int):
         self.novel = SimpleNamespace(
+            target_chapters=target_chapters,
             current_beat_index=0,
             generation_prefs=SimpleNamespace(inline_prose_aggregation_enabled=False),
         )
@@ -339,6 +408,7 @@ class _MemoryBibleRepository:
         self._bible = SimpleNamespace(
             characters=[
                 SimpleNamespace(
+                    character_id=SimpleNamespace(value="lin-che"),
                     name="林澈",
                     description="林澈的父亲已经死亡。",
                     status="",
@@ -350,6 +420,7 @@ class _MemoryBibleRepository:
                     mental_state="NORMAL",
                 ),
                 SimpleNamespace(
+                    character_id=SimpleNamespace(value="shen-qing"),
                     name="沈青",
                     description="",
                     status="alive",
@@ -546,7 +617,7 @@ async def _run_memory_stability_regression(
         chapter_repository,
     )
     story_node_repository = _CurrentStoryNodeRepository()
-    novel_repository = _NovelRepository()
+    novel_repository = _NovelRepository(chapter_count)
     pipeline = BaseStoryPipeline()
     for chapter_number in range(1, chapter_count + 1):
         if chapter_number == 10:
@@ -555,7 +626,7 @@ async def _run_memory_stability_regression(
             connection = database.get_connection()
             chapter_repository = _ChapterRepository(database)
             story_node_repository = _CurrentStoryNodeRepository()
-            novel_repository = _NovelRepository()
+            novel_repository = _NovelRepository(chapter_count)
             vector_store, llm, memory_engine, allocator, aftermath, knowledge = _build_runtime(
                 database,
                 connection,
@@ -646,13 +717,11 @@ async def _run_memory_stability_regression(
     assert memory_state is not None
     memory_payload = json.loads(memory_state[0])
     assert memory_state[1] == chapter_count
-    assert {beat["beat_id"] for beat in memory_payload["completed_beats"]} >= {
-        "ch1-durable-beat",
-        f"ch{chapter_count}-durable-beat",
+    assert f"ch{chapter_count}-durable-beat" in {
+        beat["beat_id"] for beat in memory_payload["completed_beats"]
     }
-    assert {clue["clue_id"] for clue in memory_payload["revealed_clues"]} >= {
-        "ch1-durable-clue",
-        f"ch{chapter_count}-durable-clue",
+    assert f"ch{chapter_count}-durable-clue" in {
+        clue["clue_id"] for clue in memory_payload["revealed_clues"]
     }
     if chapter_count >= 17:
         assert not any('"chapter_number": 17' in payload for payload in triple_payloads)
@@ -665,6 +734,11 @@ async def _run_memory_stability_regression(
         10: "卷一结束",
         11: "卷二开始",
         20: "幕二转场",
+        25: "沈青得知内鬼秘密",
+        70: "林澈死亡",
+        120: "沈青与陆宁从敌对转为合作",
+        200: "钟楼暗门伏笔",
+        350: "苍梧城毁灭",
     }
     for chapter_number, marker in expected_markers.items():
         if chapter_number <= chapter_count:
@@ -684,13 +758,13 @@ async def _run_memory_stability_regression(
     if chapter_count >= 12:
         assert "memory-stability_ch12_summary" in vector_store.records
 
-    return captured_contexts
+    return captured_contexts, memory_payload
 
 
 @pytest.mark.asyncio
 async def test_default_story_pipeline_persists_memory_and_evolves_next_context(tmp_path: Path, monkeypatch):
     """The default pipeline carries chapter-one memory into chapter two's real context."""
-    contexts = await _run_memory_stability_regression(
+    contexts, _memory_payload = await _run_memory_stability_regression(
         tmp_path,
         monkeypatch,
         chapter_count=2,
@@ -715,7 +789,7 @@ async def test_thirty_chapter_regression_recovers_injected_vector_failure(tmp_pa
 @pytest.mark.slow
 async def test_hundred_chapter_memory_stability_regression(tmp_path: Path, monkeypatch):
     """Run 100 real pipeline iterations with durable memory and evolving context."""
-    contexts = await _run_memory_stability_regression(
+    contexts, _memory_payload = await _run_memory_stability_regression(
         tmp_path,
         monkeypatch,
         chapter_count=100,
@@ -724,3 +798,38 @@ async def test_hundred_chapter_memory_stability_regression(tmp_path: Path, monke
     assert "第99章完成的记忆节拍" in contexts[100]
     assert "第99章揭露的记忆线索" in contexts[100]
     assert "禁止: 林澈(" not in contexts[100]
+
+
+@pytest.mark.asyncio
+@pytest.mark.slow
+@pytest.mark.parametrize("chapter_count", [300, 500, 800])
+async def test_long_run_memory_stability_preserves_durable_story_facts(
+    tmp_path: Path,
+    monkeypatch,
+    chapter_count: int,
+):
+    """Check the same persisted Canonical chain at every required long-run stop."""
+    contexts, memory_payload = await _run_memory_stability_regression(
+        tmp_path,
+        monkeypatch,
+        chapter_count=chapter_count,
+    )
+
+    current_context = contexts[chapter_count]
+    assert f"第{chapter_count - 1}章完成的记忆节拍" in current_context
+    assert f"第{chapter_count - 1}章揭露的记忆线索" in current_context
+    durable_memory = "\n".join(
+        [
+            *(str(beat.get("summary") or "") for beat in memory_payload["completed_beats"]),
+            *(str(clue.get("content") or "") for clue in memory_payload["revealed_clues"]),
+        ]
+    )
+    for marker in (
+        "林澈死亡",
+        "沈青得知内鬼秘密",
+        "沈青与陆宁从敌对转为合作",
+    ):
+        assert marker in durable_memory
+    if chapter_count >= 500:
+        assert "钟楼暗门伏笔" in durable_memory
+        assert "苍梧城毁灭" in durable_memory

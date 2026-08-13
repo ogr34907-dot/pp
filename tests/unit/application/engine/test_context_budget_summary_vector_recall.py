@@ -2,7 +2,12 @@ import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
+from application.engine.services.worldline_generation_guard import (
+    GenerationEpochUnavailableError,
+)
 from application.world.services.chapter_narrative_sync import (
     CHAPTER_NARRATIVE_PIPELINE_VERSION,
 )
@@ -327,6 +332,27 @@ def test_vector_recall_combines_narrative_query_and_filters_invalid_evidence():
     assert context.count("有效证据 A") == 1
     for forbidden in ("当前章", "未来章", "T2 已含", "失效向量", "旧版本", "无来源向量", "低分向量", "不应超过三条"):
         assert forbidden not in context
+
+
+def test_vector_recall_stops_when_the_worldline_barrier_cannot_be_read(monkeypatch):
+    vector_facade = _VectorFacade([])
+    allocator = ContextBudgetAllocator()
+    allocator.vector_facade = vector_facade
+
+    def unavailable_epoch(_novel_id):
+        raise GenerationEpochUnavailableError(
+            "generation_epoch_unavailable: worldline database is unavailable"
+        )
+
+    monkeypatch.setattr(
+        "application.engine.services.worldline_generation_guard.active_generation_epoch",
+        unavailable_epoch,
+    )
+
+    with pytest.raises(GenerationEpochUnavailableError, match="generation_epoch_unavailable"):
+        allocator._get_vector_recall("novel-1", 2, "继续上一章的冲突")
+
+    assert vector_facade.calls == []
 
 
 def test_recent_chapters_use_only_current_committed_summaries_for_n3_to_n5(tmp_path):

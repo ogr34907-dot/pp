@@ -72,6 +72,7 @@ def get_candidate_workflow_service() -> CandidateChapterWorkflowService:
         api_dependencies.get_chapter_aftermath_pipeline(),
         dag_engine=DAGEngine(),
         dag_factory=get_default_dag,
+        semantic_reviewer=api_dependencies.get_chapter_ai_review_service(),
     )
 
 

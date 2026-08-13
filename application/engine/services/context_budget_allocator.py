@@ -14,6 +14,8 @@
 当 Token 预算紧张时，从 T3 → T2 → T1 逐层挤压，T0 绝对保护。
 """
 import hashlib
+import inspect
+import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -714,9 +716,13 @@ class ContextBudgetAllocator:
         fact_lock_content = ""
         if self.memory_engine:
             try:
-                fact_lock_content = self.memory_engine.build_fact_lock_section(
-                    novel_id, chapter_number
-                )
+                builder = self.memory_engine.build_fact_lock_section
+                parameters = inspect.signature(builder).parameters
+                if "outline" in parameters or len(parameters) >= 3:
+                    fact_lock_content = builder(novel_id, chapter_number, outline)
+                else:
+                    # Compatibility for test/runtime adapters predating outline-aware FACT_LOCK.
+                    fact_lock_content = builder(novel_id, chapter_number)
             except Exception as e:
                 raise FactLockUnavailableError(
                     f"configured MemoryEngine FACT_LOCK 构建失败: {e}"
@@ -804,7 +810,9 @@ class ContextBudgetAllocator:
             try:
                 beats_content = self.memory_engine.get_completed_beats_section(novel_id)
             except Exception as e:
-                logger.warning(f"COMPLETED_BEATS 构建失败: {e}")
+                raise FactLockUnavailableError(
+                    f"configured MemoryEngine COMPLETED_BEATS 构建失败: {e}"
+                ) from e
         slots["completed_beats"] = ContextSlot(
             name="已完成节拍(COMPLETED_BEATS)",
             tier=PriorityTier.T1_COMPRESSIBLE,
@@ -838,7 +846,9 @@ class ContextBudgetAllocator:
             try:
                 clues_content = self.memory_engine.get_revealed_clues_section(novel_id)
             except Exception as e:
-                logger.warning(f"REVEALED_CLUES 构建失败: {e}")
+                raise FactLockUnavailableError(
+                    f"configured MemoryEngine REVEALED_CLUES 构建失败: {e}"
+                ) from e
         slots["revealed_clues"] = ContextSlot(
             name="已揭露线索(REVEALED_CLUES)",
             tier=PriorityTier.T1_COMPRESSIBLE,
@@ -1221,6 +1231,28 @@ class ContextBudgetAllocator:
     # 爽文引擎: T0 伏笔最大展示数量（防止 T0 膨胀；+2 为用户星标条目留余量）
     MAX_T0_FORESHADOWING_ITEMS = 8
 
+    def _filter_foreshadow_registry_for_current_worldline(
+        self, novel_id: str, registry: Any
+    ) -> Any:
+        db = getattr(self.foreshadowing_repo, "_db", None)
+        if db is None or registry is None:
+            return registry
+
+        from application.engine.services.worldline_generation_guard import (
+            visible_committed_chapters,
+        )
+
+        visible_chapters = visible_committed_chapters(novel_id, db)
+
+        def visible(item: Any) -> bool:
+            chapter = getattr(item, "planted_in_chapter", None)
+            return chapter is not None and int(chapter) in visible_chapters
+
+        registry._foreshadowings = [
+            item for item in registry.foreshadowings if visible(item)
+        ]
+        return registry
+
     def _get_pending_foreshadowings(self, novel_id: str, chapter_number: int) -> str:
         """获取待回收伏笔（轨道二核心）- 爽文引擎: 使用 T0 精选筛选，剥离冗长 pending。"""
         if not self.foreshadowing_repo:
@@ -1232,6 +1264,10 @@ class ContextBudgetAllocator:
             
             if not registry:
                 return ""
+
+            registry = self._filter_foreshadow_registry_for_current_worldline(
+                novel_id, registry
+            )
             
             # 爽文引擎: 使用 T0 筛选方法，剥离冗长 pending 伏笔
             pending_foreshadows = registry.get_t0_eligible_foreshadowings(
@@ -1303,6 +1339,12 @@ class ContextBudgetAllocator:
             return "\n".join(lines)
             
         except Exception as e:
+            from application.engine.services.worldline_generation_guard import (
+                GenerationEpochUnavailableError,
+            )
+
+            if isinstance(e, GenerationEpochUnavailableError):
+                raise
             logger.warning(f"获取待回收伏笔失败: {e}")
         
         return ""
@@ -1318,6 +1360,10 @@ class ContextBudgetAllocator:
             
             if not registry:
                 return ""
+
+            registry = self._filter_foreshadow_registry_for_current_worldline(
+                novel_id, registry
+            )
             
             deferred = registry.get_deferred_foreshadowings(current_chapter=chapter_number)
             
@@ -1711,6 +1757,19 @@ class ContextBudgetAllocator:
             return ""
         
         try:
+            from application.engine.services.worldline_generation_guard import (
+                visible_committed_chapters,
+            )
+
+            graph_db = getattr(self.triple_repo, "_db", None)
+            if graph_db is None:
+                graph_db = getattr(getattr(self.triple_repo, "_kr", None), "db", None)
+            visible_chapters = (
+                visible_committed_chapters(novel_id, graph_db)
+                if graph_db is not None
+                else None
+            )
+
             # ========== Step 1: 从大纲中提取实体名称 ==========
             mentioned_entities = self._extract_entities_from_outline(novel_id, outline)
             
@@ -1735,6 +1794,14 @@ class ContextBudgetAllocator:
             # ========== Step 6: 合并去重 ==========
             all_triples = {}
             for t in one_hop_triples + trigger_triples + semantic_triples + recent_triples:
+                if visible_chapters is not None:
+                    chapter = getattr(t, "chapter_id", None)
+                    if chapter is None:
+                        chapter = getattr(t, "chapter_number", None)
+                    if chapter is None:
+                        chapter = getattr(t, "source_chapter_id", None)
+                    if chapter is not None and int(chapter) not in visible_chapters:
+                        continue
                 if t.id not in all_triples:
                     all_triples[t.id] = t
             
@@ -1756,6 +1823,12 @@ class ContextBudgetAllocator:
             return self._format_graph_subnetwork(sorted_triples, chapter_number)
             
         except Exception as e:
+            from application.engine.services.worldline_generation_guard import (
+                GenerationEpochUnavailableError,
+            )
+
+            if isinstance(e, GenerationEpochUnavailableError):
+                raise
             logger.warning(f"获取图谱子网失败: {e}")
             return ""
     
@@ -2267,6 +2340,12 @@ class ContextBudgetAllocator:
             return "\n".join(lines)
             
         except Exception as e:
+            from application.engine.services.worldline_generation_guard import (
+                GenerationEpochUnavailableError,
+            )
+
+            if isinstance(e, GenerationEpochUnavailableError):
+                raise
             logger.warning(f"向量召回失败: {e}")
         
         return ""

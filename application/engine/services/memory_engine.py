@@ -29,8 +29,8 @@ from __future__ import annotations
 
 import json
 import hashlib
-import logging
 import re
+import logging
 import time
 from collections import OrderedDict
 from copy import deepcopy
@@ -132,10 +132,11 @@ class FactLockBuilder:
     - Character.relationships → 关系图谱
     """
 
-    def __init__(self, bible_repository: BibleRepository):
+    def __init__(self, bible_repository: BibleRepository, db_connection=None):
         self.bible_repository = bible_repository
+        self.db_connection = db_connection
 
-    def build(self, novel_id: str, current_chapter: int = 0) -> str:
+    def build(self, novel_id: str, current_chapter: int = 0, outline: str = "") -> str:
         """构建完整的 FACT_LOCK 文本块
         
         Args:
@@ -150,10 +151,259 @@ class FactLockBuilder:
             bible = self.bible_repository.get_by_novel_id(novel_id_obj)
             if not bible:
                 return ""
-            return self._build_from_bible(bible, current_chapter)
+            text = self._build_from_bible(bible, current_chapter)
+            canonical = self._build_canonical_hard_facts(
+                novel_id, current_chapter, outline, bible
+            )
+            return "\n".join(part for part in (text, canonical) if part)
         except Exception as e:
-            logger.warning(f"FactLock 构建失败: {e}")
+            raise RuntimeError(f"fact_lock_unavailable: {e}") from e
+
+    @staticmethod
+    def _canonical_entities(outline: str, bible: Any) -> list[str]:
+        """Return only Bible names/aliases explicitly mentioned in this outline.
+
+        The Bible is a catalogue, not a chapter-scene entity list.  Keeping the
+        intersection here prevents a long-run fact scan from treating every
+        character and location in the book as relevant.
+        """
+        text = str(outline or "")
+        if not text:
+            return []
+
+        entities: list[str] = []
+        for item in (
+            (getattr(bible, "characters", []) or [])
+            + (getattr(bible, "locations", []) or [])
+        ):
+            canonical = str(getattr(item, "name", "") or "").strip()
+            raw_aliases = getattr(item, "aliases", []) or []
+            if isinstance(raw_aliases, str):
+                raw_aliases = [raw_aliases]
+            phrases = []
+            for raw_phrase in [canonical, *raw_aliases]:
+                phrase = str(raw_phrase or "").strip()
+                if phrase:
+                    phrases.append(phrase)
+            if any(phrase in text for phrase in phrases):
+                entities.extend(phrases)
+
+        return sorted(set(entities), key=len, reverse=True)
+
+    def _build_canonical_hard_facts(
+        self, novel_id: str, current_chapter: int, outline: str, bible: Any
+    ) -> str:
+        """Read committed chapter facts from existing authority tables only."""
+        if self.db_connection is None or not outline:
             return ""
+        from application.engine.services.worldline_generation_guard import (
+            active_generation_epoch,
+        )
+
+        db = self.db_connection
+        # The commit table is the single row-level visibility barrier.  Reading
+        # the epoch first keeps failures fail-closed without materializing the
+        # whole committed-chapter set for every fact-lock build.
+        active_generation_epoch(novel_id, db)
+
+        entities = self._canonical_entities(outline, bible)
+        if not entities:
+            return ""
+
+        relevance_columns = {
+            "triple": ("subject", "predicate", "object"),
+            "timeline": ("event", "time_point", "description"),
+            "causal": ("source_event_summary", "target_event_summary", "state_change"),
+            "state": ("character_id", "current_state_summary"),
+            "foreshadow": ("description",),
+        }
+
+        def relevance_clause(columns: tuple[str, ...]) -> tuple[str, list[str]]:
+            terms = [
+                f"instr(COALESCE({column}, ''), ?) > 0"
+                for column in columns
+                for _entity in entities
+            ]
+            params = [entity for column in columns for entity in entities]
+            return " OR ".join(terms), params
+
+        def committed_clause(alias: str, chapter_column: str) -> str:
+            return (
+                "EXISTS (SELECT 1 FROM chapter_narrative_commits c "
+                f"WHERE c.novel_id = {alias}.novel_id "
+                f"AND c.chapter_number = {alias}.{chapter_column} "
+                "AND c.status = 'committed')"
+            )
+
+        def bounded_rows(rows: list[dict], limit: int = 200) -> list[dict]:
+            """Keep a small priority/recency mix after visibility and relevance."""
+            if len(rows) <= limit:
+                return rows
+            half = limit // 2
+
+            def chapter(row: dict) -> int:
+                for key in (
+                    "chapter_number",
+                    "source_chapter",
+                    "last_updated_chapter",
+                    "planted_chapter",
+                ):
+                    if key in row and row[key] is not None:
+                        try:
+                            return int(row[key])
+                        except (TypeError, ValueError):
+                            break
+                return 0
+
+            def confidence(row: dict) -> float:
+                try:
+                    return float(row.get("confidence") or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            priority = sorted(rows, key=lambda row: (-confidence(row), chapter(row)))
+            recent = sorted(rows, key=lambda row: (-chapter(row), -confidence(row)))
+            selected: list[dict] = []
+            seen: set[int] = set()
+            for row in [*priority[:half], *recent[: limit - half]]:
+                marker = id(row)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                selected.append(row)
+            return selected
+
+        def related(*values: Any) -> bool:
+            text = " ".join(str(value or "") for value in values)
+            return any(entity in text for entity in entities)
+
+        category_lines: list[list[str]] = []
+        triple_relevance, triple_entities = relevance_clause(relevance_columns["triple"])
+        triple_rows = db.fetch_all(
+            f"""
+            SELECT t.subject, t.predicate, t.object, t.chapter_number, t.confidence
+            FROM triples t
+            WHERE t.novel_id = ? AND t.chapter_number <= ?
+              AND {committed_clause('t', 'chapter_number')}
+              AND ({triple_relevance})
+            ORDER BY t.confidence DESC, t.chapter_number DESC
+            """,
+            (novel_id, current_chapter, *triple_entities),
+        )
+        triple_lines: list[str] = []
+        for row in bounded_rows(triple_rows):
+            if related(row["subject"], row["object"], row["predicate"]):
+                triple_lines.append(
+                    f"   [第{row['chapter_number']}章] {row['subject']} —{row['predicate']}→ {row['object']}"
+                )
+        category_lines.append(triple_lines)
+
+        timeline_relevance, timeline_entities = relevance_clause(relevance_columns["timeline"])
+        timeline_rows = db.fetch_all(
+            f"""
+            SELECT event, time_point, description, chapter_number
+            FROM bible_timeline_notes
+            WHERE novel_id = ? AND source_type = 'chapter_aftermath'
+              AND chapter_number <= ?
+              AND {committed_clause('bible_timeline_notes', 'chapter_number')}
+              AND ({timeline_relevance})
+            ORDER BY chapter_number DESC
+            """,
+            (novel_id, current_chapter, *timeline_entities),
+        )
+        timeline_lines: list[str] = []
+        for row in bounded_rows(timeline_rows):
+            if related(row["event"], row["description"], row["time_point"]):
+                timeline_lines.append(
+                    f"   [第{row['chapter_number']}章] 时间线：{row['event']}（{row['description']}）"
+                )
+        category_lines.append(timeline_lines)
+
+        causal_relevance, causal_entities = relevance_clause(relevance_columns["causal"])
+        causal_rows = db.fetch_all(
+            f"""
+            SELECT source_event_summary, causal_type, target_event_summary,
+                   source_chapter, state_change
+            FROM causal_edges
+            WHERE novel_id = ? AND source_chapter <= ?
+              AND {committed_clause('causal_edges', 'source_chapter')}
+              AND ({causal_relevance})
+            ORDER BY source_chapter DESC
+            """,
+            (novel_id, current_chapter, *causal_entities),
+        )
+        causal_lines: list[str] = []
+        for row in bounded_rows(causal_rows):
+            if related(row["source_event_summary"], row["target_event_summary"], row["state_change"]):
+                causal_lines.append(
+                    f"   [第{row['source_chapter']}章] 因果：{row['source_event_summary']}"
+                    f" —{row['causal_type']}→ {row['target_event_summary']}"
+                    f"（变化：{row['state_change']}）"
+                )
+        category_lines.append(causal_lines)
+
+        state_relevance, state_entities = relevance_clause(relevance_columns["state"])
+        state_rows = db.fetch_all(
+            f"""
+            SELECT character_id, current_state_summary, last_updated_chapter
+            FROM character_states
+            WHERE novel_id = ? AND last_updated_chapter <= ?
+              AND {committed_clause('character_states', 'last_updated_chapter')}
+              AND ({state_relevance})
+            ORDER BY last_updated_chapter DESC
+            """,
+            (novel_id, current_chapter, *state_entities),
+        )
+        state_lines: list[str] = []
+        for row in bounded_rows(state_rows):
+            if related(row["character_id"], row["current_state_summary"]):
+                state_lines.append(
+                    f"   [第{row['last_updated_chapter']}章] 人物状态："
+                    f"{row['character_id']}：{row['current_state_summary']}"
+                )
+        category_lines.append(state_lines)
+
+        foreshadow_relevance, foreshadow_entities = relevance_clause(relevance_columns["foreshadow"])
+        foreshadow_rows = db.fetch_all(
+            f"""
+            SELECT description, planted_chapter, status
+            FROM foreshadows
+            WHERE novel_id = ? AND planted_chapter <= ?
+              AND {committed_clause('foreshadows', 'planted_chapter')}
+              AND ({foreshadow_relevance})
+            ORDER BY planted_chapter DESC
+            """,
+            (novel_id, current_chapter, *foreshadow_entities),
+        )
+        foreshadow_lines: list[str] = []
+        for row in bounded_rows(foreshadow_rows):
+            if related(row["description"]):
+                foreshadow_lines.append(
+                    f"   [第{row['planted_chapter']}章] 伏笔({row['status']})：{row['description']}"
+                )
+        category_lines.append(foreshadow_lines)
+
+        # Keep the five authority types visible under a shared 40-line cap.
+        # Round-robin is deterministic and gives every non-empty type a slot
+        # before filling remaining capacity from the same stable order.
+        lines: list[str] = []
+        offsets = [0] * len(category_lines)
+        while len(lines) < 40:
+            added = False
+            for category_index, category in enumerate(category_lines):
+                offset = offsets[category_index]
+                if offset >= len(category):
+                    continue
+                lines.append(category[offset])
+                offsets[category_index] += 1
+                added = True
+                if len(lines) >= 40:
+                    break
+            if not added:
+                break
+        if not lines:
+            return ""
+        return "\n核心 Canonical 硬事实（正式正文证据，当前世界线）：\n" + "\n".join(lines[:40])
 
     def _build_from_bible(self, bible, current_chapter: int) -> str:
         """从 Bible 实体构建 FACT_LOCK"""
@@ -340,6 +590,10 @@ class MemoryState:
     applied_aftermath_versions: List[Dict[str, Any]] = field(default_factory=list)
 
 
+class MemoryStateUnavailableError(RuntimeError):
+    """Raised when durable memory cannot be read safely for prose generation."""
+
+
 class MemoryEngine:
     """V6 记忆引擎主入口
     
@@ -370,7 +624,7 @@ class MemoryEngine:
         runtime_settings: MemoryEngineRuntimeSettings | None = None,
     ):
         self.llm_service = llm_service
-        self.fact_lock_builder = FactLockBuilder(bible_repository)
+        self.fact_lock_builder = FactLockBuilder(bible_repository, db_connection)
         self.bible_repository = bible_repository
         self.db_connection = db_connection
         self._runtime_settings = runtime_settings or get_memory_engine_runtime_settings()
@@ -387,9 +641,11 @@ class MemoryEngine:
     # T0 注入接口（生成前调用）
     # ============================================================
 
-    def build_fact_lock_section(self, novel_id: str, chapter_number: int) -> str:
+    def build_fact_lock_section(
+        self, novel_id: str, chapter_number: int, outline: str = ""
+    ) -> str:
         """构建 T0-α: FACT_LOCK 不可篡改事实块"""
-        return self.fact_lock_builder.build(novel_id, chapter_number)
+        return self.fact_lock_builder.build(novel_id, chapter_number, outline)
 
     def get_completed_beats_section(self, novel_id: str) -> str:
         """构建 T0-β: 已完成节拍锁"""
@@ -736,6 +992,10 @@ class MemoryEngine:
         self._cache.pop(novel_id, None)
         self._cache_loaded_at.pop(novel_id, None)
 
+    def invalidate_cached_state(self, novel_id: str) -> None:
+        """Forget one novel after a Canonical rewrite invalidates its state."""
+        self._forget_cached_state(novel_id)
+
     def _load_from_db(self, novel_id: str) -> MemoryState:
         """从数据库加载持久化状态"""
         if not self.db_connection:
@@ -766,7 +1026,9 @@ class MemoryEngine:
                 logger.debug(f"MemoryEngine 从 DB 加载状态: novel={novel_id}, ch={state.last_updated_chapter}")
                 return state
         except Exception as e:
-            logger.warning(f"MemoryEngine DB 加载失败: {e}")
+            raise MemoryStateUnavailableError(
+                f"memory_state_unavailable: {e}"
+            ) from e
 
         return MemoryState(novel_id=novel_id)
 

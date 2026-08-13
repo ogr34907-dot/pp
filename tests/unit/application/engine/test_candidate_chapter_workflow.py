@@ -47,6 +47,15 @@ class _Outlines:
         }
 
 
+class _NoRequiredEventOutlines(_Outlines):
+    def next_published_chapter_context(self, novel_id: str, *, after_chapter: int):
+        node, chain = super().next_published_chapter_context(
+            novel_id, after_chapter=after_chapter
+        )
+        chain["chapter"]["payload"]["required_events"] = []
+        return node, chain
+
+
 class _DraftGenerator:
     def __init__(self, text: str = "主角作出选择，代价随之而来。"):
         self.text = text
@@ -74,6 +83,27 @@ class _Aftermath:
         self.calls.append(chapter_number)
         self.kwargs.append(dict(_kwargs))
         return {"narrative_sync_ok": True, "memory_engine_ok": True}
+
+
+class _SemanticReviewer:
+    def __init__(self, coverage):
+        self.coverage = coverage
+        self.calls = []
+
+    async def review(self, **kwargs):
+        self.calls.append(kwargs)
+        return type(
+            "Review",
+            (),
+            {
+                "status": "approved",
+                "score": 90,
+                "summary": "事件已在正文中完成。",
+                "issues": [],
+                "suggestions": ["保留动作证据。"],
+                "event_coverage": self.coverage,
+            },
+        )()
 
 
 class _DAG:
@@ -173,6 +203,146 @@ async def test_continuous_mode_stops_at_hard_forbidden_event_instead_of_formal_c
 
 
 @pytest.mark.asyncio
+async def test_continuous_mode_waits_when_required_outline_event_has_no_prose_evidence(workflow):
+    db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    drafts.text = "主角把手机放回桌上，没有作出决定，只让雨声填满房间。"
+    dag = _DAG([{"content": drafts.text, "approved": True, "review_required": False}])
+    service = CandidateChapterWorkflowService(
+        repo, _Outlines(), drafts, aftermath, dag_engine=dag, dag_factory=lambda: object()
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    required = candidate.audit["plan_actual_comparison"]["required_events"]
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert required == [{"event": "主角作出选择", "status": "unverified", "evidence": ""}]
+    assert candidate.commit_plan["timeline_events"] == []
+    assert db.fetch_one("SELECT COUNT(*) AS total FROM chapters WHERE novel_id = 'novel-1'")["total"] == 0
+    assert aftermath.calls == []
+
+
+@pytest.mark.asyncio
+async def test_semantic_event_evidence_allows_equivalent_prose_to_continue(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    drafts.text = "他把退路留在身后，推开雨幕，径直走向约好的港口。"
+    reviewer = _SemanticReviewer(
+        [{"event": "主角作出选择", "status": "completed", "evidence": "推开雨幕，径直走向约好的港口"}]
+    )
+    dag = _DAG([{"content": drafts.text, "approved": True, "review_required": False}])
+    service = CandidateChapterWorkflowService(
+        repo,
+        _Outlines(),
+        drafts,
+        aftermath,
+        dag_engine=dag,
+        dag_factory=lambda: object(),
+        semantic_reviewer=reviewer,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.COMMITTED
+    assert candidate.audit["plan_actual_comparison"]["required_events"] == [
+        {"event": "主角作出选择", "status": "completed", "evidence": "推开雨幕，径直走向约好的港口"}
+    ]
+    assert candidate.commit_plan["timeline_events"] == ["主角作出选择"]
+    assert len(reviewer.calls) == 1
+    assert aftermath.calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_candidate_audit_reuses_dag_semantic_evidence_without_a_second_review_call(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    drafts.text = "他把退路留在身后，推开雨幕，径直走向约好的港口。"
+
+    class _UnexpectedReviewer:
+        async def review(self, **_kwargs):
+            raise AssertionError("DAG semantic result must be reused by the candidate audit")
+
+    dag = _DAG([
+        {
+            "content": drafts.text,
+            "approved": True,
+            "review_required": False,
+            "semantic_review": {
+                "status": "approved",
+                "event_coverage": [
+                    {
+                        "event": "主角作出选择",
+                        "status": "completed",
+                        "evidence": "推开雨幕，径直走向约好的港口",
+                    }
+                ],
+            },
+        }
+    ])
+    service = CandidateChapterWorkflowService(
+        repo,
+        _Outlines(),
+        drafts,
+        aftermath,
+        dag_engine=dag,
+        dag_factory=lambda: object(),
+        semantic_reviewer=_UnexpectedReviewer(),
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.COMMITTED
+    assert candidate.audit["semantic_review"]["status"] == "approved"
+    assert aftermath.calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_direct_candidate_path_runs_full_semantic_review_without_required_events(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    reviewer = _SemanticReviewer([])
+    service = CandidateChapterWorkflowService(
+        repo,
+        _NoRequiredEventOutlines(),
+        drafts,
+        aftermath,
+        semantic_reviewer=reviewer,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert len(reviewer.calls) == 1
+    assert reviewer.calls[0]["required_events"] == []
+    assert "AI Taste" in reviewer.calls[0]["generation_hint"]
+    assert candidate.audit["semantic_review"]["status"] == "approved"
+    assert candidate.audit["semantic_review"]["status"] != "not_needed"
+    assert aftermath.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_mode", [RunMode.CONTINUOUS, RunMode.CHAPTER_REVIEW])
+async def test_direct_candidate_path_exposes_missing_semantic_review_and_stops_both_modes(
+    workflow, run_mode
+):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=run_mode, target_chapters=3)
+    service = CandidateChapterWorkflowService(
+        repo,
+        _NoRequiredEventOutlines(),
+        drafts,
+        aftermath,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert candidate.audit["semantic_review"]["status"] == "unavailable"
+    assert candidate.audit["semantic_review"]["machine_review_failed"] is True
+    assert aftermath.calls == []
+
+
+@pytest.mark.asyncio
 async def test_failed_canonical_sync_retries_the_same_formal_candidate_without_new_generation(workflow):
     _db, repo, drafts, aftermath = workflow
     repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
@@ -244,7 +414,9 @@ async def test_candidate_generation_uses_dag_state_as_the_single_draft_and_audit
 
     assert candidate.status == CandidateStatus.AWAITING_REVIEW
     assert candidate.llm_content == "主角作出选择，代价随之而来。"
-    assert candidate.audit["dag"]["approved"] is True
+    assert candidate.audit["dag"]["approved"] is False
+    assert candidate.audit["semantic_review"]["status"] == "unavailable"
+    assert candidate.audit["semantic_review"]["machine_review_failed"] is True
     assert candidate.commit_plan["dag_proposals"] == {"summary": "候选提案"}
     assert drafts.calls == []
     trace = repo.get_latest_dag_run(candidate.id)
@@ -380,6 +552,33 @@ async def test_real_dag_v2_clean_continuous_candidate_commits_after_machine_appr
     _db, repo, drafts, aftermath = workflow
     repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
     drafts.text = "主角作出选择，带着证物赶往港口。"
+    reviewer = _SemanticReviewer(
+        [{"event": "主角作出选择", "status": "completed", "evidence": "主角作出选择"}]
+    )
+    service = CandidateChapterWorkflowService(
+        repo,
+        _Outlines(),
+        drafts,
+        aftermath,
+        dag_engine=DAGEngine(),
+        dag_factory=get_default_dag,
+        semantic_reviewer=reviewer,
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.COMMITTED
+    assert candidate.audit["dag"]["approved"] is True
+    assert candidate.audit["dag"]["semantic_review"]["status"] == "approved"
+    assert aftermath.calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_real_dag_v2_continuous_candidate_waits_when_semantic_review_is_unavailable(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    drafts.text = "主角作出选择，带着证物赶往港口。"
     service = CandidateChapterWorkflowService(
         repo,
         _Outlines(),
@@ -392,6 +591,74 @@ async def test_real_dag_v2_clean_continuous_candidate_commits_after_machine_appr
 
     candidate = await service.generate_next("novel-1")
 
-    assert candidate.status == CandidateStatus.COMMITTED
-    assert candidate.audit["dag"]["approved"] is True
-    assert aftermath.calls == [1]
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert candidate.audit["dag"]["semantic_review"]["status"] == "unavailable"
+    assert candidate.audit["dag"]["semantic_review"]["machine_review_failed"] is True
+    assert aftermath.calls == []
+
+
+@pytest.mark.asyncio
+async def test_real_dag_v2_chapter_review_retains_candidate_when_machine_review_is_unavailable(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    drafts.text = "主角作出选择，带着证物赶往港口。"
+    service = CandidateChapterWorkflowService(
+        repo,
+        _Outlines(),
+        drafts,
+        aftermath,
+        dag_engine=DAGEngine(),
+        dag_factory=get_default_dag,
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert candidate.audit["dag"]["semantic_review"]["machine_review_failed"] is True
+    assert candidate.audit["dag"]["approved"] is False
+    assert aftermath.calls == []
+
+
+@pytest.mark.asyncio
+async def test_continuous_candidate_with_explicit_rhythm_cannot_commit_without_semantic_review(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    drafts.text = "主角作出选择，带着证物赶往港口。"
+
+    class _RhythmOutlines(_Outlines):
+        def next_published_chapter_context(self, novel_id: str, *, after_chapter: int):
+            node, chain = super().next_published_chapter_context(
+                novel_id, after_chapter=after_chapter
+            )
+            chain["chapter"]["payload"]["rhythm"] = {
+                "chapter_function": "transition",
+                "chapter_delta": "目标从逃离改为合作",
+            }
+            return node, chain
+
+    dag = _DAG(
+        [
+            {
+                "content": drafts.text,
+                "approved": True,
+                "review_required": False,
+            }
+        ]
+    )
+    service = CandidateChapterWorkflowService(
+        repo,
+        _RhythmOutlines(),
+        drafts,
+        aftermath,
+        dag_engine=dag,
+        dag_factory=lambda: object(),
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == CandidateStatus.AWAITING_REVIEW
+    assert candidate.audit["dag"]["approved"] is False
+    assert candidate.audit["semantic_review"]["machine_review_failed"] is True
+    assert aftermath.calls == []

@@ -38,6 +38,11 @@ from application.engine.services.narrative_gate_guard import (
     candidate_from_outline,
     enforce_chapter_candidate,
 )
+from application.engine.dag.plan.schema import (
+    chapter_rhythm_from_outline_payload,
+    render_chapter_rhythm_block,
+    serialize_chapter_rhythm,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -758,6 +763,8 @@ class AutoNovelGenerationWorkflow:
         chapter_title: str,
         outline_chain: Dict[str, Any],
         outline_text: str,
+        beats: Optional[List[Dict[str, Any]]] = None,
+        chapter_rhythm: Optional[Dict[str, Any]] = None,
         on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Generate a chapter draft without applying any formal aftermath.
@@ -781,8 +788,32 @@ class AutoNovelGenerationWorkflow:
             chapter_number,
             outline_text,
         )
-        plan_context = json.dumps(outline_chain, ensure_ascii=False, sort_keys=True)
+        source_chapter = outline_chain.get("chapter")
+        source_payload = source_chapter.get("payload") if isinstance(source_chapter, dict) else None
+        if chapter_rhythm is None and isinstance(source_payload, dict):
+            chapter_rhythm = serialize_chapter_rhythm(
+                chapter_rhythm_from_outline_payload(source_payload)
+            )
+        outline_for_prompt = dict(outline_chain)
+        chapter_for_prompt = outline_for_prompt.get("chapter")
+        if isinstance(chapter_for_prompt, dict):
+            chapter_for_prompt = dict(chapter_for_prompt)
+            payload_for_prompt = chapter_for_prompt.get("payload")
+            if isinstance(payload_for_prompt, dict):
+                payload_for_prompt = dict(payload_for_prompt)
+                payload_for_prompt.pop("rhythm", None)
+                payload_for_prompt.pop("chapter_rhythm", None)
+                chapter_for_prompt["payload"] = payload_for_prompt
+            outline_for_prompt["chapter"] = chapter_for_prompt
+        plan_context = json.dumps(outline_for_prompt, ensure_ascii=False, sort_keys=True)
         context = f"{bundle['context']}\n\n=== PUBLISHED FIVE-LEVEL OUTLINE CONTRACT ===\n{plan_context}"
+        rhythm_block = render_chapter_rhythm_block(chapter_rhythm)
+        if rhythm_block:
+            context += "\n\n=== CHAPTER RHYTHM CONTRACT ===\n" + rhythm_block
+        if beats:
+            context += "\n\n=== DAG CHAPTER BEATS ===\n" + json.dumps(
+                beats, ensure_ascii=False, sort_keys=True
+            )
         target_words = self._resolve_target_chapter_words(novel_id)
         script_parts: list[str] = []
         async for piece in self._generate_script_stream(

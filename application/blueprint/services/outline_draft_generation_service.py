@@ -133,6 +133,10 @@ class OutlineDraftGenerationService:
             "JSON 至少包含 title、narrative_text、creative_goal、entry_state、exit_state、"
             "required_events、forbidden_events、state_changes、foreshadowing、chapter_start、"
             "chapter_end、word_budget、handoff_conditions；章纲额外给 pov、scenes、beats、conflicts、ending_hook。"
+            "如果章纲明确了叙事职责，可额外给 rhythm 对象，字段可选："
+            "chapter_function（setup/transition/escalation/reversal/climax/aftermath/payoff/recovery/reveal）、"
+            "intensity_curve（low/medium/high/peak 的短数组）、chapter_goal、decisive_choice、"
+            "cost_or_risk、chapter_delta、turn_or_payoff、ending_hook；不确定时省略，不要臆造。"
         )
         return Prompt(system=system, user=user)
 

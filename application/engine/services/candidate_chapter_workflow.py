@@ -31,6 +31,10 @@ class CandidateAftermathPipeline(Protocol):
     async def run_after_chapter_saved(self, *args: Any, **kwargs: Any) -> dict[str, Any]: ...
 
 
+class CandidateSemanticReviewer(Protocol):
+    async def review(self, **kwargs: Any) -> Any: ...
+
+
 class CandidateChapterWorkflowService:
     """Drive exactly one candidate at a time from published plan to formal sync."""
 
@@ -43,6 +47,7 @@ class CandidateChapterWorkflowService:
         *,
         dag_engine: Any = None,
         dag_factory: Callable[[], Any] | None = None,
+        semantic_reviewer: CandidateSemanticReviewer | None = None,
         max_candidate_revisions: int = 2,
     ) -> None:
         self.repository = repository
@@ -51,6 +56,7 @@ class CandidateChapterWorkflowService:
         self.aftermath_pipeline = aftermath_pipeline
         self.dag_engine = dag_engine
         self.dag_factory = dag_factory
+        self.semantic_reviewer = semantic_reviewer
         self.max_candidate_revisions = max(0, int(max_candidate_revisions))
 
     async def generate_next(self, novel_id: str) -> ChapterCandidate | None:
@@ -94,12 +100,13 @@ class CandidateChapterWorkflowService:
         try:
             candidate, result = await self._generate_candidate_with_authority(candidate)
             self.repository.mark_auditing(candidate.id)
-            audit, commit_plan = self._audit_candidate(candidate, outline_chain, result)
+            audit, commit_plan = await self._audit_candidate(candidate, outline_chain, result)
             candidate = self.repository.finish_audit(
                 candidate.id,
                 audit=audit,
                 commit_plan=commit_plan,
                 require_author_review=bool(audit["hard_blocks"])
+                or not bool(audit["required_events_complete"])
                 or not bool(audit.get("dag", {}).get("approved", False)),
             )
         except Exception as exc:
@@ -138,7 +145,7 @@ class CandidateChapterWorkflowService:
         try:
             candidate, result = await self._generate_candidate_with_authority(candidate)
             self.repository.mark_auditing(candidate.id)
-            audit, commit_plan = self._audit_candidate(candidate, candidate.outline_chain, result)
+            audit, commit_plan = await self._audit_candidate(candidate, candidate.outline_chain, result)
             # Manual regeneration always returns to review.  It may not
             # silently consume the author's approval by continuing a run.
             return self.repository.finish_audit(
@@ -164,7 +171,7 @@ class CandidateChapterWorkflowService:
 
         candidate = self.repository.mark_auditing(candidate_id)
         try:
-            audit, commit_plan = self._audit_candidate(candidate, candidate.outline_chain, {})
+            audit, commit_plan = await self._audit_candidate(candidate, candidate.outline_chain, {})
             return self.repository.finish_audit(
                 candidate.id,
                 audit=audit,
@@ -213,12 +220,22 @@ class CandidateChapterWorkflowService:
         """Run a bounded candidate revision loop through DAG V2 when available."""
 
         if self.dag_engine is None or self.dag_factory is None:
+            from application.engine.dag.plan.schema import (
+                chapter_rhythm_from_outline_payload,
+                serialize_chapter_rhythm,
+            )
+
             result = await self.draft_generator.generate_candidate_draft(
                 novel_id=candidate.novel_id,
                 chapter_number=candidate.chapter_number,
                 chapter_title=candidate.title,
                 outline_chain=candidate.outline_chain,
                 outline_text=self._outline_text(candidate.outline_chain),
+                chapter_rhythm=serialize_chapter_rhythm(
+                    chapter_rhythm_from_outline_payload(
+                        candidate.outline_chain.get("chapter", {}).get("payload", {})
+                    )
+                ),
             )
             content = self._draft_content(result)
             return self.repository.set_generated_content(candidate.id, content), dict(result)
@@ -254,6 +271,7 @@ class CandidateChapterWorkflowService:
                 "outline_text": self._outline_text(candidate.outline_chain),
                 "chapter_title": candidate.title,
                 "candidate_event_sink": observer.on_candidate_event,
+                "candidate_semantic_reviewer": self.semantic_reviewer,
             }
             try:
                 run_kwargs = {"thread_id": trace["id"]}
@@ -363,8 +381,8 @@ class CandidateChapterWorkflowService:
             raise CandidateWorkflowError("candidate generator returned empty prose")
         return content
 
-    @staticmethod
-    def _audit_candidate(
+    async def _audit_candidate(
+        self,
         candidate: ChapterCandidate,
         outline_chain: dict[str, Any],
         generation_result: Any,
@@ -376,9 +394,55 @@ class CandidateChapterWorkflowService:
         required_events = [str(value) for value in chapter.get("required_events") or [] if str(value).strip()]
         forbidden_events = [str(value) for value in chapter.get("forbidden_events") or [] if str(value).strip()]
         required = [
-            {"event": event, "matched": event in content}
+            {
+                "event": event,
+                "status": "completed" if event in content else "unverified",
+                "evidence": event if event in content else "",
+            }
             for event in required_events
         ]
+        unresolved = [item["event"] for item in required if item["status"] != "completed"]
+        raw_semantic_review = (
+            generation_result.get("semantic_review")
+            if isinstance(generation_result, dict)
+            else None
+        )
+        # The real DAG gateway already paid for and persisted this review.  A
+        # second call would only slow the chapter down and can disagree with
+        # the trace the author sees.  Direct/legacy paths still need the same
+        # full semantic review, even when required_events is empty or literal
+        # evidence happens to be present.
+        semantic_review: dict[str, Any] = (
+            dict(raw_semantic_review)
+            if isinstance(raw_semantic_review, dict)
+            else await self._review_candidate_semantics(candidate, chapter, required_events)
+        )
+        if unresolved:
+            coverage = {
+                str(item.get("event") or ""): item
+                for item in semantic_review.get("event_coverage", [])
+                if isinstance(item, dict)
+            }
+            for item in required:
+                reviewed = coverage.get(item["event"])
+                if reviewed and reviewed.get("status") == "completed":
+                    evidence = str(reviewed.get("evidence") or "").strip()
+                    if evidence and evidence in content:
+                        item.update(status="completed", evidence=evidence)
+        required_events_complete = all(
+            item["status"] == "completed" for item in required
+        )
+        semantic_issues = semantic_review.get("issues", [])
+        semantic_review_ok = (
+            str(semantic_review.get("status") or "").lower() == "approved"
+            and not bool(semantic_review.get("machine_review_failed"))
+            and not bool(semantic_review.get("machine_review_incomplete"))
+            and not any(
+                isinstance(issue, dict)
+                and str(issue.get("severity") or "").lower() == "critical"
+                for issue in semantic_issues
+            )
+        )
         forbidden_hits = [event for event in forbidden_events if event in content]
         hard_blocks = [
             {
@@ -404,30 +468,39 @@ class CandidateChapterWorkflowService:
         audit = {
             "status": "blocked" if hard_blocks else "reviewable",
             "hard_blocks": hard_blocks,
+            "required_events_complete": required_events_complete,
             "soft_warnings": [
-                f"计划必发生事件尚未检测到字面匹配：{item['event']}"
+                f"计划必发生事件尚未获得正文完成证据：{item['event']}"
                 for item in required
-                if not item["matched"]
+                if item["status"] != "completed"
             ],
             "plan_actual_comparison": plan_actual,
-            "continuity": {"status": "pending_author_or_model_review"},
-            "style": {"status": "pending_author_or_model_review"},
-            "ai_taste": {"status": "pending_author_or_model_review"},
+            "continuity": {
+                "status": "verified" if required_events_complete else "requires_author_review"
+            },
+            "semantic_review": semantic_review,
+            "style": {"status": "reviewed_by_dag" if isinstance(generation_result, dict) and generation_result.get("semantic_review") else "pending_author_or_model_review"},
+            "ai_taste": {"status": "reviewed_by_dag" if isinstance(generation_result, dict) and generation_result.get("semantic_review") else "pending_author_or_model_review"},
             "dag": {
-                "approved": bool(generation_result.get("approved")) if isinstance(generation_result, dict) else False,
+                "approved": bool(generation_result.get("approved")) and semantic_review_ok
+                if isinstance(generation_result, dict)
+                else False,
                 "breaker_status": str(generation_result.get("breaker_status") or "") if isinstance(generation_result, dict) else "",
                 "retry_exhausted": bool(generation_result.get("retry_exhausted")) if isinstance(generation_result, dict) else False,
                 "review_required": bool(generation_result.get("review_required")) if isinstance(generation_result, dict) else True,
+                "semantic_review": dict(generation_result.get("semantic_review") or {}) if isinstance(generation_result, dict) else {},
             },
         }
         script = generation_result.get("script", "") if isinstance(generation_result, dict) else ""
         commit_plan = {
             "chapter_summary": content[:500],
-            "character_relation_location_world_deltas": dict(chapter.get("state_changes") or {}),
-            "timeline_events": list(chapter.get("required_events") or []),
-            "foreshadowing": dict(chapter.get("foreshadowing") or {}),
-            "narrative_debt": {"introduced": [], "advanced": list((chapter.get("foreshadowing") or {}).get("advance") or [])},
-            "next_chapter_handoff": list(chapter.get("handoff_conditions") or []),
+            "character_relation_location_world_deltas": {},
+            "timeline_events": [
+                item["event"] for item in required if item["status"] == "completed"
+            ],
+            "foreshadowing": {},
+            "narrative_debt": {"introduced": [], "advanced": []},
+            "next_chapter_handoff": [],
             "source": {
                 "candidate_id": candidate.id,
                 "generation_epoch": candidate.generation_epoch,
@@ -439,6 +512,77 @@ class CandidateChapterWorkflowService:
         if isinstance(generation_result, dict) and generation_result.get("candidate_proposals"):
             commit_plan["dag_proposals"] = generation_result["candidate_proposals"]
         return audit, commit_plan
+
+    async def _review_candidate_semantics(
+        self,
+        candidate: ChapterCandidate,
+        chapter: dict[str, Any],
+        required_events: list[str],
+    ) -> dict[str, Any]:
+        """Run the existing structured reviewer for every non-DAG candidate path."""
+
+        if self.semantic_reviewer is None:
+            return {
+                "status": "unavailable",
+                "machine_review_failed": True,
+                "issues": [],
+                "suggestions": [],
+                "event_coverage": [],
+            }
+        try:
+            from application.audit.services.chapter_ai_review_service import (
+                serialize_chapter_ai_review_result,
+            )
+            from application.engine.dag.plan.schema import (
+                chapter_rhythm_from_outline_payload,
+                serialize_chapter_rhythm,
+            )
+
+            chapter_rhythm = serialize_chapter_rhythm(
+                chapter_rhythm_from_outline_payload(chapter)
+            )
+            result = await self.semantic_reviewer.review(
+                chapter_number=candidate.chapter_number,
+                chapter_title=candidate.title,
+                chapter_content=candidate.final_content,
+                chapter_outline=json.dumps(
+                    {
+                        "creative_goal": chapter.get("creative_goal", ""),
+                        "entry_state": chapter.get("entry_state", ""),
+                        "exit_state": chapter.get("exit_state", ""),
+                        "required_events": required_events,
+                        "forbidden_events": chapter.get("forbidden_events", []),
+                        "handoff_conditions": chapter.get("handoff_conditions", []),
+                        "chapter_rhythm": chapter_rhythm,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                generation_hint=(
+                    "审查人物身份、性格、动机与行为，知识边界，位置、身体和道具状态，"
+                    "时间线、世界规则、已发生事件、伏笔、因果、AI Taste 和 Commercial Rhythm。"
+                    "required/forbidden event 仍需给出正文证据；证据不足一律阻断或标记未完成。"
+                ),
+                required_events=required_events,
+            )
+            from application.engine.dag.plan.schema import chapter_rhythm_from_outline_payload
+
+            review = serialize_chapter_ai_review_result(result)
+            rhythm = review.get("rhythm_assessment") or {}
+            review["machine_review_incomplete"] = bool(
+                chapter_rhythm_from_outline_payload(chapter)
+                and rhythm.get("status") != "complete"
+            )
+            return review
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "machine_review_failed": True,
+                "error": str(exc),
+                "issues": [],
+                "suggestions": [],
+                "event_coverage": [],
+            }
 
 
 class _CandidateDAGObserver:

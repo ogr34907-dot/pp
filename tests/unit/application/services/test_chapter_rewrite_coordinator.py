@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,8 @@ from application.core.services.chapter_rewrite_coordinator import (
     ChapterRewriteCoordinator,
 )
 from application.core.services.chapter_service import ChapterService
+from application.engine.services.memory_engine import MemoryEngine
+from application.engine.services.memory_engine_settings import MemoryEngineRuntimeSettings
 from domain.novel.entities.chapter import Chapter, ChapterStatus
 from domain.novel.value_objects.novel_id import NovelId
 from infrastructure.persistence.database.chapter_draft_repository import (
@@ -368,6 +371,44 @@ def test_safe_snapshot_rewrite_invalidates_derived_memory_state(tmp_path):
         "SELECT entity_id FROM memory_projections ORDER BY entity_id"
     )] == ["entity-stable"]
     assert db.fetch_all("SELECT * FROM memory_engine_state") == []
+
+
+def test_safe_snapshot_rewrite_evicts_the_aftermath_memory_cache(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "rewrite-memory-cache.db"))
+    novel_id = "novel-memory-cache"
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES (?, ?, ?)",
+        (novel_id, "Memory cache", novel_id),
+    )
+    repo = SqliteChapterRepository(db)
+    _seed_completed_chapter(repo, novel_id, 1, "第一章正文")
+    _seed_completed_chapter(repo, novel_id, 2, "第二章旧正文")
+    db.execute(
+        "INSERT INTO memory_engine_state (novel_id, state_json, last_updated_chapter) "
+        "VALUES (?, ?, 2)",
+        (novel_id, '{"completed_beats": [{"beat_id": "old", "summary": "旧剧情", "chapter": 2}]}'),
+    )
+    memory_engine = MemoryEngine(
+        llm_service=object(),
+        bible_repository=object(),
+        db_connection=db,
+        runtime_settings=MemoryEngineRuntimeSettings(
+            state_cache_ttl_seconds=300,
+            state_cache_max_size=1,
+        ),
+    )
+    assert memory_engine._get_or_load_state(novel_id).last_updated_chapter == 2
+
+    ChapterRewriteCoordinator(
+        db=db,
+        chapter_repository=repo,
+        aftermath_pipeline=SimpleNamespace(_memory_engine=memory_engine),
+    ).rewrite(
+        repo.get_by_novel_and_number(NovelId(novel_id), 2),
+        "第二章重写正文",
+    )
+
+    assert memory_engine._get_or_load_state(novel_id).last_updated_chapter == 0
 
 
 def test_invalidate_foreshadows_tolerates_legacy_table_without_updated_at():

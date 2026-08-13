@@ -49,3 +49,90 @@ def test_get_by_novel_id_returns_facts_without_knowledge_row(repo):
     assert sk.facts[0].subject == "青城"
     assert sk.facts[0].entity_type == "location"
     assert sk.facts[0].source_type == "bible_generated"
+
+
+def _insert_chapter(repo, chapter_number: int) -> None:
+    repo.db.execute(
+        """
+        INSERT INTO chapters (
+            id, novel_id, number, title, content, content_sha256, content_revision
+        ) VALUES (?, 'n1', ?, ?, '正文', ?, 1)
+        """,
+        (
+            f"chapter-{chapter_number}",
+            chapter_number,
+            f"第{chapter_number}章",
+            f"hash-{chapter_number}",
+        ),
+    )
+
+
+def _insert_triple(repo, triple_id: str, source_type: str | None) -> None:
+    repo.db.execute(
+        """
+        INSERT INTO triples (
+            id, novel_id, subject, predicate, object, chapter_number,
+            confidence, source_type
+        ) VALUES (?, 'n1', '甲', '状态', ?, 1, 1.0, ?)
+        """,
+        (triple_id, triple_id, source_type),
+    )
+
+
+def _insert_commit(repo, status: str) -> None:
+    repo.db.execute(
+        """
+        INSERT INTO chapter_narrative_commits (
+            novel_id, chapter_number, content_sha256, pipeline_version,
+            content_revision, status
+        ) VALUES ('n1', 1, 'hash-1', 'chapter-narrative-sync:v1', 1, ?)
+        """,
+        (status,),
+    )
+
+
+def _fact_ids(repo) -> set[str]:
+    knowledge = repo.get_by_novel_id(NovelId("n1"))
+    return {fact.id for fact in (knowledge.facts if knowledge else [])}
+
+
+def test_autopilot_extract_without_commit_is_not_visible(repo):
+    _insert_chapter(repo, 1)
+    _insert_triple(repo, "autopilot-no-commit", "autopilot_extract")
+    repo.db.commit()
+
+    assert "autopilot-no-commit" not in _fact_ids(repo)
+
+
+def test_autopilot_extract_with_failed_commit_is_not_visible(repo):
+    _insert_chapter(repo, 1)
+    _insert_triple(repo, "autopilot-failed", "autopilot_extract")
+    _insert_commit(repo, "failed")
+    repo.db.commit()
+
+    assert "autopilot-failed" not in _fact_ids(repo)
+
+
+def test_autopilot_extract_with_committed_chapter_is_visible(repo):
+    _insert_chapter(repo, 1)
+    _insert_triple(repo, "autopilot-committed", "autopilot_extract")
+    _insert_commit(repo, "committed")
+    repo.db.commit()
+
+    assert "autopilot-committed" in _fact_ids(repo)
+
+
+def test_static_and_compatibility_sources_remain_visible_without_commit(repo):
+    _insert_chapter(repo, 1)
+    _insert_triple(repo, "static-null", None)
+    _insert_triple(repo, "static-empty", "")
+    _insert_triple(repo, "manual-source", "manual")
+    _insert_triple(repo, "chapter-inferred-source", "chapter_inferred")
+    repo.db.commit()
+
+    assert {
+        "static-null",
+        "static-empty",
+        "manual-source",
+        "chapter-inferred-source",
+    } <= _fact_ids(repo)

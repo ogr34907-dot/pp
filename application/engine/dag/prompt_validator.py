@@ -25,7 +25,7 @@ class PromptTemplateValidator:
         "ctx_memory": {"novel_id", "chapter_number"},
         "ctx_debt": {"novel_id"},
         "exec_planning": {"novel_id", "target_chapters"},
-        "exec_writer": {"context", "outline", "voice_block", "beats", "foreshadowing_block", "debt_due_block"},
+        "exec_writer": {"context", "outline", "voice_block", "beats", "chapter_rhythm", "foreshadowing_block", "debt_due_block"},
         "exec_beat": {"outline"},
         "exec_scene": {"content", "outline"},
         "val_style": {"voice_fingerprint", "scene_type", "drift_threshold", "content"},

@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from application.engine.services.memory_engine import FactLockBuilder
 
 
@@ -32,3 +34,14 @@ def test_fact_lock_only_marks_explicit_or_clear_personal_death_as_dead():
         "状态死亡者",
         "显式死亡者",
     }
+
+
+def test_fact_lock_does_not_treat_a_bible_read_failure_as_an_empty_bible():
+    class BrokenBibleRepository:
+        def get_by_novel_id(self, _novel_id):
+            raise OSError("bible database is unavailable")
+
+    builder = FactLockBuilder(BrokenBibleRepository())
+
+    with pytest.raises(RuntimeError, match="fact_lock_unavailable: bible database is unavailable"):
+        builder.build("novel-1", current_chapter=2)

@@ -53,6 +53,10 @@ class IndexingService:
             ValueError: 如果参数无效
             RuntimeError: 如果索引过程失败
         """
+        # Read the worldline barrier before deriving any vector material. A
+        # failed barrier must not leave an untagged or wrongly tagged write.
+        active_epoch = active_generation_epoch(novel_id)
+
         # 1. 生成摘要
         summary = await self._summarizer.summarize(content)
 
@@ -61,11 +65,12 @@ class IndexingService:
 
         # 3. 存储到向量数据库
         chapter_id = f"{novel_id}_{chapter_number}"
-        payload = tag_payload_for_active_epoch(novel_id, {
+        payload = {
             "novel_id": novel_id,
             "chapter_number": chapter_number,
-            "summary": summary
-        })
+            "summary": summary,
+            "generation_epoch": active_epoch,
+        }
 
         await self._vector_store.insert(
             collection="chapters",

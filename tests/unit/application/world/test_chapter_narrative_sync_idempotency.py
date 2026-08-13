@@ -355,10 +355,16 @@ async def test_canonical_sync_fails_when_required_character_state_write_fails(
     tmp_path,
     monkeypatch,
 ):
-    _db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    _db, chapter_repo, chapter, knowledge = _canonical_services(
+        tmp_path, content="林澈在铜铃丢失后进入警觉状态。"
+    )
     bundle = _canonical_bundle()
     bundle["character_states"] = [
-        {"character_name": "林澈", "mental_state": "警觉"}
+        {
+            "character_name": "林澈",
+            "mental_state": "警觉",
+            "evidence_text": "林澈在铜铃丢失后进入警觉状态",
+        }
     ]
     monkeypatch.setattr(
         "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
@@ -707,10 +713,19 @@ async def test_critical_structured_write_failure_prevents_commit(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_actual_triple_repository_failure_prevents_commit(tmp_path, monkeypatch):
-    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    db, chapter_repo, chapter, knowledge = _canonical_services(
+        tmp_path, content="林澈持有铜铃，铜铃丢失后追查真相。"
+    )
     bundle = _canonical_bundle()
     bundle["relation_triples"] = [
-        {"data": {"subject": "林澈", "predicate": "持有", "object": "铜铃"}}
+        {
+            "data": {
+                "subject": "林澈",
+                "predicate": "持有",
+                "object": "铜铃",
+                "evidence_text": "林澈持有铜铃",
+            }
+        }
     ]
     monkeypatch.setattr(
         "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",

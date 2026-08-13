@@ -680,6 +680,43 @@ class WorldlineRegenerationService:
         self._archive_rows_by_chapter(
             conn, archive_id, "causal_edges", novel_id, start, chapter_column="source_chapter"
         )
+        timeline_columns = self._columns(conn, "bible_timeline_notes")
+        if {"source_type", "chapter_number"} <= timeline_columns:
+            self._archive_rows_query(
+                conn,
+                archive_id,
+                "bible_timeline_notes",
+                """
+                SELECT * FROM bible_timeline_notes
+                WHERE novel_id = ? AND source_type = 'chapter_aftermath'
+                  AND chapter_number >= ?
+                """,
+                (novel_id, start),
+                chapter_column="chapter_number",
+            )
+            self._delete_query(
+                conn,
+                "bible_timeline_notes",
+                "novel_id = ? AND source_type = 'chapter_aftermath' AND chapter_number >= ?",
+                (novel_id, start),
+            )
+        else:
+            self._archive_rows_by_chapter(
+                conn,
+                archive_id,
+                "bible_timeline_notes",
+                novel_id,
+                start,
+                chapter_column="chapter_number",
+            )
+        self._archive_rows_by_chapter(
+            conn,
+            archive_id,
+            "character_states",
+            novel_id,
+            start,
+            chapter_column="last_updated_chapter",
+        )
 
         # Summaries / plot points are linked through their owning aggregate.
         self._archive_rows_query(
@@ -755,7 +792,7 @@ class WorldlineRegenerationService:
         # Projections and checkpoint/snapshot state are derivative; rebuild them from the retained prefix.
         self._archive_and_delete_all_novel_rows(conn, archive_id, "memory_projections", novel_id)
         self._archive_and_delete_all_novel_rows(conn, archive_id, "memory_engine_state", novel_id)
-        self._archive_and_delete_all_novel_rows(conn, archive_id, "novel_foreshadow_registry", novel_id)
+        self._archive_foreshadow_registry_prefix(conn, archive_id, novel_id, start)
         self._archive_checkpoints_and_snapshots(conn, archive_id, novel_id, start, chapter_ids)
 
         # Formal chapters are last because multiple archived tables reference them.
@@ -878,6 +915,75 @@ class WorldlineRegenerationService:
         rows = self._select_rows(conn, table, "novel_id = ?", (novel_id,))
         self._archive_rows(conn, archive_id, table, rows, chapter_column=None)
         self._delete_query(conn, table, "novel_id = ?", (novel_id,))
+
+    def _archive_foreshadow_registry_prefix(
+        self, conn: sqlite3.Connection, archive_id: str, novel_id: str, start: int
+    ) -> None:
+        """Archive the snapshot but retain only entries from the formal prefix."""
+
+        if not {"novel_id", "payload"} <= self._columns(conn, "novel_foreshadow_registry"):
+            return
+        rows = self._select_rows(
+            conn, "novel_foreshadow_registry", "novel_id = ?", (novel_id,)
+        )
+        if not rows:
+            return
+        self._archive_rows(
+            conn, archive_id, "novel_foreshadow_registry", rows, chapter_column=None
+        )
+        try:
+            payload = json.loads(rows[0]["payload"] or "{}")
+            retained = self._retain_foreshadow_prefix(payload, start)
+            if retained is None:
+                self._delete_query(
+                    conn, "novel_foreshadow_registry", "novel_id = ?", (novel_id,)
+                )
+                return
+            conn.execute(
+                "UPDATE novel_foreshadow_registry "
+                "SET payload = ?, updated_at = ? WHERE novel_id = ?",
+                (json.dumps(retained, ensure_ascii=False), self._now(), novel_id),
+            )
+        except (TypeError, json.JSONDecodeError):
+            # Invalid legacy JSON is not safe continuity input.
+            self._delete_query(
+                conn, "novel_foreshadow_registry", "novel_id = ?", (novel_id,)
+            )
+
+    @classmethod
+    def _retain_foreshadow_prefix(cls, value: Any, start: int) -> Any:
+        if isinstance(value, list):
+            retained = []
+            for item in value:
+                item = cls._retain_foreshadow_prefix(item, start)
+                if item is not None:
+                    retained.append(item)
+            return retained
+        if not isinstance(value, dict):
+            return value
+
+        planted = value.get("planted_in_chapter", value.get("planted_chapter"))
+        is_foreshadow = "description" in value and (
+            "planted_in_chapter" in value or "planted_chapter" in value
+        )
+        subtext_chapter = value.get("chapter")
+        is_subtext = "question" in value and subtext_chapter is not None
+        if is_foreshadow and isinstance(planted, int) and planted >= start:
+            return None
+        if is_subtext and isinstance(subtext_chapter, int) and subtext_chapter >= start:
+            return None
+
+        retained = {
+            key: cls._retain_foreshadow_prefix(item, start)
+            for key, item in value.items()
+        }
+        for key in ("resolved_in_chapter", "resolved_chapter"):
+            resolved = retained.get(key)
+            if isinstance(resolved, int) and resolved >= start:
+                retained[key] = None
+                if "status" in retained:
+                    retained["status"] = "planted"
+        return retained
 
     def _archive_foreshadow_changes(
         self, conn: sqlite3.Connection, archive_id: str, novel_id: str, start: int) -> None:

@@ -70,6 +70,7 @@ async def test_ai_draft_is_json_normalized_and_uses_only_synced_parent_context(t
     assert drafted.draft.payload.title == "AI 总纲"
     assert drafted.draft.source == OutlineSource.AI
     assert "总纲" in llm.prompts[0].user
+    assert "rhythm" in llm.prompts[0].user
 
     repo.publish_and_sync(root.id, expected_revision=drafted.draft.revision)
     child = repo.create_contract(
