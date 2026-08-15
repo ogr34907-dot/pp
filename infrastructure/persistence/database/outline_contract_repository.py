@@ -2050,3 +2050,275 @@ class OutlineContractRepository:
             (contract_id,),
         ).fetchone()
         return self.get_generation_attempt(str(row["id"]), after_sequence=after_sequence) if row else None
+
+    def _require_open_manifest_cohort_attempt(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_revision_id: str,
+        parent_logical_node_id: str,
+        level: OutlineLevel,
+    ) -> OutlinePlanRevision:
+        plan = self.get_plan_revision(plan_revision_id, _connection=conn)
+        head = self.get_planning_head(plan.novel_id)
+        if head.authority_mode != PlanningAuthorityMode.MANIFEST:
+            raise OutlineGateError("manifest planning authority is required")
+        if head.working_plan_revision_id != plan.id:
+            raise OutlineGateError("manifest cohort attempt requires the open plan draft")
+        if plan.sealed_at or plan.status not in {
+            PlanRevisionStatus.DRAFT,
+            PlanRevisionStatus.GENERATING,
+            PlanRevisionStatus.VALIDATING,
+        }:
+            raise OutlineGateError("manifest cohort attempt requires an editable draft")
+        parent = next(
+            (item for item in plan.items if item.logical_node_id == parent_logical_node_id),
+            None,
+        )
+        if parent is None or parent.level.child_level != level:
+            raise OutlineGateError("manifest cohort attempt parent does not own this level")
+        if any(item.parent_logical_node_id == parent_logical_node_id for item in plan.items):
+            raise OutlineGateError(
+                "manifest cohort attempt requires an unexpanded parent; "
+                "future replanning must use the impact-closure workflow"
+            )
+        return plan
+
+    def _append_manifest_cohort_attempt_event(
+        self,
+        conn: sqlite3.Connection,
+        attempt_id: str,
+        event: Mapping[str, Any],
+    ) -> None:
+        sequence = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence "
+                "FROM outline_plan_cohort_attempt_events WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()["sequence"]
+        )
+        conn.execute(
+            """
+            INSERT INTO outline_plan_cohort_attempt_events
+                (id, attempt_id, sequence, event_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                f"outline-cohort-attempt-event-{uuid4()}",
+                attempt_id,
+                sequence,
+                json.dumps(dict(event), ensure_ascii=False, sort_keys=True),
+                self._now(),
+            ),
+        )
+
+    def start_manifest_cohort_attempt(
+        self,
+        *,
+        plan_revision_id: str,
+        parent_logical_node_id: str,
+        level: OutlineLevel,
+        scope: Mapping[str, Any],
+        context_digest: str,
+        prompt_snapshot: Mapping[str, Any],
+        retry_of_attempt_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Start one recoverable LLM attempt for an unexpanded draft cohort."""
+
+        conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("manifest cohort attempt requires a clean connection")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            plan = self._require_open_manifest_cohort_attempt(
+                conn,
+                plan_revision_id=plan_revision_id,
+                parent_logical_node_id=parent_logical_node_id,
+                level=level,
+            )
+            snapshot = dict(prompt_snapshot or {})
+            if retry_of_attempt_id:
+                previous = self.get_manifest_cohort_attempt(
+                    retry_of_attempt_id, _connection=conn
+                )
+                if (
+                    previous["plan_revision_id"] != plan.id
+                    or previous["parent_logical_node_id"] != parent_logical_node_id
+                    or previous["level"] != level.value
+                ):
+                    raise OutlineGateError("cohort retry belongs to another scope")
+                if previous["status"] not in {"failed", "cancelled"}:
+                    raise OutlineGateError("only failed or cancelled cohort attempts can retry")
+                if previous["context_digest"] != context_digest:
+                    raise OutlineGateError("cohort context changed; start a new attempt")
+                snapshot = dict(previous["prompt_snapshot"])
+            attempt_id = f"outline-cohort-attempt-{uuid4()}"
+            now = self._now()
+            conn.execute(
+                """
+                INSERT INTO outline_plan_cohort_attempts
+                    (id, plan_revision_id, parent_logical_node_id, level, status,
+                     retry_of_attempt_id, scope_json, context_digest,
+                     prompt_snapshot_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    plan.id,
+                    parent_logical_node_id,
+                    level.value,
+                    retry_of_attempt_id,
+                    json.dumps(dict(scope or {}), ensure_ascii=False, sort_keys=True),
+                    context_digest,
+                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            self._append_manifest_cohort_attempt_event(
+                conn,
+                attempt_id,
+                {
+                    "type": "started",
+                    "plan_revision_id": plan.id,
+                    "parent_logical_node_id": parent_logical_node_id,
+                    "level": level.value,
+                    "retry_of_attempt_id": retry_of_attempt_id,
+                },
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            if conn.in_transaction:
+                conn.rollback()
+            raise OutlineGateError("a manifest cohort attempt is already running") from exc
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        return self.get_manifest_cohort_attempt(attempt_id)
+
+    def append_manifest_cohort_attempt_delta(
+        self, attempt_id: str, text: str
+    ) -> dict[str, Any]:
+        if not text:
+            return self.get_manifest_cohort_attempt(attempt_id)
+        conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("manifest cohort attempt requires a clean connection")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM outline_plan_cohort_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"outline cohort attempt not found: {attempt_id}")
+            if str(row["status"]) != "running":
+                raise OutlineGateError("manifest cohort attempt is no longer running")
+            self._require_open_manifest_cohort_attempt(
+                conn,
+                plan_revision_id=str(row["plan_revision_id"]),
+                parent_logical_node_id=str(row["parent_logical_node_id"]),
+                level=OutlineLevel(str(row["level"])),
+            )
+            conn.execute(
+                "UPDATE outline_plan_cohort_attempts "
+                "SET accumulated_text = accumulated_text || ?, updated_at = ? WHERE id = ?",
+                (text, self._now(), attempt_id),
+            )
+            self._append_manifest_cohort_attempt_event(
+                conn, attempt_id, {"type": "delta", "text": text}
+            )
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        return self.get_manifest_cohort_attempt(attempt_id)
+
+    def _finish_manifest_cohort_attempt(
+        self, attempt_id: str, *, status: str, error: str = ""
+    ) -> dict[str, Any]:
+        if status not in {"completed", "failed", "cancelled"}:
+            raise ValueError("invalid manifest cohort attempt status")
+        conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("manifest cohort attempt requires a clean connection")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM outline_plan_cohort_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"outline cohort attempt not found: {attempt_id}")
+            if str(row["status"]) != "running":
+                conn.commit()
+                return self.get_manifest_cohort_attempt(attempt_id)
+            self._require_open_manifest_cohort_attempt(
+                conn,
+                plan_revision_id=str(row["plan_revision_id"]),
+                parent_logical_node_id=str(row["parent_logical_node_id"]),
+                level=OutlineLevel(str(row["level"])),
+            )
+            now = self._now()
+            conn.execute(
+                "UPDATE outline_plan_cohort_attempts "
+                "SET status = ?, error = ?, completed_at = ?, updated_at = ? WHERE id = ?",
+                (status, error, now, now, attempt_id),
+            )
+            event = {"type": "completed" if status == "completed" else status}
+            if error:
+                event["message"] = error
+            self._append_manifest_cohort_attempt_event(conn, attempt_id, event)
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        return self.get_manifest_cohort_attempt(attempt_id)
+
+    def complete_manifest_cohort_attempt(self, attempt_id: str) -> dict[str, Any]:
+        return self._finish_manifest_cohort_attempt(attempt_id, status="completed")
+
+    def fail_manifest_cohort_attempt(self, attempt_id: str, error: str) -> dict[str, Any]:
+        return self._finish_manifest_cohort_attempt(attempt_id, status="failed", error=error)
+
+    def cancel_manifest_cohort_attempt(self, attempt_id: str) -> dict[str, Any]:
+        return self._finish_manifest_cohort_attempt(attempt_id, status="cancelled")
+
+    def get_manifest_cohort_attempt(
+        self,
+        attempt_id: str,
+        *,
+        after_sequence: int = 0,
+        _connection: Optional[sqlite3.Connection] = None,
+    ) -> dict[str, Any]:
+        conn = _connection or self._connection()
+        row = conn.execute(
+            "SELECT * FROM outline_plan_cohort_attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outline cohort attempt not found: {attempt_id}")
+        events = conn.execute(
+            """
+            SELECT sequence, event_json FROM outline_plan_cohort_attempt_events
+            WHERE attempt_id = ? AND sequence > ? ORDER BY sequence
+            """,
+            (attempt_id, int(after_sequence)),
+        ).fetchall()
+        return {
+            "id": str(row["id"]),
+            "plan_revision_id": str(row["plan_revision_id"]),
+            "parent_logical_node_id": str(row["parent_logical_node_id"]),
+            "level": str(row["level"]),
+            "status": str(row["status"]),
+            "retry_of_attempt_id": row["retry_of_attempt_id"],
+            "scope": json.loads(row["scope_json"] or "{}"),
+            "context_digest": str(row["context_digest"] or ""),
+            "prompt_snapshot": json.loads(row["prompt_snapshot_json"] or "{}"),
+            "accumulated_text": str(row["accumulated_text"] or ""),
+            "error": str(row["error"] or ""),
+            "events": [
+                {"sequence": int(event["sequence"]), **json.loads(event["event_json"] or "{}")}
+                for event in events
+            ],
+        }

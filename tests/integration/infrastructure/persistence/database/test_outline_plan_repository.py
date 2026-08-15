@@ -652,6 +652,146 @@ def test_replace_draft_cohort_rejects_replacing_an_already_expanded_parent(plan_
     assert repository.get_plan_revision(draft.id).items == first.items
 
 
+def test_manifest_cohort_attempt_is_bound_to_the_open_draft_and_resumable(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    repository.backfill_initial_plan("novel-1")
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+    draft = repository.clone_active_plan_draft("novel-1")
+
+    attempt = repository.start_manifest_cohort_attempt(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        level=OutlineLevel.PART,
+        scope={"target_chapters": 10},
+        context_digest="cohort-context-v1",
+        prompt_snapshot={"intent": "规划全部部纲"},
+    )
+    repository.append_manifest_cohort_attempt_delta(attempt["id"], "[{")
+    repository.append_manifest_cohort_attempt_delta(attempt["id"], "}]")
+
+    persisted = repository.get_manifest_cohort_attempt(attempt["id"], after_sequence=1)
+    assert persisted["plan_revision_id"] == draft.id
+    assert persisted["parent_logical_node_id"] == root_item.logical_node_id
+    assert persisted["level"] == "part"
+    assert persisted["accumulated_text"] == "[{}]"
+    assert [event["type"] for event in persisted["events"]] == ["delta", "delta"]
+
+    cancelled = repository.cancel_manifest_cohort_attempt(attempt["id"])
+    retry = repository.start_manifest_cohort_attempt(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        level=OutlineLevel.PART,
+        scope={"target_chapters": 10},
+        context_digest="cohort-context-v1",
+        prompt_snapshot={"ignored": "retry uses original snapshot"},
+        retry_of_attempt_id=cancelled["id"],
+    )
+
+    assert retry["retry_of_attempt_id"] == cancelled["id"]
+    assert retry["prompt_snapshot"] == {"intent": "规划全部部纲"}
+
+
+def test_manifest_cohort_attempt_rejects_sealed_or_nonworking_plan(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    active = repository.backfill_initial_plan("novel-1").plan
+    assert active is not None
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+
+    with pytest.raises(OutlineGateError, match="open plan draft"):
+        repository.start_manifest_cohort_attempt(
+            plan_revision_id=active.id,
+            parent_logical_node_id=root_item.logical_node_id,
+            level=OutlineLevel.PART,
+            scope={},
+            context_digest="context",
+            prompt_snapshot={},
+        )
+
+
+def test_manifest_cohort_attempt_allows_only_one_running_attempt_per_scope(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    repository.backfill_initial_plan("novel-1")
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+    draft = repository.clone_active_plan_draft("novel-1")
+    repository.start_manifest_cohort_attempt(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        level=OutlineLevel.PART,
+        scope={},
+        context_digest="context",
+        prompt_snapshot={},
+    )
+
+    with pytest.raises(OutlineGateError, match="already running"):
+        repository.start_manifest_cohort_attempt(
+            plan_revision_id=draft.id,
+            parent_logical_node_id=root_item.logical_node_id,
+            level=OutlineLevel.PART,
+            scope={},
+            context_digest="context",
+            prompt_snapshot={},
+        )
+
+
+def test_manifest_cohort_attempt_rejects_an_expanded_parent(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    repository.backfill_initial_plan("novel-1")
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+    draft = repository.clone_active_plan_draft("novel-1")
+    repository.replace_draft_cohort_payloads(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        payloads=(
+            OutlinePayload(
+                title="第一部",
+                narrative_text="推进冲突。",
+                creative_goal="推进",
+                entry_state="旧秩序仍然完整",
+                exit_state="新秩序建立但付出代价",
+                conflicts=["冲突"],
+                state_changes={"主角": [{"change": "代价"}]},
+                handoff_conditions=["承接"],
+                chapter_start=1,
+                chapter_end=10,
+            ),
+        ),
+    )
+
+    with pytest.raises(OutlineGateError, match="unexpanded parent"):
+        repository.start_manifest_cohort_attempt(
+            plan_revision_id=draft.id,
+            parent_logical_node_id=root_item.logical_node_id,
+            level=OutlineLevel.PART,
+            scope={},
+            context_digest="context",
+            prompt_snapshot={},
+        )
+
+
 def test_identical_sealed_digest_reuses_existing_revision_and_content_version(plan_repo):
     database, repository = plan_repo
     item = _published_root(database, repository)
