@@ -27,7 +27,11 @@ from domain.structure.outline_plan import (
     PlanningHead,
     canonical_plan_digest,
 )
-from domain.structure.outline_plan_validation import validate_sibling_cohort
+from domain.structure.outline_plan_validation import (
+    ReplanImpactClosure,
+    compute_replan_impact_closure,
+    validate_sibling_cohort,
+)
 from infrastructure.persistence.database.planning_authority_guard import (
     assert_legacy_planning_mutation_allowed,
 )
@@ -837,6 +841,97 @@ class OutlineContractRepository:
                 conn.rollback()
             raise
         return self.get_plan_revision(plan_revision_id)
+
+    def prepare_future_replan_draft(
+        self,
+        *,
+        plan_revision_id: str,
+        changed_logical_node_id: str,
+    ) -> tuple[OutlinePlanRevision, ReplanImpactClosure]:
+        """Remove a future impact closure from an open draft, never history."""
+
+        conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("future replan preparation requires a clean connection")
+        now = self._now()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            plan = self.get_plan_revision(plan_revision_id, _connection=conn)
+            head = self.get_planning_head(plan.novel_id)
+            if head.authority_mode != PlanningAuthorityMode.MANIFEST:
+                raise OutlineGateError("manifest planning authority is required")
+            if head.working_plan_revision_id != plan.id:
+                raise OutlineGateError("future replan must target the open plan draft")
+            if plan.sealed_at or plan.status not in {
+                PlanRevisionStatus.DRAFT,
+                PlanRevisionStatus.GENERATING,
+                PlanRevisionStatus.VALIDATING,
+            }:
+                raise OutlineGateError("future replan requires an editable draft")
+            closure = compute_replan_impact_closure(
+                plan.items, changed_logical_node_id
+            )
+            remaining = tuple(
+                OutlinePlanItem(
+                    logical_node_id=item.logical_node_id,
+                    version_id=item.version_id,
+                    version_digest=item.version_digest,
+                    level=item.level,
+                    sibling_index=item.sibling_index,
+                    parent_logical_node_id=item.parent_logical_node_id,
+                    expansion_state=(
+                        "unexpanded"
+                        if item.logical_node_id in closure.ancestor_logical_node_ids
+                        else item.expansion_state
+                    ),
+                    validated_parent_digest=item.validated_parent_digest,
+                    validated_previous_sibling_digest=(
+                        item.validated_previous_sibling_digest
+                    ),
+                    is_reused=item.is_reused,
+                    id=item.id,
+                )
+                for item in plan.items
+                if item.logical_node_id not in closure.invalidated_logical_node_ids
+            )
+            if not remaining:
+                raise OutlineGateError("future replan cannot remove the outline root")
+            normalized = self._validate_plan_items(
+                plan.novel_id, remaining, conn=conn
+            )
+            digest = canonical_plan_digest(
+                canonical_prefix_digest=plan.canonical_prefix_digest,
+                items=normalized,
+            )
+            placeholders = ", ".join("?" for _ in closure.invalidated_logical_node_ids)
+            conn.execute(
+                f"DELETE FROM outline_plan_revision_items WHERE plan_revision_id = ? "
+                f"AND logical_node_id IN ({placeholders})",
+                (plan.id, *closure.invalidated_logical_node_ids),
+            )
+            for item in normalized:
+                if item.logical_node_id in closure.ancestor_logical_node_ids:
+                    conn.execute(
+                        "UPDATE outline_plan_revision_items SET expansion_state = ? "
+                        "WHERE plan_revision_id = ? AND logical_node_id = ?",
+                        (item.expansion_state, plan.id, item.logical_node_id),
+                    )
+            updated = conn.execute(
+                """
+                UPDATE outline_plan_revisions
+                SET digest = ?, updated_at = ?
+                WHERE id = ? AND sealed_at IS NULL AND status = ?
+                """,
+                (digest, now, plan.id, plan.status.value),
+            )
+            if updated.rowcount != 1:
+                raise OutlineGateError("future replan draft changed during preparation")
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        return self.get_plan_revision(plan_revision_id), closure
 
     def seal_plan_revision(self, plan_revision_id: str) -> OutlinePlanRevision:
         conn = self._connection()

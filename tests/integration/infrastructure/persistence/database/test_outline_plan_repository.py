@@ -652,6 +652,42 @@ def test_replace_draft_cohort_rejects_replacing_an_already_expanded_parent(plan_
     assert repository.get_plan_revision(draft.id).items == first.items
 
 
+def test_prepare_future_replan_removes_impact_closure_from_open_draft(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    repository.backfill_initial_plan("novel-1")
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+    draft = repository.clone_active_plan_draft("novel-1", replan_start_chapter=1)
+    expanded = repository.replace_draft_cohort_payloads(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        payloads=(
+            OutlinePayload(
+                title="第一部", narrative_text="推进", creative_goal="推进",
+                entry_state="旧秩序仍然完整", exit_state="新秩序建立但付出代价",
+                conflicts=["冲突"], state_changes={"主角": [{"change": "代价"}]},
+                handoff_conditions=["承接"], chapter_start=1, chapter_end=10,
+            ),
+        ),
+    )
+    part = next(item for item in expanded.items if item.level == OutlineLevel.PART)
+
+    prepared, closure = repository.prepare_future_replan_draft(
+        plan_revision_id=draft.id,
+        changed_logical_node_id=part.logical_node_id,
+    )
+
+    assert closure.invalidated_logical_node_ids == (part.logical_node_id,)
+    assert [item.logical_node_id for item in prepared.items] == [root_item.logical_node_id]
+    assert prepared.digest != expanded.digest
+    assert prepared.items[0].expansion_state == "unexpanded"
+
+
 def test_manifest_cohort_attempt_is_bound_to_the_open_draft_and_resumable(plan_repo):
     database, repository = plan_repo
     root_item = _published_root(database, repository)
