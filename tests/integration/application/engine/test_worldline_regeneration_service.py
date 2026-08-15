@@ -207,6 +207,32 @@ def test_reset_past_the_current_tail_is_regular_continuation_not_destructive(tmp
     assert db.get_connection().execute("SELECT COUNT(*) FROM chapters WHERE novel_id = 'novel-1'").fetchone()[0] == 3
 
 
+def test_empty_draft_does_not_extend_worldline_formal_head(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-empty-draft.db"))
+    _seed(db)
+    db.execute(
+        "INSERT INTO chapters (id, novel_id, number, title, content, status) "
+        "VALUES ('draft-4', 'novel-1', 4, '第四章', '', 'draft')"
+    )
+    db.get_connection().commit()
+    service = WorldlineRegenerationService(db)
+
+    preview = service.preview("novel-1", start_chapter=4, target_chapters=8)
+
+    assert preview.operation == "continue"
+    assert preview.current_generated_chapters == 3
+    assert preview.retained_through == 3
+    assert preview.archive_from is None
+    assert preview.archive_to is None
+    result = service.execute(
+        "novel-1",
+        preview_token=preview.token,
+        run_mode="chapter_review",
+    )
+    assert result.operation == "continue"
+    assert result.retained_through == 3
+
+
 def test_continue_preview_is_consumed_after_execution(tmp_path):
     db = DatabaseConnection(str(tmp_path / "worldline-continue-once.db"))
     _seed(db)

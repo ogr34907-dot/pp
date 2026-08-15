@@ -15,6 +15,9 @@ from application.engine.services.worldline_rebuild_service import (
 from application.engine.services.worldline_regeneration_service import WorldlineRegenerationService
 from application.world.services.knowledge_service import KnowledgeService
 from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.chapter_candidate_repository import (
+    ChapterCandidateRepository,
+)
 from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
     SqliteChapterNarrativeCommitRepository,
 )
@@ -117,7 +120,7 @@ class _BlockingAftermath(_Aftermath):
         return await super().run_after_chapter_saved(novel_id, chapter_number, content, **kwargs)
 
 
-def _seed(db):
+def _seed(db, *, import_legacy: bool = True):
     conn = db.get_connection()
     conn.execute("INSERT INTO novels (id, title, slug, target_chapters) VALUES ('novel-1', '重建小说', 'rebuild', 5)")
     for number in (1, 2):
@@ -135,6 +138,8 @@ def _seed(db):
             ),
         )
     conn.commit()
+    if import_legacy:
+        ChapterCandidateRepository(db).import_legacy_formal_history("novel-1")
 
 
 @pytest.mark.asyncio
@@ -319,7 +324,7 @@ async def test_rebuild_real_aftermath_restores_prefix_state_after_reset(tmp_path
     """Reset must not turn a reused claim into a completed rebuild."""
 
     db = DatabaseConnection(str(tmp_path / "worldline-rebuild-real-aftermath.db"))
-    _seed(db)
+    _seed(db, import_legacy=False)
     conn = db.get_connection()
     for number, content in ((1, "第1章关键选择；hero前缀状态"), (2, "第2章关键选择；hero尾部状态")):
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()

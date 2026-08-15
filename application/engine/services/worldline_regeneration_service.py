@@ -11,6 +11,7 @@ from typing import Any, Iterable, Optional, Union
 from uuid import uuid4
 
 from infrastructure.persistence.database.chapter_candidate_repository import (
+    CandidateGateError,
     ChapterCandidateRepository,
 )
 from domain.novel.candidate_chapter import RunMode
@@ -106,6 +107,11 @@ class WorldlineRegenerationService:
         ).fetchone()
         return int(row["generation_epoch"] or 0) if row else 0
 
+    def _formal_chapter_head(self, novel_id: str) -> int:
+        candidates = ChapterCandidateRepository(self._db or self.db_path)
+        candidates.assert_formal_history_is_proven(novel_id)
+        return candidates.formal_chapter_head(novel_id)
+
     def _ensure_run(self, conn: sqlite3.Connection, novel_id: str, target_chapters: int) -> None:
         conn.execute(
             """
@@ -128,11 +134,7 @@ class WorldlineRegenerationService:
         exists = conn.execute("SELECT 1 FROM novels WHERE id = ?", (novel_id,)).fetchone()
         if exists is None:
             raise KeyError(f"novel not found: {novel_id}")
-        row = conn.execute(
-            "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE novel_id = ?",
-            (novel_id,),
-        ).fetchone()
-        generated = int(row["max_number"] or 0)
+        generated = self._formal_chapter_head(novel_id)
         operation = "continue" if start_chapter > generated else "regenerate"
         retained = generated if operation == "continue" else max(0, start_chapter - 1)
         archive_from = start_chapter if operation == "regenerate" else None
@@ -227,11 +229,13 @@ class WorldlineRegenerationService:
 
         if preview_row["consumed_at"] is not None:
             raise WorldlineRegenerationError("preview token was already consumed")
-        current_generated = conn.execute(
-            "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE novel_id = ?",
-            (novel_id,),
-        ).fetchone()
-        if int(current_generated["max_number"] or 0) != int(preview["current_generated_chapters"]):
+        try:
+            current_formal_head = self._formal_chapter_head(novel_id)
+        except CandidateGateError as exc:
+            raise WorldlineRegenerationError(
+                "chapter prefix changed; request a new worldline preview"
+            ) from exc
+        if current_formal_head != int(preview["current_generated_chapters"]):
             raise WorldlineRegenerationError("chapter tail changed; request a new worldline preview")
         if self._generation_epoch(conn, novel_id) != int(preview["generation_epoch"]):
             raise WorldlineRegenerationError("generation epoch changed; request a new worldline preview")
