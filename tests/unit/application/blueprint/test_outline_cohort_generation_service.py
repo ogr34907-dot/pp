@@ -142,3 +142,60 @@ async def test_invalid_manifest_cohort_response_marks_attempt_failed_without_pla
     assert attempt["status"] == "failed"
     assert repository.get_plan_revision(draft.id).items == draft.items
     assert repository.get_planning_head("novel-1").active_plan_revision_id == active.id
+
+
+@pytest.mark.asyncio
+async def test_cohort_generation_never_overwrites_author_locked_fields(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "cohort-service-author-lock.db"))
+    database.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES "
+        "('novel-1', '长篇小说', 'cohort-service-author-lock', 10)"
+    )
+    database.get_connection().commit()
+    repository = OutlineContractRepository(database)
+    _, draft, root_item = _root_item(database, repository)
+    author_payload = OutlinePayload.from_dict(
+        {
+            "title": "作者第一部",
+            "narrative_text": "作者逐字写下的第一部梗概。",
+            "extra": {
+                "_field_provenance": {
+                    "title": {"source": "author", "locked": True},
+                    "narrative_text": {"source": "author", "locked": True},
+                }
+            },
+        }
+    )
+    llm = _LLM(
+        '[{"title":"AI 第一部", "narrative_text":"AI 改写",'
+        '"creative_goal":"AI 补全目标", "entry_state":"旧秩序仍然完整",'
+        '"exit_state":"新秩序建立但付出代价", "conflicts":["冲突"],'
+        '"state_changes":{"主角":[{"change":"代价"}]},'
+        '"handoff_conditions":["承接"], "chapter_start":1,"chapter_end":10}]'
+    )
+    service = OutlineCohortGenerationService(
+        repository,
+        OutlineContractService(
+            contract_repository=repository,
+            story_node_repository=StoryNodeRepository(database),
+        ),
+        llm,
+        database,
+    )
+
+    result = await service.generate_cohort(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        level=OutlineLevel.PART,
+        author_payloads=(author_payload,),
+    )
+
+    child = next(item for item in result["plan"].items if item.level == OutlineLevel.PART)
+    row = database.get_connection().execute(
+        "SELECT payload_json FROM outline_contract_versions WHERE id = ?", (child.version_id,)
+    ).fetchone()
+    payload = OutlinePayload.from_dict(__import__("json").loads(row["payload_json"]))
+    assert payload.title == "作者第一部"
+    assert payload.narrative_text == "作者逐字写下的第一部梗概。"
+    assert payload.creative_goal == "AI 补全目标"
+    assert result["author_conflicts"] == ((0, ("title", "narrative_text")),)

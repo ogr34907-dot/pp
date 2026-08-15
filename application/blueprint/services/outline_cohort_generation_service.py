@@ -9,6 +9,7 @@ from application.blueprint.services.outline_contract_service import OutlineContr
 from domain.ai.services.llm_service import GenerationConfig
 from domain.ai.value_objects.prompt import Prompt
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload
+from domain.structure.outline_plan_validation import merge_author_locked_payload
 from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
 )
@@ -43,6 +44,7 @@ class OutlineCohortGenerationService:
         plan_revision_id: str,
         parent_logical_node_id: str,
         level: OutlineLevel,
+        author_payloads: Sequence[OutlinePayload] = (),
     ) -> dict[str, Any]:
         plan = self.repository.get_plan_revision(plan_revision_id)
         parent = next(
@@ -67,13 +69,20 @@ class OutlineCohortGenerationService:
             raw = str(getattr(response, "content", response) or "")
             self.repository.append_manifest_cohort_attempt_delta(attempt["id"], raw)
             payloads = self._parse_payloads(raw)
+            payloads, author_conflicts = self._merge_author_payloads(
+                payloads, author_payloads
+            )
             updated = self.repository.replace_draft_cohort_payloads(
                 plan_revision_id=plan.id,
                 parent_logical_node_id=parent.logical_node_id,
                 payloads=payloads,
             )
             completed = self.repository.complete_manifest_cohort_attempt(attempt["id"])
-            return {"attempt": completed, "plan": updated}
+            return {
+                "attempt": completed,
+                "plan": updated,
+                "author_conflicts": author_conflicts,
+            }
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
@@ -190,3 +199,23 @@ class OutlineCohortGenerationService:
         if not isinstance(values, list) or not values or not all(isinstance(item, dict) for item in values):
             raise OutlineCohortGenerationError("cohort generation requires a non-empty JSON object array")
         return tuple(OutlinePayload.from_dict(item) for item in values)
+
+    @staticmethod
+    def _merge_author_payloads(
+        inferred: Sequence[OutlinePayload],
+        authored: Sequence[OutlinePayload],
+    ) -> tuple[tuple[OutlinePayload, ...], tuple[tuple[int, tuple[str, ...]], ...]]:
+        if not authored:
+            return tuple(inferred), ()
+        if len(authored) != len(inferred):
+            raise OutlineCohortGenerationError(
+                "author cohort payload count must match the generated sibling cohort"
+            )
+        merged: list[OutlinePayload] = []
+        conflicts: list[tuple[int, tuple[str, ...]]] = []
+        for index, (author_payload, inferred_payload) in enumerate(zip(authored, inferred)):
+            payload, fields = merge_author_locked_payload(author_payload, inferred_payload)
+            merged.append(payload)
+            if fields:
+                conflicts.append((index, fields))
+        return tuple(merged), tuple(conflicts)
