@@ -16,6 +16,7 @@
 """
 import logging
 import hashlib
+import inspect
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -172,9 +173,8 @@ class VolumeSummaryService:
             
             summary = response.content.strip() if hasattr(response, 'content') else str(response).strip()
             
-            # 保存摘要到节点
-            self._store_node_summary(act_node, summary, source_chapters)
-            await self.story_node_repo.update(act_node)
+            # Canonical-derived summary is runtime state, never mutable planning.
+            await self._store_node_summary(act_node, summary, source_chapters)
             
             logger.info(f"[VolumeSummaryService] 幕摘要生成成功: {act_node.title} ({len(summary)} 字)")
             
@@ -255,8 +255,8 @@ class VolumeSummaryService:
             
             summary = response.content.strip() if hasattr(response, 'content') else str(response).strip()
             
-            # 保存到卷节点
-            self._store_node_summary(
+            # Canonical-derived summary is runtime state, never mutable planning.
+            await self._store_node_summary(
                 volume_node,
                 summary,
                 self._chapters_in_range(
@@ -265,7 +265,6 @@ class VolumeSummaryService:
                     volume_node.chapter_end,
                 ),
             )
-            await self.story_node_repo.update(volume_node)
             
             logger.info(f"[VolumeSummaryService] 卷摘要生成成功: {volume_node.title} ({len(summary)} 字)")
             
@@ -310,7 +309,7 @@ class VolumeSummaryService:
             
             volume_summaries = []
             for vol in volume_nodes:
-                summary = vol.metadata.get("summary", "") if vol.metadata else ""
+                summary = self._get_current_node_summary(vol)
                 volume_summaries.append({
                     "number": vol.number,
                     "title": vol.title,
@@ -325,12 +324,22 @@ class VolumeSummaryService:
             )
             
             summary = response.content.strip() if hasattr(response, 'content') else str(response).strip()
-            
-            # 保存
-            part_node.metadata = part_node.metadata or {}
-            part_node.metadata["summary"] = summary
-            part_node.metadata["summary_generated_at"] = datetime.now().isoformat()
-            await self.story_node_repo.update(part_node)
+
+            source_chapters_by_number: Dict[int, Any] = {}
+            for volume in volume_nodes:
+                for chapter in self._chapters_in_range(
+                    novel_id,
+                    volume.chapter_start,
+                    volume.chapter_end,
+                ):
+                    source_chapters_by_number[
+                        int(getattr(chapter, "number", 0) or 0)
+                    ] = chapter
+            await self._store_node_summary(
+                part_node,
+                summary,
+                list(source_chapters_by_number.values()),
+            )
             
             logger.info(f"[VolumeSummaryService] 部摘要生成成功: {part_node.title}")
             
@@ -411,13 +420,7 @@ class VolumeSummaryService:
                     success=False,
                     error=f"检查点章节节点不存在: {current_chapter}",
                 )
-            checkpoint_node.metadata = checkpoint_node.metadata or {}
-            checkpoint_node.metadata["checkpoint_summary"] = summary
-            checkpoint_node.metadata["checkpoint_summary_state"] = self._build_summary_state(
-                recent,
-            )
-            checkpoint_node.metadata["checkpoint_summary_generated_at"] = datetime.now().isoformat()
-            await self.story_node_repo.update(checkpoint_node)
+            await self._store_checkpoint_summary(checkpoint_node, summary, recent)
             
             logger.info(f"[VolumeSummaryService] 检查点摘要生成成功: 第 {current_chapter} 章")
             
@@ -643,9 +646,8 @@ class VolumeSummaryService:
             
             summary = response.content.strip() if hasattr(response, 'content') else str(response).strip()
             
-            # 保存
-            self._store_node_summary(volume_node, summary, volume_chapters)
-            await self.story_node_repo.update(volume_node)
+            # Canonical-derived summary is runtime state, never mutable planning.
+            await self._store_node_summary(volume_node, summary, volume_chapters)
             
             return SummaryResult(
                 success=True,
@@ -675,49 +677,154 @@ class VolumeSummaryService:
             if int(chapter_start) <= int(getattr(chapter, "number", 0) or 0) <= int(chapter_end)
         ]
 
-    def _store_node_summary(
+    async def _store_node_summary(
         self,
         node: Any,
         summary: str,
         source_chapters: List[Any],
     ) -> None:
+        await self._persist_runtime_metadata(
+            node,
+            {
+                "runtime.summary": summary,
+                "runtime.summary_state": self._build_summary_state(source_chapters),
+                "runtime.summary_generated_at": datetime.now().isoformat(),
+                "runtime.summary_invalidated_from_chapter": None,
+            },
+        )
+
+    async def _store_checkpoint_summary(
+        self,
+        node: Any,
+        summary: str,
+        source_chapters: List[Any],
+    ) -> None:
+        await self._persist_runtime_metadata(
+            node,
+            {
+                "runtime.checkpoint_summary": summary,
+                "runtime.checkpoint_summary_state": self._build_summary_state(source_chapters),
+                "runtime.checkpoint_summary_generated_at": datetime.now().isoformat(),
+                "runtime.checkpoint_summary_invalidated_from_chapter": None,
+            },
+        )
+
+    async def _persist_runtime_metadata(
+        self,
+        node: Any,
+        runtime_metadata: Dict[str, Any],
+    ) -> None:
+        updater = getattr(self.story_node_repo, "update_runtime_fields", None)
+        if updater is None:
+            raise RuntimeError("StoryNode repository cannot persist runtime summary metadata")
+        result = updater(
+            node.id,
+            runtime_metadata=runtime_metadata,
+            _verify_summary_sources=True,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        if result is False:
+            raise RuntimeError(f"StoryNode runtime summary update failed: {node.id}")
         node.metadata = node.metadata or {}
-        node.metadata["summary"] = summary
-        node.metadata["summary_state"] = self._build_summary_state(source_chapters)
-        node.metadata["summary_generated_at"] = datetime.now().isoformat()
+        for key, value in runtime_metadata.items():
+            if value is None:
+                node.metadata.pop(key, None)
+            else:
+                node.metadata[key] = value
 
     def _get_current_node_summary(self, node: Any) -> str:
-        metadata = getattr(node, "metadata", None) or {}
-        summary = str(metadata.get("summary", "") or "").strip()
-        state = metadata.get("summary_state") or {}
-        if not summary or not isinstance(state, dict):
-            return ""
-        if state.get("status") != "committed":
-            return ""
+        for summary, state in self._summary_pairs(node, "summary", "summary_state"):
+            if not isinstance(state, dict) or state.get("status") != "committed":
+                continue
+            chapter_start = state.get("chapter_start")
+            chapter_end = state.get("chapter_end")
+            source_version = str(state.get("source_version", "") or "")
+            if chapter_start is None or chapter_end is None or not source_version:
+                continue
+            source_chapters = self._chapters_for_summary_state(
+                node.novel_id, state
+            )
+            current_state = self._build_summary_state(source_chapters)
+            if current_state.get("status") != "committed":
+                continue
+            if state.get("pipeline_version") != self.SUMMARY_PIPELINE_VERSION:
+                continue
+            if current_state.get("source_version") == source_version:
+                return summary
+        return ""
+
+    def _chapters_for_summary_state(
+        self,
+        novel_id: str,
+        state: Dict[str, Any],
+    ) -> List[Any]:
+        """Resolve current sources exactly when a summary spans sparse ranges."""
+
         chapter_start = state.get("chapter_start")
         chapter_end = state.get("chapter_end")
-        source_version = str(state.get("source_version", "") or "")
-        if chapter_start is None or chapter_end is None or not source_version:
-            return ""
-        source_chapters = self._chapters_in_range(
-            node.novel_id,
-            int(chapter_start),
-            int(chapter_end),
+        if chapter_start is None or chapter_end is None:
+            return []
+        if "source_chapter_numbers" not in state:
+            return self._chapters_in_range(
+                novel_id, int(chapter_start), int(chapter_end)
+            )
+
+        raw_numbers = state.get("source_chapter_numbers")
+        if not isinstance(raw_numbers, list) or not raw_numbers:
+            return []
+        try:
+            expected_numbers = [int(number) for number in raw_numbers]
+        except (TypeError, ValueError):
+            return []
+        if (
+            any(number < 1 for number in expected_numbers)
+            or expected_numbers != sorted(set(expected_numbers))
+            or expected_numbers[0] < int(chapter_start)
+            or expected_numbers[-1] > int(chapter_end)
+        ):
+            return []
+
+        chapters = self._chapters_in_range(
+            novel_id, min(expected_numbers), max(expected_numbers)
         )
-        current_state = self._build_summary_state(source_chapters)
-        if current_state.get("status") != "committed":
-            return ""
-        if state.get("pipeline_version") != self.SUMMARY_PIPELINE_VERSION:
-            return ""
-        if current_state.get("source_version") != source_version:
-            return ""
-        return summary
+        by_number = {
+            int(getattr(chapter, "number", 0) or 0): chapter
+            for chapter in chapters
+        }
+        if any(number not in by_number for number in expected_numbers):
+            return []
+        return [by_number[number] for number in expected_numbers]
+
+    def _summary_pairs(
+        self, node: Any, summary_key: str, state_key: str
+    ) -> tuple[tuple[str, Any], ...]:
+        selector = getattr(
+            type(self.story_node_repo), "visible_summary_metadata_pairs", None
+        )
+        if callable(selector):
+            return tuple(
+                selector(
+                    self.story_node_repo,
+                    node,
+                    summary_key=summary_key,
+                    state_key=state_key,
+                )
+            )
+        metadata = getattr(node, "metadata", None) or {}
+        pairs = []
+        for prefix in ("runtime.", ""):
+            summary = str(metadata.get(f"{prefix}{summary_key}", "") or "").strip()
+            state = metadata.get(f"{prefix}{state_key}") or {}
+            if summary:
+                pairs.append((summary, state))
+        return tuple(pairs)
 
     def is_node_summary_current(self, node: Any) -> bool:
         return bool(self._get_current_node_summary(node))
 
     def _build_summary_state(self, source_chapters: List[Any]) -> Dict[str, Any]:
-        rows = []
+        rows_by_number = {}
         for chapter in sorted(source_chapters or [], key=lambda item: int(getattr(item, "number", 0) or 0)):
             number = int(getattr(chapter, "number", 0) or 0)
             if number < 1:
@@ -727,12 +834,17 @@ class VolumeSummaryService:
             if not content_sha256:
                 content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
             revision = int(getattr(chapter, "content_revision", 0) or 0)
-            rows.append((number, content_sha256, revision))
+            rows_by_number[number] = (content_sha256, revision)
+        rows = [
+            (number, content_sha256, revision)
+            for number, (content_sha256, revision) in sorted(rows_by_number.items())
+        ]
         if not rows:
             return {
                 "status": "legacy",
                 "chapter_start": None,
                 "chapter_end": None,
+                "source_chapter_numbers": [],
                 "source_version": "",
                 "pipeline_version": self.SUMMARY_PIPELINE_VERSION,
             }
@@ -744,6 +856,7 @@ class VolumeSummaryService:
             "status": "committed",
             "chapter_start": rows[0][0],
             "chapter_end": rows[-1][0],
+            "source_chapter_numbers": [number for number, _, _ in rows],
             "source_version": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
             "pipeline_version": self.SUMMARY_PIPELINE_VERSION,
         }

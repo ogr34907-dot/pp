@@ -54,6 +54,26 @@ def _seed(db):
     ChapterCandidateRepository(db).import_legacy_formal_history("novel-1")
 
 
+def _mark_manifest_authority(db) -> None:
+    """Make a legal minimal manifest Head for Worldline cutover gates."""
+
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO outline_plan_revisions "
+        "(id, novel_id, revision, status, digest, canonical_prefix_digest, "
+        "reconciliation_status, sealed_at) "
+        "VALUES ('plan-1', 'novel-1', 1, 'ready_for_review', 'plan-digest', '', "
+        "'aligned', CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "INSERT INTO outline_planning_heads "
+        "(novel_id, authority_mode, authority_generation, active_plan_revision_id, "
+        "active_plan_digest, projection_generation) "
+        "VALUES ('novel-1', 'manifest', 1, 'plan-1', 'plan-digest', 1)"
+    )
+    conn.commit()
+
+
 def _seed_canonical_tail(db):
     conn = db.get_connection()
     conn.execute(
@@ -72,6 +92,151 @@ def _seed_canonical_tail(db):
         "VALUES ('hero', 'novel-1', '旧状态', 2)"
     )
     conn.commit()
+
+
+def _seed_runtime_summary_caches(db):
+    conn = db.get_connection()
+    affected_state = {
+        "status": "committed",
+        "chapter_start": 1,
+        "chapter_end": 3,
+        "source_chapter_numbers": [1, 2, 3],
+        "source_version": "affected-source",
+        "pipeline_version": "node-summary/v1",
+    }
+    retained_state = {
+        "status": "committed",
+        "chapter_start": 1,
+        "chapter_end": 1,
+        "source_chapter_numbers": [1],
+        "source_version": "retained-source",
+        "pipeline_version": "node-summary/v1",
+    }
+    for node_id, number, metadata in (
+        (
+            "act-affected",
+            1,
+            {"runtime.summary": "retired tail facts", "runtime.summary_state": affected_state},
+        ),
+        (
+            "act-retained",
+            2,
+            {"runtime.summary": "retained prefix facts", "runtime.summary_state": retained_state},
+        ),
+    ):
+        conn.execute(
+            "INSERT INTO story_nodes "
+            "(id, novel_id, node_type, number, title, order_index, chapter_start, chapter_end, metadata) "
+            "VALUES (?, 'novel-1', 'act', ?, ?, ?, 1, 3, ?)",
+            (node_id, number, node_id, number, json.dumps(metadata)),
+        )
+    conn.commit()
+
+
+def test_worldline_archive_stales_only_runtime_caches_with_retired_sources(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-runtime-summary-cache.db"))
+    _seed(db)
+    _seed_runtime_summary_caches(db)
+    service = WorldlineRegenerationService(db)
+
+    preview = service.preview("novel-1", start_chapter=2, target_chapters=6)
+    service.execute("novel-1", preview_token=preview.token, run_mode="chapter_review")
+
+    conn = db.get_connection()
+    affected = json.loads(
+        conn.execute("SELECT metadata FROM story_nodes WHERE id = 'act-affected'").fetchone()[0]
+    )
+    retained = json.loads(
+        conn.execute("SELECT metadata FROM story_nodes WHERE id = 'act-retained'").fetchone()[0]
+    )
+    assert "runtime.summary" not in affected
+    assert "runtime.summary_state" not in affected
+    assert affected["runtime.summary_invalidated_from_chapter"] == 2
+    assert retained["runtime.summary_state"]["status"] == "committed"
+    assert "runtime.summary_invalidated_from_chapter" not in retained
+
+
+def test_manifest_worldline_preview_is_rejected_without_creating_a_preview(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-manifest-preview.db"))
+    _seed(db)
+    _mark_manifest_authority(db)
+
+    with pytest.raises(WorldlineRegenerationError, match="manifest-aware"):
+        WorldlineRegenerationService(db).preview(
+            "novel-1", start_chapter=2, target_chapters=6
+        )
+
+    assert db.get_connection().execute(
+        "SELECT COUNT(*) FROM worldline_regeneration_previews WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 0
+
+
+def test_manifest_worldline_execute_rejects_a_legacy_preview_without_archiving(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-manifest-execute.db"))
+    _seed(db)
+    service = WorldlineRegenerationService(db)
+    preview = service.preview("novel-1", start_chapter=2, target_chapters=6)
+    _mark_manifest_authority(db)
+
+    with pytest.raises(WorldlineRegenerationError, match="manifest-aware"):
+        service.execute(
+            "novel-1", preview_token=preview.token, run_mode="chapter_review"
+        )
+
+    conn = db.get_connection()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM chapters WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 3
+    assert conn.execute(
+        "SELECT consumed_at FROM worldline_regeneration_previews WHERE token = ?",
+        (preview.token,),
+    ).fetchone()[0] is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM worldline_archives WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 0
+
+
+def test_manifest_worldline_restore_rejects_a_legacy_archive_without_mutating_tail(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-manifest-restore.db"))
+    _seed(db)
+    service = WorldlineRegenerationService(db)
+    preview = service.preview("novel-1", start_chapter=2, target_chapters=6)
+    archived = service.execute(
+        "novel-1", preview_token=preview.token, run_mode="chapter_review"
+    )
+    _mark_manifest_authority(db)
+
+    with pytest.raises(WorldlineRegenerationError, match="manifest-aware"):
+        service.restore(
+            "novel-1", archive_id=archived.archive_id, run_mode="chapter_review"
+        )
+
+    conn = db.get_connection()
+    assert conn.execute(
+        "SELECT GROUP_CONCAT(number, ',') FROM chapters WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == "1"
+    assert conn.execute(
+        "SELECT status FROM worldline_archives WHERE id = ?", (archived.archive_id,)
+    ).fetchone()[0] == "archived"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM worldline_archives WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 1
+
+
+def test_legacy_worldline_remains_available_before_manifest_rebase_exists(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-legacy-control.db"))
+    _seed(db)
+    service = WorldlineRegenerationService(db)
+
+    preview = service.preview("novel-1", start_chapter=2, target_chapters=6)
+    result = service.execute(
+        "novel-1", preview_token=preview.token, run_mode="chapter_review"
+    )
+
+    assert result.operation == "regenerate"
+    assert db.get_connection().execute(
+        "SELECT COUNT(*) FROM chapters WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 1
 
 
 def test_regenerate_from_any_chapter_archives_tail_and_preserves_prefix_hash(tmp_path):
@@ -295,3 +460,129 @@ def test_restore_archived_worldline_replaces_new_tail_and_creates_a_new_epoch(tm
     assert conn.execute(
         "SELECT status FROM worldline_archives WHERE id = ?", (archived.archive_id,)
     ).fetchone()[0] == "restored"
+
+
+def test_restore_keeps_archived_checkpoint_summary_inactive_until_rebuilt(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-restore-runtime-checkpoint.db"))
+    _seed(db)
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO story_nodes "
+        "(id, novel_id, node_type, number, title, order_index, metadata) "
+        "VALUES ('chapter-2', 'novel-1', 'chapter', 2, 'Chapter 2', 2, ?)",
+        (
+            json.dumps(
+                {
+                    "runtime.checkpoint_summary": "old checkpoint cache",
+                    "runtime.checkpoint_summary_state": {
+                        "status": "committed",
+                        "chapter_start": 2,
+                        "chapter_end": 2,
+                        "source_chapter_numbers": [2],
+                        "source_version": "old-source",
+                        "pipeline_version": "node-summary/v1",
+                    },
+                }
+            ),
+        ),
+    )
+    conn.commit()
+    service = WorldlineRegenerationService(db)
+
+    preview = service.preview("novel-1", start_chapter=2, target_chapters=6)
+    archived = service.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    conn.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, title, content, content_sha256, content_revision, status) "
+        "VALUES ('replacement-2', 'novel-1', 2, 'Replacement', 'new prose', "
+        "'replacement-hash', 1, 'completed')"
+    )
+    conn.commit()
+
+    service.restore("novel-1", archive_id=archived.archive_id, run_mode="chapter_review")
+
+    metadata = json.loads(
+        conn.execute("SELECT metadata FROM story_nodes WHERE id = 'chapter-2'").fetchone()[0]
+    )
+    assert "runtime.checkpoint_summary" not in metadata
+    assert "runtime.checkpoint_summary_state" not in metadata
+    assert metadata["runtime.checkpoint_summary_invalidated_from_chapter"] == 2
+
+
+def test_restore_strips_pre_fix_archived_runtime_summary_payload(tmp_path):
+    """A historical archive must not revive runtime caches created before invalidation.
+
+    Archives made before the manifest/runtime-cache correction contain the
+    original StoryNode metadata.  Simulate that persisted payload directly
+    rather than relying on a new archive, which is already sanitized by the
+    current writer.
+    """
+
+    db = DatabaseConnection(str(tmp_path / "worldline-restore-legacy-runtime.db"))
+    _seed(db)
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO story_nodes "
+        "(id, novel_id, node_type, number, title, order_index, metadata) "
+        "VALUES ('chapter-2', 'novel-1', 'chapter', 2, 'Chapter 2', 2, ?)",
+        (json.dumps({}),),
+    )
+    conn.commit()
+    service = WorldlineRegenerationService(db)
+
+    preview = service.preview("novel-1", start_chapter=2, target_chapters=6)
+    archived = service.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    archive_entry = conn.execute(
+        """
+        SELECT id, payload_json
+        FROM worldline_archive_entries
+        WHERE archive_id = ? AND source_table = 'story_nodes'
+          AND json_extract(payload_json, '$.id') = 'chapter-2'
+        """,
+        (archived.archive_id,),
+    ).fetchone()
+    assert archive_entry is not None
+    archive_payload = json.loads(archive_entry[1])
+    archive_payload["metadata"] = json.dumps(
+        {
+            "runtime.checkpoint_summary": "pre-fix checkpoint cache",
+            "runtime.checkpoint_summary_state": {
+                "status": "committed",
+                "chapter_start": 2,
+                "chapter_end": 2,
+                "source_chapter_numbers": [2],
+                "source_version": "pre-fix-source",
+                "pipeline_version": "node-summary/v1",
+            },
+            "checkpoint_summary": "pre-fix legacy fallback",
+            "checkpoint_summary_state": {
+                "status": "committed",
+                "chapter_start": 2,
+                "chapter_end": 2,
+                "source_version": "pre-fix-source",
+            },
+        }
+    )
+    conn.execute(
+        "UPDATE worldline_archive_entries SET payload_json = ? WHERE id = ?",
+        (json.dumps(archive_payload), archive_entry[0]),
+    )
+    conn.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, title, content, content_sha256, content_revision, status) "
+        "VALUES ('replacement-2', 'novel-1', 2, 'Replacement', 'new prose', "
+        "'replacement-hash', 1, 'completed')"
+    )
+    conn.commit()
+
+    service.restore("novel-1", archive_id=archived.archive_id, run_mode="chapter_review")
+
+    metadata = json.loads(
+        conn.execute("SELECT metadata FROM story_nodes WHERE id = 'chapter-2'").fetchone()[0]
+    )
+    assert "runtime.checkpoint_summary" not in metadata
+    assert "runtime.checkpoint_summary_state" not in metadata
+    assert metadata["runtime.checkpoint_summary_invalidated_from_chapter"] == 2
+    # Legacy payload is retained only for compatibility and cannot be read
+    # while the explicit runtime invalidation marker is present.
+    assert metadata["checkpoint_summary"] == "pre-fix legacy fallback"

@@ -1,6 +1,6 @@
 """Runtime guards for the book-level planning authority.
 
-The manifest Head is deliberately queried at the write boundary.  This keeps
+The manifest Head is deliberately queried at the write boundary. This keeps
 legacy repositories and direct application SQL fail-closed after cutover,
 while leaving read-only compatibility projections available to existing
 consumers.
@@ -8,7 +8,6 @@ consumers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import sqlite3
 from typing import Optional
 
@@ -17,26 +16,56 @@ class PlanningAuthorityError(RuntimeError):
     """Raised when a legacy planning writer bypasses a manifest transaction."""
 
 
-class _ProjectionCapabilityToken:
-    pass
-
-
-_PROJECTION_CAPABILITY_TOKEN = _ProjectionCapabilityToken()
-
-
-@dataclass(frozen=True)
 class ProjectionWriteCapability:
-    """Opaque capability bound to one connection, book, generation and plan."""
+    """Retired compatibility type for a withdrawn projection API."""
 
-    novel_id: str
-    plan_revision_id: str
-    authority_generation: int
-    connection_identity: int
-    _token: object = field(
-        default=_PROJECTION_CAPABILITY_TOKEN,
-        repr=False,
-        compare=False,
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("ProjectionWriteCapability is disabled")
+
+
+def _begin_projection_writer_session(
+    conn: sqlite3.Connection,
+) -> object:
+    """Projection sessions are unavailable without a sealed physical batch."""
+
+    del conn
+    raise PlanningAuthorityError("StoryNode projection permits are disabled")
+
+
+def _end_projection_writer_session(
+    conn: sqlite3.Connection,
+    session: object,
+) -> None:
+    del conn, session
+
+
+def _mint_projection_capability(
+    conn: sqlite3.Connection,
+    *,
+    novel_id: str,
+    plan_revision_id: str,
+    designated_operation: str,
+    authority_generation: int,
+    projection_generation: int,
+    expected_active_plan_revision_id: Optional[str],
+    expected_active_plan_digest: str,
+    _session: Optional[object] = None,
+) -> ProjectionWriteCapability:
+    """Fail closed until the sealed projection declaration exists."""
+
+    del (
+        conn,
+        novel_id,
+        plan_revision_id,
+        designated_operation,
+        authority_generation,
+        projection_generation,
+        expected_active_plan_revision_id,
+        expected_active_plan_digest,
+        _session,
     )
+    raise PlanningAuthorityError("StoryNode projection permits are disabled")
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -64,18 +93,30 @@ def manifest_head(
 ) -> Optional[dict[str, object]]:
     """Return the current manifest Head, or ``None`` for legacy/unmigrated DBs."""
 
+    head = _raw_planning_head(conn, novel_id)
+    if head is None or head["authority_mode"] != "manifest":
+        return None
+    return head
+
+
+def _raw_planning_head(
+    conn: sqlite3.Connection, novel_id: str
+) -> Optional[dict[str, object]]:
     if not _table_exists(conn, "outline_planning_heads"):
         return None
     row = conn.execute(
         "SELECT * FROM outline_planning_heads WHERE novel_id = ?",
         (novel_id,),
     ).fetchone()
-    if row is None or str(_value(row, "authority_mode", 1) or "legacy") != "manifest":
+    if row is None:
         return None
     return {
         "novel_id": str(_value(row, "novel_id") or novel_id),
+        "authority_mode": str(_value(row, "authority_mode", 1) or "legacy"),
         "authority_generation": int(_value(row, "authority_generation", 2) or 0),
         "active_plan_revision_id": _value(row, "active_plan_revision_id", 3),
+        "active_plan_digest": str(_value(row, "active_plan_digest", 4) or ""),
+        "projection_generation": int(_value(row, "projection_generation", 6) or 0),
     }
 
 
@@ -88,50 +129,10 @@ def _validate_projection_capability(
     novel_id: str,
     capability: ProjectionWriteCapability,
 ) -> None:
-    if capability._token is not _PROJECTION_CAPABILITY_TOKEN:
-        raise PlanningAuthorityError("invalid StoryNode projection capability")
-    if capability.novel_id != novel_id or capability.connection_identity != id(conn):
-        raise PlanningAuthorityError("StoryNode projection capability is out of scope")
-    head = manifest_head(conn, novel_id)
-    if head is None or int(head["authority_generation"]) != capability.authority_generation:
-        raise PlanningAuthorityError("planning Head changed during StoryNode projection")
-    if not _table_exists(conn, "outline_plan_revisions"):
-        raise PlanningAuthorityError("outline plan manifest is unavailable")
-    row = conn.execute(
-        """
-        SELECT 1 FROM outline_plan_revisions
-        WHERE id = ? AND novel_id = ? AND sealed_at IS NOT NULL
-        """,
-        (capability.plan_revision_id, novel_id),
-    ).fetchone()
-    if row is None:
-        raise PlanningAuthorityError("projection plan is not a sealed revision")
+    """No capability can authorize mutable StoryNode planning writes today."""
 
-
-def _issue_projection_capability(
-    conn: sqlite3.Connection,
-    *,
-    novel_id: str,
-    plan_revision_id: str,
-) -> ProjectionWriteCapability:
-    """Issue a capability for ``PlanProjectionWriter`` only.
-
-    The function is intentionally named as an internal boundary.  Callers
-    should obtain capabilities through ``PlanProjectionWriter`` so they are
-    created on the same SQLite connection as the publish transaction.
-    """
-
-    head = manifest_head(conn, novel_id)
-    if head is None:
-        raise PlanningAuthorityError("projection capability requires manifest authority")
-    capability = ProjectionWriteCapability(
-        novel_id=novel_id,
-        plan_revision_id=plan_revision_id,
-        authority_generation=int(head["authority_generation"]),
-        connection_identity=id(conn),
-    )
-    _validate_projection_capability(conn, novel_id, capability)
-    return capability
+    del conn, novel_id, capability
+    raise PlanningAuthorityError("StoryNode projection permits are disabled")
 
 
 def assert_story_node_write_allowed(
@@ -141,15 +142,16 @@ def assert_story_node_write_allowed(
     operation: str,
     capability: Optional[ProjectionWriteCapability] = None,
 ) -> None:
-    """Reject protected StoryNode writes unless they belong to a projection TXN."""
+    """Reject protected StoryNode writes unless the writer owns the transaction."""
 
+    if capability is not None:
+        _validate_projection_capability(conn, novel_id, capability)
+        return
     if not is_manifest_authority(conn, novel_id):
         return
-    if capability is None:
-        raise PlanningAuthorityError(
-            f"manifest planning authority forbids legacy StoryNode write: {operation}"
-        )
-    _validate_projection_capability(conn, novel_id, capability)
+    raise PlanningAuthorityError(
+        f"manifest planning authority forbids legacy StoryNode write: {operation}"
+    )
 
 
 def assert_legacy_planning_mutation_allowed(

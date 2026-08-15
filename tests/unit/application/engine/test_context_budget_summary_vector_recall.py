@@ -149,6 +149,13 @@ def test_recent_act_summaries_use_valid_metadata_and_fallback_for_stale_nodes():
                 "chapter_end": 2,
                 "source_version": _source_version(*chapters),
             },
+            "runtime.summary": "来源不匹配的运行时卷摘要",
+            "runtime.summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 2,
+                "source_version": "stale-runtime-source",
+            },
         },
     )
     committed = _node(
@@ -158,8 +165,8 @@ def test_recent_act_summaries_use_valid_metadata_and_fallback_for_stale_nodes():
         chapter_start=1,
         chapter_end=2,
         metadata={
-            "summary": "已提交幕摘要",
-            "summary_state": {
+            "runtime.summary": "已提交幕摘要",
+            "runtime.summary_state": {
                 "status": "committed",
                 "chapter_start": 1,
                 "chapter_end": 2,
@@ -181,8 +188,8 @@ def test_recent_act_summaries_use_valid_metadata_and_fallback_for_stale_nodes():
     )
     checkpoint = _node("chapter-2", NodeType.CHAPTER, 2)
     checkpoint.metadata = {
-        "checkpoint_summary": "最近有效检查点摘要",
-        "checkpoint_summary_state": {
+        "runtime.checkpoint_summary": "最近有效检查点摘要",
+        "runtime.checkpoint_summary_state": {
             "status": "committed",
             "chapter_start": 1,
             "chapter_end": 2,
@@ -201,6 +208,76 @@ def test_recent_act_summaries_use_valid_metadata_and_fallback_for_stale_nodes():
     assert "最近有效检查点摘要" in context
     assert "不应进入正文的失效摘要" not in context
     assert "失效幕描述回退" in context
+
+
+def test_allocator_keeps_a_valid_sparse_part_summary_outside_unrelated_chapters():
+    chapters = [
+        SimpleNamespace(
+            number=number,
+            content_sha256=f"hash-{number}",
+            content_revision=1,
+        )
+        for number in range(1, 6)
+    ]
+    part = _node(
+        "part-sparse",
+        NodeType.PART,
+        1,
+        chapter_start=1,
+        chapter_end=5,
+        metadata={
+            "runtime.summary": "仅覆盖第一与第三卷的部摘要",
+            "runtime.summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 5,
+                "source_chapter_numbers": [1, 2, 4, 5],
+                "source_version": _source_version(
+                    chapters[0], chapters[1], chapters[3], chapters[4]
+                ),
+            },
+        },
+    )
+    allocator = ContextBudgetAllocator(
+        story_node_repository=_StoryNodeRepository([part]),
+        chapter_repository=_ChapterRepository(chapters),
+    )
+
+    assert allocator._get_valid_node_summary("novel-1", part) == "仅覆盖第一与第三卷的部摘要"
+
+
+def test_allocator_hides_runtime_and_legacy_summary_when_rewrite_marker_exists():
+    chapter = SimpleNamespace(number=1, content_sha256="hash-1", content_revision=2)
+    node = _node(
+        "act-invalidated",
+        NodeType.ACT,
+        1,
+        chapter_start=1,
+        chapter_end=1,
+        metadata={
+            "runtime.summary": "重写前运行时摘要",
+            "runtime.summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 1,
+                "source_version": _source_version(chapter),
+            },
+            "summary": "重写前旧摘要",
+            "summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 1,
+                "source_version": _source_version(chapter),
+            },
+            "runtime.summary_invalidated_from_chapter": 1,
+        },
+    )
+    allocator = ContextBudgetAllocator(
+        story_node_repository=_StoryNodeRepository([node]),
+        chapter_repository=_ChapterRepository([chapter]),
+    )
+
+    assert allocator._get_valid_node_summary("novel-1", node) == ""
 
 
 def test_allocator_includes_current_part_and_volume_contract_in_t0_context():

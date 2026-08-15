@@ -1,17 +1,24 @@
-"""Capability-bound compatibility projection writer.
+"""Reserved manifest-to-StoryNode projection boundary.
 
-This is the only runtime adapter allowed to mutate protected ``story_nodes``
-fields for a manifest book.  It intentionally delegates to
-``StoryNodeRepository`` so the repository and direct SQL paths share one guard.
+The first Manifest migration records logical topology and sealed outline
+payloads. It deliberately does not record an immutable physical StoryNode
+projection batch. Accepting caller-provided create/update/delete operations
+would therefore let an arbitrary physical tree masquerade as an approved
+Manifest projection.
+
+This boundary stays fail-closed until a later migration introduces a sealed
+physical projection declaration. Keeping the constructor and coroutine name
+avoids an accidental compatibility break while ensuring no caller can use the
+old generic batch API to change a Head or StoryNode tree.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional
 
 from infrastructure.persistence.database.planning_authority_guard import (
-    ProjectionWriteCapability,
-    _issue_projection_capability,
+    PlanningAuthorityError,
 )
 
 if TYPE_CHECKING:
@@ -20,53 +27,48 @@ if TYPE_CHECKING:
 
 
 class PlanProjectionWriter:
-    """Write the current manifest projection using an explicit capability."""
+    """Reject undeclared physical projections until their snapshot exists."""
 
     def __init__(self, repository: "StoryNodeRepository") -> None:
-        self.repository = repository
+        # Preserve dependency-injection compatibility without retaining a
+        # callable repository path for projection DML.
+        del repository
 
-    def capability_for(
+    async def apply_atomic(
         self,
+        *,
         novel_id: str,
         plan_revision_id: str,
-    ) -> ProjectionWriteCapability:
-        return _issue_projection_capability(
-            self.repository._get_connection(),
-            novel_id=novel_id,
-            plan_revision_id=plan_revision_id,
-        )
-
-    def save_sync(
-        self,
-        node: "StoryNode",
-        capability: ProjectionWriteCapability,
-    ) -> "StoryNode":
-        return self.repository.save_sync(node, _capability=capability)
-
-    def update(
-        self,
-        node: "StoryNode",
-        capability: ProjectionWriteCapability,
-    ) -> "StoryNode":
-        return self.repository.update(node, _capability=capability)
-
-    def save_batch(
-        self,
-        nodes: list["StoryNode"],
-        capability: ProjectionWriteCapability,
-    ) -> list["StoryNode"]:
-        return self.repository.save_batch(nodes, _capability=capability)
-
-    def apply_merge_plan(
-        self,
-        creates: list[dict],
-        updates: list[dict],
-        deletes: list[str],
-        capability: ProjectionWriteCapability,
+        operation: str,
+        expected_active_plan_revision_id: Optional[str],
+        expected_active_plan_digest: str,
+        expected_authority_generation: int,
+        expected_projection_generation: int,
+        creates: Sequence["StoryNode"] = (),
+        updates: Sequence["StoryNode"] = (),
+        deletes: Sequence[str] = (),
     ) -> None:
-        self.repository.apply_merge_plan(
+        """Fail closed instead of accepting an unverifiable projection batch.
+
+        Parameters remain intentionally visible because a future sealed
+        projection declaration must bind the exact Head CAS and physical
+        batch. They are not consumed today: doing so would imply that
+        caller-supplied StoryNode values are Manifest facts.
+        """
+
+        del (
+            novel_id,
+            plan_revision_id,
+            operation,
+            expected_active_plan_revision_id,
+            expected_active_plan_digest,
+            expected_authority_generation,
+            expected_projection_generation,
             creates,
             updates,
             deletes,
-            _capability=capability,
+        )
+        raise PlanningAuthorityError(
+            "caller-supplied StoryNode projection batches are disabled until "
+            "the Manifest stores an immutable physical projection declaration"
         )

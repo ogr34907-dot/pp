@@ -268,6 +268,48 @@ def test_snapshot_preserves_story_node_planning_and_chapter_fields(chain):
     assert record["pov_character_id"] == "hero"
 
 
+def test_snapshot_uses_manifest_safe_runtime_summary_before_legacy_summary(chain):
+    act = chain[2]
+    act.metadata = {
+        "contract_digest": "act-d",
+        "runtime.summary": "运行时幕摘要",
+        "summary": "旧幕摘要",
+        "committed_metadata": {"summary": "提交幕摘要"},
+    }
+
+    snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain)
+
+    assert snapshot.ancestry["act"]["description"] == "运行时幕摘要"
+
+
+def test_snapshot_uses_runtime_summary_when_legacy_summary_is_absent(chain):
+    act = chain[2]
+    act.metadata = {
+        "contract_digest": "act-d",
+        "runtime.summary": "仅运行时幕摘要",
+    }
+
+    snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain)
+
+    assert snapshot.ancestry["act"]["description"] == "仅运行时幕摘要"
+
+
+def test_snapshot_hides_all_summary_fallbacks_after_runtime_invalidation(chain):
+    act = chain[2]
+    act.description = ""
+    act.metadata = {
+        "contract_digest": "act-d",
+        "runtime.summary": "已废弃的运行时幕摘要",
+        "summary": "已废弃的旧幕摘要",
+        "committed_metadata": {"summary": "已废弃的提交幕摘要"},
+        "runtime.summary_invalidated_from_chapter": 2,
+    }
+
+    snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain)
+
+    assert snapshot.ancestry["act"]["description"] == ""
+
+
 def test_cross_novel_ancestor_is_blocking(chain):
     chain[2].novel_id = "other-novel"
     snapshot = HierarchicalNarrativeAlignmentGate().build_snapshot("chapter-1", chain)

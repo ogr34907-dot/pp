@@ -149,11 +149,13 @@ class HierarchicalNarrativeAlignmentGate:
         llm_evaluator: Optional[Callable[..., Any]] = None,
         memory_engine: Any = None,
         vector_retriever: Any = None,
+        story_node_repository: Any = None,
         min_confidence: float = 0.6,
     ) -> None:
         self.llm_evaluator = llm_evaluator
         self.memory_engine = memory_engine
         self.vector_retriever = vector_retriever
+        self.story_node_repository = story_node_repository
         self.min_confidence = min_confidence
         self._consumed_overrides: set[str] = set()
 
@@ -230,50 +232,75 @@ class HierarchicalNarrativeAlignmentGate:
         )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
-    @classmethod
-    def _node_record(cls, node: Any) -> dict[str, Any]:
-        metadata = cls._node_value(node, "metadata", {}) or {}
+    def _node_record(
+        self,
+        node: Any,
+        *,
+        summary_visibility_repository: Any = None,
+    ) -> dict[str, Any]:
+        metadata = self._node_value(node, "metadata", {}) or {}
         if isinstance(metadata, str):
             try:
                 metadata = json.loads(metadata)
             except (TypeError, ValueError):
                 metadata = {}
+        if not isinstance(metadata, Mapping):
+            metadata = {}
         committed = metadata.get("committed_metadata", {}) or {}
         if isinstance(committed, str):
             try:
                 committed = json.loads(committed)
             except (TypeError, ValueError):
                 committed = {}
-        summary = metadata.get("summary") or committed.get("summary", "")
+        summary = ""
+        repository = summary_visibility_repository or self.story_node_repository
+        selector = getattr(
+            type(repository), "visible_summary_metadata_pairs", None
+        )
+        if callable(selector):
+            pairs = selector(
+                repository,
+                node,
+                summary_key="summary",
+                state_key="summary_state",
+            )
+            if pairs:
+                summary = pairs[0][0]
+        elif not self._summary_is_explicitly_invalidated(metadata, "summary"):
+            summary = (
+                metadata.get("runtime.summary")
+                or metadata.get("summary")
+                or committed.get("summary", "")
+            )
         record = {
-            "id": cls._node_value(node, "id"),
-            "novel_id": cls._node_value(node, "novel_id"),
-            "node_type": cls._node_type(node),
-            "number": cls._node_value(node, "number"),
-            "title": cls._node_value(node, "title", ""),
-            "parent_id": cls._node_value(node, "parent_id"),
-            "order_index": cls._node_value(node, "order_index"),
-            "planning_status": getattr(cls._node_value(node, "planning_status", "draft"), "value", cls._node_value(node, "planning_status", "draft")),
-            "planning_source": getattr(cls._node_value(node, "planning_source", "manual"), "value", cls._node_value(node, "planning_source", "manual")),
-            "chapter_start": cls._node_value(node, "chapter_start"),
-            "chapter_end": cls._node_value(node, "chapter_end"),
-            "chapter_count": cls._node_value(node, "chapter_count", 0),
-            "suggested_chapter_count": cls._node_value(node, "suggested_chapter_count"),
-            "description": cls._node_value(node, "description") or summary,
-            "content": cls._node_value(node, "content"),
-            "word_count": cls._node_value(node, "word_count", 0),
-            "status": cls._node_value(node, "status", "draft"),
-            "pov_character_id": cls._node_value(node, "pov_character_id"),
-            "timeline_start": cls._node_value(node, "timeline_start"),
-            "timeline_end": cls._node_value(node, "timeline_end"),
-            "created_at": cls._node_value(node, "created_at"),
-            "updated_at": cls._node_value(node, "updated_at"),
-            "themes": cls._node_value(node, "themes", None) or metadata.get("themes", []),
-            "key_events": cls._node_value(node, "key_events", None) or metadata.get("key_events", []),
-            "narrative_arc": cls._node_value(node, "narrative_arc", None) or metadata.get("narrative_arc", ""),
-            "conflicts": cls._node_value(node, "conflicts", None) or metadata.get("conflicts", []),
+            "id": self._node_value(node, "id"),
+            "novel_id": self._node_value(node, "novel_id"),
+            "node_type": self._node_type(node),
+            "number": self._node_value(node, "number"),
+            "title": self._node_value(node, "title", ""),
+            "parent_id": self._node_value(node, "parent_id"),
+            "order_index": self._node_value(node, "order_index"),
+            "planning_status": getattr(self._node_value(node, "planning_status", "draft"), "value", self._node_value(node, "planning_status", "draft")),
+            "planning_source": getattr(self._node_value(node, "planning_source", "manual"), "value", self._node_value(node, "planning_source", "manual")),
+            "chapter_start": self._node_value(node, "chapter_start"),
+            "chapter_end": self._node_value(node, "chapter_end"),
+            "chapter_count": self._node_value(node, "chapter_count", 0),
+            "suggested_chapter_count": self._node_value(node, "suggested_chapter_count"),
+            "description": self._node_value(node, "description") or summary,
+            "content": self._node_value(node, "content"),
+            "word_count": self._node_value(node, "word_count", 0),
+            "status": self._node_value(node, "status", "draft"),
+            "pov_character_id": self._node_value(node, "pov_character_id"),
+            "timeline_start": self._node_value(node, "timeline_start"),
+            "timeline_end": self._node_value(node, "timeline_end"),
+            "created_at": self._node_value(node, "created_at"),
+            "updated_at": self._node_value(node, "updated_at"),
+            "themes": self._node_value(node, "themes", None) or metadata.get("themes", []),
+            "key_events": self._node_value(node, "key_events", None) or metadata.get("key_events", []),
+            "narrative_arc": self._node_value(node, "narrative_arc", None) or metadata.get("narrative_arc", ""),
+            "conflicts": self._node_value(node, "conflicts", None) or metadata.get("conflicts", []),
             "metadata": metadata,
-            "contract_digest": cls.derive_contract_digest(node),
+            "contract_digest": self.derive_contract_digest(node),
         }
         # Keep all existing planning fields available to consumers without
         # coupling this gate to a particular schema revision.
@@ -284,10 +311,17 @@ class HierarchicalNarrativeAlignmentGate:
             "emotional_arc", "setup_for", "payoff_from", "required_threads", "out_of_scope",
             "character_agency", "handoff_from_previous", "handoff_to_next",
         ):
-            value = cls._node_value(node, key, None)
+            value = self._node_value(node, key, None)
             if value is not None:
                 record[key] = value
         return record
+
+    @staticmethod
+    def _summary_is_explicitly_invalidated(
+        metadata: Mapping[str, Any], summary_key: str
+    ) -> bool:
+        marker = metadata.get(f"runtime.{summary_key}_invalidated_from_chapter")
+        return marker not in (None, "")
 
     @staticmethod
     def _repair_plan(violations: Iterable[AlignmentViolation]) -> tuple[str, ...]:
@@ -341,8 +375,15 @@ class HierarchicalNarrativeAlignmentGate:
         memory_state: Optional[Mapping[str, Any]] = None,
         vector_evidence: Any = None,
         novel_id: Optional[str] = None,
+        summary_visibility_repository: Any = None,
     ) -> HierarchySnapshot:
-        records = {str(self._node_value(n, "id")): self._node_record(n) for n in nodes}
+        records = {
+            str(self._node_value(n, "id")): self._node_record(
+                n,
+                summary_visibility_repository=summary_visibility_repository,
+            )
+            for n in nodes
+        }
         chapter = records.get(str(chapter_id))
         structural: list[AlignmentViolation] = []
         if chapter is None:

@@ -14,6 +14,10 @@ from infrastructure.persistence.database.chapter_candidate_repository import (
     CandidateGateError,
     ChapterCandidateRepository,
 )
+from infrastructure.persistence.database.planning_authority_guard import (
+    is_manifest_authority,
+)
+from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 from domain.novel.candidate_chapter import RunMode
 
 
@@ -123,6 +127,23 @@ class WorldlineRegenerationService:
             (novel_id, target_chapters, self._now()),
         )
 
+    @staticmethod
+    def _assert_legacy_worldline_allowed(
+        conn: sqlite3.Connection, novel_id: str
+    ) -> None:
+        """Block the legacy archive algorithm after Manifest cutover.
+
+        The legacy implementation deletes contracts by mutable physical
+        StoryNode identity.  A sealed manifest needs a dedicated rebase
+        transaction, so any public Worldline mutation must remain closed
+        until that transaction exists.
+        """
+
+        if is_manifest_authority(conn, novel_id):
+            raise WorldlineRegenerationError(
+                "manifest-authority Worldline requires manifest-aware rebase support"
+            )
+
     def preview(self, novel_id: str, *, start_chapter: int, target_chapters: int) -> WorldlinePreview:
         if start_chapter < 1:
             raise WorldlineRegenerationError("start_chapter must be at least 1")
@@ -131,6 +152,7 @@ class WorldlineRegenerationService:
         if target_chapters < start_chapter:
             raise WorldlineRegenerationError("target_chapters must be at least start_chapter")
         conn = self._connection()
+        self._assert_legacy_worldline_allowed(conn, novel_id)
         exists = conn.execute("SELECT 1 FROM novels WHERE id = ?", (novel_id,)).fetchone()
         if exists is None:
             raise KeyError(f"novel not found: {novel_id}")
@@ -207,6 +229,7 @@ class WorldlineRegenerationService:
         if run_mode not in {"continuous", "chapter_review"}:
             raise WorldlineRegenerationError("run_mode must be continuous or chapter_review")
         conn = self._connection()
+        self._assert_legacy_worldline_allowed(conn, novel_id)
         preview_row = conn.execute(
             "SELECT * FROM worldline_regeneration_previews WHERE token = ? AND novel_id = ?",
             (preview_token, novel_id),
@@ -408,6 +431,7 @@ class WorldlineRegenerationService:
         if run_mode not in {"continuous", "chapter_review"}:
             raise WorldlineRegenerationError("run_mode must be continuous or chapter_review")
         conn = self._connection()
+        self._assert_legacy_worldline_allowed(conn, novel_id)
         source = conn.execute(
             "SELECT * FROM worldline_archives WHERE id = ? AND novel_id = ?",
             (archive_id, novel_id),
@@ -467,6 +491,9 @@ class WorldlineRegenerationService:
             )
             self._archive_tail(conn, replacement_archive_id, novel_id, start)
             self._restore_source_rows(conn, archive_id)
+            # Archived node metadata can contain pre-fix runtime summaries.
+            # Rebuild jobs own their next visible version after the epoch switch.
+            self._invalidate_runtime_summary_caches(conn, novel_id, start)
             restored_max_row = conn.execute(
                 "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE novel_id = ?",
                 (novel_id,),
@@ -651,6 +678,13 @@ class WorldlineRegenerationService:
     def _archive_tail(self, conn: sqlite3.Connection, archive_id: str, novel_id: str, start: int) -> None:
         """Archive known chapter-provenance rows first, then remove the active tail."""
 
+        self._assert_legacy_worldline_allowed(conn, novel_id)
+
+        # Macro/checkpoint summaries are derived runtime caches.  They must be
+        # invalid before the new Worldline epoch becomes observable, while the
+        # immutable planning projection remains untouched.
+        self._invalidate_runtime_summary_caches(conn, novel_id, start)
+
         tail_chapters = self._select_rows(
             conn, "chapters", "novel_id = ? AND number >= ?", (novel_id, start)
         )
@@ -828,6 +862,19 @@ class WorldlineRegenerationService:
         # Formal chapters are last because multiple archived tables reference them.
         self._archive_rows(conn, archive_id, "chapters", tail_chapters, chapter_column="number")
         self._delete_query(conn, "chapters", "novel_id = ? AND number >= ?", (novel_id, start))
+
+    def _invalidate_runtime_summary_caches(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: str,
+        start_chapter: int,
+    ) -> None:
+        StoryNodeRepository(self._db or self.db_path).invalidate_runtime_summary_caches(
+            novel_id,
+            start_chapter,
+            _connection=conn,
+            _commit=False,
+        )
 
     def _archive_rows_by_chapter(
         self,

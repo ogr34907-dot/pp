@@ -202,6 +202,8 @@ class OutlineContract:
     has_author_edits: bool = False
     published_digest: str = ""
     previous_sibling_digest: str = ""
+    version_id: str = ""
+    sibling_index: Optional[int] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.level, str):
@@ -283,8 +285,14 @@ class OutlineChain:
         return {
             level.value: {
                 "contract_id": self._contracts[level].id,
+                "logical_node_id": self._contracts[level].id,
+                "version_id": self._contracts[level].version_id,
                 "revision": self._contracts[level].revision,
                 "digest": self._contracts[level].published_digest or self._contracts[level].digest,
+                "level": self._contracts[level].level.value,
+                "parent_logical_node_id": self._contracts[level].parent_id,
+                "sibling_index": self._contracts[level].sibling_index,
+                "story_node_id": self._contracts[level].story_node_id,
                 "payload": self._contracts[level].payload.canonical_dict(),
             }
             for level in OutlineLevel.ordered()

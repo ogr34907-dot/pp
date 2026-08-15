@@ -255,10 +255,11 @@ async def test_streaming_outline_delta_commits_once_and_preserves_text_and_event
     ]
     assert events[-1]["payload"]["title"] == "流式总纲"
 
-    # Fixed non-delta commits: start attempt, started event, draft, terminal event.
-    # The two live fragments share one durable delta transaction.
+    # Fixed non-delta commits: the attempt and its started event are one
+    # durable transaction, followed by draft and terminal event commits. The
+    # two live fragments share one durable delta transaction.
     commit_count = sum(1 for statement in sql_trace if statement.strip().upper() == "COMMIT")
-    assert commit_count == 5
+    assert commit_count == 4
 
 
 @pytest.mark.asyncio

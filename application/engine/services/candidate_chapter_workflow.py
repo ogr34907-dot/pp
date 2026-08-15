@@ -132,6 +132,7 @@ class CandidateChapterWorkflowService:
     ) -> ChapterCandidate:
         """Apply the exact author-approved candidate revision and commit plan."""
 
+        self._require_manifest_reconciliation(self.repository.get_candidate(candidate_id))
         self.repository.approve_for_commit(
             candidate_id, continue_after_commit=continue_after_commit
         )
@@ -216,8 +217,40 @@ class CandidateChapterWorkflowService:
         return completed
 
     async def _commit_and_sync(self, candidate_id: str) -> ChapterCandidate:
+        self._require_manifest_reconciliation(self.repository.get_candidate(candidate_id))
         candidate = self.repository.commit_formal(candidate_id)
         return await self._sync_formal_candidate(candidate)
+
+    def _require_manifest_reconciliation(self, candidate: ChapterCandidate) -> None:
+        """Fail closed when the Candidate's exact plan boundary moved under it."""
+
+        if not candidate.plan_revision_id:
+            return
+        reconcile = getattr(self.outline_service, "reconcile_plan_boundary", None)
+        if not callable(reconcile):
+            raise CandidateWorkflowError(
+                "manifest plan reconciliation is unavailable for this Candidate"
+            )
+        try:
+            report = reconcile(
+                novel_id=candidate.novel_id,
+                plan_revision_id=str(candidate.plan_revision_id),
+            )
+        except Exception as exc:
+            raise CandidateWorkflowError(
+                "manifest plan reconciliation failed before Candidate work"
+            ) from exc
+        status = getattr(report, "status", "")
+        status_value = str(getattr(status, "value", status))
+        canonical_ready = bool(getattr(report, "canonical_ready", False))
+        memory_ready = bool(getattr(report, "memory_ready", False))
+        if status_value == "aligned" and canonical_ready and memory_ready:
+            return
+        blockers = tuple(str(item) for item in getattr(report, "blockers", ()) if item)
+        details = ", ".join(blockers) or status_value or "unknown"
+        raise CandidateWorkflowError(
+            "manifest plan reconciliation blocks Candidate work: " + details
+        )
 
     async def _generate_candidate_with_authority(
         self, candidate: ChapterCandidate
@@ -228,6 +261,7 @@ class CandidateChapterWorkflowService:
             candidate = self.repository.revalidate_candidate_generation_authority(
                 candidate.id
             )
+            self._require_manifest_reconciliation(candidate)
             from application.engine.dag.plan.schema import (
                 chapter_rhythm_from_outline_payload,
                 serialize_chapter_rhythm,
@@ -253,6 +287,7 @@ class CandidateChapterWorkflowService:
             candidate = self.repository.revalidate_candidate_generation_authority(
                 candidate.id
             )
+            self._require_manifest_reconciliation(candidate)
             trace = self.repository.start_dag_run(
                 candidate.id, content_revision=candidate.content_revision + 1
             )

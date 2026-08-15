@@ -631,11 +631,34 @@ class ChapterRewriteCoordinator:
         )
 
     def _invalidate_story_nodes(self, conn: Any, novel_id: str, chapter_number: int) -> None:
-        if is_manifest_authority(conn, novel_id):
-            # The manifest projection is rebuilt only by a confirmed Worldline
-            # transaction; ordinary rewrite invalidation must not mutate it.
-            return
+        # Runtime-derived summaries must be invalidated for every book.  The
+        # legacy bookkeeping below only marks older metadata stale; it does
+        # not remove a manifest-safe runtime cache by itself.
         columns = self._table_columns(conn, "story_nodes")
+        runtime_summary_columns = {
+            "id",
+            "novel_id",
+            "node_type",
+            "number",
+            "chapter_start",
+            "chapter_end",
+            "metadata",
+        }
+        if runtime_summary_columns <= columns:
+            from infrastructure.persistence.database.story_node_repository import (
+                StoryNodeRepository,
+            )
+
+            StoryNodeRepository(self._db).invalidate_runtime_summary_caches(
+                novel_id,
+                chapter_number,
+                _connection=conn,
+                _commit=False,
+            )
+        if is_manifest_authority(conn, novel_id):
+            # The projection's planning payload remains immutable, but
+            # Canonical-derived runtime caches must not survive a prose rewrite.
+            return
         if not {"id", "novel_id", "node_type", "metadata"} <= columns:
             return
         range_columns = {"chapter_start", "chapter_end"} <= columns

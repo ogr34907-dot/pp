@@ -275,3 +275,58 @@ async def test_summary_trigger_rebuilds_completed_act_with_stale_summary():
 
     assert summary_service.generated_act_ids == ["act-1"]
 
+
+@pytest.mark.asyncio
+async def test_summary_trigger_skips_completed_part_with_current_runtime_summary():
+    host = DaemonHostMixin.__new__(DaemonHostMixin)
+    part = StoryNode(
+        id="part-1",
+        novel_id="novel-1",
+        node_type=NodeType.PART,
+        number=1,
+        title="第一部",
+        order_index=1,
+        metadata={
+            "runtime.summary": "当前部摘要",
+            "runtime.summary_state": {"status": "committed"},
+        },
+    )
+    volume = StoryNode(
+        id="volume-1",
+        novel_id="novel-1",
+        node_type=NodeType.VOLUME,
+        number=1,
+        title="第一卷",
+        order_index=1,
+        parent_id="part-1",
+        chapter_start=1,
+        chapter_end=1,
+        metadata={
+            "runtime.summary": "当前卷摘要",
+            "runtime.summary_state": {"status": "committed"},
+        },
+    )
+
+    class SummaryService:
+        def __init__(self):
+            self.generated_part_numbers = []
+
+        async def should_generate_checkpoint(self, _novel_id, _chapter_number):
+            return False
+
+        def is_node_summary_current(self, node):
+            return node.metadata.get("runtime.summary_state", {}).get("status") == "committed"
+
+        async def generate_part_summary(self, _novel_id, part_number):
+            self.generated_part_numbers.append(part_number)
+            return SimpleNamespace(success=True, error=None)
+
+    summary_service = SummaryService()
+    host.volume_summary_service = summary_service
+    host.story_node_repo = SimpleNamespace(get_by_novel=AsyncMock(return_value=[part, volume]))
+    novel = SimpleNamespace(novel_id=SimpleNamespace(value="novel-1"))
+
+    await host._maybe_generate_summaries(novel, completed_count=1)
+
+    assert summary_service.generated_part_numbers == []
+

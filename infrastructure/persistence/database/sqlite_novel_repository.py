@@ -416,6 +416,12 @@ class SqliteNovelRepository(NovelRepository):
                 novel_scoped_tables.append(table_name)
 
         with self.db.transaction() as transaction:
+            # A replan revision can reference its prior revision with
+            # ON DELETE RESTRICT. Deleting the aggregate root cascades both
+            # rows, but SQLite otherwise checks the intermediate order before
+            # the cascade has removed the child. This pragma is transaction
+            # scoped, so ordinary direct manifest deletion remains blocked.
+            transaction.execute("PRAGMA defer_foreign_keys = ON")
             transaction.execute("DELETE FROM novels WHERE id = ?", (novel_id.value,))
             for table_name in novel_scoped_tables:
                 quoted_table = table_name.replace('"', '""')

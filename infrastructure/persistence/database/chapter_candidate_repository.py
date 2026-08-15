@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
@@ -20,6 +21,19 @@ from domain.novel.candidate_chapter import (
 
 class CandidateGateError(ValueError):
     """Raised when a candidate transition would bypass author/commit gates."""
+
+
+@dataclass(frozen=True)
+class FormalChapterIdentity:
+    """One exact Formal chapter identity, independent of its write-era source."""
+
+    source: str
+    novel_id: str
+    chapter_number: int
+    chapter_id: str
+    content_sha256: str
+    content_revision: int
+    candidate_id: Optional[str] = None
 
 
 _OPEN_CANDIDATE_STATUSES = {
@@ -89,6 +103,11 @@ class ChapterCandidateRepository:
             plan_revision_id=row["plan_revision_id"],
             plan_digest=str(row["plan_digest"] or ""),
             chapter_outline_digest=str(row["chapter_outline_digest"] or ""),
+            plan_pin_fingerprint=(
+                str(row["plan_pin_fingerprint"] or "")
+                if "plan_pin_fingerprint" in row.keys()
+                else ""
+            ),
             llm_content=str(row["llm_content"] or ""),
             author_content=row["author_content"],
             content_revision=int(row["content_revision"] or 0),
@@ -116,6 +135,34 @@ class ChapterCandidateRepository:
 
         conn = self._connection()
         return self._persisted_formal_chapter_head(conn, novel_id)
+
+    def formal_history_snapshot(self, novel_id: str) -> tuple[int, tuple[str, ...]]:
+        """Return the unique Formal head and any unsupported completed tail.
+
+        The head comes only from the legacy baseline plus exact Candidate-first
+        formal commits. Completed ``chapters`` rows are examined solely to
+        report a tail that is not part of that authority; they never advance
+        the returned head.
+        """
+
+        conn = self._connection()
+        baseline = self._validated_pre_candidate_baseline(conn, novel_id)
+        formal_head = self._persisted_formal_chapter_head(
+            conn, novel_id, baseline=baseline
+        )
+        unproven_rows = conn.execute(
+            """
+            SELECT number
+            FROM chapters
+            WHERE novel_id = ? AND number > ? AND status = 'completed'
+              AND TRIM(COALESCE(content, '')) <> ''
+            ORDER BY number
+            """,
+            (novel_id, formal_head),
+        ).fetchall()
+        return formal_head, tuple(
+            f"formal:chapter:{int(row['number'])}" for row in unproven_rows
+        )
 
     def assert_formal_history_is_proven(self, novel_id: str) -> None:
         """Reject a run before it can observe unproven completed prose."""
@@ -178,6 +225,33 @@ class ChapterCandidateRepository:
             and str(row["authority_content_sha256"] or "") == actual_sha256
             and int(row["chapter_content_revision"] or 0)
             == int(row["authority_content_revision"] or 0)
+        )
+
+    @classmethod
+    def _canonical_aftermath_barrier(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        content_sha256: str,
+        content_revision: int,
+    ) -> tuple[bool, str]:
+        """Require the exact Formal identity to have completed aftermath.
+
+        This compatibility wrapper keeps the Candidate repository's public
+        behavior while delegating the predicate to the shared read-only gate
+        used by every Canonical-derived Context cache.
+        """
+        from infrastructure.persistence.database.canonical_aftermath_barrier import (
+            exact_candidate_aftermath_is_ready,
+        )
+        return exact_candidate_aftermath_is_ready(
+            conn,
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            content_revision=content_revision,
         )
 
     def _validated_pre_candidate_baseline(
@@ -262,6 +336,138 @@ class ChapterCandidateRepository:
             if not self._formal_version_matches(row):
                 raise CandidateGateError("formal chapter authority mismatch")
 
+    def _formal_identity_at(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        baseline: list[sqlite3.Row],
+    ) -> FormalChapterIdentity:
+        """Resolve one continuous Formal identity from legacy or Candidate authority."""
+
+        if chapter_number < 1:
+            raise CandidateGateError("formal chapter number must be positive")
+        if chapter_number <= len(baseline):
+            row = baseline[chapter_number - 1]
+            return FormalChapterIdentity(
+                source="legacy",
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                chapter_id=str(row["chapter_id"]),
+                content_sha256=str(row["content_sha256"]),
+                content_revision=int(row["content_revision"] or 0),
+            )
+
+        row = conn.execute(
+            """
+            SELECT chapter.id AS chapter_id, chapter.number, chapter.content,
+                   chapter.content_sha256 AS chapter_content_sha256,
+                   chapter.content_revision AS chapter_content_revision,
+                   chapter.status AS chapter_status,
+                   formal.candidate_id, formal.content_sha256 AS authority_content_sha256,
+                   formal.content_revision AS authority_content_revision,
+                   formal.sync_status AS authority_sync_status,
+                   candidate.novel_id AS candidate_novel_id,
+                   candidate.chapter_number AS candidate_chapter_number,
+                   candidate.status AS candidate_status
+            FROM chapter_candidate_formal_commits AS formal
+            JOIN chapters AS chapter ON chapter.id = formal.chapter_id
+            JOIN chapter_candidates AS candidate ON candidate.id = formal.candidate_id
+            WHERE formal.novel_id = ? AND formal.chapter_number = ?
+            """,
+            (novel_id, chapter_number),
+        ).fetchone()
+        if row is None:
+            raise CandidateGateError("formal identity missing")
+        if (
+            str(row["candidate_novel_id"] or "") != novel_id
+            or int(row["candidate_chapter_number"] or 0) != chapter_number
+            or int(row["number"] or 0) != chapter_number
+            or str(row["chapter_status"] or "") != "completed"
+            or str(row["candidate_status"] or "") != CandidateStatus.COMMITTED.value
+            or str(row["authority_sync_status"] or "") != "ready"
+            or not self._formal_version_matches(row)
+        ):
+            raise CandidateGateError("formal chapter authority mismatch")
+        return FormalChapterIdentity(
+            source="candidate",
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            chapter_id=str(row["chapter_id"]),
+            content_sha256=str(row["authority_content_sha256"]),
+            content_revision=int(row["authority_content_revision"] or 0),
+            candidate_id=str(row["candidate_id"]),
+        )
+
+    def resolve_formal_identity(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> FormalChapterIdentity:
+        """Return the exact authoritative Formal identity for one chapter.
+
+        Imported legacy rows and Candidate-first commits intentionally share
+        this boundary. Callers that need Context, planning or cursor movement
+        can no longer accidentally grant legacy prose a weaker proof rule.
+        """
+
+        conn = connection or self._connection()
+        baseline = self._validated_pre_candidate_baseline(conn, novel_id)
+        self._ensure_no_unproven_completed_chapters(conn, novel_id, len(baseline))
+        return self._formal_identity_at(
+            conn,
+            novel_id=novel_id,
+            chapter_number=int(chapter_number),
+            baseline=baseline,
+        )
+
+    def require_formal_prefix_aftermath_ready(
+        self,
+        novel_id: str,
+        through_chapter: int,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> tuple[FormalChapterIdentity, ...]:
+        """Require exact Canonical/Summary/Memory evidence for a Formal prefix."""
+
+        requested = int(through_chapter)
+        if requested < 0:
+            raise CandidateGateError("formal chapter number must not be negative")
+        conn = connection or self._connection()
+        baseline = self._validated_pre_candidate_baseline(conn, novel_id)
+        self._ensure_no_unproven_completed_chapters(conn, novel_id, len(baseline))
+        formal_head = self._persisted_formal_chapter_head(
+            conn, novel_id, baseline=baseline
+        )
+        if formal_head < requested:
+            raise CandidateGateError("formal history is not continuous through requested chapter")
+
+        identities: list[FormalChapterIdentity] = []
+        for chapter_number in range(1, requested + 1):
+            identity = self._formal_identity_at(
+                conn,
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                baseline=baseline,
+            )
+            ready, reason = self._canonical_aftermath_barrier(
+                conn,
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                content_sha256=identity.content_sha256,
+                content_revision=identity.content_revision,
+            )
+            if not ready:
+                raise CandidateGateError(
+                    "canonical aftermath is not ready for formal chapter "
+                    f"{chapter_number}: {reason}"
+                )
+            identities.append(identity)
+        return tuple(identities)
+
     def _formal_slot_placeholder_id(
         self, conn: sqlite3.Connection, novel_id: str, chapter_number: int
     ) -> Optional[str]:
@@ -326,7 +532,7 @@ class ChapterCandidateRepository:
             raise CandidateGateError("manifest planning Head is not synced")
         plan = conn.execute(
             """
-            SELECT sealed_at, digest, status
+            SELECT sealed_at, digest, status, reconciliation_status
             FROM outline_plan_revisions
             WHERE id = ? AND novel_id = ?
             """,
@@ -336,25 +542,237 @@ class ChapterCandidateRepository:
             plan is None
             or not plan["sealed_at"]
             or str(plan["digest"] or "") != digest
-            or str(plan["status"] or "") != "published"
+            or str(plan["status"] or "") != "ready_for_review"
+            or str(plan["reconciliation_status"] or "") != "aligned"
         ):
             raise CandidateGateError("manifest planning Head is not backed by a sealed plan")
         return generation, str(plan_id), digest
 
+    @staticmethod
+    def _outline_chain_digest(outline_chain: dict[str, Any]) -> str:
+        encoded = json.dumps(outline_chain, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _plan_pin_fingerprint(
+        *,
+        planning_authority_generation: int,
+        plan_revision_id: Optional[str],
+        plan_digest: str,
+    ) -> str:
+        """Return the immutable Candidate provenance checksum.
+
+        The checksum deliberately excludes the active Head.  A future-only
+        replan may retain this Candidate when its exact five-level chain is
+        still present, while its original planning provenance remains
+        inspectable and unchanged.
+        """
+
+        values = (
+            str(int(planning_authority_generation)),
+            str(plan_revision_id) if plan_revision_id is not None else "<null>",
+            str(plan_digest),
+        )
+        return "|".join(f"{len(value)}:{value}" for value in values)
+
+    def _validate_manifest_outline_chain(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        outline_chain: dict[str, Any],
+        expected_outline_chain_digest: str = "",
+    ) -> tuple[int, Optional[str], str]:
+        """Match a Candidate's five-level chain to the active sealed Manifest.
+
+        ``plan_revision_id`` and the whole-plan digest remain immutable
+        provenance. They are not proof that a stored prompt chain belongs to
+        the current chapter, especially after a future-only replan. This
+        validator checks the exact logical/version/topology chain instead.
+        """
+
+        generation, plan_id, plan_digest = self._current_plan_pin(conn, novel_id)
+        if plan_id is None:
+            return generation, plan_id, plan_digest
+        if not isinstance(outline_chain, dict):
+            raise CandidateGateError("candidate outline chain must be an object")
+        actual_outline_chain_digest = self._outline_chain_digest(outline_chain)
+        if (
+            expected_outline_chain_digest
+            and actual_outline_chain_digest != expected_outline_chain_digest
+        ):
+            raise CandidateGateError("candidate outline chain digest is corrupted")
+
+        rows = conn.execute(
+            """
+            SELECT item.logical_node_id, item.version_id,
+                   item.parent_logical_node_id, item.level, item.sibling_index,
+                   contract.story_node_id, contract.novel_id AS contract_novel_id,
+                   version.revision AS version_revision,
+                   version.digest AS version_digest, version.payload_json,
+                   version.sealed_at
+            FROM outline_plan_revision_items AS item
+            JOIN outline_contracts AS contract
+              ON contract.id = item.logical_node_id
+            JOIN outline_contract_versions AS version
+              ON version.id = item.version_id
+            WHERE item.plan_revision_id = ?
+            """,
+            (plan_id,),
+        ).fetchall()
+        required_levels = ("outline", "part", "volume", "act", "chapter")
+        if any(level not in outline_chain for level in required_levels):
+            raise CandidateGateError("candidate outline chain is missing a required level")
+        if set(outline_chain) != set(required_levels):
+            raise CandidateGateError("candidate outline chain has unsealed fields")
+        by_logical = {str(row["logical_node_id"]): row for row in rows}
+        chain_rows: dict[str, sqlite3.Row] = {}
+        previous_logical_id: Optional[str] = None
+        for level in required_levels:
+            supplied = outline_chain.get(level)
+            if not isinstance(supplied, dict):
+                raise CandidateGateError("candidate outline chain is missing a required level")
+            logical_node_id = str(supplied.get("logical_node_id") or "")
+            contract_id = str(supplied.get("contract_id") or "")
+            version_id = str(supplied.get("version_id") or "")
+            if not logical_node_id or logical_node_id != contract_id or not version_id:
+                raise CandidateGateError("candidate outline chain lacks immutable manifest identity")
+            row = by_logical.get(logical_node_id)
+            if row is None:
+                raise CandidateGateError("candidate outline chain is not in the active plan")
+            try:
+                sibling_index = int(supplied.get("sibling_index"))
+            except (TypeError, ValueError) as exc:
+                raise CandidateGateError(
+                    "candidate outline chain has no valid sibling position"
+                ) from exc
+            if (
+                str(row["contract_novel_id"] or "") != novel_id
+                or str(row["level"] or "") != level
+                or str(row["version_id"] or "") != version_id
+                or str(row["version_digest"] or "") != str(supplied.get("digest") or "")
+                or str(supplied.get("level") or "") != level
+                or supplied.get("parent_logical_node_id")
+                != row["parent_logical_node_id"]
+                or sibling_index != int(row["sibling_index"] or 0)
+                or supplied.get("story_node_id") != row["story_node_id"]
+                or not row["sealed_at"]
+            ):
+                raise CandidateGateError("candidate outline chain differs from the active manifest")
+            try:
+                from domain.structure.outline_contract import OutlinePayload
+
+                payload = OutlinePayload.from_dict(
+                    json.loads(str(row["payload_json"] or "{}"))
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CandidateGateError("active manifest outline payload is invalid") from exc
+            if payload.digest != str(row["version_digest"] or ""):
+                raise CandidateGateError("active manifest outline payload digest is invalid")
+            expected_entry = {
+                "contract_id": str(row["logical_node_id"]),
+                "logical_node_id": str(row["logical_node_id"]),
+                "version_id": str(row["version_id"]),
+                "revision": int(row["version_revision"] or 0),
+                "digest": str(row["version_digest"]),
+                "level": str(row["level"]),
+                "parent_logical_node_id": row["parent_logical_node_id"],
+                "sibling_index": int(row["sibling_index"] or 0),
+                "story_node_id": row["story_node_id"],
+                "payload": payload.canonical_dict(),
+            }
+            if supplied != expected_entry:
+                raise CandidateGateError(
+                    "candidate outline chain differs from the sealed manifest snapshot"
+                )
+            if previous_logical_id is None:
+                if row["parent_logical_node_id"] is not None:
+                    raise CandidateGateError("candidate outline root has a parent")
+            elif str(row["parent_logical_node_id"] or "") != previous_logical_id:
+                raise CandidateGateError("candidate outline chain parent linkage is invalid")
+            chain_rows[level] = row
+            previous_logical_id = logical_node_id
+
+        chapter_row = chain_rows["chapter"]
+        chapter_story_node_id = str(chapter_row["story_node_id"] or "")
+        if not chapter_story_node_id:
+            raise CandidateGateError("active chapter outline has no physical projection")
+        chapter_node = conn.execute(
+            """
+            SELECT novel_id, node_type, number FROM story_nodes WHERE id = ?
+            """,
+            (chapter_story_node_id,),
+        ).fetchone()
+        if (
+            chapter_node is None
+            or str(chapter_node["novel_id"] or "") != novel_id
+            or str(chapter_node["node_type"] or "") != "chapter"
+            or int(chapter_node["number"] or 0) != int(chapter_number)
+        ):
+            raise CandidateGateError("active chapter outline does not map to the candidate chapter")
+        chapter_payload = json.loads(str(chapter_row["payload_json"] or "{}"))
+        try:
+            chapter_start = int(chapter_payload["chapter_start"])
+            chapter_end = int(chapter_payload["chapter_end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CandidateGateError("active chapter outline has no chapter range") from exc
+        if chapter_start > chapter_end or not (
+            chapter_start <= int(chapter_number) <= chapter_end
+        ):
+            raise CandidateGateError("candidate chapter is outside the active chapter outline range")
+        return generation, plan_id, plan_digest
+
     def _assert_plan_pin_current(
         self, conn: sqlite3.Connection, candidate: ChapterCandidate
     ) -> None:
-        generation, plan_id, digest = self._current_plan_pin(conn, candidate.novel_id)
+        expected_provenance = self._plan_pin_fingerprint(
+            planning_authority_generation=candidate.planning_authority_generation,
+            plan_revision_id=candidate.plan_revision_id,
+            plan_digest=candidate.plan_digest,
+        )
+        if candidate.plan_pin_fingerprint:
+            if candidate.plan_pin_fingerprint != expected_provenance:
+                raise CandidateGateError("candidate plan provenance is corrupted")
+        elif candidate.plan_revision_id is not None:
+            # Manifest Candidates created before the hardening migration must
+            # be re-created instead of silently gaining mutable provenance.
+            raise CandidateGateError("candidate plan provenance is incomplete")
+
+        if candidate.plan_revision_id is not None:
+            provenance = conn.execute(
+                """
+                SELECT sealed_at, digest
+                FROM outline_plan_revisions
+                WHERE id = ? AND novel_id = ?
+                """,
+                (candidate.plan_revision_id, candidate.novel_id),
+            ).fetchone()
+            if (
+                provenance is None
+                or not provenance["sealed_at"]
+                or str(provenance["digest"] or "") != candidate.plan_digest
+            ):
+                raise CandidateGateError("candidate plan provenance is stale")
+
+        generation, plan_id, digest = self._validate_manifest_outline_chain(
+            conn,
+            novel_id=candidate.novel_id,
+            chapter_number=candidate.chapter_number,
+            outline_chain=candidate.outline_chain,
+            expected_outline_chain_digest=candidate.outline_chain_digest,
+        )
         if candidate.plan_revision_id is None:
             if plan_id is not None:
                 raise CandidateGateError("candidate has no current plan pin")
             return
-        if (
-            plan_id != candidate.plan_revision_id
-            or digest != candidate.plan_digest
-            or generation != candidate.planning_authority_generation
-        ):
+        if plan_id is None:
             raise CandidateGateError("candidate plan pin is stale")
+        chapter_digest = str(
+            (candidate.outline_chain.get("chapter") or {}).get("digest") or ""
+        )
+        if not chapter_digest or chapter_digest != candidate.chapter_outline_digest:
+            raise CandidateGateError("candidate chapter outline pin is stale")
 
     def _assert_candidate_authority(
         self,
@@ -362,6 +780,9 @@ class ChapterCandidateRepository:
         candidate_id: str,
         *,
         allowed_statuses: tuple[CandidateStatus, ...],
+        allowed_run_states: tuple[GenerationRunState, ...] = (
+            GenerationRunState.RUNNING,
+        ),
     ) -> tuple[ChapterCandidate, GenerationRun]:
         """Recheck the durable cursor immediately before generation or formal write."""
 
@@ -371,18 +792,18 @@ class ChapterCandidateRepository:
         if row is None:
             raise KeyError(f"candidate not found: {candidate_id}")
         candidate = self._candidate_from_row(row)
-        if candidate.status not in allowed_statuses:
-            raise CandidateGateError("candidate is no longer in an authority-bearing state")
-
         run_row = conn.execute(
             "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (candidate.novel_id,)
         ).fetchone()
         if run_row is None:
             raise CandidateGateError("generation run is missing")
         run = self._run_from_row(run_row)
+        if candidate.generation_epoch != run.generation_epoch:
+            raise CandidateGateError("candidate belongs to a retired generation epoch")
+        if candidate.status not in allowed_statuses:
+            raise CandidateGateError("candidate is no longer in an authority-bearing state")
         if (
-            run.state != GenerationRunState.RUNNING
-            or candidate.generation_epoch != run.generation_epoch
+            run.state not in allowed_run_states
             or run.current_candidate_id != candidate.id
             or int(run.current_candidate_chapter or 0) != candidate.chapter_number
             or str(run.canonical_sync_status or "ready") != "ready"
@@ -397,6 +818,11 @@ class ChapterCandidateRepository:
         )
         formal_head = self._persisted_formal_chapter_head(
             conn, candidate.novel_id, baseline=baseline
+        )
+        self.require_formal_prefix_aftermath_ready(
+            candidate.novel_id,
+            formal_head,
+            connection=conn,
         )
         if (
             run.current_formal_chapter != formal_head
@@ -446,7 +872,7 @@ class ChapterCandidateRepository:
             (novel_id,),
         ).fetchone()
         if run is not None and (
-            str(run["state"] or "") in {"running", "waiting_review"}
+            str(run["state"] or "") in {"running", "waiting_review", "waiting_planning"}
             or run["current_candidate_id"]
             or str(run["canonical_sync_status"] or "ready") != "ready"
         ):
@@ -574,55 +1000,91 @@ class ChapterCandidateRepository:
         target_chapters: int | None = None,
     ) -> GenerationRun:
         conn = self._connection()
-        novel = conn.execute(
-            "SELECT target_chapters FROM novels WHERE id = ?", (novel_id,)
-        ).fetchone()
-        if novel is None:
-            raise KeyError(f"novel not found: {novel_id}")
-        target_chapters = int(novel["target_chapters"] or 0)
-        if target_chapters < 1:
-            raise CandidateGateError("novel target_chapters must be at least 1")
-        self.assert_formal_history_is_proven(novel_id)
-        existing = conn.execute(
-            "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
-        ).fetchone()
-        persisted_chapter_head = self.formal_chapter_head(novel_id)
-        if existing is not None:
-            current = self._run_from_row(existing)
-            if current.canonical_sync_status not in {"ready", ""}:
-                raise CandidateGateError(
-                    "canonical rebuild or sync is not ready; resolve the current recovery action first"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            novel = conn.execute(
+                "SELECT target_chapters FROM novels WHERE id = ?", (novel_id,)
+            ).fetchone()
+            if novel is None:
+                raise KeyError(f"novel not found: {novel_id}")
+            target_chapters = int(novel["target_chapters"] or 0)
+            if target_chapters < 1:
+                raise CandidateGateError("novel target_chapters must be at least 1")
+
+            baseline = self._validated_pre_candidate_baseline(conn, novel_id)
+            self._ensure_no_unproven_completed_chapters(
+                conn, novel_id, len(baseline)
+            )
+            persisted_chapter_head = self._persisted_formal_chapter_head(
+                conn, novel_id, baseline=baseline
+            )
+            existing = conn.execute(
+                "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+            ).fetchone()
+            now = self._now()
+            if existing is None:
+                inserted = conn.execute(
+                    """
+                    INSERT INTO novel_generation_runs
+                        (novel_id, run_mode, state, generation_epoch, target_chapters,
+                         current_formal_chapter, max_pending_candidates, prefetch,
+                         canonical_sync_status, next_action, updated_at)
+                    VALUES (?, ?, 'running', 0, ?, ?, 1, 0, 'ready', 'generate_candidate', ?)
+                    ON CONFLICT(novel_id) DO NOTHING
+                    """,
+                    (
+                        novel_id,
+                        run_mode.value,
+                        target_chapters,
+                        persisted_chapter_head,
+                        now,
+                    ),
                 )
-            if current.current_candidate_id:
-                raise CandidateGateError("cannot start a new run while a pending candidate exists")
-            epoch = current.generation_epoch
-            current_formal_chapter = persisted_chapter_head
-        else:
-            epoch = 0
-            current_formal_chapter = persisted_chapter_head
-        now = self._now()
-        conn.execute(
-            """
-            INSERT INTO novel_generation_runs
-                (novel_id, run_mode, state, generation_epoch, target_chapters,
-                 current_formal_chapter, max_pending_candidates, prefetch,
-                 canonical_sync_status, next_action, updated_at)
-            VALUES (?, ?, 'running', ?, ?, ?, 1, 0, 'ready', 'generate_candidate', ?)
-            ON CONFLICT(novel_id) DO UPDATE SET
-                run_mode = excluded.run_mode,
-                state = 'running',
-                target_chapters = excluded.target_chapters,
-                current_formal_chapter = excluded.current_formal_chapter,
-                max_pending_candidates = 1,
-                prefetch = 0,
-                canonical_sync_status = 'ready',
-                next_action = 'generate_candidate',
-                last_error = '',
-                updated_at = excluded.updated_at
-            """,
-            (novel_id, run_mode.value, epoch, target_chapters, current_formal_chapter, now),
-        )
-        conn.commit()
+                if inserted.rowcount != 1:
+                    raise CandidateGateError("generation run changed before start")
+            else:
+                current = self._run_from_row(existing)
+                if current.canonical_sync_status not in {"ready", ""}:
+                    raise CandidateGateError(
+                        "canonical rebuild or sync is not ready; resolve the current recovery action first"
+                    )
+                if current.current_candidate_id:
+                    raise CandidateGateError("cannot start a new run while a pending candidate exists")
+                if current.state == GenerationRunState.WAITING_PLANNING:
+                    raise CandidateGateError(
+                        "outline expansion is required before starting generation"
+                    )
+                updated = conn.execute(
+                    """
+                    UPDATE novel_generation_runs
+                    SET run_mode = ?, state = 'running', target_chapters = ?,
+                        current_formal_chapter = ?, max_pending_candidates = 1,
+                        prefetch = 0, canonical_sync_status = 'ready',
+                        next_action = 'generate_candidate', last_error = '', updated_at = ?
+                    WHERE novel_id = ? AND generation_epoch = ? AND state = ?
+                      AND current_formal_chapter = ?
+                      AND current_candidate_id IS NULL
+                      AND current_candidate_chapter IS NULL
+                      AND canonical_sync_status = ?
+                    """,
+                    (
+                        run_mode.value,
+                        target_chapters,
+                        persisted_chapter_head,
+                        now,
+                        novel_id,
+                        current.generation_epoch,
+                        current.state.value,
+                        current.current_formal_chapter,
+                        current.canonical_sync_status,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise CandidateGateError("generation run changed before start")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_run(novel_id)
 
     def get_candidate(self, candidate_id: str) -> ChapterCandidate:
@@ -893,11 +1355,20 @@ class ChapterCandidateRepository:
                     "generation run formal cursor does not match the persisted formal head"
                 )
             self._formal_slot_placeholder_id(conn, novel_id, chapter_number)
-            planning_generation, plan_revision_id, plan_digest = self._current_plan_pin(
-                conn, novel_id
+            planning_generation, plan_revision_id, plan_digest = self._validate_manifest_outline_chain(
+                conn,
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                outline_chain=outline_chain,
+                expected_outline_chain_digest=outline_digest,
             )
             chapter_outline_digest = str(
                 (outline_chain.get("chapter") or {}).get("digest") or ""
+            )
+            plan_pin_fingerprint = self._plan_pin_fingerprint(
+                planning_authority_generation=planning_generation,
+                plan_revision_id=plan_revision_id,
+                plan_digest=plan_digest,
             )
             open_row = conn.execute(
                 """
@@ -916,9 +1387,10 @@ class ChapterCandidateRepository:
                     (id, novel_id, chapter_number, title, generation_epoch, status,
                      outline_chain_json, outline_chain_digest,
                      planning_authority_generation, plan_revision_id, plan_digest,
-                     chapter_outline_digest, llm_content, content_revision,
+                     chapter_outline_digest, plan_pin_fingerprint,
+                     llm_content, content_revision,
                      created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'streaming', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'streaming', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate_id,
@@ -932,6 +1404,7 @@ class ChapterCandidateRepository:
                     plan_revision_id,
                     plan_digest,
                     chapter_outline_digest,
+                    plan_pin_fingerprint,
                     llm_content,
                     content_revision,
                     now,
@@ -963,31 +1436,51 @@ class ChapterCandidateRepository:
         return self.get_candidate(candidate_id)
 
     def set_generated_content(self, candidate_id: str, llm_content: str) -> ChapterCandidate:
-        candidate = self.get_candidate(candidate_id)
-        self._ensure_current_generation(candidate)
-        self._assert_plan_pin_current(self._connection(), candidate)
-        if candidate.status not in {CandidateStatus.STREAMING, CandidateStatus.REGENERATING}:
-            raise CandidateGateError("generated content can only be written while candidate is streaming")
-        revision = candidate.content_revision + 1
-        now = self._now()
         conn = self._connection()
-        conn.execute(
-            """
-            UPDATE chapter_candidates
-            SET llm_content = ?, author_content = NULL, content_revision = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (llm_content, revision, now, candidate_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO chapter_candidate_versions
-                (id, candidate_id, content_revision, content, source, created_at)
-            VALUES (?, ?, ?, ?, 'llm', ?)
-            """,
-            (f"candidate-version-{uuid4()}", candidate_id, revision, llm_content, now),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate, _ = self._assert_candidate_authority(
+                conn,
+                candidate_id,
+                allowed_statuses=(
+                    CandidateStatus.STREAMING,
+                    CandidateStatus.REGENERATING,
+                ),
+            )
+            revision = candidate.content_revision + 1
+            now = self._now()
+            updated = conn.execute(
+                """
+                UPDATE chapter_candidates
+                SET llm_content = ?, author_content = NULL, content_revision = ?, updated_at = ?
+                WHERE id = ? AND generation_epoch = ? AND content_revision = ?
+                  AND status IN ('streaming', 'regenerating')
+                """,
+                (
+                    llm_content,
+                    revision,
+                    now,
+                    candidate_id,
+                    candidate.generation_epoch,
+                    candidate.content_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError(
+                    "candidate changed before generated content could be saved"
+                )
+            conn.execute(
+                """
+                INSERT INTO chapter_candidate_versions
+                    (id, candidate_id, content_revision, content, source, created_at)
+                VALUES (?, ?, ?, ?, 'llm', ?)
+                """,
+                (f"candidate-version-{uuid4()}", candidate_id, revision, llm_content, now),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_candidate(candidate_id)
 
     def mark_auditing(self, candidate_id: str) -> ChapterCandidate:
@@ -1335,6 +1828,12 @@ class ChapterCandidateRepository:
             status = str(candidate_row["status"]) if candidate_row is not None else ""
             candidate_id = str(candidate_row["id"]) if candidate_row is not None else ""
 
+            if run.state == GenerationRunState.WAITING_PLANNING and candidate_row is None:
+                # Planning expansion is a durable normal pause, not an
+                # interrupted writing run.  Restart must preserve the gate.
+                conn.commit()
+                return self.get_run(novel_id)
+
             if status in {
                 CandidateStatus.STREAMING.value,
                 CandidateStatus.AUDITING.value,
@@ -1462,7 +1961,8 @@ class ChapterCandidateRepository:
             rows = conn.execute(
                 """
                 SELECT novel_id FROM novel_generation_runs
-                WHERE state = 'running' OR current_candidate_id IS NOT NULL
+                WHERE state IN ('running', 'waiting_planning')
+                   OR current_candidate_id IS NOT NULL
                 ORDER BY novel_id
                 """
             ).fetchall()
@@ -1527,45 +2027,61 @@ class ChapterCandidateRepository:
     def wait_for_outline_expansion(self, novel_id: str, reason: str = "") -> GenerationRun:
         """Persist a normal planning pause after all current barriers are ready."""
 
-        run = self.get_run(novel_id)
-        if run.current_candidate_id or run.canonical_sync_status != "ready":
-            raise CandidateGateError(
-                "outline expansion is blocked until the current Candidate and Canonical sync are ready"
-            )
         conn = self._connection()
-        if run.current_formal_chapter > 0:
-            row = conn.execute(
-                """
-                SELECT status, memory_status
-                FROM chapter_narrative_commits
-                WHERE novel_id = ? AND chapter_number = ?
-                ORDER BY updated_at DESC
-                LIMIT 1
-                """,
-                (novel_id, run.current_formal_chapter),
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute(
+                "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
             ).fetchone()
-            if row is not None and (
-                str(row["status"] or "") != "committed"
-                or str(row["memory_status"] or "not_required")
-                not in {"committed", "not_required"}
+            if run_row is None:
+                raise KeyError(f"generation run not found: {novel_id}")
+            run = self._run_from_row(run_row)
+            if (
+                run.state != GenerationRunState.RUNNING
+                or run.current_candidate_id is not None
+                or run.current_candidate_chapter is not None
+                or run.canonical_sync_status != "ready"
             ):
                 raise CandidateGateError(
-                    "outline expansion is blocked until Canonical and Memory are ready"
+                    "outline expansion is blocked until the current Candidate and Canonical sync are ready"
                 )
-        now = self._now()
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET state = 'waiting_planning', next_action = 'expand_outline_cohort',
-                last_error = ?, updated_at = ?
-            WHERE novel_id = ? AND current_candidate_id IS NULL
-              AND canonical_sync_status = 'ready'
-            """,
-            (reason, now, novel_id),
-        )
-        if conn.execute("SELECT changes()").fetchone()[0] != 1:
-            raise CandidateGateError("generation run changed before planning pause")
-        conn.commit()
+            if run.current_formal_chapter > 0:
+                try:
+                    self.require_formal_prefix_aftermath_ready(
+                        novel_id,
+                        run.current_formal_chapter,
+                        connection=conn,
+                    )
+                except CandidateGateError as exc:
+                    raise CandidateGateError(
+                        "outline expansion is blocked until Canonical and Memory are ready: "
+                        + str(exc)
+                    ) from exc
+            now = self._now()
+            conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'waiting_planning', next_action = 'expand_outline_cohort',
+                    last_error = ?, updated_at = ?
+                WHERE novel_id = ? AND state = ? AND generation_epoch = ?
+                  AND current_formal_chapter = ? AND current_candidate_id IS NULL
+                  AND current_candidate_chapter IS NULL AND canonical_sync_status = 'ready'
+                """,
+                (
+                    reason,
+                    now,
+                    novel_id,
+                    run.state.value,
+                    run.generation_epoch,
+                    run.current_formal_chapter,
+                ),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise CandidateGateError("generation run changed before planning pause")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return self.get_run(novel_id)
 
     def complete_run(self, novel_id: str) -> GenerationRun:
@@ -1609,37 +2125,67 @@ class ChapterCandidateRepository:
         return self.get_candidate(candidate_id)
 
     def approve_for_commit(self, candidate_id: str, *, continue_after_commit: bool) -> ChapterCandidate:
-        candidate = self.get_candidate(candidate_id)
-        self._ensure_current_generation(candidate)
-        self._assert_plan_pin_current(self._connection(), candidate)
-        if candidate.status != CandidateStatus.AWAITING_REVIEW:
-            raise CandidateGateError("candidate is not awaiting author review")
-        if not candidate.audit_is_current or not candidate.commit_plan_is_current:
-            raise CandidateGateError("re-audit is required before formal commit")
-        audit = candidate.audit or {}
-        if audit.get("hard_blocks"):
-            raise CandidateGateError("candidate has hard block(s); formal commit is blocked")
-        if audit.get("required_events_complete") is False:
-            raise CandidateGateError("required event is incomplete; formal commit is blocked")
-        now = self._now()
         conn = self._connection()
-        conn.execute(
-            """
-            UPDATE chapter_candidates
-            SET status = 'committing', continue_after_commit = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (int(continue_after_commit), now, candidate_id),
-        )
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET state = 'running', next_action = 'commit_candidate', updated_at = ?
-            WHERE novel_id = ?
-            """,
-            (now, candidate.novel_id),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate, run = self._assert_candidate_authority(
+                conn,
+                candidate_id,
+                allowed_statuses=(CandidateStatus.AWAITING_REVIEW,),
+                allowed_run_states=(GenerationRunState.WAITING_REVIEW,),
+            )
+            if not candidate.audit_is_current or not candidate.commit_plan_is_current:
+                raise CandidateGateError("re-audit is required before formal commit")
+            audit = candidate.audit or {}
+            if audit.get("hard_blocks"):
+                raise CandidateGateError("candidate has hard block(s); formal commit is blocked")
+            if audit.get("required_events_complete") is False:
+                raise CandidateGateError("required event is incomplete; formal commit is blocked")
+            now = self._now()
+            updated = conn.execute(
+                """
+                UPDATE chapter_candidates
+                SET status = 'committing', continue_after_commit = ?, updated_at = ?
+                WHERE id = ? AND status = 'awaiting_review' AND generation_epoch = ?
+                  AND content_revision = ? AND audit_revision = ?
+                  AND commit_plan_content_revision = ?
+                """,
+                (
+                    int(continue_after_commit),
+                    now,
+                    candidate_id,
+                    candidate.generation_epoch,
+                    candidate.content_revision,
+                    candidate.audit_revision,
+                    candidate.commit_plan_content_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("candidate changed before author approval")
+            updated = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'running', next_action = 'commit_candidate', updated_at = ?
+                WHERE novel_id = ? AND state = 'waiting_review'
+                  AND generation_epoch = ? AND current_formal_chapter = ?
+                  AND current_candidate_id = ? AND current_candidate_chapter = ?
+                  AND canonical_sync_status = 'ready'
+                """,
+                (
+                    now,
+                    candidate.novel_id,
+                    run.generation_epoch,
+                    run.current_formal_chapter,
+                    candidate_id,
+                    candidate.chapter_number,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before author approval")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_candidate(candidate_id)
 
     def commit_formal(self, candidate_id: str) -> ChapterCandidate:
@@ -1804,6 +2350,18 @@ class ChapterCandidateRepository:
                 or not self._formal_version_matches(version)
             ):
                 raise CandidateGateError("candidate formal version changed before sync publication")
+
+            ready, barrier_reason = self._canonical_aftermath_barrier(
+                conn,
+                novel_id=candidate.novel_id,
+                chapter_number=candidate.chapter_number,
+                content_sha256=str(version["authority_content_sha256"] or ""),
+                content_revision=int(version["authority_content_revision"] or 0),
+            )
+            if not ready:
+                raise CandidateGateError(
+                    "canonical aftermath is not ready: " + barrier_reason
+                )
 
             pause_after_sync = str(version["run_next_action"] or "") == "finish_sync_then_pause"
             next_state = (

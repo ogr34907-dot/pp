@@ -23,7 +23,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from domain.structure.outline_contract import OutlineLevel
+from domain.structure.outline_contract import OutlineLevel, OutlinePayload
 from domain.structure.outline_plan import OutlinePlanItem, canonical_plan_digest
 
 # =============================================================================
@@ -147,6 +147,49 @@ DISCARD_TABLES = [
 ]
 
 
+# A clone starts a new writing history. StoryNode planning annotations remain,
+# while these keys describe derived Canonical/runtime state from the source.
+_DERIVED_STORY_NODE_METADATA_KEYS = {
+    "summary",
+    "summary_state",
+    "summary_generated_at",
+    "summary_status",
+    "summary_stale_from_chapter",
+    "checkpoint_summary",
+    "checkpoint_summary_state",
+    "checkpoint_summary_generated_at",
+    "summary_provenance",
+    "act_summary_provenance",
+    "volume_summary_provenance",
+    "checkpoint_summary_provenance",
+    "committed_metadata",
+}
+_DERIVED_STORY_NODE_METADATA_PREFIXES = ("runtime.", "canonical.", "memory.")
+_CLONE_RESET_SUMMARY_PIPELINE = "clone-reset"
+_PLANNING_HISTORY_RESET_VALUES = {
+    "unified_characters": {
+        "active_wounds_json": "[]",
+        "mental_state": "NORMAL",
+        "mental_state_reason": "",
+        "emotional_arc_json": "[]",
+        "current_state_summary": "",
+        "last_updated_chapter": 0,
+    },
+    "character_states": {
+        "scars": "[]",
+        "motivations": "[]",
+        "emotional_arc": "[]",
+        "current_state_summary": "",
+        "last_updated_chapter": 0,
+    },
+    "storylines": {
+        "current_milestone_index": 0,
+        "last_active_chapter": 0,
+        "progress_summary": "",
+    },
+}
+
+
 def get_db_path() -> Path:
     """获取数据库文件路径"""
     root = Path(__file__).resolve().parent.parent
@@ -188,6 +231,201 @@ def _delete_novel_cascade(conn: sqlite3.Connection, novel_id: str) -> None:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("DELETE FROM novels WHERE id = ?", (novel_id,))
     conn.execute("PRAGMA foreign_keys = OFF")
+
+
+def _clone_safe_story_node_metadata(raw_metadata: object) -> str:
+    """Retain author planning annotations, never source writing history."""
+
+    try:
+        metadata = json.loads(str(raw_metadata or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    cleaned = {
+        str(key): value
+        for key, value in metadata.items()
+        if str(key) not in _DERIVED_STORY_NODE_METADATA_KEYS
+        and not str(key).endswith("_summary_provenance")
+        and not str(key).startswith(_DERIVED_STORY_NODE_METADATA_PREFIXES)
+    }
+    return json.dumps(cleaned, ensure_ascii=False, sort_keys=True)
+
+
+def _validate_active_manifest_snapshot(
+    conn: sqlite3.Connection,
+    novel_id: str,
+) -> tuple[dict, list[dict]] | None:
+    """Fail closed unless a manifest Head is a complete immutable snapshot."""
+
+    head = conn.execute(
+        "SELECT * FROM outline_planning_heads WHERE novel_id = ?",
+        (novel_id,),
+    ).fetchone()
+    if head is None or str(head["authority_mode"] or "legacy") != "manifest":
+        return None
+    if not head["active_plan_revision_id"] or not str(head["active_plan_digest"] or ""):
+        raise ValueError("manifest planning Head has no active plan")
+    if int(head["authority_generation"] or 0) != int(
+        head["projection_generation"] or 0
+    ):
+        raise ValueError("manifest planning Head projection generation is stale")
+
+    plan = conn.execute(
+        """
+        SELECT * FROM outline_plan_revisions
+        WHERE id = ? AND novel_id = ?
+        """,
+        (head["active_plan_revision_id"], novel_id),
+    ).fetchone()
+    if plan is None or not plan["sealed_at"]:
+        raise ValueError("manifest planning Head does not reference a sealed plan")
+    if str(plan["status"] or "") != "ready_for_review":
+        raise ValueError(
+            "manifest planning Head must reference a ready_for_review plan"
+        )
+    if str(plan["reconciliation_status"] or "") != "aligned":
+        raise ValueError(
+            "manifest planning Head must reference an aligned plan"
+        )
+    if str(plan["digest"] or "") != str(head["active_plan_digest"]):
+        raise ValueError("manifest planning Head digest does not match its plan")
+
+    rows = conn.execute(
+        """
+        SELECT item.*, contract.novel_id AS contract_novel_id,
+               version.contract_id AS version_contract_id,
+               version.digest AS version_digest,
+               version.payload_json AS version_payload_json,
+               version.sealed_at AS version_sealed_at
+        FROM outline_plan_revision_items AS item
+        JOIN outline_contracts AS contract ON contract.id = item.logical_node_id
+        JOIN outline_contract_versions AS version ON version.id = item.version_id
+        WHERE item.plan_revision_id = ?
+        """,
+        (plan["id"],),
+    ).fetchall()
+    if not rows:
+        raise ValueError("manifest plan has no items")
+
+    items: list[OutlinePlanItem] = []
+    logical_ids: set[str] = set()
+    positions: set[tuple[str, str, int]] = set()
+    for row in rows:
+        logical_node_id = str(row["logical_node_id"] or "")
+        version_id = str(row["version_id"] or "")
+        if not logical_node_id or not version_id:
+            raise ValueError("manifest plan contains an incomplete item")
+        if str(row["contract_novel_id"] or "") != novel_id:
+            raise ValueError("manifest plan item belongs to another novel")
+        if str(row["version_contract_id"] or "") != logical_node_id:
+            raise ValueError("manifest plan item version belongs to another node")
+        if not row["version_sealed_at"]:
+            raise ValueError("manifest plan item version is not sealed")
+        try:
+            payload = OutlinePayload.from_dict(
+                json.loads(str(row["version_payload_json"] or "{}"))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("manifest plan item payload is invalid") from exc
+        if payload.digest != str(row["version_digest"] or ""):
+            raise ValueError("manifest plan item payload digest does not match")
+        try:
+            level = OutlineLevel(str(row["level"]))
+            sibling_index = int(row["sibling_index"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("manifest plan item has invalid topology") from exc
+        parent_id = row["parent_logical_node_id"]
+        position = (str(parent_id or ""), level.value, sibling_index)
+        if logical_node_id in logical_ids or position in positions:
+            raise ValueError("manifest plan contains duplicate topology positions")
+        logical_ids.add(logical_node_id)
+        positions.add(position)
+        items.append(
+            OutlinePlanItem(
+                logical_node_id=logical_node_id,
+                version_id=version_id,
+                version_digest=str(row["version_digest"] or ""),
+                parent_logical_node_id=parent_id,
+                level=level,
+                sibling_index=sibling_index,
+                expansion_state=str(row["expansion_state"] or "unexpanded"),
+                validated_parent_digest=str(row["validated_parent_digest"] or ""),
+                validated_previous_sibling_digest=str(
+                    row["validated_previous_sibling_digest"] or ""
+                ),
+                is_reused=bool(row["is_reused"]),
+            )
+        )
+
+    roots = [
+        item
+        for item in items
+        if item.level == OutlineLevel.OUTLINE and item.parent_logical_node_id is None
+    ]
+    if len(roots) != 1 or any(
+        item.level == OutlineLevel.OUTLINE and item.parent_logical_node_id is not None
+        for item in items
+    ):
+        raise ValueError("manifest plan requires exactly one outline root")
+
+    by_logical_id = {item.logical_node_id: item for item in items}
+    for item in items:
+        if item.level == OutlineLevel.OUTLINE:
+            if item.validated_parent_digest:
+                raise ValueError("manifest outline root cannot declare a parent digest")
+            continue
+        if not item.parent_logical_node_id:
+            raise ValueError("manifest non-root item is missing its parent")
+        parent = by_logical_id.get(item.parent_logical_node_id)
+        if parent is None or parent.level.child_level != item.level:
+            raise ValueError("manifest plan has an invalid parent child level")
+        if item.validated_parent_digest != parent.version_digest:
+            raise ValueError("manifest plan parent digest does not match")
+
+    sibling_groups: dict[tuple[str, OutlineLevel], list[OutlinePlanItem]] = {}
+    for item in items:
+        sibling_groups.setdefault(
+            (item.parent_logical_node_id or "", item.level), []
+        ).append(item)
+    for siblings in sibling_groups.values():
+        siblings.sort(key=lambda item: item.sibling_index)
+        for index, item in enumerate(siblings):
+            if item.sibling_index != index:
+                raise ValueError("manifest plan sibling indexes are not contiguous")
+            previous_digest = "" if index == 0 else siblings[index - 1].version_digest
+            if item.validated_previous_sibling_digest != previous_digest:
+                raise ValueError("manifest plan sibling handoff digest does not match")
+
+    expected_digest = canonical_plan_digest(
+        canonical_prefix_digest=str(plan["canonical_prefix_digest"] or ""),
+        items=items,
+    )
+    if expected_digest != str(plan["digest"]):
+        raise ValueError("manifest plan digest does not match its topology")
+    if expected_digest != str(head["active_plan_digest"]):
+        raise ValueError("manifest planning Head digest does not match topology")
+
+    projections = conn.execute(
+        """
+        SELECT contract_id, version_id, digest
+        FROM outline_plan_projections
+        WHERE novel_id = ? AND is_active = 1
+        """,
+        (novel_id,),
+    ).fetchall()
+    expected_projections = {
+        (item.logical_node_id, item.version_id, item.version_digest) for item in items
+    }
+    actual_projections = [
+        (str(row["contract_id"]), str(row["version_id"]), str(row["digest"]))
+        for row in projections
+    ]
+    if len(actual_projections) != len(expected_projections) or set(
+        actual_projections
+    ) != expected_projections:
+        raise ValueError("manifest active projection set does not match its plan")
+    return dict(plan), [dict(row) for row in rows]
 
 
 # =============================================================================
@@ -339,6 +577,10 @@ def copy_story_nodes(
         row_dict["id"] = new_id
         row_dict["novel_id"] = new_novel_id
         row_dict["content"] = ""
+        if "metadata" in row_dict:
+            row_dict["metadata"] = _clone_safe_story_node_metadata(
+                row_dict["metadata"]
+            )
         if "word_count" in row_dict:
             row_dict["word_count"] = 0
 
@@ -412,6 +654,10 @@ def copy_chapters(
         row_dict["novel_id"] = new_novel_id
         row_dict["content"] = ""
         row_dict["status"] = "draft"
+        if "content_sha256" in row_dict:
+            row_dict["content_sha256"] = ""
+        if "content_revision" in row_dict:
+            row_dict["content_revision"] = 0
         if "word_count" in row_dict:
             row_dict["word_count"] = 0
         if "tension_score" in row_dict:
@@ -453,23 +699,8 @@ def _source_outline_snapshot(
         "SELECT * FROM outline_planning_heads WHERE novel_id = ?",
         (novel_id,),
     ).fetchone()
-    if head and head["active_plan_revision_id"]:
-        plan = conn.execute(
-            "SELECT * FROM outline_plan_revisions WHERE id = ? AND novel_id = ?",
-            (head["active_plan_revision_id"], novel_id),
-        ).fetchone()
-        rows = conn.execute(
-            """
-            SELECT item.*, version.digest AS version_digest
-            FROM outline_plan_revision_items AS item
-            JOIN outline_contract_versions AS version ON version.id = item.version_id
-            WHERE item.plan_revision_id = ?
-            """,
-            (head["active_plan_revision_id"],),
-        ).fetchall()
-        if plan is None or not rows:
-            raise ValueError("active outline manifest is incomplete")
-        return dict(plan), [dict(row) for row in rows]
+    if head and str(head["authority_mode"] or "legacy") == "manifest":
+        return _validate_active_manifest_snapshot(conn, novel_id)
 
     rows = conn.execute(
         """
@@ -741,6 +972,7 @@ def copy_outline_planning(
         """,
         (new_novel_id, plan_id, plan_digest, now),
     )
+    _validate_active_manifest_snapshot(conn, new_novel_id)
     return {
         "contracts": len(contract_rows),
         "versions": len(version_rows),
@@ -986,12 +1218,21 @@ def copy_knowledge_tables(
                 s_dict["knowledge_id"] = new_knowledge_id
                 s_dict["id"] = _uid("cs", next(id_counter))
                 s_dict["summary"] = ""
+                for col, value in (
+                    ("source_content_sha256", ""),
+                    ("source_content_revision", 0),
+                    ("pipeline_version", _CLONE_RESET_SUMMARY_PIPELINE),
+                    ("sync_status", "draft"),
+                    ("sync_error", ""),
+                    ("sync_attempts", 0),
+                    ("canonical_payload_sha256", ""),
+                ):
+                    if col in s_dict:
+                        s_dict[col] = value
                 for col in ("key_events", "open_threads", "consistency_note",
                             "beat_sections", "micro_beats"):
                     if col in s_dict:
                         s_dict[col] = None
-                if "sync_status" in s_dict:
-                    s_dict["sync_status"] = "draft"
 
                 conn.execute(
                     f"INSERT INTO chapter_summaries ({', '.join(cs_col_names)}) VALUES ({', '.join('?' for _ in cs_col_names)})",
@@ -1011,8 +1252,16 @@ def copy_planning_tables(
     all_id_maps: dict[str, dict[str, str]] = {}
     for table_name in PLANNING_TABLES_WITH_NOVEL_ID:
         table_id_map: dict[str, str] = {}
+        reset_values = {
+            column: value
+            for column, value in _PLANNING_HISTORY_RESET_VALUES.get(
+                table_name, {}
+            ).items()
+            if column in get_table_columns(conn, table_name)
+        }
         count, _ = copy_table_simple(
             conn, table_name, old_novel_id, new_novel_id, id_counter,
+            clear_columns=reset_values,
             id_map=table_id_map,
         )
         stats[table_name] = count
@@ -1020,7 +1269,55 @@ def copy_planning_tables(
             all_id_maps[table_name] = table_id_map
         if count > 0:
             print(f"  {table_name}: 已复制 {count} 条")
+    _remap_cloned_character_state_ids(conn, new_novel_id, all_id_maps)
     return stats, all_id_maps
+
+
+def _remap_cloned_character_state_ids(
+    conn: sqlite3.Connection,
+    novel_id: str,
+    id_maps: dict[str, dict[str, str]],
+) -> None:
+    """Keep dynamic state rows bound to the clone's re-keyed characters."""
+
+    if not table_exists(conn, "character_states"):
+        return
+    columns = get_table_columns(conn, "character_states")
+    if not {"character_id", "novel_id"} <= columns:
+        return
+
+    character_id_map: dict[str, str] = {}
+    for table_name in ("bible_characters", "unified_characters"):
+        for old_id, new_id in id_maps.get(table_name, {}).items():
+            previous = character_id_map.setdefault(old_id, new_id)
+            if previous != new_id:
+                raise ValueError(
+                    "clone character state identity is ambiguous: "
+                    f"{old_id} maps to both {previous} and {new_id}"
+                )
+
+    for old_id, new_id in character_id_map.items():
+        conflicting = conn.execute(
+            """
+            SELECT 1 FROM character_states
+            WHERE novel_id = ? AND character_id = ? AND character_id != ?
+            LIMIT 1
+            """,
+            (novel_id, new_id, old_id),
+        ).fetchone()
+        if conflicting is not None:
+            raise ValueError(
+                "clone character state identity conflicts with an existing state: "
+                f"{new_id}"
+            )
+        conn.execute(
+            """
+            UPDATE character_states
+            SET character_id = ?
+            WHERE novel_id = ? AND character_id = ?
+            """,
+            (new_id, novel_id, old_id),
+        )
 
 
 def validate_source_data(

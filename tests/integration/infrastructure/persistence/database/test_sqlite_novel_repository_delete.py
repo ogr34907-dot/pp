@@ -1,5 +1,9 @@
 """Deletion contracts for SqliteNovelRepository."""
 
+import sqlite3
+
+import pytest
+
 from domain.novel.entities.novel import Novel
 from domain.novel.value_objects.novel_id import NovelId
 from infrastructure.persistence.database.connection import DatabaseConnection
@@ -10,6 +14,7 @@ from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
 )
 from domain.structure.outline_contract import OutlinePayload, OutlineSource
+from domain.structure.outline_plan import OutlinePlanItem
 from infrastructure.persistence.database.write_dispatch import (
     startup_sqlite_writes_bypass_queue,
 )
@@ -168,3 +173,119 @@ def test_delete_manifest_book_removes_sealed_plan_history_without_orphans(tmp_pa
         "SELECT COUNT(*) AS count FROM outline_contract_versions WHERE contract_id = ?",
         (root.id,),
     )["count"] == 0
+
+
+def test_controlled_delete_handles_manifest_replan_parent_chain(tmp_path):
+    """A public full-book delete may clear r2 -> r1 only inside its own TXN."""
+
+    database = DatabaseConnection(str(tmp_path / "delete-manifest-chain.db"))
+    novels = SqliteNovelRepository(database)
+    outlines = OutlineContractRepository(database)
+    novel_id = "novel-manifest-chain"
+
+    with startup_sqlite_writes_bypass_queue():
+        _save_novel(novels, novel_id)
+        root = outlines.ensure_root(novel_id)
+        first_draft = outlines.save_draft(
+            root.id,
+            OutlinePayload(
+                title="总纲 r1",
+                narrative_text="第一版未来规划。",
+                creative_goal="完成第一版目标",
+                entry_state="开始",
+                exit_state="结束",
+            ),
+            source=OutlineSource.AUTHOR,
+        )
+        outlines.publish_and_sync(root.id, expected_revision=first_draft.draft.revision)
+        first_plan = outlines.backfill_initial_plan(novel_id).plan
+        assert first_plan is not None
+
+        second_draft = outlines.save_draft(
+            root.id,
+            OutlinePayload(
+                title="总纲 r2",
+                narrative_text="替换后的未来规划。",
+                creative_goal="完成第二版目标",
+                entry_state="开始",
+                exit_state="新的结束",
+            ),
+            source=OutlineSource.AUTHOR,
+        )
+        conn = database.get_connection()
+        version = conn.execute(
+            """
+            SELECT version.id, version.digest
+            FROM outline_contracts AS contract
+            JOIN outline_contract_versions AS version
+              ON version.id = contract.draft_version_id
+            WHERE contract.id = ?
+            """,
+            (root.id,),
+        ).fetchone()
+        second_plan = outlines.create_plan_draft(
+            novel_id=novel_id,
+            items=(
+                OutlinePlanItem(
+                    logical_node_id=root.id,
+                    version_id=str(version["id"]),
+                    version_digest=str(version["digest"]),
+                    level=root.level,
+                    sibling_index=0,
+                ),
+            ),
+            canonical_prefix_digest="",
+            canonical_boundary={"formal_head": 0},
+            parent_plan_revision_id=first_plan.id,
+        )
+        second_plan = outlines.seal_plan_revision(second_plan.id)
+        conn.execute(
+            """
+            UPDATE outline_planning_heads
+            SET authority_mode = 'manifest', authority_generation = 1,
+                projection_generation = 1
+            WHERE novel_id = ?
+            """,
+            (novel_id,),
+        )
+        conn.execute(
+            """
+            UPDATE outline_planning_heads
+            SET active_plan_revision_id = ?, active_plan_digest = ?,
+                authority_generation = 2, projection_generation = 2
+            WHERE novel_id = ?
+            """,
+            (second_plan.id, second_plan.digest, novel_id),
+        )
+        conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM novels WHERE id = ?", (novel_id,))
+        conn.rollback()
+
+        novels.delete(NovelId(novel_id))
+
+    checks = {
+        "novels": "SELECT COUNT(*) AS count FROM novels WHERE id = ?",
+        "outline_planning_heads": (
+            "SELECT COUNT(*) AS count FROM outline_planning_heads WHERE novel_id = ?"
+        ),
+        "outline_plan_revisions": (
+            "SELECT COUNT(*) AS count FROM outline_plan_revisions WHERE novel_id = ?"
+        ),
+        "outline_plan_revision_items": (
+            "SELECT COUNT(*) AS count FROM outline_plan_revision_items AS item "
+            "JOIN outline_plan_revisions AS revision "
+            "ON revision.id = item.plan_revision_id WHERE revision.novel_id = ?"
+        ),
+        "outline_contract_versions": (
+            "SELECT COUNT(*) AS count FROM outline_contract_versions AS version "
+            "JOIN outline_contracts AS contract ON contract.id = version.contract_id "
+            "WHERE contract.novel_id = ?"
+        ),
+        "outline_contracts": (
+            "SELECT COUNT(*) AS count FROM outline_contracts WHERE novel_id = ?"
+        ),
+    }
+    for table, sql in checks.items():
+        assert database.fetch_one(sql, (novel_id,))["count"] == 0, table

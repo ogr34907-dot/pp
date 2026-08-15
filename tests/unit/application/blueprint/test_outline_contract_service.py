@@ -20,6 +20,11 @@ class _NodeRepo:
         return [node for node in self.nodes if node.novel_id == novel_id]
 
 
+class _FailingNodeRepo(_NodeRepo):
+    def get_by_novel_sync(self, novel_id: str):
+        raise AssertionError("manifest logical tree must not read mutable StoryNode parents")
+
+
 class _Contracts:
     """Small fake that exposes the repository boundary used by the service."""
 
@@ -211,3 +216,64 @@ def test_manifest_chain_uses_logical_plan_parent_not_physical_story_parent():
         OutlineLevel.CHAPTER,
     )
     assert chain.contract_for(OutlineLevel.VOLUME).payload.title == "卷纲"
+    context = chain.to_prompt_context()
+    assert context["chapter"] == {
+        "contract_id": "chapter-1",
+        "logical_node_id": "chapter-1",
+        "version_id": "version-chapter-1",
+        "revision": 1,
+        "digest": "digest-chapter-1",
+        "level": "chapter",
+        "parent_logical_node_id": "act-1",
+        "sibling_index": 0,
+        "story_node_id": "chapter-1",
+        "payload": context["chapter"]["payload"],
+    }
+
+
+def test_manifest_logical_tree_is_rendered_from_the_active_manifest():
+    rows = []
+    payloads = {
+        "root": ("outline", None, "总纲"),
+        "part-1": ("part", "root", "部纲"),
+        "volume-1": ("volume", "part-1", "卷纲"),
+        "act-1": ("act", "volume-1", "幕纲"),
+        "chapter-1": ("chapter", "act-1", "章纲"),
+    }
+    for logical_id, (level, parent_id, title) in payloads.items():
+        rows.append(
+            {
+                "item_id": f"item-{logical_id}",
+                "logical_node_id": logical_id,
+                "parent_logical_node_id": parent_id,
+                "level": level,
+                "sibling_index": 0,
+                "novel_id": "novel-1",
+                "story_node_id": None if logical_id == "root" else f"physical-{logical_id}",
+                "author_locked": 0,
+                "version_id": f"version-{logical_id}",
+                "version_revision": 1,
+                "version_digest": f"digest-{logical_id}",
+                "payload_json": __import__("json").dumps(
+                    {
+                        "title": title,
+                        "narrative_text": title,
+                        "creative_goal": "推进目标",
+                        "entry_state": "前态",
+                        "exit_state": "后态",
+                    }
+                ),
+                "version_source": "author",
+                "validated_previous_sibling_digest": "",
+            }
+        )
+    service = OutlineContractService(
+        contract_repository=_ManifestContracts(rows),
+        story_node_repository=_FailingNodeRepo([]),
+    )
+
+    tree = service.logical_tree("novel-1")
+
+    assert tree["id"] == "root"
+    assert tree["children"][0]["id"] == "physical-part-1"
+    assert tree["children"][0]["children"][0]["children"][0]["children"][0]["title"] == "章纲"

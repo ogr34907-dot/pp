@@ -2,23 +2,36 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 import sqlite3
 import threading
+from types import SimpleNamespace
 
 import pytest
 
+from application.blueprint.services.outline_contract_service import OutlineContractService
+from application.engine.services.generation_start_preflight import (
+    GenerationStartPreflight,
+    GenerationStartPreflightError,
+)
 from application.world.services.chapter_narrative_sync import (
     CHAPTER_NARRATIVE_PIPELINE_VERSION,
 )
 from domain.novel.candidate_chapter import CandidateStatus, GenerationRunState, RunMode
+from domain.structure.outline_contract import OutlinePayload, OutlineSource
+from domain.structure.story_node import NodeType, StoryNode
 from infrastructure.persistence.database.chapter_candidate_repository import (
     CandidateGateError,
     ChapterCandidateRepository,
 )
 from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.outline_contract_repository import (
+    OutlineContractRepository,
+)
 from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
     SqliteChapterNarrativeCommitRepository,
 )
+from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 
 
 @pytest.fixture
@@ -39,6 +52,72 @@ def _chain():
     return {"outline": {"contract_id": "root", "revision": 1, "digest": "root-v1"}}
 
 
+def _activate_manifest_five_level_chain(
+    db: DatabaseConnection,
+    *,
+    novel_id: str,
+    chapter_number: int = 1,
+):
+    """Use the production backfill path to create one active sealed chain."""
+
+    node_repository = StoryNodeRepository(db)
+    parent_id = None
+    nodes = []
+    for index, node_type in enumerate(
+        (NodeType.PART, NodeType.VOLUME, NodeType.ACT, NodeType.CHAPTER), start=1
+    ):
+        node = StoryNode(
+            id=f"{novel_id}-{node_type.value}-{chapter_number}",
+            novel_id=novel_id,
+            node_type=node_type,
+            number=chapter_number,
+            title=f"{node_type.value}-{chapter_number}",
+            order_index=index,
+            parent_id=parent_id,
+        )
+        node_repository.save_sync(node)
+        nodes.append(node)
+        parent_id = node.id
+    contracts = OutlineContractRepository(db)
+    service = OutlineContractService(
+        contract_repository=contracts,
+        story_node_repository=node_repository,
+    )
+    payload = OutlinePayload(
+        title="已发布文学大纲",
+        narrative_text="主角承担不可逆代价，并将当前冲突交接给下一阶段。",
+        creative_goal="推进冲突和人物变化",
+        entry_state="承接前一阶段结局",
+        exit_state="留下下一阶段必须回应的变化",
+        required_events=["发生不可逆选择"],
+        state_changes={"characters": [{"name": "主角", "change": "承担代价"}]},
+        handoff_conditions=["下一阶段承接本阶段结局"],
+        chapter_start=chapter_number,
+        chapter_end=chapter_number,
+    )
+    root = contracts.ensure_root(novel_id)
+    root = contracts.save_draft(root.id, payload, source=OutlineSource.AUTHOR)
+    contracts.publish_and_sync(root.id, expected_revision=root.draft.revision)
+    for node in nodes:
+        slot = service.ensure_contract_for_story_node(novel_id, node.id)
+        slot = contracts.save_draft(slot.id, payload, source=OutlineSource.AUTHOR)
+        contracts.publish_and_sync(slot.id, expected_revision=slot.draft.revision)
+    backfill = contracts.backfill_initial_plan(novel_id)
+    assert backfill.plan is not None
+    conn = db.get_connection()
+    conn.execute(
+        """
+        UPDATE outline_planning_heads
+        SET authority_mode = 'manifest', authority_generation = 1,
+            projection_generation = 1
+        WHERE novel_id = ?
+        """,
+        (novel_id,),
+    )
+    conn.commit()
+    return service, nodes[-1], backfill.plan
+
+
 def _insert_legacy_chapter(conn, novel_id: str, number: int, content: str, *, status: str = "completed") -> None:
     conn.execute(
         """
@@ -47,6 +126,161 @@ def _insert_legacy_chapter(conn, novel_id: str, number: int, content: str, *, st
         """,
         (f"legacy-{novel_id}-{number}", novel_id, number, f"第{number}章", content, status),
     )
+
+
+def _persist_legacy_durable_aftermath(
+    db: DatabaseConnection,
+    *,
+    novel_id: str,
+    chapter_number: int,
+    memory_status: str = "committed",
+    include_summary: bool = True,
+) -> None:
+    """Persist the exact post-chapter evidence for an imported legacy chapter."""
+
+    conn = db.get_connection()
+    chapter = conn.execute(
+        "SELECT id, content, content_revision FROM chapters WHERE novel_id = ? AND number = ?",
+        (novel_id, chapter_number),
+    ).fetchone()
+    assert chapter is not None
+    content_sha256 = hashlib.sha256(str(chapter["content"] or "").encode("utf-8")).hexdigest()
+    content_revision = int(chapter["content_revision"] or 0)
+    conn.execute(
+        "INSERT INTO knowledge (id, novel_id) VALUES (?, ?) ON CONFLICT(novel_id) DO NOTHING",
+        (f"legacy-knowledge-{novel_id}", novel_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO chapter_narrative_commits
+            (novel_id, chapter_number, content_sha256, pipeline_version,
+             content_revision, status, memory_status)
+        VALUES (?, ?, ?, ?, ?, 'committed', ?)
+        ON CONFLICT(novel_id, chapter_number, content_sha256, pipeline_version)
+        DO UPDATE SET content_revision = excluded.content_revision,
+                      status = excluded.status,
+                      memory_status = excluded.memory_status
+        """,
+        (
+            novel_id,
+            chapter_number,
+            content_sha256,
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision,
+            memory_status,
+        ),
+    )
+    if include_summary:
+        knowledge = conn.execute(
+            "SELECT id FROM knowledge WHERE novel_id = ?", (novel_id,)
+        ).fetchone()
+        assert knowledge is not None
+        conn.execute(
+            """
+            INSERT INTO chapter_summaries
+                (id, knowledge_id, chapter_number, summary, source_content_sha256,
+                 source_content_revision, pipeline_version, sync_status)
+            VALUES (?, ?, ?, '可信旧章节摘要', ?, ?, ?, 'committed')
+            ON CONFLICT(knowledge_id, chapter_number)
+            DO UPDATE SET summary = excluded.summary,
+                          source_content_sha256 = excluded.source_content_sha256,
+                          source_content_revision = excluded.source_content_revision,
+                          pipeline_version = excluded.pipeline_version,
+                          sync_status = excluded.sync_status
+            """,
+            (
+                f"legacy-summary-{novel_id}-{chapter_number}",
+                str(knowledge["id"]),
+                chapter_number,
+                content_sha256,
+                content_revision,
+                CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            ),
+        )
+    conn.commit()
+
+
+def _tamper_manifest_candidate_chain(
+    conn: sqlite3.Connection,
+    *,
+    candidate_id: str,
+    mutate,
+) -> None:
+    """Model a corrupt Candidate row written before plan-pin hardening."""
+
+    _disable_candidate_plan_pin_immutability(conn)
+    row = conn.execute(
+        "SELECT outline_chain_json FROM chapter_candidates WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    assert row is not None
+    chain = json.loads(str(row["outline_chain_json"] or "{}"))
+    mutate(chain)
+    encoded = json.dumps(chain, ensure_ascii=False, sort_keys=True)
+    conn.execute(
+        """
+        UPDATE chapter_candidates
+        SET outline_chain_json = ?, outline_chain_digest = ?
+        WHERE id = ?
+        """,
+        (
+            encoded,
+            hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+            candidate_id,
+        ),
+    )
+    conn.commit()
+
+
+def _disable_candidate_plan_pin_immutability(conn: sqlite3.Connection) -> None:
+    """Model a row persisted before the Candidate-pin hardening migration."""
+
+    conn.execute("DROP TRIGGER IF EXISTS trg_chapter_candidates_plan_pin_immutable")
+    conn.commit()
+
+
+def _manifest_candidate_for_pin_boundary(tmp_path, *, boundary: str):
+    db = DatabaseConnection(str(tmp_path / f"manifest-pin-{boundary}.db"))
+    conn = db.get_connection()
+    novel_id = f"manifest-pin-{boundary}"
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        (novel_id, "Manifest Pin", novel_id, 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id=novel_id
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(novel_id, run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
+    candidate = repo.create_streaming_candidate(
+        novel_id=novel_id,
+        chapter_number=1,
+        title="第一章",
+        outline_chain=service.published_context_for_chapter(novel_id, chapter_node.id),
+        llm_content="候选正文",
+    )
+    if boundary == "approval":
+        repo.mark_auditing(candidate.id)
+        candidate = repo.finish_audit(
+            candidate.id, audit={}, commit_plan={}, require_author_review=True
+        )
+    elif boundary == "formal":
+        repo.mark_auditing(candidate.id)
+        candidate = repo.finish_audit(
+            candidate.id, audit={}, commit_plan={}, require_author_review=True
+        )
+        candidate = repo.approve_for_commit(candidate.id, continue_after_commit=False)
+    return db, repo, candidate
+
+
+class _LegacyPreflightOutline:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def next_published_chapter_context(self, novel_id: str, *, after_chapter: int):
+        self.calls.append((novel_id, after_chapter))
+        return SimpleNamespace(number=after_chapter + 1), {}
 
 
 class _BeginBarrierConnection:
@@ -94,115 +328,526 @@ def test_new_book_has_no_pre_candidate_head(tmp_path):
     assert ChapterCandidateRepository(db).formal_chapter_head("new-book") == 0
 
 
-def test_manifest_candidate_persists_plan_pin_at_creation(tmp_path):
+def test_manifest_candidate_creation_rejects_a_forged_sealed_chain_version(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "manifest-chain-version.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-chain", "Manifest Chain", "manifest-chain", 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-chain"
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-chain", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+    forged_chain = service.published_context_for_chapter(
+        "manifest-chain", chapter_node.id
+    )
+    forged_chain["volume"]["version_id"] = "forged-volume-version"
+
+    with pytest.raises(CandidateGateError, match="outline chain"):
+        repo.create_streaming_candidate(
+            novel_id="manifest-chain",
+            chapter_number=1,
+            title="第一章",
+            outline_chain=forged_chain,
+        )
+
+
+def test_manifest_candidate_creation_rejects_a_one_level_chain(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "manifest-one-level.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-one-level", "Manifest One Level", "manifest-one-level", 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-one-level"
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-one-level", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+    one_level = {
+        "chapter": service.published_context_for_chapter(
+            "manifest-one-level", chapter_node.id
+        )["chapter"]
+    }
+
+    with pytest.raises(CandidateGateError, match="missing a required level"):
+        repo.create_streaming_candidate(
+            novel_id="manifest-one-level",
+            chapter_number=1,
+            title="第一章",
+            outline_chain=one_level,
+        )
+
+    assert conn.execute(
+        "SELECT COUNT(*) AS total FROM chapter_candidates WHERE novel_id = ?",
+        ("manifest-one-level",),
+    ).fetchone()["total"] == 0
+
+
+@pytest.mark.parametrize(
+    "level", ("outline", "part", "volume", "act", "chapter")
+)
+def test_manifest_candidate_creation_rejects_forged_payload_with_matching_membership(
+    tmp_path,
+    level,
+):
+    """Candidate prompt content must be the sealed Manifest payload, not caller text."""
+
+    db = DatabaseConnection(str(tmp_path / "manifest-forged-payload.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-forged-payload", "Manifest Payload", "manifest-forged-payload", 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-forged-payload"
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-forged-payload", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+    forged_chain = service.published_context_for_chapter(
+        "manifest-forged-payload", chapter_node.id
+    )
+    forged_chain[level]["payload"]["narrative_text"] = (
+        "forged prompt context must not enter prose generation"
+    )
+
+    with pytest.raises(CandidateGateError, match="outline chain"):
+        repo.create_streaming_candidate(
+            novel_id="manifest-forged-payload",
+            chapter_number=1,
+            title="第一章",
+            outline_chain=forged_chain,
+        )
+
+    assert conn.execute(
+        "SELECT COUNT(*) AS total FROM chapter_candidates WHERE novel_id = ?",
+        ("manifest-forged-payload",),
+    ).fetchone()["total"] == 0
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda chain: chain.__setitem__("untrusted_top_level", "prompt injection"),
+        lambda chain: chain["chapter"].__setitem__(
+            "untrusted_node_field", "prompt injection"
+        ),
+        lambda chain: chain["chapter"]["payload"].__setitem__(
+            "untrusted_payload_field", "prompt injection"
+        ),
+    ),
+    ids=("top-level", "node", "payload"),
+)
+def test_manifest_candidate_creation_rejects_extra_unsealed_prompt_fields(
+    tmp_path,
+    mutate,
+):
+    """No caller-controlled fields may extend a sealed Manifest prompt chain."""
+
+    db = DatabaseConnection(str(tmp_path / "manifest-extra-prompt-fields.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-extra-prompt", "Manifest Prompt", "manifest-extra-prompt", 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-extra-prompt"
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-extra-prompt", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+    forged_chain = service.published_context_for_chapter(
+        "manifest-extra-prompt", chapter_node.id
+    )
+    mutate(forged_chain)
+
+    with pytest.raises(CandidateGateError, match="outline chain"):
+        repo.create_streaming_candidate(
+            novel_id="manifest-extra-prompt",
+            chapter_number=1,
+            title="Chapter 1",
+            outline_chain=forged_chain,
+        )
+
+
+def test_manifest_candidate_persists_full_five_level_plan_pin_at_creation(tmp_path):
     db = DatabaseConnection(str(tmp_path / "candidate-plan-pin.db"))
     conn = db.get_connection()
     conn.execute(
         "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
         ("manifest-pin", "Manifest Pin", "manifest-pin", 20),
     )
-    conn.execute(
-        "INSERT INTO outline_plan_revisions "
-        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
-        "VALUES ('plan-pin-1', 'manifest-pin', 1, 'published', 'plan-digest', '', CURRENT_TIMESTAMP)"
-    )
-    conn.execute(
-        "INSERT INTO outline_planning_heads "
-        "(novel_id, authority_mode, authority_generation, active_plan_revision_id, "
-        "active_plan_digest, projection_generation) "
-        "VALUES ('manifest-pin', 'manifest', 4, 'plan-pin-1', 'plan-digest', 4)"
-    )
     conn.commit()
+    service, chapter_node, plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-pin"
+    )
     repo = ChapterCandidateRepository(db)
     repo.start_run("manifest-pin", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
+    outline_chain = service.published_context_for_chapter("manifest-pin", chapter_node.id)
 
     candidate = repo.create_streaming_candidate(
         novel_id="manifest-pin",
         chapter_number=1,
         title="第一章",
-        outline_chain={
-            "chapter": {
-                "contract_id": "chapter-slot",
-                "digest": "chapter-digest",
-                "payload": {"title": "第一章"},
-            }
-        },
+        outline_chain=outline_chain,
     )
 
-    assert candidate.planning_authority_generation == 4
-    assert candidate.plan_revision_id == "plan-pin-1"
-    assert candidate.plan_digest == "plan-digest"
-    assert candidate.chapter_outline_digest == "chapter-digest"
+    assert candidate.planning_authority_generation == 1
+    assert candidate.plan_revision_id == plan.id
+    assert candidate.plan_digest == plan.digest
+    assert candidate.chapter_outline_digest == outline_chain["chapter"]["digest"]
+    assert candidate.plan_pin_fingerprint
+    assert set(candidate.outline_chain) == {
+        "outline",
+        "part",
+        "volume",
+        "act",
+        "chapter",
+    }
+    assert all(candidate.outline_chain[level]["version_id"] for level in candidate.outline_chain)
 
 
-def test_manifest_candidate_is_rejected_after_head_switch_before_formal_commit(
-    candidates,
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("planning_authority_generation", 99),
+        ("plan_revision_id", None),
+        ("plan_digest", "tampered-plan-digest"),
+        ("outline_chain_json", "{}"),
+        ("outline_chain_digest", "tampered-outline-chain-digest"),
+        ("chapter_outline_digest", "tampered-chapter-outline-digest"),
+        ("plan_pin_fingerprint", "tampered-plan-pin-fingerprint"),
+    ],
+)
+def test_manifest_candidate_plan_pin_fields_reject_direct_sql_updates(
+    tmp_path, column, value
 ):
-    repo, db = candidates
+    """Candidate provenance is immutable after its exact Manifest pin is created."""
+
+    db, repo, candidate = _manifest_candidate_for_pin_boundary(
+        tmp_path, boundary="revalidation"
+    )
+    conn = db.get_connection()
+
+    with pytest.raises(sqlite3.IntegrityError, match="candidate plan pin is immutable"):
+        conn.execute(
+            f"UPDATE chapter_candidates SET {column} = ? WHERE id = ?",
+            (value, candidate.id),
+        )
+    conn.rollback()
+
+    persisted = repo.get_candidate(candidate.id)
+    assert persisted.outline_chain == candidate.outline_chain
+    assert persisted.plan_revision_id == candidate.plan_revision_id
+    assert persisted.plan_digest == candidate.plan_digest
+
+
+def test_candidate_plan_pin_immutability_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "candidate-plan-pin-migration.db"
+    DatabaseConnection(str(db_path))
+    reopened = DatabaseConnection(str(db_path))
+    conn = reopened.get_connection()
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migrations_applied "
+        "WHERE migration_file = '034_candidate_plan_pin_immutability.sql'"
+    ).fetchone()[0] == 1
+    assert "plan_pin_fingerprint" in {
+        row[1] for row in conn.execute("PRAGMA table_info(chapter_candidates)")
+    }
+
+
+@pytest.mark.parametrize(
+    ("aftermath",),
+    [("missing",), ("partial",)],
+)
+def test_generation_start_preflight_rejects_legacy_formal_without_exact_durable_aftermath(
+    tmp_path, aftermath
+):
+    db = DatabaseConnection(str(tmp_path / f"legacy-preflight-{aftermath}.db"))
     conn = db.get_connection()
     conn.execute(
-        "INSERT INTO outline_plan_revisions "
-        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
-        "VALUES ('plan-old', 'novel-1', 1, 'published', 'old-digest', '', CURRENT_TIMESTAMP)"
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("legacy-preflight", "Legacy Preflight", "legacy-preflight", 20),
+    )
+    _insert_legacy_chapter(conn, "legacy-preflight", 1, "旧正文第一章")
+    conn.commit()
+    repository = ChapterCandidateRepository(db)
+    repository.import_legacy_formal_history("legacy-preflight")
+    if aftermath == "partial":
+        _persist_legacy_durable_aftermath(
+            db,
+            novel_id="legacy-preflight",
+            chapter_number=1,
+            include_summary=False,
+        )
+    outline = _LegacyPreflightOutline()
+    preflight = GenerationStartPreflight(db, repository, outline)
+
+    with pytest.raises(GenerationStartPreflightError, match="canonical_aftermath_not_ready"):
+        preflight.ensure_startable("legacy-preflight")
+
+    assert outline.calls == []
+
+
+def test_generation_start_preflight_allows_legacy_formal_with_exact_durable_aftermath(
+    tmp_path,
+):
+    db = DatabaseConnection(str(tmp_path / "legacy-preflight-ready.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("legacy-preflight-ready", "Legacy Preflight", "legacy-preflight-ready", 20),
+    )
+    _insert_legacy_chapter(conn, "legacy-preflight-ready", 1, "旧正文第一章")
+    conn.commit()
+    repository = ChapterCandidateRepository(db)
+    repository.import_legacy_formal_history("legacy-preflight-ready")
+    _persist_legacy_durable_aftermath(
+        db, novel_id="legacy-preflight-ready", chapter_number=1
+    )
+    outline = _LegacyPreflightOutline()
+    preflight = GenerationStartPreflight(db, repository, outline)
+
+    preflight.ensure_startable("legacy-preflight-ready")
+
+    assert outline.calls == [("legacy-preflight-ready", 1)]
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("revalidation", "generated_content", "approval", "formal"),
+)
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("planning_authority_generation", 99),
+        ("plan_revision_id", None),
+        ("plan_digest", "tampered-plan-digest"),
+    ],
+)
+def test_pre_hardening_manifest_candidate_pin_corruption_is_rejected_before_each_authority_boundary(
+    tmp_path, boundary, column, value
+):
+    """A current five-level chain cannot rescue altered Candidate provenance."""
+
+    db, repo, candidate = _manifest_candidate_for_pin_boundary(
+        tmp_path, boundary=boundary
+    )
+    conn = db.get_connection()
+    original_chain = conn.execute(
+        "SELECT outline_chain_json FROM chapter_candidates WHERE id = ?", (candidate.id,)
+    ).fetchone()["outline_chain_json"]
+    _disable_candidate_plan_pin_immutability(conn)
+    conn.execute(
+        f"UPDATE chapter_candidates SET {column} = ? WHERE id = ?",
+        (value, candidate.id),
+    )
+    conn.commit()
+
+    assert conn.execute(
+        "SELECT outline_chain_json FROM chapter_candidates WHERE id = ?", (candidate.id,)
+    ).fetchone()["outline_chain_json"] == original_chain
+
+    with pytest.raises(CandidateGateError, match="plan provenance"):
+        if boundary == "revalidation":
+            repo.revalidate_candidate_generation_authority(candidate.id)
+        elif boundary == "generated_content":
+            repo.set_generated_content(candidate.id, "不应保存的候选正文")
+        elif boundary == "approval":
+            repo.approve_for_commit(candidate.id, continue_after_commit=False)
+        else:
+            repo.commit_formal(candidate.id)
+
+    persisted = repo.get_candidate(candidate.id)
+    if boundary == "generated_content":
+        assert persisted.content_revision == candidate.content_revision
+    elif boundary == "approval":
+        assert persisted.status == CandidateStatus.AWAITING_REVIEW
+    elif boundary == "formal":
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chapters WHERE novel_id = ?", (candidate.novel_id,)
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "reconciliation_status"),
+    [
+        ("published", "aligned"),
+        ("ready_for_review", "repairable"),
+    ],
+)
+def test_manifest_candidate_rejects_pre_hardening_nonpublishable_head(
+    tmp_path, status, reconciliation_status
+):
+    """Candidate pinning must defend against Heads created before migration 033."""
+
+    db = DatabaseConnection(str(tmp_path / f"nonpublishable-{status}.db"))
+    conn = db.get_connection()
+    # Migration 033 rejects this at write time. Remove only its Head-policy
+    # triggers to model an already persisted 031/032-era invalid Head.
+    conn.execute("DROP TRIGGER trg_outline_planning_heads_publishable_insert")
+    conn.execute("DROP TRIGGER trg_outline_planning_heads_publishable_update")
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-invalid", "Invalid Manifest", "manifest-invalid", 20),
     )
     conn.execute(
         "INSERT INTO outline_plan_revisions "
-        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
-        "VALUES ('plan-new', 'novel-1', 2, 'published', 'new-digest', '', CURRENT_TIMESTAMP)"
+        "(id, novel_id, revision, status, digest, canonical_prefix_digest, "
+        "reconciliation_status, sealed_at) "
+        "VALUES ('plan-invalid', 'manifest-invalid', 1, ?, 'plan-digest', '', ?, "
+        "CURRENT_TIMESTAMP)",
+        (status, reconciliation_status),
     )
     conn.execute(
         "INSERT INTO outline_planning_heads "
         "(novel_id, authority_mode, authority_generation, active_plan_revision_id, "
         "active_plan_digest, projection_generation) "
-        "VALUES ('novel-1', 'manifest', 1, 'plan-old', 'old-digest', 1)"
+        "VALUES ('manifest-invalid', 'manifest', 1, 'plan-invalid', 'plan-digest', 1)"
     )
     conn.commit()
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-invalid", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+
+    with pytest.raises(CandidateGateError, match="not backed by a sealed plan"):
+        repo.create_streaming_candidate(
+            novel_id="manifest-invalid",
+            chapter_number=1,
+            title="第一章",
+            outline_chain={"chapter": {"digest": "chapter-digest", "payload": {}}},
+        )
+
+
+def test_set_generated_content_revalidates_manifest_pin_inside_write_transaction(
+    tmp_path,
+):
+    db = DatabaseConnection(str(tmp_path / "manifest-save-cas.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-save", "Manifest Save", "manifest-save", 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-save"
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run("manifest-save", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
     candidate = repo.create_streaming_candidate(
-        novel_id="novel-1",
+        novel_id="manifest-save",
         chapter_number=1,
         title="第一章",
-        outline_chain={"chapter": {"digest": "chapter-digest", "payload": {}}},
+        outline_chain=service.published_context_for_chapter("manifest-save", chapter_node.id),
     )
-    repo.set_generated_content(candidate.id, "候选正文")
-    conn.execute(
-        "UPDATE outline_planning_heads SET authority_generation = 2, "
-        "active_plan_revision_id = 'plan-new', active_plan_digest = 'new-digest', "
-        "projection_generation = 2 WHERE novel_id = 'novel-1'"
-    )
-    conn.commit()
 
-    with pytest.raises(CandidateGateError, match="plan"):
-        repo.revalidate_candidate_generation_authority(candidate.id)
+    competing_db = DatabaseConnection(db.db_path)
+
+    def corrupt_candidate_pin():
+        _tamper_manifest_candidate_chain(
+            competing_db.get_connection(),
+            candidate_id=candidate.id,
+            mutate=lambda chain: chain["volume"].pop("version_id"),
+        )
+
+    wrapped = _BeforeBeginConnection(db.get_connection(), corrupt_candidate_pin)
+    repo._connection = lambda: wrapped
+
+    with pytest.raises(CandidateGateError, match="outline chain"):
+        repo.set_generated_content(candidate.id, "候选正文")
+
+    persisted = db.get_connection().execute(
+        "SELECT content_revision, llm_content FROM chapter_candidates WHERE id = ?",
+        (candidate.id,),
+    ).fetchone()
+    assert persisted["content_revision"] == 0
+    assert persisted["llm_content"] == ""
 
 
-def test_manifest_plan_pin_is_rechecked_at_approval_and_formal_cas(candidates):
-    repo, db = candidates
+def test_approval_revalidates_manifest_pin_inside_write_transaction(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "manifest-approval-cas.db"))
     conn = db.get_connection()
     conn.execute(
-        "INSERT INTO outline_plan_revisions "
-        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
-        "VALUES ('plan-old', 'novel-1', 1, 'published', 'old-digest', '', CURRENT_TIMESTAMP)"
-    )
-    conn.execute(
-        "INSERT INTO outline_plan_revisions "
-        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
-        "VALUES ('plan-new', 'novel-1', 2, 'published', 'new-digest', '', CURRENT_TIMESTAMP)"
-    )
-    conn.execute(
-        "INSERT INTO outline_planning_heads "
-        "(novel_id, authority_mode, authority_generation, active_plan_revision_id, "
-        "active_plan_digest, projection_generation) "
-        "VALUES ('novel-1', 'manifest', 1, 'plan-old', 'old-digest', 1)"
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-approval", "Manifest Approval", "manifest-approval", 20),
     )
     conn.commit()
-    repo.create_streaming_candidate(
-        novel_id="novel-1",
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-approval"
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-approval", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+    candidate = repo.create_streaming_candidate(
+        novel_id="manifest-approval",
         chapter_number=1,
         title="第一章",
-        outline_chain={"chapter": {"digest": "chapter-digest", "payload": {}}},
+        outline_chain=service.published_context_for_chapter("manifest-approval", chapter_node.id),
+        llm_content="候选正文",
     )
-    candidate = repo.get_current_candidate("novel-1")
-    repo.set_generated_content(candidate.id, "候选正文")
+    repo.mark_auditing(candidate.id)
+    candidate = repo.finish_audit(
+        candidate.id, audit={}, commit_plan={}, require_author_review=True
+    )
+
+    competing_db = DatabaseConnection(db.db_path)
+
+    def corrupt_candidate_pin():
+        _tamper_manifest_candidate_chain(
+            competing_db.get_connection(),
+            candidate_id=candidate.id,
+            mutate=lambda chain: chain["act"].pop("version_id"),
+        )
+
+    wrapped = _BeforeBeginConnection(db.get_connection(), corrupt_candidate_pin)
+    repo._connection = lambda: wrapped
+
+    with pytest.raises(CandidateGateError, match="outline chain"):
+        repo.approve_for_commit(candidate.id, continue_after_commit=False)
+
+    assert db.get_connection().execute(
+        "SELECT status FROM chapter_candidates WHERE id = ?", (candidate.id,)
+    ).fetchone()["status"] == CandidateStatus.AWAITING_REVIEW.value
+
+
+def test_formal_commit_revalidates_stored_manifest_chain_before_prose_write(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "manifest-formal-pin.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-formal", "Manifest Formal", "manifest-formal", 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-formal"
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-formal", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+    candidate = repo.create_streaming_candidate(
+        novel_id="manifest-formal",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=service.published_context_for_chapter("manifest-formal", chapter_node.id),
+        llm_content="候选正文",
+    )
     repo.mark_auditing(candidate.id)
     candidate = repo.finish_audit(
         candidate.id,
@@ -210,47 +855,19 @@ def test_manifest_plan_pin_is_rechecked_at_approval_and_formal_cas(candidates):
         commit_plan={},
         require_author_review=True,
     )
+    repo.approve_for_commit(candidate.id, continue_after_commit=False)
+    _tamper_manifest_candidate_chain(
+        conn,
+        candidate_id=candidate.id,
+        mutate=lambda chain: chain["chapter"].pop("version_id"),
+    )
 
-    conn.execute(
-        "UPDATE outline_planning_heads SET authority_generation = 2, "
-        "active_plan_revision_id = 'plan-new', active_plan_digest = 'new-digest', "
-        "projection_generation = 2 WHERE novel_id = 'novel-1'"
-    )
-    conn.commit()
-    with pytest.raises(CandidateGateError, match="plan"):
-        repo.approve_for_commit(candidate.id, continue_after_commit=False)
+    with pytest.raises(CandidateGateError, match="outline chain"):
+        repo.commit_formal(candidate.id)
 
-    repo.reject_and_stop(candidate.id)
-    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
-    repo.create_streaming_candidate(
-        novel_id="novel-1",
-        chapter_number=1,
-        title="第一章",
-        outline_chain={"chapter": {"digest": "chapter-digest", "payload": {}}},
-    )
-    second = repo.get_current_candidate("novel-1")
-    repo.set_generated_content(second.id, "候选正文")
-    repo.mark_auditing(second.id)
-    second = repo.finish_audit(
-        second.id,
-        audit={"hard_blocks": [], "required_events_complete": True},
-        commit_plan={},
-        require_author_review=True,
-    )
-    repo.approve_for_commit(second.id, continue_after_commit=False)
-    conn.execute(
-        "INSERT INTO outline_plan_revisions "
-        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
-        "VALUES ('plan-third', 'novel-1', 3, 'published', 'third-digest', '', CURRENT_TIMESTAMP)"
-    )
-    conn.execute(
-        "UPDATE outline_planning_heads SET authority_generation = 3, "
-        "active_plan_revision_id = 'plan-third', active_plan_digest = 'third-digest', "
-        "projection_generation = 3 WHERE novel_id = 'novel-1'"
-    )
-    conn.commit()
-    with pytest.raises(CandidateGateError, match="plan"):
-        repo.commit_formal(second.id)
+    assert db.get_connection().execute(
+        "SELECT COUNT(*) AS total FROM chapters WHERE novel_id = 'manifest-formal'"
+    ).fetchone()["total"] == 0
 
 
 @pytest.mark.parametrize("run_mode", [RunMode.CHAPTER_REVIEW, RunMode.CONTINUOUS])
@@ -295,6 +912,10 @@ def test_explicit_legacy_baseline_continues_at_next_chapter_in_both_modes(tmp_pa
     assert repo.formal_chapter_head("legacy-book") == 10
     assert conn.execute("SELECT COUNT(*) FROM chapter_candidate_formal_commits").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM chapter_candidates").fetchone()[0] == 0
+    for number in range(1, 11):
+        _persist_legacy_durable_aftermath(
+            db, novel_id="legacy-book", chapter_number=number
+        )
     run = repo.start_run("legacy-book", run_mode=run_mode, target_chapters=1)
     assert run.current_formal_chapter == 10
     candidate = repo.create_streaming_candidate(
@@ -313,6 +934,7 @@ def test_explicit_legacy_baseline_continues_at_next_chapter_in_both_modes(tmp_pa
     else:
         assert candidate.status == CandidateStatus.COMMITTING
     repo.commit_formal(candidate.id)
+    _persist_durable_aftermath(db, candidate)
     repo.mark_sync_succeeded(candidate.id)
     assert repo.formal_chapter_head("legacy-book") == 11
 
@@ -558,6 +1180,7 @@ def test_legacy_baseline_rejects_candidate_first_history(tmp_path):
     repo.finish_audit(candidate.id, audit={}, commit_plan={})
     repo.approve_for_commit(candidate.id, continue_after_commit=False)
     repo.commit_formal(candidate.id)
+    _persist_durable_aftermath(db, candidate)
     repo.mark_sync_succeeded(candidate.id)
 
     with pytest.raises(CandidateGateError, match="Candidate-first"):
@@ -697,6 +1320,9 @@ def test_formal_commit_rechecks_legacy_baseline_inside_its_write_transaction(tmp
     conn.commit()
     repo = ChapterCandidateRepository(db)
     repo.import_legacy_formal_history("legacy-commit")
+    _persist_legacy_durable_aftermath(
+        db, novel_id="legacy-commit", chapter_number=1
+    )
     repo.start_run("legacy-commit", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=2)
     candidate = repo.create_streaming_candidate(
         novel_id="legacy-commit",
@@ -777,6 +1403,7 @@ def test_start_run_resumes_formal_cursor_after_synced_candidate_commits(tmp_path
         repo.finish_audit(candidate.id, audit={}, commit_plan={})
         repo.approve_for_commit(candidate.id, continue_after_commit=number == 1)
         repo.commit_formal(candidate.id)
+        _persist_durable_aftermath(db, candidate)
         repo.mark_sync_succeeded(candidate.id)
 
     run = repo.start_run(
@@ -804,6 +1431,7 @@ def test_formal_authority_persists_exact_version_and_rejects_tampering(candidate
     repo.finish_audit(candidate.id, audit={}, commit_plan={})
     repo.approve_for_commit(candidate.id, continue_after_commit=False)
     formal = repo.commit_formal(candidate.id)
+    _persist_durable_aftermath(db, candidate)
     repo.mark_sync_succeeded(candidate.id)
 
     authority = db.fetch_one(
@@ -831,6 +1459,310 @@ def test_formal_authority_persists_exact_version_and_rejects_tampering(candidate
     assert repo.formal_chapter_head("novel-1") == 0
     with pytest.raises(CandidateGateError, match="formal chapter authority mismatch"):
         repo.assert_formal_history_is_proven("novel-1")
+
+
+def _syncing_candidate(repo: ChapterCandidateRepository):
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选正式正文",
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    repo.approve_for_commit(candidate.id, continue_after_commit=True)
+    return repo.commit_formal(candidate.id)
+
+
+def _persist_durable_aftermath(
+    db: DatabaseConnection,
+    candidate,
+    *,
+    memory_status: str = "committed",
+    include_summary: bool = True,
+) -> None:
+    """Write the exact durable evidence the sync-publication gate consumes."""
+
+    conn = db.get_connection()
+    content_sha256 = hashlib.sha256(candidate.final_content.encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO knowledge (id, novel_id) VALUES (?, ?) "
+        "ON CONFLICT(novel_id) DO NOTHING",
+        (f"knowledge-{candidate.novel_id}", candidate.novel_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO chapter_narrative_commits
+            (novel_id, chapter_number, content_sha256, pipeline_version,
+             content_revision, status, memory_status)
+        VALUES (?, ?, ?, ?, ?, 'committed', ?)
+        ON CONFLICT(novel_id, chapter_number, content_sha256, pipeline_version)
+        DO UPDATE SET content_revision = excluded.content_revision,
+                      status = excluded.status,
+                      memory_status = excluded.memory_status
+        """,
+        (
+            candidate.novel_id,
+            candidate.chapter_number,
+            content_sha256,
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            candidate.content_revision,
+            memory_status,
+        ),
+    )
+    if include_summary:
+        knowledge = conn.execute(
+            "SELECT id FROM knowledge WHERE novel_id = ?", (candidate.novel_id,)
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO chapter_summaries
+                (id, knowledge_id, chapter_number, summary, source_content_sha256,
+                 source_content_revision, pipeline_version, sync_status)
+            VALUES (?, ?, ?, '可信章节摘要', ?, ?, ?, 'committed')
+            ON CONFLICT(knowledge_id, chapter_number)
+            DO UPDATE SET summary = excluded.summary,
+                          source_content_sha256 = excluded.source_content_sha256,
+                          source_content_revision = excluded.source_content_revision,
+                          pipeline_version = excluded.pipeline_version,
+                          sync_status = excluded.sync_status
+            """,
+            (
+                f"summary-{candidate.id}",
+                str(knowledge["id"]),
+                candidate.chapter_number,
+                content_sha256,
+                candidate.content_revision,
+                CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            ),
+        )
+    conn.commit()
+
+
+def test_mark_sync_succeeded_requires_exact_canonical_aftermath_and_memory_barrier(candidates):
+    repo, db = candidates
+    syncing = _syncing_candidate(repo)
+
+    with pytest.raises(CandidateGateError, match="canonical aftermath"):
+        repo.mark_sync_succeeded(syncing.id)
+
+    assert repo.get_run("novel-1").current_formal_chapter == 0
+    assert repo.get_candidate(syncing.id).status == CandidateStatus.SYNCING
+
+    digest = hashlib.sha256(syncing.final_content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status, memory_status) "
+        "VALUES ('novel-1', 1, ?, ?, ?, 'committed', 'pending')",
+        (digest, CHAPTER_NARRATIVE_PIPELINE_VERSION, syncing.content_revision),
+    )
+    db.get_connection().commit()
+    with pytest.raises(CandidateGateError, match="canonical aftermath"):
+        repo.mark_sync_succeeded(syncing.id)
+
+    db.execute(
+        "UPDATE chapter_narrative_commits SET memory_status='committed' "
+        "WHERE novel_id='novel-1' AND chapter_number=1"
+    )
+    db.get_connection().commit()
+    with pytest.raises(CandidateGateError, match="canonical aftermath"):
+        repo.mark_sync_succeeded(syncing.id)
+
+    _persist_durable_aftermath(db, syncing)
+    assert repo.mark_sync_succeeded(syncing.id).status == CandidateStatus.COMMITTED
+
+
+def test_mark_sync_succeeded_rejects_not_required_memory_even_with_exact_summary(candidates):
+    repo, db = candidates
+    syncing = _syncing_candidate(repo)
+    _persist_durable_aftermath(db, syncing, memory_status="not_required")
+
+    with pytest.raises(CandidateGateError, match="canonical aftermath"):
+        repo.mark_sync_succeeded(syncing.id)
+
+
+@pytest.mark.parametrize("mismatch", ["hash", "revision", "pipeline"])
+def test_mark_sync_succeeded_rejects_non_exact_narrative_identity(candidates, mismatch):
+    repo, db = candidates
+    syncing = _syncing_candidate(repo)
+    digest = hashlib.sha256(syncing.final_content.encode("utf-8")).hexdigest()
+    _persist_durable_aftermath(db, syncing)
+    db.execute(
+        "DELETE FROM chapter_narrative_commits "
+        "WHERE novel_id=? AND chapter_number=? AND content_sha256=? AND pipeline_version=?",
+        (
+            syncing.novel_id,
+            syncing.chapter_number,
+            digest,
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        ),
+    )
+    values = {
+        "hash": "wrong-hash",
+        "revision": syncing.content_revision + 1,
+        "pipeline": "wrong-pipeline",
+    }
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status, memory_status) "
+        "VALUES ('novel-1', 1, ?, ?, ?, 'committed', 'committed')",
+        (
+            values["hash"] if mismatch == "hash" else digest,
+            values["pipeline"] if mismatch == "pipeline" else CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            values["revision"] if mismatch == "revision" else syncing.content_revision,
+        ),
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(CandidateGateError, match="canonical aftermath"):
+        repo.mark_sync_succeeded(syncing.id)
+
+
+@pytest.mark.parametrize("mismatch", ["hash", "revision", "pipeline"])
+def test_mark_sync_succeeded_rejects_non_exact_summary_identity(candidates, mismatch):
+    repo, db = candidates
+    syncing = _syncing_candidate(repo)
+    digest = hashlib.sha256(syncing.final_content.encode("utf-8")).hexdigest()
+    _persist_durable_aftermath(db, syncing)
+    values = {
+        "hash": "wrong-hash",
+        "revision": syncing.content_revision + 1,
+        "pipeline": "wrong-pipeline",
+    }
+    summary_column = {
+        "hash": "source_content_sha256",
+        "revision": "source_content_revision",
+        "pipeline": "pipeline_version",
+    }[mismatch]
+    db.execute(
+        f"UPDATE chapter_summaries SET {summary_column}=? "
+        "WHERE knowledge_id IN (SELECT id FROM knowledge WHERE novel_id=?) "
+        "AND chapter_number=?",
+        (
+            values[mismatch],
+            syncing.novel_id,
+            syncing.chapter_number,
+        ),
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(CandidateGateError, match="canonical aftermath"):
+        repo.mark_sync_succeeded(syncing.id)
+
+
+def test_mark_sync_succeeded_requires_an_exact_committed_summary_when_knowledge_exists(candidates):
+    repo, db = candidates
+    syncing = _syncing_candidate(repo)
+    digest = hashlib.sha256(syncing.final_content.encode("utf-8")).hexdigest()
+    db.execute("INSERT INTO knowledge (id, novel_id) VALUES ('knowledge-1', 'novel-1')")
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status, memory_status) "
+        "VALUES ('novel-1', 1, ?, ?, ?, 'committed', 'committed')",
+        (digest, CHAPTER_NARRATIVE_PIPELINE_VERSION, syncing.content_revision),
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(CandidateGateError, match="canonical aftermath"):
+        repo.mark_sync_succeeded(syncing.id)
+
+
+def test_wait_for_outline_expansion_rejects_missing_exact_narrative_commit(candidates):
+    repo, db = candidates
+    syncing = _syncing_candidate(repo)
+    db.execute(
+        "UPDATE chapter_candidate_formal_commits SET sync_status='ready' WHERE candidate_id=?",
+        (syncing.id,),
+    )
+    db.execute(
+        "UPDATE chapter_candidates SET status='committed' WHERE id=?",
+        (syncing.id,),
+    )
+    db.execute(
+        "UPDATE novel_generation_runs SET current_candidate_id=NULL, current_candidate_chapter=NULL, "
+        "current_formal_chapter=1, canonical_sync_status='ready' WHERE novel_id='novel-1'"
+    )
+    db.get_connection().commit()
+    with pytest.raises(CandidateGateError, match="Canonical and Memory"):
+        repo.wait_for_outline_expansion("novel-1")
+    assert repo.get_run("novel-1").state == GenerationRunState.RUNNING
+
+
+def test_wait_for_outline_expansion_requires_exact_aftermath_for_legacy_formal_history(
+    tmp_path,
+):
+    db = DatabaseConnection(str(tmp_path / "legacy-outline-expansion.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("legacy-outline", "Legacy Outline", "legacy-outline", 20),
+    )
+    _insert_legacy_chapter(conn, "legacy-outline", 1, "旧正文第一章")
+    conn.commit()
+    repo = ChapterCandidateRepository(db)
+    repo.import_legacy_formal_history("legacy-outline")
+    repo.start_run(
+        "legacy-outline", run_mode=RunMode.CONTINUOUS, target_chapters=20
+    )
+
+    with pytest.raises(CandidateGateError, match="Canonical and Memory"):
+        repo.wait_for_outline_expansion("legacy-outline")
+
+    _persist_legacy_durable_aftermath(
+        db,
+        novel_id="legacy-outline",
+        chapter_number=1,
+        include_summary=False,
+    )
+    with pytest.raises(CandidateGateError, match="Canonical and Memory"):
+        repo.wait_for_outline_expansion("legacy-outline")
+
+    _persist_legacy_durable_aftermath(
+        db, novel_id="legacy-outline", chapter_number=1
+    )
+    paused = repo.wait_for_outline_expansion("legacy-outline")
+
+    assert paused.state == GenerationRunState.WAITING_PLANNING
+    assert paused.next_action == "expand_outline_cohort"
+
+
+def test_wait_for_outline_expansion_does_not_overwrite_a_stopped_run_during_transition(
+    candidates,
+):
+    repo, db = candidates
+    competing_repository = ChapterCandidateRepository(DatabaseConnection(db.db_path))
+    wrapped = _BeforeBeginConnection(
+        db.get_connection(), lambda: competing_repository.stop_run("novel-1")
+    )
+    repo._connection = lambda: wrapped
+
+    with pytest.raises(CandidateGateError, match="outline expansion is blocked"):
+        repo.wait_for_outline_expansion("novel-1")
+
+    run = competing_repository.get_run("novel-1")
+    assert run.state == GenerationRunState.STOPPED
+    assert run.next_action == "idle"
+
+
+def test_start_run_does_not_overwrite_a_new_waiting_planning_pause(candidates):
+    repo, db = candidates
+    competing_repository = ChapterCandidateRepository(DatabaseConnection(db.db_path))
+    wrapped = _BeforeBeginConnection(
+        db.get_connection(),
+        lambda: competing_repository.wait_for_outline_expansion("novel-1"),
+    )
+    repo._connection = lambda: wrapped
+
+    with pytest.raises(CandidateGateError, match="outline expansion"):
+        repo.start_run(
+            "novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+        )
+
+    assert wrapped._called is True
+    run = competing_repository.get_run("novel-1")
+    assert run.state == GenerationRunState.WAITING_PLANNING
+    assert run.next_action == "expand_outline_cohort"
 
 
 def test_start_run_uses_persisted_novel_target_chapters(tmp_path):
@@ -932,6 +1864,7 @@ def test_author_edit_stales_audit_and_commit_plan_until_reaudited(candidates):
     assert syncing.status == CandidateStatus.SYNCING
     assert db.fetch_one("SELECT content FROM chapters WHERE novel_id = ? AND number = 1", ("novel-1",))["content"] == "作者修订稿"
 
+    _persist_durable_aftermath(db, syncing)
     committed = repo.mark_sync_succeeded(candidate.id)
     assert committed.status == CandidateStatus.COMMITTED
     assert repo.get_run("novel-1").state == GenerationRunState.RUNNING
@@ -1035,6 +1968,7 @@ def test_formal_candidate_with_failed_sync_can_retry_without_duplicate_chapter(c
 
     retrying = repo.begin_sync_retry(candidate.id)
     assert retrying.status == CandidateStatus.SYNCING
+    _persist_durable_aftermath(db, candidate)
     repo.mark_sync_succeeded(candidate.id)
     assert db.fetch_one("SELECT COUNT(*) AS total FROM chapters WHERE novel_id = ?", ("novel-1",))["total"] == 1
 
@@ -1127,7 +2061,7 @@ def test_sync_ready_publication_rejects_candidate_formal_version_mismatch(candid
 
 
 def test_stopping_during_canonical_sync_finishes_sync_then_pauses(candidates):
-    repo, _db = candidates
+    repo, db = candidates
     candidate = repo.create_streaming_candidate(
         novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain(), llm_content="候选"
     )
@@ -1135,6 +2069,7 @@ def test_stopping_during_canonical_sync_finishes_sync_then_pauses(candidates):
     repo.finish_audit(candidate.id, audit={}, commit_plan={})
     repo.approve_for_commit(candidate.id, continue_after_commit=True)
     repo.commit_formal(candidate.id)
+    _persist_durable_aftermath(db, candidate)
 
     stopped = repo.stop_run("novel-1")
 
@@ -1381,6 +2316,7 @@ def test_service_restart_does_not_regress_sync_published_before_recovery_transac
     repo.finish_audit(candidate.id, audit={}, commit_plan={})
     repo.approve_for_commit(candidate.id, continue_after_commit=True)
     repo.commit_formal(candidate.id)
+    _persist_durable_aftermath(db, candidate)
 
     publishing_db = DatabaseConnection(db.db_path)
     publishing_repo = ChapterCandidateRepository(publishing_db)

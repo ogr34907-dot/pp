@@ -49,6 +49,8 @@ class GenerationStartPreflight:
             if status != "ready":
                 reason = "worldline_rebuild_active" if status == "rebuilding" else "canonical_sync_not_ready"
                 raise GenerationStartPreflightError(reason)
+            if str(run["state"] or "") == "waiting_planning":
+                raise GenerationStartPreflightError("outline_expansion_required")
             if str(run["state"] or "") in {"running", "waiting_review"}:
                 raise GenerationStartPreflightError("generation_run_active")
             rebuilding = conn.execute(
@@ -68,6 +70,12 @@ class GenerationStartPreflight:
             raise GenerationStartPreflightError("unproven_formal_history") from exc
 
         formal_head = self.candidate_repository.formal_chapter_head(novel_id)
+        try:
+            self.candidate_repository.require_formal_prefix_aftermath_ready(
+                novel_id, formal_head
+            )
+        except Exception as exc:
+            raise GenerationStartPreflightError("canonical_aftermath_not_ready") from exc
         next_chapter = formal_head + 1
         if not self.candidate_repository.formal_slot_is_available(
             novel_id, next_chapter

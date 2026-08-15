@@ -68,6 +68,7 @@ class ChapterCandidate:
     plan_revision_id: Optional[str] = None
     plan_digest: str = ""
     chapter_outline_digest: str = ""
+    plan_pin_fingerprint: str = ""
     llm_content: str = ""
     author_content: Optional[str] = None
     content_revision: int = 0

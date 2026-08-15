@@ -80,6 +80,24 @@ class OutlineContractRepository:
             self._connection(), novel_id, operation=operation
         )
 
+    def _begin_legacy_mutation_transaction(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: str,
+        operation: str,
+    ) -> None:
+        """Fast-fail, then bind the authoritative legacy check to the writer lock."""
+
+        if conn.in_transaction:
+            raise OutlineGateError("legacy outline mutation requires a clean connection")
+        self._assert_legacy_mutation(novel_id, operation)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._assert_legacy_mutation(novel_id, operation)
+        except BaseException:
+            conn.rollback()
+            raise
+
     @staticmethod
     def _now() -> str:
         return datetime.now().isoformat()
@@ -141,8 +159,13 @@ class OutlineContractRepository:
             for row in rows
         )
 
-    def get_plan_revision(self, plan_revision_id: str) -> OutlinePlanRevision:
-        conn = self._connection()
+    def get_plan_revision(
+        self,
+        plan_revision_id: str,
+        *,
+        _connection: Optional[sqlite3.Connection] = None,
+    ) -> OutlinePlanRevision:
+        conn = _connection or self._connection()
         row = conn.execute(
             "SELECT * FROM outline_plan_revisions WHERE id = ?",
             (plan_revision_id,),
@@ -192,29 +215,79 @@ class OutlineContractRepository:
             items=self._plan_items_from_rows(item_rows),
         )
 
+    def _require_active_manifest_plan(
+        self,
+        novel_id: str,
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> OutlinePlanRevision:
+        """Load and verify the exact immutable snapshot selected by a Head."""
+
+        conn = conn or self._connection()
+        head_row = conn.execute(
+            "SELECT * FROM outline_planning_heads WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        if head_row is None:
+            raise OutlineGateError("manifest planning Head is missing")
+        head = self._head_from_row(head_row)
+        if head.authority_mode != PlanningAuthorityMode.MANIFEST:
+            raise OutlineGateError("novel is not using manifest planning authority")
+        if not head.active_plan_revision_id or not head.active_plan_digest:
+            raise OutlineGateError("manifest planning Head has no active revision")
+        if head.authority_generation != head.projection_generation:
+            raise OutlineGateError("manifest planning Head projection is out of sync")
+
+        plan = self.get_plan_revision(
+            head.active_plan_revision_id,
+            _connection=conn,
+        )
+        if plan.novel_id != novel_id:
+            raise OutlineGateError("manifest planning Head targets another novel")
+        if not plan.sealed_at:
+            raise OutlineGateError("manifest planning Head is not sealed")
+        if plan.status != PlanRevisionStatus.READY_FOR_REVIEW:
+            raise OutlineGateError(
+                f"active manifest revision is {plan.status.value}"
+            )
+        if plan.reconciliation_status != PlanReconciliationStatus.ALIGNED:
+            raise OutlineGateError("active manifest revision is not aligned")
+        if plan.digest != head.active_plan_digest:
+            raise OutlineGateError("manifest planning Head digest does not match its revision")
+
+        normalized_items = self._validate_plan_items(
+            novel_id,
+            plan.items,
+            conn=conn,
+            require_sealed_versions=True,
+        )
+        recomputed_digest = canonical_plan_digest(
+            canonical_prefix_digest=plan.canonical_prefix_digest,
+            items=normalized_items,
+        )
+        if recomputed_digest != plan.digest:
+            raise OutlineGateError("active manifest revision digest is invalid")
+        return plan
+
     def get_active_plan(self, novel_id: str) -> Optional[OutlinePlanRevision]:
-        row = self._connection().execute(
+        conn = self._connection()
+        row = conn.execute(
             "SELECT active_plan_revision_id FROM outline_planning_heads WHERE novel_id = ?",
             (novel_id,),
         ).fetchone()
         if row is None or not row["active_plan_revision_id"]:
             return None
-        return self.get_plan_revision(str(row["active_plan_revision_id"]))
+        head = self.get_planning_head(novel_id)
+        if head.authority_mode == PlanningAuthorityMode.MANIFEST:
+            return self._require_active_manifest_plan(novel_id, conn=conn)
+        return self.get_plan_revision(str(row["active_plan_revision_id"]), _connection=conn)
 
     def active_plan_items_with_payload(self, novel_id: str) -> list[dict[str, Any]]:
         """Return the immutable active manifest topology and sealed payloads."""
 
-        head = self.get_planning_head(novel_id)
-        if head.authority_mode != PlanningAuthorityMode.MANIFEST:
-            raise OutlineGateError("novel is not using manifest planning authority")
-        if not head.active_plan_revision_id:
-            raise OutlineGateError("manifest planning Head has no active revision")
-        plan = self.get_plan_revision(head.active_plan_revision_id)
-        if not plan.sealed_at or plan.digest != head.active_plan_digest:
-            raise OutlineGateError("manifest planning Head is not synced to its sealed revision")
-        if plan.status != PlanRevisionStatus.PUBLISHED:
-            raise OutlineGateError(f"active manifest revision is {plan.status.value}")
-        rows = self._connection().execute(
+        conn = self._connection()
+        plan = self._require_active_manifest_plan(novel_id, conn=conn)
+        rows = conn.execute(
             """
             SELECT item.id AS item_id, item.logical_node_id,
                    item.parent_logical_node_id, item.level, item.sibling_index,
@@ -246,11 +319,16 @@ class OutlineContractRepository:
         return [dict(row) for row in rows]
 
     def _validate_plan_items(
-        self, novel_id: str, items: Sequence[OutlinePlanItem]
+        self,
+        novel_id: str,
+        items: Sequence[OutlinePlanItem],
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+        require_sealed_versions: bool = False,
     ) -> tuple[OutlinePlanItem, ...]:
         if not items:
             raise OutlineGateError("outline plan requires at least one item")
-        conn = self._connection()
+        conn = conn or self._connection()
         normalized: list[OutlinePlanItem] = []
         logical_ids: set[str] = set()
         positions: set[tuple[str, str, int]] = set()
@@ -258,7 +336,7 @@ class OutlineContractRepository:
             row = conn.execute(
                 """
                 SELECT contract.novel_id, contract.level, version.contract_id,
-                       version.digest
+                       version.digest, version.payload_json, version.sealed_at
                 FROM outline_contracts AS contract
                 JOIN outline_contract_versions AS version
                   ON version.contract_id = contract.id
@@ -272,6 +350,16 @@ class OutlineContractRepository:
                 raise OutlineGateError("outline plan item level does not match its contract")
             if str(row["digest"]) != item.version_digest:
                 raise OutlineGateError("outline plan item version digest mismatch")
+            if require_sealed_versions and not row["sealed_at"]:
+                raise OutlineGateError("outline plan item content version is not sealed")
+            try:
+                payload = OutlinePayload.from_dict(
+                    json.loads(str(row["payload_json"] or "{}"))
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise OutlineGateError("outline plan item payload is invalid") from exc
+            if payload.digest != item.version_digest:
+                raise OutlineGateError("outline plan item payload digest mismatch")
             position = (
                 item.parent_logical_node_id or "",
                 item.level.value,
@@ -284,9 +372,52 @@ class OutlineContractRepository:
             logical_ids.add(item.logical_node_id)
             positions.add(position)
             normalized.append(item)
+        roots = [
+            item
+            for item in normalized
+            if item.level == OutlineLevel.OUTLINE and item.parent_logical_node_id is None
+        ]
+        if len(roots) != 1 or any(
+            item.level == OutlineLevel.OUTLINE and item.parent_logical_node_id is not None
+            for item in normalized
+        ):
+            raise OutlineGateError("outline plan requires exactly one root outline item")
+
+        by_logical_id = {item.logical_node_id: item for item in normalized}
         for item in normalized:
-            if item.parent_logical_node_id and item.parent_logical_node_id not in logical_ids:
+            if item.level == OutlineLevel.OUTLINE:
+                if item.validated_parent_digest:
+                    raise OutlineGateError("outline root cannot declare a parent digest")
+                continue
+            if not item.parent_logical_node_id:
+                raise OutlineGateError("non-root outline plan item requires a parent")
+            parent = by_logical_id.get(item.parent_logical_node_id)
+            if parent is None:
                 raise OutlineGateError("outline plan item parent is missing from the plan")
+            if parent.level.child_level != item.level:
+                raise OutlineGateError(
+                    f"outline plan parent {parent.level.value} cannot own {item.level.value}"
+                )
+            if item.validated_parent_digest != parent.version_digest:
+                raise OutlineGateError(
+                    "outline plan item validated_parent_digest does not match its parent version"
+                )
+
+        sibling_groups: dict[tuple[str, OutlineLevel], list[OutlinePlanItem]] = {}
+        for item in normalized:
+            sibling_groups.setdefault(
+                (item.parent_logical_node_id or "", item.level), []
+            ).append(item)
+        for siblings in sibling_groups.values():
+            siblings.sort(key=lambda item: item.sibling_index)
+            for index, item in enumerate(siblings):
+                if item.sibling_index != index:
+                    raise OutlineGateError("outline plan sibling indexes must be contiguous")
+                expected_previous = "" if index == 0 else siblings[index - 1].version_digest
+                if item.validated_previous_sibling_digest != expected_previous:
+                    raise OutlineGateError(
+                        "outline plan sibling handoff digest does not match the previous version"
+                    )
         return tuple(normalized)
 
     @staticmethod
@@ -416,25 +547,33 @@ class OutlineContractRepository:
         return self.get_plan_revision(plan_id)
 
     def seal_plan_revision(self, plan_revision_id: str) -> OutlinePlanRevision:
-        plan = self.get_plan_revision(plan_revision_id)
-        if plan.sealed_at:
-            return plan
-        if plan.status not in {
-            PlanRevisionStatus.DRAFT,
-            PlanRevisionStatus.GENERATING,
-            PlanRevisionStatus.VALIDATING,
-        }:
-            raise OutlineGateError("only an editable outline plan can be sealed")
-        digest = canonical_plan_digest(
-            canonical_prefix_digest=plan.canonical_prefix_digest,
-            items=plan.items,
-        )
-        if digest != plan.digest:
-            raise OutlineGateError("outline plan digest changed before sealing")
         conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("outline plan sealing requires a clean connection")
         now = self._now()
         try:
-            conn.execute("BEGIN")
+            # Read every mutable input only after the write lock is held.  A
+            # plan digest is meaningful only for this exact locked snapshot.
+            conn.execute("BEGIN IMMEDIATE")
+            plan = self.get_plan_revision(plan_revision_id, _connection=conn)
+            if plan.sealed_at:
+                conn.commit()
+                return plan
+            if plan.status not in {
+                PlanRevisionStatus.DRAFT,
+                PlanRevisionStatus.GENERATING,
+                PlanRevisionStatus.VALIDATING,
+            }:
+                raise OutlineGateError("only an editable outline plan can be sealed")
+            normalized_items = self._validate_plan_items(
+                plan.novel_id, plan.items, conn=conn
+            )
+            digest = canonical_plan_digest(
+                canonical_prefix_digest=plan.canonical_prefix_digest,
+                items=normalized_items,
+            )
+            if digest != plan.digest:
+                raise OutlineGateError("outline plan digest changed before sealing")
             existing = conn.execute(
                 """
                 SELECT id FROM outline_plan_revisions
@@ -452,32 +591,37 @@ class OutlineContractRepository:
                     """,
                     (now, plan.novel_id, plan.id),
                 )
-                conn.execute(
-                    "DELETE FROM outline_plan_revisions WHERE id = ?",
+                deleted = conn.execute(
+                    "DELETE FROM outline_plan_revisions WHERE id = ? AND sealed_at IS NULL",
                     (plan.id,),
                 )
+                if deleted.rowcount != 1:
+                    raise OutlineGateError("outline plan changed during duplicate sealing")
                 conn.commit()
                 return self.get_plan_revision(str(existing["id"]))
             conn.execute(
                 """
-                UPDATE outline_plan_revisions
-                SET status = 'ready_for_review', sealed_at = ?, updated_at = ?
-                WHERE id = ? AND sealed_at IS NULL
-                """,
-                (now, now, plan.id),
-            )
-            conn.execute(
-                """
                 UPDATE outline_contract_versions
-                SET sealed_at = COALESCE(sealed_at, ?)
-                WHERE id IN (
+                SET sealed_at = ?
+                WHERE sealed_at IS NULL
+                  AND id IN (
                     SELECT version_id FROM outline_plan_revision_items
                     WHERE plan_revision_id = ?
                 )
                 """,
                 (now, plan.id),
             )
-            conn.execute(
+            sealed = conn.execute(
+                """
+                UPDATE outline_plan_revisions
+                SET status = 'ready_for_review', sealed_at = ?, updated_at = ?
+                WHERE id = ? AND sealed_at IS NULL AND status = ? AND digest = ?
+                """,
+                (now, now, plan.id, plan.status.value, plan.digest),
+            )
+            if sealed.rowcount != 1:
+                raise OutlineGateError("outline plan changed during sealing")
+            cleared = conn.execute(
                 """
                 UPDATE outline_planning_heads
                 SET working_plan_revision_id = NULL, updated_at = ?
@@ -485,6 +629,8 @@ class OutlineContractRepository:
                 """,
                 (now, plan.novel_id, plan.id),
             )
+            if cleared.rowcount != 1:
+                raise OutlineGateError("outline planning Head changed during sealing")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -641,71 +787,103 @@ class OutlineContractRepository:
                 plan=self.get_plan_revision(head.active_plan_revision_id),
             )
         conn = self._connection()
-        formal_row = conn.execute(
-            """
-            SELECT 1 FROM chapters
-            WHERE novel_id = ? AND trim(COALESCE(content, '')) <> ''
-            LIMIT 1
-            """,
-            (novel_id,),
-        ).fetchone()
-        if formal_row is not None:
-            return BackfillResult(
-                status=BackfillStatus.PLANNING_MIGRATION_REQUIRED,
-                head=head,
-                reason="formal history requires canonical reconciliation",
-            )
+        if conn.in_transaction:
+            raise OutlineGateError("outline plan backfill requires a clean connection")
         try:
+            # The legacy tree is mutable until this book's Head is switched.
+            # Derive and seal a shadow snapshot only while the writer lock
+            # proves the Head is still legacy and unclaimed.
+            conn.execute("BEGIN IMMEDIATE")
+            head = self.get_planning_head(novel_id)
+            if head.active_plan_revision_id:
+                conn.commit()
+                return BackfillResult(
+                    status=BackfillStatus.ALREADY_BACKFILLED,
+                    head=head,
+                    plan=self.get_plan_revision(
+                        head.active_plan_revision_id,
+                        _connection=conn,
+                    ),
+                )
+            if head.authority_mode != PlanningAuthorityMode.LEGACY:
+                raise OutlineGateError(
+                    "manifest planning Head has no active immutable revision"
+                )
+            formal_row = conn.execute(
+                """
+                SELECT 1 FROM chapters
+                WHERE novel_id = ? AND trim(COALESCE(content, '')) <> ''
+                LIMIT 1
+                """,
+                (novel_id,),
+            ).fetchone()
+            if formal_row is not None:
+                conn.commit()
+                return BackfillResult(
+                    status=BackfillStatus.PLANNING_MIGRATION_REQUIRED,
+                    head=head,
+                    reason="formal history requires canonical reconciliation",
+                )
             items = self._legacy_projection_items(novel_id)
         except OutlineGateError as exc:
+            if conn.in_transaction:
+                conn.rollback()
             return BackfillResult(
                 status=BackfillStatus.PLANNING_MIGRATION_REQUIRED,
                 head=head,
                 reason=str(exc),
             )
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
 
-        canonical_prefix_digest = ""
-        digest = canonical_plan_digest(
-            canonical_prefix_digest=canonical_prefix_digest,
-            items=items,
-        )
-        existing = conn.execute(
-            """
-            SELECT id FROM outline_plan_revisions
-            WHERE novel_id = ? AND digest = ? AND sealed_at IS NOT NULL
-            """,
-            (novel_id, digest),
-        ).fetchone()
-        now = self._now()
-        if existing is not None:
-            plan = self.get_plan_revision(str(existing["id"]))
-            conn.execute(
-                """
-                UPDATE outline_planning_heads
-                SET active_plan_revision_id = ?, active_plan_digest = ?,
-                    working_plan_revision_id = NULL, updated_at = ?
-                WHERE novel_id = ?
-                """,
-                (plan.id, plan.digest, now, novel_id),
-            )
-            conn.commit()
-            updated_head = self.get_planning_head(novel_id)
-            return BackfillResult(
-                status=BackfillStatus.MIGRATED,
-                head=updated_head,
-                plan=plan,
-            )
-
-        revision = int(
-            conn.execute(
-                "SELECT COALESCE(MAX(revision), 0) + 1 AS revision "
-                "FROM outline_plan_revisions WHERE novel_id = ?",
-                (novel_id,),
-            ).fetchone()["revision"]
-        )
-        plan_id = f"outline-plan-{uuid4()}"
         try:
-            conn.execute("BEGIN")
+            canonical_prefix_digest = ""
+            digest = canonical_plan_digest(
+                canonical_prefix_digest=canonical_prefix_digest,
+                items=items,
+            )
+            existing = conn.execute(
+                """
+                SELECT id FROM outline_plan_revisions
+                WHERE novel_id = ? AND digest = ? AND sealed_at IS NOT NULL
+                """,
+                (novel_id, digest),
+            ).fetchone()
+            now = self._now()
+            if existing is not None:
+                plan = self.get_plan_revision(
+                    str(existing["id"]), _connection=conn
+                )
+                activated = conn.execute(
+                    """
+                    UPDATE outline_planning_heads
+                    SET active_plan_revision_id = ?, active_plan_digest = ?,
+                        working_plan_revision_id = NULL, updated_at = ?
+                    WHERE novel_id = ? AND authority_mode = 'legacy'
+                      AND active_plan_revision_id IS NULL
+                    """,
+                    (plan.id, plan.digest, now, novel_id),
+                )
+                if activated.rowcount != 1:
+                    raise OutlineGateError("legacy planning Head changed during backfill")
+                conn.commit()
+                updated_head = self.get_planning_head(novel_id)
+                return BackfillResult(
+                    status=BackfillStatus.MIGRATED,
+                    head=updated_head,
+                    plan=plan,
+                )
+
+            revision = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(revision), 0) + 1 AS revision "
+                    "FROM outline_plan_revisions WHERE novel_id = ?",
+                    (novel_id,),
+                ).fetchone()["revision"]
+            )
+            plan_id = f"outline-plan-{uuid4()}"
             conn.execute(
                 """
                 INSERT INTO outline_plan_revisions
@@ -731,8 +909,8 @@ class OutlineContractRepository:
             conn.execute(
                 """
                 UPDATE outline_contract_versions
-                SET sealed_at = COALESCE(sealed_at, ?)
-                WHERE id IN (
+                SET sealed_at = ?
+                WHERE sealed_at IS NULL AND id IN (
                     SELECT version_id FROM outline_plan_revision_items
                     WHERE plan_revision_id = ?
                 )
@@ -760,7 +938,7 @@ class OutlineContractRepository:
             if conn.execute("SELECT changes()").fetchone()[0] != 1:
                 raise OutlineGateError("legacy planning Head changed during backfill")
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         plan = self.get_plan_revision(plan_id)
@@ -848,29 +1026,35 @@ class OutlineContractRepository:
         return self._slot_from_row(row) if row is not None else None
 
     def ensure_root(self, novel_id: str) -> OutlineContractSlot:
-        self._assert_legacy_mutation(novel_id, "ensure_root")
         conn = self._connection()
-        row = conn.execute(
-            """
-            SELECT * FROM outline_contracts
-            WHERE novel_id = ? AND level = 'outline' AND parent_contract_id IS NULL
-            """,
-            (novel_id,),
-        ).fetchone()
-        if row is not None:
-            return self._slot_from_row(row)
-        contract_id = f"outline-{uuid4()}"
-        now = datetime.now().isoformat()
-        conn.execute(
-            """
-            INSERT INTO outline_contracts
-                (id, novel_id, level, status, created_at, updated_at)
-            VALUES (?, ?, 'outline', 'draft', ?, ?)
-            """,
-            (contract_id, novel_id, now, now),
-        )
-        conn.commit()
-        return self.get_slot(contract_id)
+        self._begin_legacy_mutation_transaction(conn, novel_id, "ensure_root")
+        try:
+            row = conn.execute(
+                """
+                SELECT * FROM outline_contracts
+                WHERE novel_id = ? AND level = 'outline' AND parent_contract_id IS NULL
+                """,
+                (novel_id,),
+            ).fetchone()
+            if row is not None:
+                slot = self._slot_from_row(row)
+            else:
+                contract_id = f"outline-{uuid4()}"
+                now = datetime.now().isoformat()
+                conn.execute(
+                    """
+                    INSERT INTO outline_contracts
+                        (id, novel_id, level, status, created_at, updated_at)
+                    VALUES (?, ?, 'outline', 'draft', ?, ?)
+                    """,
+                    (contract_id, novel_id, now, now),
+                )
+                slot = self.get_slot(contract_id)
+            conn.commit()
+            return slot
+        except BaseException:
+            conn.rollback()
+            raise
 
     def create_contract(
         self,
@@ -880,29 +1064,33 @@ class OutlineContractRepository:
         parent_contract_id: str,
         story_node_id: Optional[str] = None,
     ) -> OutlineContractSlot:
-        self._assert_legacy_mutation(novel_id, "create_contract")
-        parent = self.get_slot(parent_contract_id)
-        if parent.novel_id != novel_id:
-            raise OutlineGateError("parent outline belongs to another novel")
-        if parent.level.child_level != level:
-            expected = parent.level.child_level.value if parent.level.child_level else "none"
-            raise OutlineGateError(f"{parent.level.value} can only create {expected}")
-        if parent.active is None or parent.active.status != OutlineStatus.SYNCED:
-            raise OutlineGateError(
-                f"{parent.level.value}:{parent.active_status.value if parent.active_status else 'missing'} must be synced before generating {level.value}"
-            )
-        contract_id = f"outline-{uuid4()}"
-        now = datetime.now().isoformat()
         conn = self._connection()
-        conn.execute(
-            """
-            INSERT INTO outline_contracts
-                (id, novel_id, level, story_node_id, parent_contract_id, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)
-            """,
-            (contract_id, novel_id, level.value, story_node_id, parent_contract_id, now, now),
-        )
-        conn.commit()
+        self._begin_legacy_mutation_transaction(conn, novel_id, "create_contract")
+        try:
+            parent = self.get_slot(parent_contract_id)
+            if parent.novel_id != novel_id:
+                raise OutlineGateError("parent outline belongs to another novel")
+            if parent.level.child_level != level:
+                expected = parent.level.child_level.value if parent.level.child_level else "none"
+                raise OutlineGateError(f"{parent.level.value} can only create {expected}")
+            if parent.active is None or parent.active.status != OutlineStatus.SYNCED:
+                raise OutlineGateError(
+                    f"{parent.level.value}:{parent.active_status.value if parent.active_status else 'missing'} must be synced before generating {level.value}"
+                )
+            contract_id = f"outline-{uuid4()}"
+            now = datetime.now().isoformat()
+            conn.execute(
+                """
+                INSERT INTO outline_contracts
+                    (id, novel_id, level, story_node_id, parent_contract_id, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)
+                """,
+                (contract_id, novel_id, level.value, story_node_id, parent_contract_id, now, now),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_slot(contract_id)
 
     def save_draft(
@@ -913,44 +1101,49 @@ class OutlineContractRepository:
         source: OutlineSource = OutlineSource.AI,
     ) -> OutlineContractSlot:
         slot = self.get_slot(contract_id)
-        self._assert_legacy_mutation(slot.novel_id, "save_draft")
-        parent_digest = ""
-        if slot.parent_contract_id:
-            parent = self.get_slot(slot.parent_contract_id)
-            if parent.active is None or parent.active.status != OutlineStatus.SYNCED:
-                raise OutlineGateError(
-                    f"{parent.level.value}:{parent.active_status.value if parent.active_status else 'missing'} must be synced before drafting {slot.level.value}"
-                )
-            parent_digest = parent.active.published_digest or parent.active.digest
         conn = self._connection()
-        row = conn.execute(
-            "SELECT COALESCE(MAX(revision), 0) AS current_revision FROM outline_contract_versions WHERE contract_id = ?",
-            (contract_id,),
-        ).fetchone()
-        revision = int(row["current_revision"] or 0) + 1
-        version_id = f"outline-version-{uuid4()}"
-        now = datetime.now().isoformat()
-        payload_json = json.dumps(payload.canonical_dict(), ensure_ascii=False, sort_keys=True)
-        conn.execute(
-            """
-            INSERT INTO outline_contract_versions
-                (id, contract_id, revision, payload_json, digest, parent_revision_digest, source, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
-            """,
-            (version_id, contract_id, revision, payload_json, payload.digest, parent_digest, source.value, now, now),
-        )
-        conn.execute(
-            """
-            UPDATE outline_contracts
-            SET draft_version_id = ?,
-                status = CASE WHEN active_version_id IS NULL THEN 'draft' ELSE status END,
-                has_author_edits = CASE WHEN ? = 'author' THEN 1 ELSE has_author_edits END,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (version_id, source.value, now, contract_id),
-        )
-        conn.commit()
+        self._begin_legacy_mutation_transaction(conn, slot.novel_id, "save_draft")
+        try:
+            slot = self.get_slot(contract_id)
+            parent_digest = ""
+            if slot.parent_contract_id:
+                parent = self.get_slot(slot.parent_contract_id)
+                if parent.active is None or parent.active.status != OutlineStatus.SYNCED:
+                    raise OutlineGateError(
+                        f"{parent.level.value}:{parent.active_status.value if parent.active_status else 'missing'} must be synced before drafting {slot.level.value}"
+                    )
+                parent_digest = parent.active.published_digest or parent.active.digest
+            row = conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) AS current_revision FROM outline_contract_versions WHERE contract_id = ?",
+                (contract_id,),
+            ).fetchone()
+            revision = int(row["current_revision"] or 0) + 1
+            version_id = f"outline-version-{uuid4()}"
+            now = datetime.now().isoformat()
+            payload_json = json.dumps(payload.canonical_dict(), ensure_ascii=False, sort_keys=True)
+            conn.execute(
+                """
+                INSERT INTO outline_contract_versions
+                    (id, contract_id, revision, payload_json, digest, parent_revision_digest, source, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                """,
+                (version_id, contract_id, revision, payload_json, payload.digest, parent_digest, source.value, now, now),
+            )
+            conn.execute(
+                """
+                UPDATE outline_contracts
+                SET draft_version_id = ?,
+                    status = CASE WHEN active_version_id IS NULL THEN 'draft' ELSE status END,
+                    has_author_edits = CASE WHEN ? = 'author' THEN 1 ELSE has_author_edits END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (version_id, source.value, now, contract_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_slot(contract_id)
 
     def _previous_synced_sibling(self, slot: OutlineContractSlot) -> Optional[OutlineContract]:
@@ -1030,57 +1223,86 @@ class OutlineContractRepository:
         """Atomically make the chosen draft current and regenerate its projection."""
 
         slot = self.get_slot(contract_id)
-        self._assert_legacy_mutation(slot.novel_id, "publish_and_sync")
         conn = self._connection()
-        if idempotency_key:
-            operation = "publish_and_sync"
-            existing = conn.execute(
-                """
-                SELECT contract_id, revision FROM outline_operation_keys
-                WHERE novel_id = ? AND idempotency_key = ? AND operation = ?
-                """,
-                (slot.novel_id, idempotency_key, operation),
-            ).fetchone()
-            if existing is not None:
-                if str(existing["contract_id"]) != contract_id:
-                    raise OutlineGateError("idempotency key belongs to another outline contract")
-                return self.get_slot(contract_id)
-
-        draft = slot.draft
-        if draft is None:
-            raise OutlineGateError("no draft revision is available to publish")
-        if draft.revision != expected_revision:
-            raise OutlineGateError(
-                f"revision conflict: expected {expected_revision}, current draft is {draft.revision}"
-            )
-        if slot.parent_contract_id:
-            parent = self.get_slot(slot.parent_contract_id)
-            if parent.active is None or parent.active.status != OutlineStatus.SYNCED:
-                raise OutlineGateError("parent outline must be synced before publishing a child")
-            parent_digest = parent.active.published_digest or parent.active.digest
-            if draft.parent_revision_digest != parent_digest:
-                raise OutlineGateError("parent outline changed; regenerate or reconcile this child draft")
-
-        previous_sibling_digest = self._validate_sibling_continuity(
-            draft, self._previous_synced_sibling(slot)
+        self._begin_legacy_mutation_transaction(
+            conn, slot.novel_id, "publish_and_sync"
         )
-
-        now = datetime.now().isoformat()
-        locked_value = slot.author_locked if author_locked is None else bool(author_locked)
         try:
-            conn.execute("BEGIN")
-            if slot.active is not None:
+            slot = self.get_slot(contract_id)
+            if idempotency_key:
+                operation = "publish_and_sync"
+                existing = conn.execute(
+                    """
+                    SELECT contract_id, revision FROM outline_operation_keys
+                    WHERE novel_id = ? AND idempotency_key = ? AND operation = ?
+                    """,
+                    (slot.novel_id, idempotency_key, operation),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["contract_id"]) != contract_id:
+                        raise OutlineGateError(
+                            "idempotency key belongs to another outline contract"
+                        )
+                    conn.commit()
+                    return self.get_slot(contract_id)
+
+            draft = slot.draft
+            if draft is None:
+                raise OutlineGateError("no draft revision is available to publish")
+            if draft.revision != expected_revision:
+                raise OutlineGateError(
+                    f"revision conflict: expected {expected_revision}, current draft is {draft.revision}"
+                )
+            if slot.parent_contract_id:
+                parent = self.get_slot(slot.parent_contract_id)
+                if parent.active is None or parent.active.status != OutlineStatus.SYNCED:
+                    raise OutlineGateError("parent outline must be synced before publishing a child")
+                parent_digest = parent.active.published_digest or parent.active.digest
+                if draft.parent_revision_digest != parent_digest:
+                    raise OutlineGateError(
+                        "parent outline changed; regenerate or reconcile this child draft"
+                    )
+
+            previous_sibling_digest = self._validate_sibling_continuity(
+                draft, self._previous_synced_sibling(slot)
+            )
+
+            now = datetime.now().isoformat()
+            locked_value = slot.author_locked if author_locked is None else bool(author_locked)
+            active_version_id = self._active_version_id(contract_id) if slot.active else None
+            draft_version_id = self._draft_version_id(contract_id)
+            draft_sealed = conn.execute(
+                "SELECT sealed_at FROM outline_contract_versions WHERE id = ?",
+                (draft_version_id,),
+            ).fetchone()
+            if draft_sealed is None:
+                raise OutlineGateError("draft outline version is missing")
+            if draft_sealed["sealed_at"]:
+                raise OutlineGateError(
+                    "sealed outline version cannot be published by legacy flow"
+                )
+            active_is_sealed = False
+            if active_version_id:
+                active_row = conn.execute(
+                    "SELECT sealed_at FROM outline_contract_versions WHERE id = ?",
+                    (active_version_id,),
+                ).fetchone()
+                if active_row is None:
+                    raise OutlineGateError("active outline version is missing")
+                active_is_sealed = bool(active_row["sealed_at"])
+
+            if active_version_id is not None and not active_is_sealed:
                 conn.execute(
                     "UPDATE outline_contract_versions SET status = 'superseded', updated_at = ? WHERE id = ?",
-                    (now, self._active_version_id(contract_id)),
+                    (now, active_version_id),
                 )
             conn.execute(
                 "UPDATE outline_contract_versions SET status = 'syncing', updated_at = ? WHERE id = ?",
-                (now, self._draft_version_id(contract_id)),
+                (now, draft_version_id),
             )
             conn.execute(
                 "UPDATE outline_contract_versions SET previous_sibling_digest = ? WHERE id = ?",
-                (previous_sibling_digest, self._draft_version_id(contract_id)),
+                (previous_sibling_digest, draft_version_id),
             )
             conn.execute(
                 """
@@ -1094,9 +1316,9 @@ class OutlineContractRepository:
                 """,
                 (int(locked_value), now, contract_id),
             )
-            active_version_id = self._active_version_id(contract_id)
             active_row = conn.execute(
-                "SELECT digest, payload_json FROM outline_contract_versions WHERE id = ?", (active_version_id,)
+                "SELECT digest, payload_json FROM outline_contract_versions WHERE id = ?",
+                (draft_version_id,),
             ).fetchone()
             conn.execute(
                 "UPDATE outline_plan_projections SET is_active = 0 WHERE contract_id = ?", (contract_id,)
@@ -1116,7 +1338,7 @@ class OutlineContractRepository:
                     f"outline-projection-{uuid4()}",
                     slot.novel_id,
                     contract_id,
-                    active_version_id,
+                    draft_version_id,
                     active_row["digest"],
                     active_row["payload_json"],
                     now,
@@ -1125,7 +1347,7 @@ class OutlineContractRepository:
             )
             conn.execute(
                 "UPDATE outline_contract_versions SET status = 'synced', updated_at = ? WHERE id = ?",
-                (now, active_version_id),
+                (now, draft_version_id),
             )
             conn.execute(
                 "UPDATE outline_contracts SET status = 'synced', updated_at = ? WHERE id = ?",
@@ -1153,7 +1375,7 @@ class OutlineContractRepository:
                 (now, slot.novel_id),
             )
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         return self.get_slot(contract_id)
@@ -1197,7 +1419,11 @@ class OutlineContractRepository:
                 (status, now, row["id"]),
             )
             conn.execute(
-                "UPDATE outline_contract_versions SET status = ?, updated_at = ? WHERE id = ?",
+                """
+                UPDATE outline_contract_versions
+                SET status = ?, updated_at = ?
+                WHERE id = ? AND sealed_at IS NULL
+                """,
                 (status, now, row["active_version_id"]),
             )
             conn.execute(
@@ -1259,22 +1485,31 @@ class OutlineContractRepository:
         """Create one durable streamed-draft attempt before calling an LLM."""
 
         slot = self.get_slot(contract_id)
-        self._assert_legacy_mutation(slot.novel_id, "start_generation_attempt")
-        snapshot = dict(prompt_snapshot or {})
-        if retry_of_attempt_id:
-            previous = self.get_generation_attempt(retry_of_attempt_id)
-            if previous["contract_id"] != contract_id:
-                raise OutlineGateError("retry attempt belongs to another outline contract")
-            if previous["status"] not in {"failed", "cancelled"}:
-                raise OutlineGateError("only failed or cancelled outline attempts can be retried")
-            if previous["context_digest"] != context_digest:
-                raise OutlineGateError("outline context changed; start a new generation attempt")
-            snapshot = dict(previous["prompt_snapshot"])
-
-        attempt_id = f"outline-attempt-{uuid4()}"
-        now = self._now()
         conn = self._connection()
+        self._begin_legacy_mutation_transaction(
+            conn, slot.novel_id, "start_generation_attempt"
+        )
         try:
+            # Re-read the contract and retry source after acquiring the writer
+            # lock so a manifest cutover cannot leave a legacy stream behind.
+            slot = self.get_slot(contract_id)
+            snapshot = dict(prompt_snapshot or {})
+            if retry_of_attempt_id:
+                previous = self.get_generation_attempt(retry_of_attempt_id)
+                if previous["contract_id"] != contract_id:
+                    raise OutlineGateError("retry attempt belongs to another outline contract")
+                if previous["status"] not in {"failed", "cancelled"}:
+                    raise OutlineGateError(
+                        "only failed or cancelled outline attempts can be retried"
+                    )
+                if previous["context_digest"] != context_digest:
+                    raise OutlineGateError(
+                        "outline context changed; start a new generation attempt"
+                    )
+                snapshot = dict(previous["prompt_snapshot"])
+
+            attempt_id = f"outline-attempt-{uuid4()}"
+            now = self._now()
             conn.execute(
                 """
                 INSERT INTO outline_generation_attempts
@@ -1292,13 +1527,22 @@ class OutlineContractRepository:
                     now,
                 ),
             )
+            self._append_generation_attempt_event(
+                attempt_id,
+                {
+                    "type": "started",
+                    "contract_id": contract_id,
+                    "retry_of_attempt_id": retry_of_attempt_id,
+                },
+                commit=False,
+            )
             conn.commit()
         except sqlite3.IntegrityError as exc:
+            conn.rollback()
             raise OutlineGateError("an outline generation attempt is already running") from exc
-        self._append_generation_attempt_event(
-            attempt_id,
-            {"type": "started", "contract_id": contract_id, "retry_of_attempt_id": retry_of_attempt_id},
-        )
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_generation_attempt(attempt_id)
 
     def _append_generation_attempt_event(
@@ -1351,10 +1595,23 @@ class OutlineContractRepository:
         ).fetchone()
         if row is None:
             raise KeyError(f"outline generation attempt not found: {attempt_id}")
-        self._assert_legacy_mutation(str(row["novel_id"]), "append_generation_attempt_delta")
-        if row["status"] != "running":
-            raise OutlineGateError("outline generation attempt is no longer running")
+        self._begin_legacy_mutation_transaction(
+            conn, str(row["novel_id"]), "append_generation_attempt_delta"
+        )
         try:
+            row = conn.execute(
+                """
+                SELECT attempt.status, contract.novel_id
+                FROM outline_generation_attempts AS attempt
+                JOIN outline_contracts AS contract ON contract.id = attempt.contract_id
+                WHERE attempt.id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"outline generation attempt not found: {attempt_id}")
+            if row["status"] != "running":
+                raise OutlineGateError("outline generation attempt is no longer running")
             conn.execute(
                 """
                 UPDATE outline_generation_attempts
@@ -1369,7 +1626,7 @@ class OutlineContractRepository:
                 commit=False,
             )
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         return self.get_generation_attempt(attempt_id)
@@ -1411,16 +1668,34 @@ class OutlineContractRepository:
         ).fetchone()
         if row is None:
             raise KeyError(f"outline generation attempt not found: {attempt_id}")
-        self._assert_legacy_mutation(str(row["novel_id"]), "finish_generation_attempt")
-        if row["status"] != "running":
-            return self.get_generation_attempt(attempt_id)
-        now = self._now()
-        event = {"type": "completed" if status == "completed" else ("cancelled" if status == "cancelled" else "error")}
-        if draft_revision is not None:
-            event["draft_revision"] = draft_revision
-        if error:
-            event["message"] = error
+        self._begin_legacy_mutation_transaction(
+            conn, str(row["novel_id"]), "finish_generation_attempt"
+        )
         try:
+            row = conn.execute(
+                """
+                SELECT attempt.status, contract.novel_id
+                FROM outline_generation_attempts AS attempt
+                JOIN outline_contracts AS contract ON contract.id = attempt.contract_id
+                WHERE attempt.id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"outline generation attempt not found: {attempt_id}")
+            if row["status"] != "running":
+                conn.commit()
+                return self.get_generation_attempt(attempt_id)
+            now = self._now()
+            event = {
+                "type": "completed"
+                if status == "completed"
+                else ("cancelled" if status == "cancelled" else "error")
+            }
+            if draft_revision is not None:
+                event["draft_revision"] = draft_revision
+            if error:
+                event["message"] = error
             conn.execute(
                 """
                 UPDATE outline_generation_attempts
@@ -1431,7 +1706,7 @@ class OutlineContractRepository:
             )
             self._append_generation_attempt_event(attempt_id, event, commit=False)
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         return self.get_generation_attempt(attempt_id)

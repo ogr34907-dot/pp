@@ -2601,7 +2601,12 @@ class DaemonHostMixin:
                 if child_volumes:
                     last_vol = max(child_volumes, key=lambda x: x.number)
                     if last_vol.chapter_end and last_vol.chapter_end <= completed_count:
-                        has_summary = part.metadata.get("summary") if part.metadata else None
+                        is_current = getattr(
+                            self.volume_summary_service,
+                            "is_node_summary_current",
+                            None,
+                        )
+                        has_summary = bool(is_current(part)) if callable(is_current) else False
                         if not has_summary:
                             logger.info(f"[{novel_id}] 生成部摘要: {part.title}")
                             result = await self.volume_summary_service.generate_part_summary(novel_id, part.number)

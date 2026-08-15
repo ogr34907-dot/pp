@@ -65,7 +65,9 @@ class NarrativeGovernanceService:
                 HierarchicalNarrativeAlignmentGate,
             )
 
-            self.hierarchy_gate = HierarchicalNarrativeAlignmentGate()
+            self.hierarchy_gate = HierarchicalNarrativeAlignmentGate(
+                story_node_repository=self.story_node_repository
+            )
         return self.hierarchy_gate
 
     def _hierarchy_nodes(self, novel_id: str) -> list[Any]:
@@ -120,10 +122,18 @@ class NarrativeGovernanceService:
         if not isinstance(candidate, dict):
             raise ValueError("candidate must be an object")
         gate = self._hierarchy_gate()
+        resolved_nodes = self._hierarchy_nodes(novel_id) if nodes is None else nodes
+        summary_visibility_repository = self.story_node_repository
+        if (
+            summary_visibility_repository is not None
+            and getattr(gate, "story_node_repository", None) is None
+        ):
+            gate.story_node_repository = summary_visibility_repository
         snapshot = gate.build_snapshot(
             chapter_id,
-            self._hierarchy_nodes(novel_id) if nodes is None else nodes,
+            resolved_nodes,
             novel_id=novel_id,
+            summary_visibility_repository=summary_visibility_repository,
         )
         report = gate.check(snapshot, candidate)
         payload = self._alignment_payload(report)

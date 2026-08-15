@@ -20,13 +20,14 @@ from application.engine.services.memory_engine import CompletedBeatItem, MemoryE
 from application.engine.services.memory_engine_settings import MemoryEngineRuntimeSettings
 from application.engine.services.worldline_rebuild_service import WorldlineRebuildService
 from application.world.services.chapter_narrative_sync import (
+    CHAPTER_NARRATIVE_PIPELINE_VERSION,
     sync_chapter_narrative_after_save,
 )
 from application.world.services.knowledge_service import KnowledgeService
 from domain.ai.services.llm_service import GenerationResult
 from domain.ai.value_objects.prompt import Prompt
 from domain.ai.value_objects.token_usage import TokenUsage
-from domain.novel.candidate_chapter import GenerationRunState, RunMode
+from domain.novel.candidate_chapter import CandidateStatus, GenerationRunState, RunMode
 from domain.novel.value_objects.novel_id import NovelId
 from engine.pipeline.prose_composer import (
     ChapterProseInvocationComposer,
@@ -806,6 +807,209 @@ async def test_default_story_pipeline_persists_memory_and_evolves_next_context(t
     assert "第1章完成的记忆节拍" in contexts[2]
     assert "第1章揭露的记忆线索" in contexts[2]
     assert "禁止: 林澈(" not in contexts[2]
+
+
+@pytest.mark.asyncio
+async def test_real_candidate_formal_aftermath_persists_exact_durable_barrier_evidence(
+    tmp_path: Path, monkeypatch
+):
+    """A normal Candidate-first commit reaches Formal only after exact durable aftermath."""
+
+    await _run_memory_stability_regression(
+        tmp_path,
+        monkeypatch,
+        chapter_count=1,
+    )
+
+    database_path = tmp_path / "memory-stability-regression.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        evidence = connection.execute(
+            """
+            SELECT candidate.status AS candidate_status,
+                   formal.sync_status AS formal_sync_status,
+                   chapter.content AS chapter_content,
+                   chapter.content_sha256 AS chapter_sha256,
+                   chapter.content_revision AS chapter_revision,
+                   narrative.status AS narrative_status,
+                   narrative.memory_status AS narrative_memory_status,
+                   narrative.pipeline_version AS narrative_pipeline_version,
+                   summary.source_content_sha256 AS summary_sha256,
+                   summary.source_content_revision AS summary_revision,
+                   summary.pipeline_version AS summary_pipeline_version,
+                   summary.sync_status AS summary_sync_status,
+                   summary.summary AS summary_text,
+                   run.current_formal_chapter,
+                   run.canonical_sync_status
+            FROM chapter_candidates AS candidate
+            JOIN chapter_candidate_formal_commits AS formal
+              ON formal.candidate_id = candidate.id
+            JOIN chapters AS chapter
+              ON chapter.id = formal.chapter_id
+            JOIN chapter_narrative_commits AS narrative
+              ON narrative.novel_id = chapter.novel_id
+             AND narrative.chapter_number = chapter.number
+             AND narrative.content_sha256 = chapter.content_sha256
+             AND narrative.content_revision = chapter.content_revision
+             AND narrative.pipeline_version = ?
+            JOIN knowledge
+              ON knowledge.novel_id = chapter.novel_id
+            JOIN chapter_summaries AS summary
+              ON summary.knowledge_id = knowledge.id
+             AND summary.chapter_number = chapter.number
+             AND summary.source_content_sha256 = chapter.content_sha256
+             AND summary.source_content_revision = chapter.content_revision
+             AND summary.pipeline_version = narrative.pipeline_version
+            JOIN novel_generation_runs AS run
+              ON run.novel_id = chapter.novel_id
+            WHERE chapter.novel_id = 'memory-stability' AND chapter.number = 1
+            """,
+            (CHAPTER_NARRATIVE_PIPELINE_VERSION,),
+        ).fetchone()
+
+    assert evidence is not None
+    assert evidence["candidate_status"] == "committed"
+    assert evidence["formal_sync_status"] == "ready"
+    assert evidence["chapter_revision"] == 1
+    assert evidence["chapter_sha256"] == hashlib.sha256(
+        evidence["chapter_content"].encode("utf-8")
+    ).hexdigest()
+    assert evidence["narrative_status"] == "committed"
+    assert evidence["narrative_memory_status"] == "committed"
+    assert evidence["narrative_pipeline_version"] == CHAPTER_NARRATIVE_PIPELINE_VERSION
+    assert evidence["summary_sha256"] == evidence["chapter_sha256"]
+    assert evidence["summary_revision"] == evidence["chapter_revision"]
+    assert evidence["summary_pipeline_version"] == CHAPTER_NARRATIVE_PIPELINE_VERSION
+    assert evidence["summary_sync_status"] == "committed"
+    assert evidence["summary_text"].strip()
+    assert evidence["current_formal_chapter"] == 1
+    assert evidence["canonical_sync_status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_real_canonical_retry_repairs_missing_knowledge_and_summary_without_memory_bypass(
+    tmp_path: Path, monkeypatch
+):
+    """An old Formal row remains blocked until the real retry path recreates durable evidence."""
+
+    database_path = tmp_path / "canonical-retry-recovery.sqlite"
+    database = DatabaseConnection(str(database_path))
+    connection = database.get_connection()
+    database.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) "
+        "VALUES ('retry-book', 'Retry Book', 'retry-book', 1)"
+    )
+    connection.executescript(
+        """
+        CREATE TABLE chapter_knowledge (chapter_number INTEGER PRIMARY KEY, summary TEXT NOT NULL, key_events TEXT NOT NULL, open_threads TEXT NOT NULL);
+        CREATE TABLE extracted_triples (id TEXT PRIMARY KEY, chapter_number INTEGER NOT NULL, payload_json TEXT NOT NULL);
+        CREATE TABLE extracted_foreshadows (description TEXT PRIMARY KEY);
+        CREATE TABLE character_state_snapshots (character_id TEXT PRIMARY KEY, summary TEXT NOT NULL);
+        CREATE TABLE vector_collections (name TEXT PRIMARY KEY);
+        CREATE TABLE vectors (id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);
+        """
+    )
+    connection.commit()
+
+    candidates = ChapterCandidateRepository(database)
+    candidates.start_run("retry-book", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=1)
+    candidate = candidates.create_streaming_candidate(
+        novel_id="retry-book",
+        chapter_number=1,
+        title="第一章",
+        outline_chain={"outline": {"contract_id": "outline-1", "digest": "outline-1"}},
+        llm_content="第一章正式正文：主角作出选择。",
+    )
+    candidates.mark_auditing(candidate.id)
+    candidates.finish_audit(candidate.id, audit={}, commit_plan={})
+
+    class _UnavailableAftermath:
+        async def run_after_chapter_saved(self, *_args, **_kwargs):
+            return {"narrative_sync_ok": False, "failure_reason": "aftermath_unavailable"}
+
+    workflow = CandidateChapterWorkflowService(
+        candidates,
+        outline_service=object(),
+        draft_generator=object(),
+        aftermath_pipeline=_UnavailableAftermath(),
+    )
+    failed = await workflow.accept_candidate(candidate.id, continue_after_commit=False)
+
+    assert failed.status == CandidateStatus.FAILED
+    assert connection.execute(
+        "SELECT COUNT(*) FROM knowledge WHERE novel_id = 'retry-book'"
+    ).fetchone()[0] == 0
+    assert connection.execute(
+        "SELECT COUNT(*) FROM chapter_summaries"
+    ).fetchone()[0] == 0
+
+    chapter_repository = SqliteChapterRepository(database)
+    llm = _DeterministicLLM()
+    memory_engine = MemoryEngine(
+        llm_service=llm,
+        bible_repository=_MemoryBibleRepository(),
+        db_connection=database,
+        runtime_settings=MemoryEngineRuntimeSettings(
+            state_cache_ttl_seconds=0,
+            state_cache_max_size=0,
+        ),
+    )
+    recovery_pipeline = ChapterAftermathPipeline(
+        knowledge_service=KnowledgeService(SqliteKnowledgeRepository(database)),
+        chapter_indexing_service=ChapterIndexingService(
+            _ControllableVectorStore(database_path, fail_chapters=set()),
+            _DeterministicEmbeddingService(),
+        ),
+        llm_service=llm,
+        triple_repository=_SqliteTripleRepository(connection),
+        foreshadowing_repository=_SqliteForeshadowingRepository(connection),
+        causal_edge_repository=_SqliteCausalEdgeRepository(connection),
+        character_state_repository=_SqliteCharacterStateRepository(connection),
+        chapter_repository=chapter_repository,
+        memory_engine=memory_engine,
+    )
+    workflow.aftermath_pipeline = recovery_pipeline
+
+    committed = await workflow.retry_canonical_sync(candidate.id)
+    await recovery_pipeline.drain_auxiliary_stages()
+
+    evidence = connection.execute(
+        """
+        SELECT narrative.status, narrative.memory_status, summary.sync_status,
+               chapter.content, chapter.content_sha256, chapter.content_revision,
+               summary.source_content_sha256, summary.source_content_revision
+        FROM chapter_narrative_commits AS narrative
+        JOIN chapters AS chapter
+          ON chapter.novel_id = narrative.novel_id
+         AND chapter.number = narrative.chapter_number
+         AND chapter.content_sha256 = narrative.content_sha256
+         AND chapter.content_revision = narrative.content_revision
+        JOIN knowledge
+          ON knowledge.novel_id = chapter.novel_id
+        JOIN chapter_summaries AS summary
+          ON summary.knowledge_id = knowledge.id
+         AND summary.chapter_number = chapter.number
+         AND summary.source_content_sha256 = chapter.content_sha256
+         AND summary.source_content_revision = chapter.content_revision
+         AND summary.pipeline_version = narrative.pipeline_version
+        WHERE narrative.novel_id = 'retry-book'
+          AND narrative.pipeline_version = ?
+        """,
+        (CHAPTER_NARRATIVE_PIPELINE_VERSION,),
+    ).fetchone()
+
+    assert committed.status == CandidateStatus.COMMITTED
+    assert evidence is not None
+    assert evidence["status"] == "committed"
+    assert evidence["memory_status"] == "committed"
+    assert evidence["sync_status"] == "committed"
+    assert evidence["content_revision"] == 1
+    assert evidence["content_sha256"] == hashlib.sha256(
+        evidence["content"].encode("utf-8")
+    ).hexdigest()
+    assert evidence["source_content_sha256"] == evidence["content_sha256"]
+    assert evidence["source_content_revision"] == evidence["content_revision"]
+    assert candidates.get_run("retry-book").canonical_sync_status == "ready"
 
 
 @pytest.mark.asyncio

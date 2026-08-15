@@ -69,6 +69,73 @@ def _summary_source_version(*chapters: SimpleNamespace) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def test_continuous_planning_keeps_a_valid_sparse_runtime_summary():
+    chapters = [
+        SimpleNamespace(
+            number=number,
+            content_sha256=f"hash-{number}",
+            content_revision=1,
+        )
+        for number in range(1, 6)
+    ]
+    node = _story_node(
+        "part-sparse",
+        NodeType.PART,
+        1,
+        chapter_start=1,
+        chapter_end=5,
+        metadata={
+            "runtime.summary": "非连续来源的部摘要",
+            "runtime.summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 5,
+                "source_chapter_numbers": [1, 2, 4, 5],
+                "source_version": _summary_source_version(
+                    chapters[0], chapters[1], chapters[3], chapters[4]
+                ),
+            },
+        },
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=Mock(),
+        chapter_element_repo=Mock(),
+        chapter_repository=_VersionedChapterRepo(chapters),
+        llm_service=Mock(),
+    )
+
+    assert service._get_current_node_summary(node) == "非连续来源的部摘要"
+
+
+def test_continuous_planning_hides_explicitly_invalidated_summary():
+    chapter = SimpleNamespace(number=1, content_sha256="hash-1", content_revision=2)
+    node = _story_node(
+        "act-invalidated",
+        NodeType.ACT,
+        1,
+        chapter_start=1,
+        chapter_end=1,
+        metadata={
+            "runtime.summary": "重写前幕摘要",
+            "runtime.summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 1,
+                "source_version": _summary_source_version(chapter),
+            },
+            "runtime.summary_invalidated_from_chapter": 1,
+        },
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=Mock(),
+        chapter_element_repo=Mock(),
+        chapter_repository=_VersionedChapterRepo([chapter]),
+        llm_service=Mock(),
+    )
+
+    assert service._get_current_node_summary(node) == ""
+
+
 class _AsyncStoryNodeRepo:
     def __init__(self, nodes: list[StoryNode]):
         self.nodes = nodes
@@ -264,6 +331,13 @@ async def test_previous_act_summaries_use_committed_metadata_and_stale_fallback(
                 "chapter_start": 1,
                 "chapter_end": 2,
                 "source_version": _summary_source_version(*chapters),
+            },
+            "runtime.summary": "来源不匹配的运行时前幕摘要",
+            "runtime.summary_state": {
+                "status": "committed",
+                "chapter_start": 1,
+                "chapter_end": 2,
+                "source_version": "stale-runtime-source",
             },
         },
     )
@@ -839,6 +913,40 @@ async def test_confirm_act_alignment_block_does_not_replace_existing_chapters():
     assert result["success"] is False
     repo.delete.assert_not_awaited()
     repo.save_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_act_alignment_passes_story_node_summary_visibility_repository():
+    """Act planning cannot let an injected gate fall back to raw metadata."""
+
+    act = _story_node("act-1", NodeType.ACT, 1, metadata={"contract_digest": "a"})
+    repository = Mock()
+    repository.get_by_novel = AsyncMock(return_value=[act])
+
+    class CapturingGate:
+        def __init__(self):
+            self.story_node_repository = None
+            self.snapshot_calls = []
+
+        def build_snapshot(self, *_args, **kwargs):
+            self.snapshot_calls.append(kwargs)
+            return object()
+
+        async def evaluate(self, *_args):
+            return SimpleNamespace(to_dict=lambda: {"decision": "pass"})
+
+    gate = CapturingGate()
+    service = ContinuousPlanningService(
+        repository, Mock(), Mock(), alignment_gate=gate
+    )
+
+    report = await service._evaluate_act_alignment(
+        act,
+        [{"number": 1, "title": "Chapter", "main_event": "Event"}],
+    )
+
+    assert report == {"decision": "pass"}
+    assert gate.snapshot_calls[0]["summary_visibility_repository"] is repository
 
 
 def test_macro_structure_rejects_any_part_without_a_volume():

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import json
+import sqlite3
 from collections.abc import Mapping
 
 from domain.structure.outline_contract import (
@@ -32,6 +33,10 @@ from domain.structure.outline_plan import (
 from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
     OutlineContractSlot,
+)
+from infrastructure.persistence.database.chapter_candidate_repository import (
+    CandidateGateError,
+    ChapterCandidateRepository,
 )
 
 
@@ -121,6 +126,8 @@ class OutlineContractService:
             previous_sibling_digest=str(
                 row.get("validated_previous_sibling_digest") or ""
             ),
+            version_id=str(row.get("version_id") or ""),
+            sibling_index=int(row.get("sibling_index") or 0),
         )
 
     def _manifest_chain_for_chapter(
@@ -163,6 +170,61 @@ class OutlineContractService:
 
     def logical_tree(self, novel_id: str) -> dict[str, Any]:
         """Return a root-first tree without rewriting legacy parent IDs."""
+
+        manifest_rows = self._manifest_rows(novel_id)
+        if manifest_rows is not None:
+            by_parent: dict[Optional[str], list[dict[str, Any]]] = {}
+            for row in manifest_rows:
+                by_parent.setdefault(row.get("parent_logical_node_id"), []).append(row)
+            for siblings in by_parent.values():
+                siblings.sort(
+                    key=lambda row: (
+                        int(row.get("sibling_index") or 0),
+                        str(row.get("logical_node_id") or ""),
+                    )
+                )
+            root_rows = [
+                row
+                for row in by_parent.get(None, [])
+                if str(row.get("level")) == OutlineLevel.OUTLINE.value
+            ]
+            if len(root_rows) != 1:
+                raise ValueError("active manifest must contain exactly one outline root")
+
+            def render_manifest(row: Mapping[str, Any]) -> dict[str, Any]:
+                contract = self._manifest_contract(row)
+                payload = contract.payload
+                physical_id = row.get("story_node_id")
+                result: dict[str, Any] = {
+                    "id": str(physical_id or row["logical_node_id"]),
+                    "logical_node_id": str(row["logical_node_id"]),
+                    "story_node_id": physical_id,
+                    "novel_id": novel_id,
+                    "node_type": str(row["level"]),
+                    "number": int(row.get("sibling_index") or 0) + 1,
+                    "order_index": int(row.get("sibling_index") or 0),
+                    "title": payload.title,
+                    "description": payload.narrative_text,
+                    "outline": payload.narrative_text,
+                    "chapter_start": payload.chapter_start,
+                    "chapter_end": payload.chapter_end,
+                    "outline_contract": {
+                        "contract_id": contract.id,
+                        "level": contract.level.value,
+                        "status": OutlineStatus.SYNCED.value,
+                        "active_revision": contract.revision,
+                        "draft_revision": None,
+                        "version_digest": contract.published_digest,
+                        "author_locked": bool(row.get("author_locked")),
+                    },
+                }
+                result["children"] = [
+                    render_manifest(child)
+                    for child in by_parent.get(str(row["logical_node_id"]), [])
+                ]
+                return result
+
+            return render_manifest(root_rows[0])
 
         root = self.contract_repository.ensure_root(novel_id)
         nodes = self.story_node_repository.get_by_novel_sync(novel_id)
@@ -293,139 +355,51 @@ class OutlineContractService:
         formal_head = 0
         canonical_ready = True
         memory_ready = True
+        formal_repository = ChapterCandidateRepository(
+            self.contract_repository._db or self.contract_repository.db_path
+        )
 
         for chapter_number in range(1, requested + 1):
-            baseline = conn.execute(
-                """
-                SELECT baseline.chapter_number, baseline.chapter_id,
-                       baseline.content_sha256, baseline.content_revision,
-                       chapter.number, chapter.content, chapter.content_sha256 AS chapter_sha,
-                       chapter.content_revision AS chapter_revision, chapter.status
-                FROM pre_candidate_formal_history AS baseline
-                JOIN chapters AS chapter ON chapter.id = baseline.chapter_id
-                WHERE baseline.novel_id = ? AND baseline.chapter_number = ?
-                """,
-                (novel_id, chapter_number),
-            ).fetchone()
-            if baseline is not None:
-                content = str(baseline["content"] or "")
-                actual_sha = self._content_sha256(content)
-                valid = (
-                    int(baseline["number"] or 0) == chapter_number
-                    and str(baseline["status"] or "") == "completed"
-                    and bool(content.strip())
-                    and str(baseline["content_sha256"] or "") == actual_sha
-                    and int(baseline["content_revision"] or 0)
-                    == int(baseline["chapter_revision"] or 0)
-                    and (
-                        not str(baseline["chapter_sha"] or "")
-                        or str(baseline["chapter_sha"]) == actual_sha
-                    )
+            try:
+                identity = formal_repository.resolve_formal_identity(
+                    novel_id,
+                    chapter_number,
+                    connection=conn,
                 )
-                if not valid:
-                    blockers.append(f"formal:chapter:{chapter_number}")
-                    break
-                identities.append(
-                    {
-                        "source": "legacy",
-                        "chapter_number": chapter_number,
-                        "chapter_id": str(baseline["chapter_id"]),
-                        "content_sha256": actual_sha,
-                        "content_revision": int(baseline["content_revision"] or 0),
-                    }
-                )
-                formal_head = chapter_number
-                continue
-
-            formal = conn.execute(
-                """
-                SELECT chapter.id AS chapter_id, chapter.number,
-                       chapter.content, chapter.content_sha256 AS chapter_sha,
-                       chapter.content_revision AS chapter_revision, chapter.status,
-                       candidate.id AS candidate_id, candidate.status AS candidate_status,
-                       formal.content_sha256 AS formal_sha,
-                       formal.content_revision AS formal_revision,
-                       formal.sync_status
-                FROM chapters AS chapter
-                JOIN chapter_candidate_formal_commits AS formal
-                  ON formal.chapter_id = chapter.id
-                 AND formal.novel_id = chapter.novel_id
-                 AND formal.chapter_number = chapter.number
-                JOIN chapter_candidates AS candidate
-                  ON candidate.id = formal.candidate_id
-                WHERE chapter.novel_id = ? AND chapter.number = ?
-                """,
-                (novel_id, chapter_number),
-            ).fetchone()
-            if formal is None:
+            except CandidateGateError:
                 blockers.append(f"formal:chapter:{chapter_number}")
                 break
-            content = str(formal["content"] or "")
-            actual_sha = self._content_sha256(content)
-            valid = (
-                int(formal["number"] or 0) == chapter_number
-                and str(formal["status"] or "") == "completed"
-                and str(formal["candidate_status"] or "") == "committed"
-                and str(formal["sync_status"] or "") == "ready"
-                and bool(content.strip())
-                and actual_sha == str(formal["chapter_sha"] or "")
-                and actual_sha == str(formal["formal_sha"] or "")
-                and int(formal["chapter_revision"] or 0)
-                == int(formal["formal_revision"] or 0)
-            )
-            if not valid:
-                blockers.append(f"formal:chapter:{chapter_number}")
-                break
-
-            narrative = conn.execute(
-                """
-                SELECT novel_id, chapter_number, content_sha256,
-                       pipeline_version, content_revision, status, memory_status
-                FROM chapter_narrative_commits
-                WHERE novel_id = ? AND chapter_number = ?
-                  AND content_sha256 = ? AND content_revision = ?
-                ORDER BY CASE WHEN status = 'committed' THEN 0 ELSE 1 END,
-                         updated_at DESC
-                LIMIT 1
-                """,
-                (novel_id, chapter_number, actual_sha, int(formal["formal_revision"] or 0)),
-            ).fetchone()
-            if narrative is None:
-                canonical_ready = False
-                memory_ready = False
-                blockers.append(f"canonical:chapter:{chapter_number}")
-            else:
-                if str(narrative["status"] or "") != "committed":
-                    canonical_ready = False
-                    blockers.append(f"canonical:chapter:{chapter_number}")
-                if str(narrative["memory_status"] or "not_required") not in {
-                    "committed",
-                    "not_required",
-                }:
+            try:
+                formal_repository.require_formal_prefix_aftermath_ready(
+                    novel_id,
+                    chapter_number,
+                    connection=conn,
+                )
+                aftermath_reason = ""
+            except CandidateGateError as exc:
+                aftermath_reason = str(exc).rsplit(": ", 1)[-1]
+            if aftermath_reason:
+                if aftermath_reason == "memory_not_ready":
                     memory_ready = False
                     blockers.append(f"memory:chapter:{chapter_number}")
-                identities.append(
-                    {
-                        "source": "candidate",
-                        "chapter_number": chapter_number,
-                        "chapter_id": str(formal["chapter_id"]),
-                        "candidate_id": str(formal["candidate_id"]),
-                        "content_sha256": actual_sha,
-                        "content_revision": int(formal["formal_revision"] or 0),
-                        "pipeline_version": str(narrative["pipeline_version"] or ""),
-                    }
-                )
-            if narrative is None:
-                identities.append(
-                    {
-                        "source": "candidate",
-                        "chapter_number": chapter_number,
-                        "chapter_id": str(formal["chapter_id"]),
-                        "candidate_id": str(formal["candidate_id"]),
-                        "content_sha256": actual_sha,
-                        "content_revision": int(formal["formal_revision"] or 0),
-                    }
-                )
+                elif aftermath_reason.startswith("canonical_summary"):
+                    canonical_ready = False
+                    memory_ready = False
+                    blockers.append(f"canonical_summary:chapter:{chapter_number}")
+                else:
+                    canonical_ready = False
+                    memory_ready = False
+                    blockers.append(f"canonical:chapter:{chapter_number}")
+            item: dict[str, Any] = {
+                "source": identity.source,
+                "chapter_number": identity.chapter_number,
+                "chapter_id": identity.chapter_id,
+                "content_sha256": identity.content_sha256,
+                "content_revision": identity.content_revision,
+            }
+            if identity.candidate_id:
+                item["candidate_id"] = identity.candidate_id
+            identities.append(item)
             formal_head = chapter_number
 
         if requested == 0:
@@ -459,12 +433,36 @@ class OutlineContractService:
             if boundary.get("formal_head") is not None
             else max(0, int(plan.replan_start_chapter or 1) - 1)
         )
-        prefix = self.compute_canonical_prefix(novel_id, expected_head)
+        expected_prefix = self.compute_canonical_prefix(novel_id, expected_head)
         expected_digest = str(plan.canonical_prefix_digest or "")
-        digest_matches = not expected_digest or expected_digest == prefix.digest
-        if prefix.formal_head < expected_head:
-            status = PlanReconciliationStatus.REPAIRABLE
-        elif not digest_matches:
+        formal_repository = ChapterCandidateRepository(
+            self.contract_repository._db or self.contract_repository.db_path
+        )
+        try:
+            actual_head, authority_blockers = formal_repository.formal_history_snapshot(
+                novel_id
+            )
+        except CandidateGateError:
+            actual_head = 0
+            authority_blockers = ("formal:history_invalid",)
+        current_prefix = self.compute_canonical_prefix(novel_id, actual_head)
+        blockers = [
+            *expected_prefix.blockers,
+            *current_prefix.blockers,
+            *authority_blockers,
+        ]
+        if actual_head > expected_head:
+            blockers.append("formal:head_advanced_after_plan_boundary")
+        elif actual_head < expected_head:
+            blockers.append("formal:head_missing_or_damaged")
+        digest_matches = not expected_digest or expected_digest == expected_prefix.digest
+        if (
+            actual_head != expected_head
+            or not digest_matches
+            or not expected_prefix.ready
+            or not current_prefix.ready
+            or authority_blockers
+        ):
             status = PlanReconciliationStatus.AUTHOR_DECISION_REQUIRED
         else:
             status = PlanReconciliationStatus.ALIGNED
@@ -472,12 +470,12 @@ class OutlineContractService:
             plan_revision_id=plan_revision_id,
             status=status,
             expected_formal_head=expected_head,
-            actual_formal_head=prefix.formal_head,
+            actual_formal_head=actual_head,
             expected_prefix_digest=expected_digest,
-            actual_prefix_digest=prefix.digest,
-            canonical_ready=prefix.canonical_ready,
-            memory_ready=prefix.memory_ready,
-            blockers=prefix.blockers,
+            actual_prefix_digest=current_prefix.digest,
+            canonical_ready=expected_prefix.canonical_ready,
+            memory_ready=expected_prefix.memory_ready,
+            blockers=tuple(dict.fromkeys(blockers)),
         )
 
     def next_published_chapter_context(

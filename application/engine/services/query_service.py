@@ -211,6 +211,7 @@ def _overlay_generation_authority(
     presentation_status = {
         "idle": "stopped",
         "running": "running",
+        "waiting_planning": "waiting_planning",
         "waiting_review": "paused_for_review",
         "paused": "stopped",
         "stopped": "stopped",
@@ -219,6 +220,7 @@ def _overlay_generation_authority(
     }.get(state, "stopped")
     stage = {
         "running": str((candidate_payload or {}).get("status") or "candidate_pending"),
+        "waiting_planning": "waiting_planning",
         "waiting_review": "waiting_review",
         "paused": "paused",
         "stopped": "stopped",

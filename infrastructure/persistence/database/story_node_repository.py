@@ -5,6 +5,7 @@
 import sqlite3
 import json
 import logging
+import hashlib
 from typing import Any, List, Optional, Union
 from datetime import datetime
 
@@ -132,32 +133,408 @@ class StoryNodeRepository:
         word_count: Optional[int] = None,
         status: Optional[str] = None,
         runtime_metadata: Optional[dict[str, Any]] = None,
+        _connection: Optional[sqlite3.Connection] = None,
+        _commit: Optional[bool] = None,
+        _verify_summary_sources: bool = False,
     ) -> bool:
-        """Update only display/runtime fields while preserving planning fields."""
+        """Update only display/runtime fields while preserving planning fields.
 
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT novel_id, metadata FROM story_nodes WHERE id = ?", (node_id,)
-        ).fetchone()
-        if row is None:
-            return False
-        metadata = self._json_object(row["metadata"] if isinstance(row, sqlite3.Row) else row[1])
-        for key, value in (runtime_metadata or {}).items():
-            if not str(key).startswith("runtime."):
-                raise ValueError("runtime metadata keys must start with runtime.")
-            metadata[str(key)] = value
-        sets: list[str] = ["metadata = ?", "updated_at = ?"]
-        params: list[Any] = [json.dumps(metadata, ensure_ascii=False, sort_keys=True), datetime.now().isoformat()]
-        if word_count is not None:
-            sets.append("word_count = ?")
-            params.append(int(word_count))
-        if status is not None:
-            sets.append("status = ?")
-            params.append(str(status))
-        params.append(node_id)
-        conn.execute(f"UPDATE story_nodes SET {', '.join(sets)} WHERE id = ?", tuple(params))
-        conn.commit()
+        Callers that already own a transaction pass ``_connection`` and
+        ``_commit=False``.  That keeps runtime cache invalidation in the same
+        transaction as the canonical rewrite or Worldline switch.
+        """
+
+        conn = _connection or self._get_connection()
+        owns_transaction = _connection is None and not conn.in_transaction
+        commit_after_write = owns_transaction if _commit is None else bool(_commit)
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT novel_id, metadata FROM story_nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+            if row is None:
+                if owns_transaction:
+                    conn.rollback()
+                return False
+            novel_id = str(row["novel_id"] if isinstance(row, sqlite3.Row) else row[0])
+            metadata = self._json_object(
+                row["metadata"] if isinstance(row, sqlite3.Row) else row[1]
+            )
+            for key, value in (runtime_metadata or {}).items():
+                key = str(key)
+                if not key.startswith("runtime."):
+                    raise ValueError("runtime metadata keys must start with runtime.")
+                if value is None:
+                    metadata.pop(key, None)
+                else:
+                    metadata[key] = value
+
+            summary_patch_keys = {
+                "runtime.summary",
+                "runtime.summary_state",
+                "runtime.checkpoint_summary",
+                "runtime.checkpoint_summary_state",
+            }
+            summary_payload_present = any(
+                str(metadata.get(summary_key, "") or "").strip()
+                for summary_key in (
+                    "runtime.summary",
+                    "runtime.checkpoint_summary",
+                )
+            )
+            manifest_summary_write = (
+                is_manifest_authority(conn, novel_id)
+                and bool(summary_patch_keys.intersection(runtime_metadata or {}))
+                and summary_payload_present
+            )
+            if (
+                (_verify_summary_sources or manifest_summary_write)
+                and not self._runtime_summary_sources_are_current(
+                    conn, novel_id, metadata
+                )
+            ):
+                if owns_transaction:
+                    conn.rollback()
+                return False
+
+            columns = {
+                str(item[1]) for item in conn.execute("PRAGMA table_info(story_nodes)")
+            }
+            sets: list[str] = ["metadata = ?"]
+            params: list[Any] = [json.dumps(metadata, ensure_ascii=False, sort_keys=True)]
+            if "updated_at" in columns:
+                sets.append("updated_at = ?")
+                params.append(datetime.now().isoformat())
+            if word_count is not None:
+                sets.append("word_count = ?")
+                params.append(int(word_count))
+            if status is not None:
+                sets.append("status = ?")
+                params.append(str(status))
+            params.append(node_id)
+            conn.execute(
+                f"UPDATE story_nodes SET {', '.join(sets)} WHERE id = ?", tuple(params)
+            )
+            if commit_after_write:
+                conn.commit()
+            return True
+        except Exception:
+            if owns_transaction and conn.in_transaction:
+                conn.rollback()
+            raise
+
+    def _runtime_summary_sources_are_current(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: str,
+        runtime_metadata: dict[str, Any],
+    ) -> bool:
+        for summary_key, state_key in (
+            ("runtime.summary", "runtime.summary_state"),
+            ("runtime.checkpoint_summary", "runtime.checkpoint_summary_state"),
+        ):
+            if not str(runtime_metadata.get(summary_key, "") or "").strip():
+                continue
+            state = runtime_metadata.get(state_key)
+            if not self._runtime_summary_state_is_current(conn, novel_id, state):
+                return False
         return True
+
+    def visible_summary_metadata_pairs(
+        self,
+        node: Any,
+        *,
+        summary_key: str,
+        state_key: str,
+    ) -> tuple[tuple[str, Any], ...]:
+        """Return summaries that may be consumed by the current authority.
+
+        Legacy-authority books retain their existing committed-cache selector.
+        Once a book has a Manifest Head, a summary cache is Context-visible
+        only when each source chapter proves the exact Formal, Canonical, and
+        Memory aftermath identity. This is intentionally a read policy: cache
+        writers already verify the same predicate before storing runtime
+        metadata, but a legacy key or direct SQL write must not bypass it
+        after Manifest cutover.
+        """
+
+        metadata = self._json_object(getattr(node, "metadata", None))
+        marker = metadata.get(f"runtime.{summary_key}_invalidated_from_chapter")
+        if marker not in (None, ""):
+            return ()
+
+        novel_id = str(getattr(node, "novel_id", "") or "")
+        conn = self._get_connection()
+        manifest_mode = bool(novel_id) and is_manifest_authority(conn, novel_id)
+        pairs: list[tuple[str, Any]] = []
+        for prefix in ("runtime.", ""):
+            summary = str(metadata.get(f"{prefix}{summary_key}", "") or "").strip()
+            if not summary:
+                continue
+            state = metadata.get(f"{prefix}{state_key}") or {}
+            if manifest_mode:
+                if (
+                    not isinstance(state, dict)
+                    or str(state.get("pipeline_version") or "")
+                    != "node-summary/v1"
+                    or not self._runtime_summary_state_is_current(
+                        conn,
+                        novel_id,
+                        state,
+                        legacy_baseline_only=(prefix == ""),
+                    )
+                ):
+                    continue
+            pairs.append((summary, state))
+        return tuple(pairs)
+
+    def _runtime_summary_state_is_current(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: str,
+        state: Any,
+        *,
+        legacy_baseline_only: bool = False,
+    ) -> bool:
+        if not isinstance(state, dict) or state.get("status") != "committed":
+            return False
+        expected_version = str(state.get("source_version") or "")
+        chapter_start = state.get("chapter_start")
+        chapter_end = state.get("chapter_end")
+        if not expected_version or chapter_start is None or chapter_end is None:
+            return False
+        try:
+            start = int(chapter_start)
+            end = int(chapter_end)
+        except (TypeError, ValueError):
+            return False
+        if start < 1 or end < start:
+            return False
+
+        raw_numbers = state.get("source_chapter_numbers")
+        if raw_numbers is None:
+            expected_numbers = list(range(start, end + 1))
+        else:
+            if not isinstance(raw_numbers, list) or not raw_numbers:
+                return False
+            try:
+                expected_numbers = [int(number) for number in raw_numbers]
+            except (TypeError, ValueError):
+                return False
+            if (
+                any(number < start or number > end for number in expected_numbers)
+                or expected_numbers != sorted(set(expected_numbers))
+            ):
+                return False
+
+        placeholders = ", ".join("?" for _ in expected_numbers)
+        rows = conn.execute(
+            f"""
+            SELECT number, content, content_sha256, content_revision
+            FROM chapters
+            WHERE novel_id = ? AND number IN ({placeholders})
+            ORDER BY number
+            """,
+            (novel_id, *expected_numbers),
+        ).fetchall()
+        if len(rows) != len(expected_numbers):
+            return False
+        try:
+            from infrastructure.persistence.database.chapter_candidate_repository import (
+                CandidateGateError,
+                ChapterCandidateRepository,
+            )
+
+            source_repository = ChapterCandidateRepository(
+                self._db if self._db is not None else self.db_path
+            )
+            identities = source_repository.require_formal_prefix_aftermath_ready(
+                novel_id,
+                max(expected_numbers),
+                connection=conn,
+            )
+        except (CandidateGateError, sqlite3.Error, ValueError):
+            return False
+        identities_by_number = {
+            identity.chapter_number: identity for identity in identities
+        }
+        payload_rows = []
+        for row, expected_number in zip(rows, expected_numbers):
+            number = int(row[0])
+            if number != expected_number:
+                return False
+            content = str(row[1] or "")
+            content_sha256 = str(row[2] or "") or hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest()
+            content_revision = int(row[3] or 0)
+            identity = identities_by_number.get(number)
+            if (
+                identity is None
+                or identity.content_sha256 != content_sha256
+                or int(identity.content_revision) != content_revision
+                or (legacy_baseline_only and identity.source != "legacy")
+            ):
+                return False
+            payload_rows.append(
+                f"{number}:{content_sha256}:{content_revision}"
+            )
+        source_version = hashlib.sha256(
+            "|".join(payload_rows).encode("utf-8")
+        ).hexdigest()
+        return source_version == expected_version
+
+    @classmethod
+    def _runtime_cache_may_depend_on_boundary(
+        cls,
+        state: Any,
+        *,
+        node_type: Any,
+        node_number: Any,
+        node_chapter_start: Any,
+        node_chapter_end: Any,
+        invalidated_from_chapter: int,
+    ) -> bool:
+        if isinstance(state, dict):
+            raw_numbers = state.get("source_chapter_numbers")
+            if raw_numbers is not None:
+                if not isinstance(raw_numbers, list) or not raw_numbers:
+                    return True
+                try:
+                    numbers = [int(number) for number in raw_numbers]
+                except (TypeError, ValueError):
+                    return True
+                if numbers != sorted(set(numbers)) or any(number < 1 for number in numbers):
+                    return True
+                return any(number >= invalidated_from_chapter for number in numbers)
+            try:
+                chapter_start = int(state.get("chapter_start"))
+                chapter_end = int(state.get("chapter_end"))
+            except (TypeError, ValueError):
+                return True
+            if chapter_start < 1 or chapter_end < chapter_start:
+                return True
+            return chapter_end >= invalidated_from_chapter
+
+        try:
+            chapter_end = int(node_chapter_end)
+        except (TypeError, ValueError):
+            chapter_end = None
+        if chapter_end is not None:
+            return chapter_end >= invalidated_from_chapter
+        try:
+            chapter_start = int(node_chapter_start)
+        except (TypeError, ValueError):
+            chapter_start = None
+        if chapter_start is not None:
+            return chapter_start >= invalidated_from_chapter
+        if str(getattr(node_type, "value", node_type) or "") != NodeType.CHAPTER.value:
+            # A part/volume/act ordinal is not a chapter boundary.  Without
+            # provenance or a chapter range it cannot prove cache safety.
+            return True
+        try:
+            return int(node_number) >= invalidated_from_chapter
+        except (TypeError, ValueError):
+            return True
+
+    def invalidate_runtime_summary_caches(
+        self,
+        novel_id: str,
+        invalidated_from_chapter: int,
+        *,
+        _connection: Optional[sqlite3.Connection] = None,
+        _commit: Optional[bool] = None,
+    ) -> list[str]:
+        """Fail closed for cached summaries that may include a changed chapter.
+
+        This only writes the runtime namespace.  A marker deliberately hides
+        runtime, legacy, and committed fallback summaries until an exact-source
+        runtime regeneration clears it.
+        """
+
+        boundary = int(invalidated_from_chapter)
+        if boundary < 1:
+            raise ValueError("invalidated_from_chapter must be positive")
+        conn = _connection or self._get_connection()
+        owns_transaction = _connection is None and not conn.in_transaction
+        commit_after_write = owns_transaction if _commit is None else bool(_commit)
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, node_type, number, chapter_start, chapter_end, metadata
+                FROM story_nodes
+                WHERE novel_id = ?
+                """,
+                (novel_id,),
+            ).fetchall()
+            invalidated: list[str] = []
+            for row in rows:
+                metadata = self._json_object(row[5])
+                committed = self._json_object(metadata.get("committed_metadata"))
+                runtime_patch: dict[str, Any] = {}
+                for summary_key, state_key in (
+                    ("summary", "summary_state"),
+                    ("checkpoint_summary", "checkpoint_summary_state"),
+                ):
+                    summary_sources = (
+                        (
+                            metadata.get(f"runtime.{summary_key}"),
+                            metadata.get(f"runtime.{state_key}"),
+                        ),
+                        (metadata.get(summary_key), metadata.get(state_key)),
+                        (committed.get(summary_key), committed.get(state_key)),
+                    )
+                    existing_sources = [
+                        state
+                        for summary, state in summary_sources
+                        if str(summary or "").strip()
+                    ]
+                    if not existing_sources or not any(
+                        self._runtime_cache_may_depend_on_boundary(
+                            state,
+                            node_type=row[1],
+                            node_number=row[2],
+                            node_chapter_start=row[3],
+                            node_chapter_end=row[4],
+                            invalidated_from_chapter=boundary,
+                        )
+                        for state in existing_sources
+                    ):
+                        continue
+                    # Remove the cached payload and provenance rather than
+                    # retaining readable stale facts in runtime metadata.  The
+                    # marker still fences legacy/committed fallback text until
+                    # a fresh exact-source runtime summary clears it.
+                    for runtime_key in (
+                        f"runtime.{summary_key}",
+                        f"runtime.{state_key}",
+                        f"runtime.{summary_key}_generated_at",
+                    ):
+                        if runtime_key in metadata:
+                            runtime_patch[runtime_key] = None
+                    runtime_patch[
+                        f"runtime.{summary_key}_invalidated_from_chapter"
+                    ] = boundary
+                if not runtime_patch:
+                    continue
+                if not self.update_runtime_fields(
+                    str(row[0]),
+                    runtime_metadata=runtime_patch,
+                    _connection=conn,
+                    _commit=False,
+                ):
+                    raise RuntimeError(f"story node disappeared during runtime invalidation: {row[0]}")
+                invalidated.append(str(row[0]))
+            if commit_after_write:
+                conn.commit()
+            return invalidated
+        except Exception:
+            if owns_transaction and conn.in_transaction:
+                conn.rollback()
+            raise
 
     def save_sync(
         self,
@@ -546,13 +923,24 @@ class StoryNodeRepository:
             if self._should_close_after_use():
                 conn.close()
 
-    async def delete_by_novel(self, novel_id: str) -> int:
+    async def delete_by_novel(
+        self,
+        novel_id: str,
+        *,
+        _capability: Optional[ProjectionWriteCapability] = None,
+    ) -> int:
         """删除小说的所有节点"""
         conn = self._get_connection()
         try:
+            self._assert_write_allowed(
+                novel_id,
+                operation="delete_by_novel",
+                capability=_capability,
+            )
             cursor = conn.cursor()
             cursor.execute("DELETE FROM story_nodes WHERE novel_id = ?", (novel_id,))
-            conn.commit()
+            if _capability is None:
+                conn.commit()
             return cursor.rowcount
         finally:
             if self._should_close_after_use():

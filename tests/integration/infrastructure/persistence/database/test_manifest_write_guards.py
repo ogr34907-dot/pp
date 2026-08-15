@@ -1,6 +1,7 @@
 """Manifest cutover must close every legacy StoryNode/contract writer."""
 
 import asyncio
+import json
 import sqlite3
 
 import pytest
@@ -24,8 +25,7 @@ from application.core.services.chapter_rewrite_coordinator import ChapterRewrite
 from application.engine.services.autopilot_recovery_policy import AutopilotRecoveryPolicy
 
 
-@pytest.fixture
-def manifest_book(tmp_path):
+def _book_with_sealed_plan(tmp_path, *, manifest: bool):
     database = DatabaseConnection(str(tmp_path / "manifest-guard.db"))
     conn = database.get_connection()
     conn.execute(
@@ -70,14 +70,25 @@ def manifest_book(tmp_path):
         canonical_boundary={"formal_head": 0},
     )
     plan = contracts.seal_plan_revision(plan.id)
-    conn.execute(
-        "UPDATE outline_planning_heads SET authority_mode='manifest', "
-        "authority_generation=1, projection_generation=1, "
-        "active_plan_revision_id=?, active_plan_digest=? WHERE novel_id=?",
-        (plan.id, plan.digest, "novel-1"),
-    )
+    if manifest:
+        conn.execute(
+            "UPDATE outline_planning_heads SET authority_mode='manifest', "
+            "authority_generation=1, projection_generation=1, "
+            "active_plan_revision_id=?, active_plan_digest=? WHERE novel_id=?",
+            (plan.id, plan.digest, "novel-1"),
+        )
     conn.commit()
     return database, StoryNodeRepository(database), contracts, plan.id
+
+
+@pytest.fixture
+def manifest_book(tmp_path):
+    return _book_with_sealed_plan(tmp_path, manifest=True)
+
+
+@pytest.fixture
+def legacy_plan_book(tmp_path):
+    return _book_with_sealed_plan(tmp_path, manifest=False)
 
 
 def _node(node_id: str = "part-1") -> StoryNode:
@@ -89,6 +100,56 @@ def _node(node_id: str = "part-1") -> StoryNode:
         title="Part",
         order_index=0,
     )
+
+
+def _seed_projection_node(database, node: StoryNode) -> None:
+    """Test-only fixture data; production projection batches are disabled."""
+
+    conn = database.get_connection()
+    conn.execute(
+        """
+        INSERT INTO story_nodes (
+            id, novel_id, parent_id, node_type, number, title, description, order_index,
+            planning_status, planning_source,
+            chapter_start, chapter_end, chapter_count, suggested_chapter_count,
+            content, outline, word_count, status,
+            themes, key_events, narrative_arc, conflicts,
+            pov_character_id, timeline_start, timeline_end,
+            metadata, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node.id,
+            node.novel_id,
+            node.parent_id,
+            node.node_type.value,
+            node.number,
+            node.title,
+            node.description,
+            node.order_index,
+            node.planning_status.value,
+            node.planning_source.value,
+            node.chapter_start,
+            node.chapter_end,
+            node.chapter_count,
+            node.suggested_chapter_count,
+            node.content,
+            node.outline,
+            node.word_count,
+            node.status,
+            json.dumps(node.themes),
+            json.dumps(node.key_events),
+            node.narrative_arc,
+            json.dumps(node.conflicts),
+            node.pov_character_id,
+            node.timeline_start,
+            node.timeline_end,
+            json.dumps(node.metadata),
+            node.created_at.isoformat(),
+            node.updated_at.isoformat(),
+        ),
+    )
+    conn.commit()
 
 
 def test_legacy_story_node_writers_fail_closed(manifest_book):
@@ -118,21 +179,310 @@ def test_legacy_story_node_writers_fail_closed(manifest_book):
         repository.bulk_replace_text_sync("novel-1", "old", "new")
 
 
-def test_projection_writer_is_the_explicit_manifest_exception(manifest_book):
-    _, repository, _, plan_id = manifest_book
+def _head_snapshot(database):
+    row = database.get_connection().execute(
+        """
+        SELECT authority_mode, active_plan_revision_id, active_plan_digest,
+               authority_generation, projection_generation
+        FROM outline_planning_heads
+        WHERE novel_id = 'novel-1'
+        """
+    ).fetchone()
+    return {
+        "mode": str(row["authority_mode"]),
+        "plan_id": row["active_plan_revision_id"],
+        "digest": str(row["active_plan_digest"] or ""),
+        "authority_generation": int(row["authority_generation"]),
+        "projection_generation": int(row["projection_generation"]),
+    }
+
+
+def _apply_atomic(writer, database, plan_id, *, operation, creates=(), updates=(), deletes=(), **expected):
+    head = _head_snapshot(database)
+    return asyncio.run(
+        writer.apply_atomic(
+            novel_id="novel-1",
+            plan_revision_id=plan_id,
+            operation=operation,
+            expected_active_plan_revision_id=expected.get("expected_active_plan_revision_id", head["plan_id"]),
+            expected_active_plan_digest=expected.get("expected_active_plan_digest", head["digest"]),
+            expected_authority_generation=expected.get(
+                "expected_authority_generation", head["authority_generation"]
+            ),
+            expected_projection_generation=expected.get(
+                "expected_projection_generation", head["projection_generation"]
+            ),
+            creates=creates,
+            updates=updates,
+            deletes=deletes,
+        )
+    )
+
+
+def _insert_sealed_plan(
+    database,
+    plan_id: str,
+    *,
+    revision: int = 99,
+    digest: str = "replacement-digest",
+    status: str = "ready_for_review",
+    reconciliation_status: str = "aligned",
+):
+    conn = database.get_connection()
+    conn.execute(
+        """
+        INSERT INTO outline_plan_revisions
+        (id, novel_id, revision, status, digest, canonical_prefix_digest,
+         reconciliation_status, sealed_at)
+        VALUES (?, 'novel-1', ?, ?, ?, '', ?, CURRENT_TIMESTAMP)
+        """,
+        (plan_id, revision, status, digest, reconciliation_status),
+    )
+    conn.commit()
+
+
+def test_atomic_writer_exposes_no_capability_or_transaction_callback(manifest_book):
+    database, repository, _, plan_id = manifest_book
     writer = PlanProjectionWriter(repository)
-    capability = writer.capability_for("novel-1", plan_id)
-    writer.save_sync(_node(), capability)
-    saved = asyncio.run(repository.get_by_id("part-1"))
-    assert saved is not None
-    assert saved.title == "Part"
+
+    assert callable(writer.apply_atomic)
+    assert not hasattr(writer, "transaction")
+    assert not hasattr(writer, "capability_for")
+    assert not hasattr(writer, "activate_head")
+    assert not hasattr(writer, "save_sync")
+    assert not hasattr(writer, "repository")
+
+    from infrastructure.persistence.database.planning_authority_guard import (
+        ProjectionWriteCapability,
+    )
+
+    with pytest.raises(TypeError, match="disabled"):
+        ProjectionWriteCapability(
+            novel_id="novel-1",
+            plan_revision_id=plan_id,
+            authority_generation=1,
+            connection_identity=id(database.get_connection()),
+        )
+    with pytest.raises(PlanningAuthorityError, match="legacy StoryNode"):
+        repository.save_sync(_node())
+
+
+def test_private_projection_permit_path_is_disabled(manifest_book):
+    database, _, _, plan_id = manifest_book
+    from infrastructure.persistence.database.planning_authority_guard import (
+        _mint_projection_capability,
+    )
+
+    head = _head_snapshot(database)
+    conn = database.get_connection()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(PlanningAuthorityError, match="disabled"):
+            _mint_projection_capability(
+                conn,
+                novel_id="novel-1",
+                plan_revision_id=plan_id,
+                designated_operation="projection",
+                authority_generation=head["authority_generation"],
+                projection_generation=head["projection_generation"],
+                expected_active_plan_revision_id=head["plan_id"],
+                expected_active_plan_digest=head["digest"],
+            )
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+
+
+def test_atomic_projection_rejects_a_sealed_non_active_plan_before_projection_dml(
+    manifest_book,
+):
+    database, repository, _, _ = manifest_book
+    replacement = "historical-plan"
+    _insert_sealed_plan(database, replacement, digest="historical-digest")
+    writer = PlanProjectionWriter(repository)
+
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+        _apply_atomic(
+            writer,
+            database,
+            replacement,
+            operation="projection",
+            creates=(_node("historical-projection"),),
+        )
+
+    assert asyncio.run(repository.get_by_id("historical-projection")) is None
+
+
+def test_atomic_projection_rejects_every_caller_batch_before_node_writes(
+    manifest_book,
+):
+    database, repository, _, plan_id = manifest_book
+    writer = PlanProjectionWriter(repository)
+    first = _node("first-part")
+    second = _node("duplicate-part")
+    second.number = first.number
+    second.order_index = 1
+
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+        _apply_atomic(
+            writer,
+            database,
+            plan_id,
+            operation="projection",
+            creates=(first, second),
+        )
+
+    fresh = DatabaseConnection(database.db_path).get_connection()
+    assert fresh.execute(
+        "SELECT COUNT(*) FROM story_nodes WHERE id IN ('first-part', 'duplicate-part')"
+    ).fetchone()[0] == 0
+
+
+def test_atomic_publish_rejects_caller_batch_before_head_cas(manifest_book):
+    database, repository, _, _ = manifest_book
+    replacement = "publish-target"
+    _insert_sealed_plan(database, replacement, digest="publish-target-digest")
+    conn = database.get_connection()
+    conn.execute(
+        """
+        CREATE TRIGGER reject_test_head_switch
+        BEFORE UPDATE ON outline_planning_heads
+        WHEN NEW.active_plan_revision_id = 'publish-target'
+        BEGIN
+            SELECT RAISE(ABORT, 'forced Head failure');
+        END
+        """
+    )
+    conn.commit()
+    before = _head_snapshot(database)
+    writer = PlanProjectionWriter(repository)
+
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+        _apply_atomic(
+            writer,
+            database,
+            replacement,
+            operation="publish",
+            creates=(_node("publish-rollback"),),
+        )
+
+    fresh = DatabaseConnection(database.db_path).get_connection()
+    assert fresh.execute(
+        "SELECT COUNT(*) FROM story_nodes WHERE id = 'publish-rollback'"
+    ).fetchone()[0] == 0
+    assert _head_snapshot(database) == before
+
+
+def test_atomic_publish_cannot_switch_head_without_declared_projection(manifest_book):
+    database, repository, _, _ = manifest_book
+    replacement = "publish-target"
+    _insert_sealed_plan(database, replacement, digest="publish-target-digest")
+    writer = PlanProjectionWriter(repository)
+
+    before = _head_snapshot(database)
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+        _apply_atomic(
+            writer,
+            database,
+            replacement,
+            operation="publish",
+            creates=(_node("published-part"),),
+        )
+
+    fresh = DatabaseConnection(database.db_path).get_connection()
+    head = fresh.execute(
+        """
+        SELECT authority_mode, active_plan_revision_id, active_plan_digest,
+               authority_generation, projection_generation
+        FROM outline_planning_heads WHERE novel_id = 'novel-1'
+        """
+    ).fetchone()
+    assert tuple(head) == (
+        before["mode"],
+        before["plan_id"],
+        before["digest"],
+        before["authority_generation"],
+        before["projection_generation"],
+    )
+    assert fresh.execute(
+        "SELECT COUNT(*) FROM story_nodes WHERE id = 'published-part'"
+    ).fetchone()[0] == 0
+
+
+def test_atomic_writer_rejects_stale_head_and_non_publishable_target_before_dml(
+    manifest_book,
+):
+    database, repository, _, active_plan_id = manifest_book
+    writer = PlanProjectionWriter(repository)
+
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+        _apply_atomic(
+            writer,
+            database,
+            active_plan_id,
+            operation="projection",
+            expected_authority_generation=99,
+            creates=(_node("stale-head-node"),),
+        )
+
+    rejected_plan = "needs-author-decision"
+    _insert_sealed_plan(
+        database,
+        rejected_plan,
+        digest="needs-author-decision-digest",
+        status="ready_for_review",
+        reconciliation_status="author_decision_required",
+    )
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+        _apply_atomic(
+            writer,
+            database,
+            rejected_plan,
+            operation="publish",
+            creates=(_node("non-publishable-node"),),
+        )
+
+    assert asyncio.run(repository.get_by_id("stale-head-node")) is None
+    assert asyncio.run(repository.get_by_id("non-publishable-node")) is None
+
+
+def test_atomic_cutover_is_disabled_without_declared_projection(legacy_plan_book):
+    database, repository, _, plan_id = legacy_plan_book
+    writer = PlanProjectionWriter(repository)
+    assert _head_snapshot(database) == {
+        "mode": "legacy",
+        "plan_id": None,
+        "digest": "",
+        "authority_generation": 0,
+        "projection_generation": 0,
+    }
+
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+        _apply_atomic(
+            writer,
+            database,
+            plan_id,
+            operation="cutover",
+            creates=(_node("cutover-part"),),
+        )
+
+    fresh = DatabaseConnection(database.db_path).get_connection()
+    head = fresh.execute(
+        """
+        SELECT authority_mode, active_plan_revision_id, authority_generation,
+               projection_generation
+        FROM outline_planning_heads WHERE novel_id = 'novel-1'
+        """
+    ).fetchone()
+    assert tuple(head) == ("legacy", None, 0, 0)
+    assert fresh.execute(
+        "SELECT COUNT(*) FROM story_nodes WHERE id = 'cutover-part'"
+    ).fetchone()[0] == 0
 
 
 def test_manifest_runtime_whitelist_does_not_allow_planning_changes(manifest_book):
-    _, repository, _, plan_id = manifest_book
-    writer = PlanProjectionWriter(repository)
-    capability = writer.capability_for("novel-1", plan_id)
-    writer.save_sync(_node(), capability)
+    database, repository, _, _ = manifest_book
+    _seed_projection_node(database, _node())
     node = asyncio.run(repository.get_by_id("part-1"))
     node.word_count = 42
     node.status = "completed"
@@ -150,9 +500,8 @@ def test_manifest_runtime_whitelist_does_not_allow_planning_changes(manifest_boo
 
 
 def test_direct_chapter_delete_and_tree_purge_are_blocked(manifest_book):
-    database, repository, _, plan_id = manifest_book
-    writer = PlanProjectionWriter(repository)
-    writer.save_sync(_node(), writer.capability_for("novel-1", plan_id))
+    database, repository, _, _ = manifest_book
+    _seed_projection_node(database, _node())
     conn = database.get_connection()
     conn.execute(
         "INSERT INTO chapters (id, novel_id, number, title, content, status) "
@@ -209,6 +558,7 @@ def test_rewrite_invalidation_does_not_mutate_manifest_projection(manifest_book)
     )
     conn.commit()
     coordinator = ChapterRewriteCoordinator.__new__(ChapterRewriteCoordinator)
+    coordinator._db = database
     coordinator._invalidate_story_nodes(conn, "novel-1", 1)
     metadata = conn.execute(
         "SELECT metadata FROM story_nodes WHERE id = 'act-1'"

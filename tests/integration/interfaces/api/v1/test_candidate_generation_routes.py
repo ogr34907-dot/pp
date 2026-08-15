@@ -6,6 +6,9 @@ from application.blueprint.services.outline_contract_service import OutlineContr
 from domain.structure.outline_contract import OutlinePayload, OutlineSource
 from domain.structure.story_node import NodeType, StoryNode
 from infrastructure.persistence.database.outline_contract_repository import OutlineContractRepository
+from infrastructure.persistence.database.chapter_candidate_repository import (
+    ChapterCandidateRepository,
+)
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 from interfaces.api.v1.engine import generation_routes
 
@@ -274,6 +277,32 @@ def test_start_rejects_unproven_completed_history_before_creating_a_run(client, 
 
     assert response.status_code == 409
     assert response.json()["detail"] == "generation_preflight:unproven_formal_history"
+    assert db.fetch_one(
+        "SELECT 1 FROM novel_generation_runs WHERE novel_id = ?", (test_novel_id,)
+    ) is None
+
+
+def test_start_rejects_legacy_baseline_without_exact_durable_aftermath(
+    client, db, test_novel_id
+):
+    _publish_next_chapter_chain(db, test_novel_id)
+    db.execute(
+        """
+        INSERT INTO chapters (id, novel_id, number, title, content, status)
+        VALUES ('legacy-baseline-1', ?, 1, '旧第一章', '已确认但未同步的旧正文', 'completed')
+        """,
+        (test_novel_id,),
+    )
+    db.get_connection().commit()
+    ChapterCandidateRepository(db).import_legacy_formal_history(test_novel_id)
+
+    response = client.post(
+        f"/api/v1/generation/novels/{test_novel_id}/start",
+        json={"run_mode": "chapter_review"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "generation_preflight:canonical_aftermath_not_ready"
     assert db.fetch_one(
         "SELECT 1 FROM novel_generation_runs WHERE novel_id = ?", (test_novel_id,)
     ) is None

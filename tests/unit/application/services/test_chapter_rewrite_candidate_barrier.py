@@ -1,5 +1,7 @@
 """A formal rewrite must retire downstream candidate work before rebuild."""
 
+import hashlib
+
 import pytest
 
 from application.core.services.chapter_rewrite_coordinator import (
@@ -26,6 +28,86 @@ from infrastructure.persistence.database.sqlite_chapter_narrative_commit_reposit
 )
 
 
+def _persist_durable_aftermath(
+    db,
+    *,
+    novel_id: str,
+    chapter_number: int,
+    content: str,
+    content_sha256: str,
+    content_revision: int,
+) -> None:
+    """Create the same exact durable evidence required before a Formal cursor moves."""
+
+    connection = db.get_connection()
+    connection.execute(
+        "INSERT OR IGNORE INTO knowledge (id, novel_id) VALUES ('knowledge-1', ?)",
+        (novel_id,),
+    )
+    summary = {
+        "summary": content,
+        "key_events": content,
+        "open_threads": "",
+        "consistency_note": "",
+        "beat_sections": [],
+        "micro_beats": [],
+    }
+    payload_sha256 = canonical_summary_payload_sha256(**summary)
+    connection.execute(
+        "INSERT OR REPLACE INTO chapter_summaries "
+        "(id, knowledge_id, chapter_number, summary, key_events, open_threads, "
+        "consistency_note, beat_sections, micro_beats, source_content_sha256, "
+        "source_content_revision, pipeline_version, sync_status, sync_attempts, "
+        "canonical_payload_sha256) VALUES (?, 'knowledge-1', ?, ?, ?, ?, ?, "
+        "'[]', '[]', ?, ?, ?, 'draft', 0, ?)",
+        (
+            f"summary-{chapter_number}",
+            chapter_number,
+            summary["summary"],
+            summary["key_events"],
+            summary["open_threads"],
+            summary["consistency_note"],
+            content_sha256,
+            content_revision,
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            payload_sha256,
+        ),
+    )
+    connection.commit()
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    claim = repository.claim(
+        novel_id=novel_id,
+        chapter_number=chapter_number,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        expected_content_revision=content_revision,
+    )
+    repository.prepare_summary(
+        novel_id=novel_id,
+        chapter_number=chapter_number,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        attempt_count=claim.attempt_count,
+        canonical_payload_sha256=payload_sha256,
+    )
+    repository.commit(
+        novel_id=novel_id,
+        chapter_number=chapter_number,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        attempt_count=claim.attempt_count,
+        content_revision=content_revision,
+        canonical_payload_sha256=payload_sha256,
+    )
+    assert repository.finish_memory_sync(
+        novel_id=novel_id,
+        chapter_number=chapter_number,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        content_revision=content_revision,
+    )
+
+
 class _SuccessfulAftermath:
     def __init__(self, db):
         self.db = db
@@ -34,64 +116,13 @@ class _SuccessfulAftermath:
         novel_id, chapter_number, content = _args[:3]
         content_sha256 = str(_kwargs["expected_content_sha256"])
         content_revision = int(_kwargs["expected_content_revision"])
-        connection = self.db.get_connection()
-        connection.execute(
-            "INSERT OR IGNORE INTO knowledge (id, novel_id) VALUES ('knowledge-1', ?)",
-            (novel_id,),
-        )
-        summary = {
-            "summary": content,
-            "key_events": content,
-            "open_threads": "",
-            "consistency_note": "",
-            "beat_sections": [],
-            "micro_beats": [],
-        }
-        payload_sha256 = canonical_summary_payload_sha256(**summary)
-        connection.execute(
-            "INSERT OR REPLACE INTO chapter_summaries "
-            "(id, knowledge_id, chapter_number, summary, key_events, open_threads, "
-            "consistency_note, beat_sections, micro_beats, source_content_sha256, "
-            "source_content_revision, pipeline_version, sync_status, sync_attempts, "
-            "canonical_payload_sha256) VALUES (?, 'knowledge-1', ?, ?, ?, ?, ?, '[]', '[]', ?, ?, ?, 'draft', 0, ?)",
-            (
-                f"summary-{chapter_number}",
-                chapter_number,
-                summary["summary"],
-                summary["key_events"],
-                summary["open_threads"],
-                summary["consistency_note"],
-                content_sha256,
-                content_revision,
-                CHAPTER_NARRATIVE_PIPELINE_VERSION,
-                payload_sha256,
-            ),
-        )
-        connection.commit()
-        repository = SqliteChapterNarrativeCommitRepository(self.db)
-        claim = repository.claim(
+        _persist_durable_aftermath(
+            self.db,
             novel_id=novel_id,
             chapter_number=chapter_number,
             content_sha256=content_sha256,
-            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-            expected_content_revision=content_revision,
-        )
-        repository.prepare_summary(
-            novel_id=novel_id,
-            chapter_number=chapter_number,
-            content_sha256=content_sha256,
-            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-            attempt_count=claim.attempt_count,
-            canonical_payload_sha256=payload_sha256,
-        )
-        repository.commit(
-            novel_id=novel_id,
-            chapter_number=chapter_number,
-            content_sha256=content_sha256,
-            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
-            attempt_count=claim.attempt_count,
             content_revision=content_revision,
-            canonical_payload_sha256=payload_sha256,
+            content=content,
         )
         return {
             "narrative_sync_ok": True,
@@ -117,7 +148,7 @@ def _outline_chain() -> dict:
     return {"outline": {"contract_id": "root", "digest": "root-v1"}}
 
 
-def _commit_first_chapter(repository: ChapterCandidateRepository) -> None:
+def _commit_first_chapter(repository: ChapterCandidateRepository, db) -> None:
     candidate = repository.create_streaming_candidate(
         novel_id="novel-1",
         chapter_number=1,
@@ -128,7 +159,15 @@ def _commit_first_chapter(repository: ChapterCandidateRepository) -> None:
     repository.mark_auditing(candidate.id)
     repository.finish_audit(candidate.id, audit={}, commit_plan={})
     repository.approve_for_commit(candidate.id, continue_after_commit=True)
-    repository.commit_formal(candidate.id)
+    formal = repository.commit_formal(candidate.id)
+    _persist_durable_aftermath(
+        db,
+        novel_id=formal.novel_id,
+        chapter_number=formal.chapter_number,
+        content=formal.final_content,
+        content_sha256=hashlib.sha256(formal.final_content.encode("utf-8")).hexdigest(),
+        content_revision=formal.content_revision,
+    )
     repository.mark_sync_succeeded(candidate.id)
 
 
@@ -142,7 +181,7 @@ async def test_rewrite_retires_downstream_candidate_until_canonical_rebuild(tmp_
     db.get_connection().commit()
     candidates = ChapterCandidateRepository(db)
     candidates.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
-    _commit_first_chapter(candidates)
+    _commit_first_chapter(candidates, db)
 
     downstream = candidates.create_streaming_candidate(
         novel_id="novel-1",
@@ -216,7 +255,7 @@ def test_rewrite_refuses_to_retire_a_downstream_formal_sync(tmp_path):
     db.get_connection().commit()
     candidates = ChapterCandidateRepository(db)
     candidates.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
-    _commit_first_chapter(candidates)
+    _commit_first_chapter(candidates, db)
 
     downstream = candidates.create_streaming_candidate(
         novel_id="novel-1",
@@ -255,7 +294,7 @@ async def test_rewrite_rebuilds_a_ready_downstream_formal_tail_before_resuming(t
     db.get_connection().commit()
     candidates = ChapterCandidateRepository(db)
     candidates.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
-    _commit_first_chapter(candidates)
+    _commit_first_chapter(candidates, db)
     downstream = candidates.create_streaming_candidate(
         novel_id="novel-1",
         chapter_number=2,
@@ -266,7 +305,15 @@ async def test_rewrite_rebuilds_a_ready_downstream_formal_tail_before_resuming(t
     candidates.mark_auditing(downstream.id)
     candidates.finish_audit(downstream.id, audit={}, commit_plan={})
     candidates.approve_for_commit(downstream.id, continue_after_commit=True)
-    candidates.commit_formal(downstream.id)
+    formal = candidates.commit_formal(downstream.id)
+    _persist_durable_aftermath(
+        db,
+        novel_id=formal.novel_id,
+        chapter_number=formal.chapter_number,
+        content=formal.final_content,
+        content_sha256=hashlib.sha256(formal.final_content.encode("utf-8")).hexdigest(),
+        content_revision=formal.content_revision,
+    )
     candidates.mark_sync_succeeded(downstream.id)
 
     chapters = SqliteChapterRepository(db)
@@ -303,7 +350,7 @@ async def test_worldline_rebuild_replays_only_candidate_first_formal_chapters(tm
     db.get_connection().commit()
     candidates = ChapterCandidateRepository(db)
     candidates.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
-    _commit_first_chapter(candidates)
+    _commit_first_chapter(candidates, db)
     second = candidates.create_streaming_candidate(
         novel_id="novel-1",
         chapter_number=2,
@@ -314,7 +361,15 @@ async def test_worldline_rebuild_replays_only_candidate_first_formal_chapters(tm
     candidates.mark_auditing(second.id)
     candidates.finish_audit(second.id, audit={}, commit_plan={})
     candidates.approve_for_commit(second.id, continue_after_commit=True)
-    candidates.commit_formal(second.id)
+    formal = candidates.commit_formal(second.id)
+    _persist_durable_aftermath(
+        db,
+        novel_id=formal.novel_id,
+        chapter_number=formal.chapter_number,
+        content=formal.final_content,
+        content_sha256=hashlib.sha256(formal.final_content.encode("utf-8")).hexdigest(),
+        content_revision=formal.content_revision,
+    )
     candidates.mark_sync_succeeded(second.id)
     db.execute(
         "INSERT INTO chapters (id, novel_id, number, title, content, status) "

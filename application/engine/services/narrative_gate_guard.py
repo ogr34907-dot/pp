@@ -135,6 +135,7 @@ async def evaluate_chapter_candidate(
         novel_id=novel_id,
         memory_state=memory_state,
         vector_evidence=vector_evidence,
+        summary_visibility_repository=story_node_repo,
     )
     # Digest bindings are persisted structure metadata, not LLM output.  Old
     # act plans can carry a digest copied before their chapter row was

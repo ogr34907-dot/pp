@@ -2610,22 +2610,25 @@ class ContextBudgetAllocator:
         )
 
     def _get_valid_node_summary(self, novel_id: str, node: Any) -> str:
-        metadata = getattr(node, "metadata", None) or {}
-        summary = str(metadata.get("summary", "") or "").strip()
-        state = metadata.get("summary_state") or {}
-        if not summary or state.get("status") != "committed":
-            return ""
-        source_version = str(state.get("source_version", "") or "")
-        chapter_start = state.get("chapter_start")
-        chapter_end = state.get("chapter_end")
-        if not source_version or chapter_start is None or chapter_end is None:
-            return ""
-        current_version = self._chapter_source_version(
-            novel_id,
-            int(chapter_start),
-            int(chapter_end),
-        )
-        return summary if current_version == source_version else ""
+        for summary, state in self._summary_metadata_pairs(
+            node, "summary", "summary_state"
+        ):
+            if not isinstance(state, dict) or state.get("status") != "committed":
+                continue
+            source_version = str(state.get("source_version", "") or "")
+            chapter_start = state.get("chapter_start")
+            chapter_end = state.get("chapter_end")
+            if not source_version or chapter_start is None or chapter_end is None:
+                continue
+            current_version = self._chapter_source_version(
+                novel_id,
+                int(chapter_start),
+                int(chapter_end),
+                source_chapter_numbers=state.get("source_chapter_numbers"),
+            )
+            if current_version == source_version:
+                return summary
+        return ""
 
     def _get_latest_valid_checkpoint_summary(
         self,
@@ -2639,33 +2642,75 @@ class ContextBudgetAllocator:
                 continue
             if int(getattr(node, "number", 0) or 0) >= int(chapter_number):
                 continue
-            metadata = getattr(node, "metadata", None) or {}
-            state = metadata.get("checkpoint_summary_state") or {}
-            summary = str(metadata.get("checkpoint_summary", "") or "").strip()
-            if not summary or state.get("status") != "committed":
-                continue
-            source_version = str(state.get("source_version", "") or "")
-            chapter_start = state.get("chapter_start")
-            chapter_end = state.get("chapter_end")
-            if not source_version or chapter_start is None or chapter_end is None:
-                continue
-            if self._chapter_source_version(
-                novel_id,
-                int(chapter_start),
-                int(chapter_end),
-            ) != source_version:
-                continue
-            checkpoints.append(node)
+            for summary, state in self._summary_metadata_pairs(
+                node, "checkpoint_summary", "checkpoint_summary_state"
+            ):
+                if not isinstance(state, dict) or state.get("status") != "committed":
+                    continue
+                source_version = str(state.get("source_version", "") or "")
+                chapter_start = state.get("chapter_start")
+                chapter_end = state.get("chapter_end")
+                if not source_version or chapter_start is None or chapter_end is None:
+                    continue
+                if self._chapter_source_version(
+                    novel_id,
+                    int(chapter_start),
+                    int(chapter_end),
+                    source_chapter_numbers=state.get("source_chapter_numbers"),
+                ) != source_version:
+                    continue
+                checkpoints.append((node, summary))
+                break
         if not checkpoints:
             return ""
-        latest = max(checkpoints, key=lambda item: int(getattr(item, "number", 0) or 0))
-        return str(latest.metadata["checkpoint_summary"] or "").strip()
+        _, summary = max(
+            checkpoints,
+            key=lambda item: int(getattr(item[0], "number", 0) or 0),
+        )
+        return summary
+
+    def _summary_metadata_pairs(
+        self, node: Any, summary_key: str, state_key: str
+    ) -> tuple[tuple[str, Any], ...]:
+        """Prefer manifest-safe runtime summaries while accepting legacy rows."""
+
+        selector = getattr(
+            type(self.story_node_repo), "visible_summary_metadata_pairs", None
+        )
+        if callable(selector):
+            return tuple(
+                selector(
+                    self.story_node_repo,
+                    node,
+                    summary_key=summary_key,
+                    state_key=state_key,
+                )
+            )
+        metadata = getattr(node, "metadata", None) or {}
+        if self._summary_is_explicitly_invalidated(metadata, summary_key):
+            return ()
+        pairs = []
+        for prefix in ("runtime.", ""):
+            summary = str(metadata.get(f"{prefix}{summary_key}", "") or "").strip()
+            state = metadata.get(f"{prefix}{state_key}") or {}
+            if summary:
+                pairs.append((summary, state))
+        return tuple(pairs)
+
+    @staticmethod
+    def _summary_is_explicitly_invalidated(
+        metadata: Dict[str, Any], summary_key: str
+    ) -> bool:
+        marker = metadata.get(f"runtime.{summary_key}_invalidated_from_chapter")
+        return marker not in (None, "")
 
     def _chapter_source_version(
         self,
         novel_id: str,
         chapter_start: int,
         chapter_end: int,
+        *,
+        source_chapter_numbers: Any = None,
     ) -> str:
         if self.chapter_repo is None:
             return ""
@@ -2673,10 +2718,28 @@ class ContextBudgetAllocator:
             chapters = self.chapter_repo.list_by_novel(NovelId(novel_id))
         except Exception:
             return ""
+        expected_numbers: Optional[list[int]] = None
+        if source_chapter_numbers is not None:
+            if not isinstance(source_chapter_numbers, list) or not source_chapter_numbers:
+                return ""
+            try:
+                expected_numbers = [int(number) for number in source_chapter_numbers]
+            except (TypeError, ValueError):
+                return ""
+            if (
+                any(number < 1 for number in expected_numbers)
+                or expected_numbers != sorted(set(expected_numbers))
+                or expected_numbers[0] < int(chapter_start)
+                or expected_numbers[-1] > int(chapter_end)
+            ):
+                return ""
+        expected_set = set(expected_numbers or [])
         rows = []
         for chapter in sorted(chapters or [], key=lambda item: int(getattr(item, "number", 0) or 0)):
             number = int(getattr(chapter, "number", 0) or 0)
-            if number < chapter_start or number > chapter_end:
+            if expected_numbers is None and (number < chapter_start or number > chapter_end):
+                continue
+            if expected_numbers is not None and number not in expected_set:
                 continue
             content_sha256 = str(getattr(chapter, "content_sha256", "") or "")
             if not content_sha256:
@@ -2686,6 +2749,8 @@ class ContextBudgetAllocator:
             rows.append(
                 f"{number}:{content_sha256}:{int(getattr(chapter, 'content_revision', 0) or 0)}"
             )
+        if expected_numbers is not None and len(rows) != len(expected_numbers):
+            return ""
         if not rows:
             return ""
         return hashlib.sha256("|".join(rows).encode("utf-8")).hexdigest()

@@ -1,6 +1,8 @@
 """Candidate-first workflow keeps unapproved prose out of formal facts and memory."""
 
+import hashlib
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,12 +13,24 @@ from application.engine.services.candidate_chapter_workflow import (
 from application.blueprint.services.outline_contract_service import OutlineExpansionRequired
 from application.engine.dag.engine import DAGEngine
 from application.engine.dag.models import DAGRunResult, NodeResult, get_default_dag
-from domain.novel.candidate_chapter import CandidateStatus, GenerationRunState, RunMode
+from application.world.services.chapter_narrative_sync import (
+    CHAPTER_NARRATIVE_PIPELINE_VERSION,
+)
+from domain.knowledge.chapter_summary import canonical_summary_payload_sha256
+from domain.novel.candidate_chapter import (
+    CandidateStatus,
+    ChapterCandidate,
+    GenerationRunState,
+    RunMode,
+)
 from infrastructure.persistence.database.chapter_candidate_repository import (
     CandidateGateError,
     ChapterCandidateRepository,
 )
 from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+    SqliteChapterNarrativeCommitRepository,
+)
 
 
 @dataclass
@@ -87,14 +101,96 @@ class _StreamingDraftGenerator(_DraftGenerator):
 
 
 class _Aftermath:
-    def __init__(self):
+    def __init__(self, db):
+        self.db = db
         self.calls: list[int] = []
         self.kwargs: list[dict] = []
 
     async def run_after_chapter_saved(self, novel_id, chapter_number, content, **_kwargs):
         self.calls.append(chapter_number)
         self.kwargs.append(dict(_kwargs))
-        return {"narrative_sync_ok": True, "memory_engine_ok": True}
+        return self._persist_durable_aftermath(novel_id, chapter_number, content, **_kwargs)
+
+    def _persist_durable_aftermath(self, novel_id, chapter_number, content, **kwargs):
+        content_sha256 = str(kwargs["expected_content_sha256"])
+        content_revision = int(kwargs["expected_content_revision"])
+        assert content_sha256 == hashlib.sha256(content.encode("utf-8")).hexdigest()
+        connection = self.db.get_connection()
+        connection.execute(
+            "INSERT OR IGNORE INTO knowledge (id, novel_id) VALUES (?, ?)",
+            (f"knowledge-{novel_id}", novel_id),
+        )
+        summary = {
+            "summary": content,
+            "key_events": content,
+            "open_threads": "",
+            "consistency_note": "",
+            "beat_sections": [],
+            "micro_beats": [],
+        }
+        payload_sha256 = canonical_summary_payload_sha256(**summary)
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO chapter_summaries
+                (id, knowledge_id, chapter_number, summary, key_events, open_threads,
+                 consistency_note, beat_sections, micro_beats, source_content_sha256,
+                 source_content_revision, pipeline_version, sync_status, sync_attempts,
+                 canonical_payload_sha256)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?, ?, ?, 'draft', 0, ?)
+            """,
+            (
+                f"summary-{novel_id}-{chapter_number}",
+                f"knowledge-{novel_id}",
+                chapter_number,
+                summary["summary"],
+                summary["key_events"],
+                summary["open_threads"],
+                summary["consistency_note"],
+                content_sha256,
+                content_revision,
+                CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                payload_sha256,
+            ),
+        )
+        connection.commit()
+        repository = SqliteChapterNarrativeCommitRepository(self.db)
+        claim = repository.claim(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            expected_content_revision=content_revision,
+        )
+        repository.prepare_summary(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            attempt_count=claim.attempt_count,
+            canonical_payload_sha256=payload_sha256,
+        )
+        repository.commit(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            attempt_count=claim.attempt_count,
+            content_revision=content_revision,
+            canonical_payload_sha256=payload_sha256,
+        )
+        assert repository.set_memory_sync_status(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision=content_revision,
+            memory_status="committed",
+        )
+        return {
+            "narrative_sync_ok": True,
+            "memory_engine_ok": True,
+            "memory_status": "committed",
+        }
 
 
 class _SemanticReviewer:
@@ -141,6 +237,68 @@ class _RuntimeAwareDAG(_DAG):
         return await super().run(_dag, initial_state, thread_id)
 
 
+class _ManifestReconciliationBlockedOutlines:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    def reconcile_plan_boundary(self, *, novel_id: str, plan_revision_id: str):
+        self.calls.append((novel_id, plan_revision_id))
+        return SimpleNamespace(
+            status="author_decision_required",
+            canonical_ready=True,
+            memory_ready=True,
+            blockers=("formal:head_advanced_after_plan_boundary",),
+        )
+
+
+class _ManifestReconciliationRepository:
+    def __init__(self, candidate: ChapterCandidate):
+        self.candidate = candidate
+        self.approve_calls = 0
+        self.formal_calls = 0
+        self.save_calls = 0
+
+    def get_candidate(self, candidate_id: str) -> ChapterCandidate:
+        assert candidate_id == self.candidate.id
+        return self.candidate
+
+    def revalidate_candidate_generation_authority(
+        self, candidate_id: str
+    ) -> ChapterCandidate:
+        return self.get_candidate(candidate_id)
+
+    def set_generated_content(self, candidate_id: str, _content: str) -> ChapterCandidate:
+        self.save_calls += 1
+        return self.get_candidate(candidate_id)
+
+    def approve_for_commit(self, candidate_id: str, *, continue_after_commit: bool) -> None:
+        self.approve_calls += 1
+        raise AssertionError("approval must not run after a failed Manifest reconciliation")
+
+    def commit_formal(self, candidate_id: str) -> ChapterCandidate:
+        self.formal_calls += 1
+        raise AssertionError("formal commit must not run after a failed Manifest reconciliation")
+
+
+def _manifest_candidate(*, status: CandidateStatus) -> ChapterCandidate:
+    return ChapterCandidate(
+        id="manifest-candidate",
+        novel_id="novel-1",
+        chapter_number=2,
+        title="第二章",
+        generation_epoch=1,
+        status=status,
+        plan_revision_id="manifest-plan-1",
+        plan_digest="manifest-plan-digest",
+        chapter_outline_digest="chapter-digest",
+        outline_chain={"chapter": {"payload": {}}},
+        llm_content="候选正文",
+        content_revision=1,
+        audit_revision=1,
+        commit_plan_content_revision=1,
+    )
+
+
 @pytest.fixture
 def workflow(tmp_path):
     db = DatabaseConnection(str(tmp_path / "candidate-workflow.db"))
@@ -151,8 +309,53 @@ def workflow(tmp_path):
     conn.commit()
     repo = ChapterCandidateRepository(db)
     drafts = _DraftGenerator()
-    aftermath = _Aftermath()
+    aftermath = _Aftermath(db)
     return db, repo, drafts, aftermath
+
+
+@pytest.mark.asyncio
+async def test_manifest_reconciliation_blocks_llm_before_any_draft_call():
+    candidate = _manifest_candidate(status=CandidateStatus.STREAMING)
+    repository = _ManifestReconciliationRepository(candidate)
+    outlines = _ManifestReconciliationBlockedOutlines()
+    drafts = _DraftGenerator()
+    service = CandidateChapterWorkflowService(repository, outlines, drafts, object())
+
+    with pytest.raises(CandidateWorkflowError, match="reconciliation"):
+        await service._generate_candidate_with_authority(candidate)
+
+    assert outlines.calls == [("novel-1", "manifest-plan-1")]
+    assert drafts.calls == []
+    assert repository.save_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_manifest_reconciliation_blocks_manual_approval_before_commit_transition():
+    candidate = _manifest_candidate(status=CandidateStatus.AWAITING_REVIEW)
+    repository = _ManifestReconciliationRepository(candidate)
+    outlines = _ManifestReconciliationBlockedOutlines()
+    service = CandidateChapterWorkflowService(repository, outlines, object(), object())
+
+    with pytest.raises(CandidateWorkflowError, match="reconciliation"):
+        await service.accept_candidate(candidate.id, continue_after_commit=False)
+
+    assert outlines.calls == [("novel-1", "manifest-plan-1")]
+    assert repository.approve_calls == 0
+    assert repository.formal_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_manifest_reconciliation_blocks_formal_write_after_auto_approval():
+    candidate = _manifest_candidate(status=CandidateStatus.COMMITTING)
+    repository = _ManifestReconciliationRepository(candidate)
+    outlines = _ManifestReconciliationBlockedOutlines()
+    service = CandidateChapterWorkflowService(repository, outlines, object(), object())
+
+    with pytest.raises(CandidateWorkflowError, match="reconciliation"):
+        await service._commit_and_sync(candidate.id)
+
+    assert outlines.calls == [("novel-1", "manifest-plan-1")]
+    assert repository.formal_calls == 0
 
 
 @pytest.mark.asyncio
@@ -222,6 +425,106 @@ async def test_legacy_baseline_integrity_blocks_the_draft_generator_before_it_is
         await service.generate_next("novel-1")
 
     assert drafts.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_baseline_without_durable_aftermath_blocks_the_draft_generator(
+    workflow,
+):
+    db, repo, drafts, aftermath = workflow
+    conn = db.get_connection()
+    conn.execute(
+        """
+        INSERT INTO chapters (id, novel_id, number, title, content, status)
+        VALUES ('legacy-aftermath-1', 'novel-1', 1, '第一章', '已确认的旧正文', 'completed')
+        """
+    )
+    conn.commit()
+    repo.import_legacy_formal_history("novel-1")
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    service = CandidateChapterWorkflowService(repo, _Outlines(), drafts, aftermath)
+
+    with pytest.raises(CandidateWorkflowError, match="canonical aftermath"):
+        await service.generate_next("novel-1")
+
+    assert drafts.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_baseline_with_partial_aftermath_blocks_the_draft_generator(
+    workflow,
+):
+    db, repo, drafts, aftermath = workflow
+    content = "已有正式历史，但 Memory 尚未完成。"
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    conn = db.get_connection()
+    conn.execute(
+        """
+        INSERT INTO chapters
+            (id, novel_id, number, title, content, content_sha256, content_revision, status)
+        VALUES ('legacy-partial-1', 'novel-1', 1, '第一章', ?, ?, 1, 'completed')
+        """,
+        (content, digest),
+    )
+    conn.commit()
+    repo.import_legacy_formal_history("novel-1")
+    aftermath._persist_durable_aftermath(
+        "novel-1",
+        1,
+        content,
+        expected_content_sha256=digest,
+        expected_content_revision=1,
+    )
+    conn.execute(
+        """
+        UPDATE chapter_narrative_commits
+        SET memory_status = 'pending'
+        WHERE novel_id = 'novel-1' AND chapter_number = 1
+        """
+    )
+    conn.commit()
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    service = CandidateChapterWorkflowService(repo, _Outlines(), drafts, aftermath)
+
+    with pytest.raises(CandidateWorkflowError, match="canonical aftermath"):
+        await service.generate_next("novel-1")
+
+    assert drafts.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_baseline_with_exact_aftermath_allows_next_candidate_generation(
+    workflow,
+):
+    db, repo, drafts, aftermath = workflow
+    content = "已有正式历史，所有 Aftermath 已完成。"
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    conn = db.get_connection()
+    conn.execute(
+        """
+        INSERT INTO chapters
+            (id, novel_id, number, title, content, content_sha256, content_revision, status)
+        VALUES ('legacy-ready-1', 'novel-1', 1, '第一章', ?, ?, 1, 'completed')
+        """,
+        (content, digest),
+    )
+    conn.commit()
+    repo.import_legacy_formal_history("novel-1")
+    aftermath._persist_durable_aftermath(
+        "novel-1",
+        1,
+        content,
+        expected_content_sha256=digest,
+        expected_content_revision=1,
+    )
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    service = CandidateChapterWorkflowService(repo, _Outlines(), drafts, aftermath)
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate is not None
+    assert candidate.chapter_number == 2
+    assert drafts.calls == [2]
 
 
 @pytest.mark.asyncio
@@ -637,10 +940,7 @@ async def test_failed_canonical_sync_retries_the_same_formal_candidate_without_n
     assert failed.status == CandidateStatus.FAILED
     assert drafts.calls == [1]
 
-    async def ready_sync(*_args, **_kwargs):
-        return {"narrative_sync_ok": True}
-
-    aftermath.run_after_chapter_saved = ready_sync
+    aftermath.run_after_chapter_saved = aftermath._persist_durable_aftermath
     committed = await service.retry_canonical_sync(candidate.id)
     assert committed.status == CandidateStatus.COMMITTED
     assert drafts.calls == [1]

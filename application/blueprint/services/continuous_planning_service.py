@@ -11,7 +11,7 @@ import sys
 import copy
 import hashlib
 import inspect
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 from json_repair import repair_json
 
@@ -495,6 +495,10 @@ class ContinuousPlanningService:
         self.chapter_repository = chapter_repository
         self.novel_repository = novel_repository
         self.alignment_gate = alignment_gate or narrative_alignment_gate
+        if self.alignment_gate is not None and getattr(
+            self.alignment_gate, "story_node_repository", None
+        ) is None:
+            self.alignment_gate.story_node_repository = story_node_repo
 
     # CPMS 提示词渲染
 
@@ -1790,7 +1794,12 @@ class ContinuousPlanningService:
                 order_index=index + 1, parent_id=act_node.id,
                 metadata={"contract_digest": digests["chapter"]},
             )
-            snapshot = self.alignment_gate.build_snapshot(chapter_id, [*nodes, synthetic])
+            snapshot = self.alignment_gate.build_snapshot(
+                chapter_id,
+                [*nodes, synthetic],
+                novel_id=act_node.novel_id,
+                summary_visibility_repository=self.story_node_repo,
+            )
             reports.append((await self.alignment_gate.evaluate(snapshot, candidate)).to_dict())
         return next((r for r in reports if r.get("decision") in {"block", "review"}), reports[0] if reports else None)
 
@@ -3363,28 +3372,66 @@ class ContinuousPlanningService:
         summary_key: str,
         state_key: str,
     ) -> str:
-        metadata = getattr(node, "metadata", None) or {}
-        summary = str(metadata.get(summary_key) or "").strip()
-        state = metadata.get(state_key) or {}
-        if not summary or state.get("status") != "committed":
-            return ""
-        source_version = str(state.get("source_version") or "")
-        chapter_start = state.get("chapter_start")
-        chapter_end = state.get("chapter_end")
-        if not source_version or chapter_start is None or chapter_end is None:
-            return ""
-        current_version = self._chapter_source_version(
-            node.novel_id,
-            int(chapter_start),
-            int(chapter_end),
+        for summary, state in self._summary_metadata_pairs(
+            node, summary_key, state_key
+        ):
+            if not isinstance(state, dict) or state.get("status") != "committed":
+                continue
+            source_version = str(state.get("source_version") or "")
+            chapter_start = state.get("chapter_start")
+            chapter_end = state.get("chapter_end")
+            if not source_version or chapter_start is None or chapter_end is None:
+                continue
+            current_version = self._chapter_source_version(
+                node.novel_id,
+                int(chapter_start),
+                int(chapter_end),
+                source_chapter_numbers=state.get("source_chapter_numbers"),
+            )
+            if current_version == source_version:
+                return summary
+        return ""
+
+    def _summary_metadata_pairs(
+        self, node: StoryNode, summary_key: str, state_key: str
+    ) -> tuple[tuple[str, Any], ...]:
+        selector = getattr(
+            type(self.story_node_repo), "visible_summary_metadata_pairs", None
         )
-        return summary if current_version == source_version else ""
+        if callable(selector):
+            return tuple(
+                selector(
+                    self.story_node_repo,
+                    node,
+                    summary_key=summary_key,
+                    state_key=state_key,
+                )
+            )
+        metadata = getattr(node, "metadata", None) or {}
+        if self._summary_is_explicitly_invalidated(metadata, summary_key):
+            return ()
+        pairs = []
+        for prefix in ("runtime.", ""):
+            summary = str(metadata.get(f"{prefix}{summary_key}") or "").strip()
+            state = metadata.get(f"{prefix}{state_key}") or {}
+            if summary:
+                pairs.append((summary, state))
+        return tuple(pairs)
+
+    @staticmethod
+    def _summary_is_explicitly_invalidated(
+        metadata: Dict[str, Any], summary_key: str
+    ) -> bool:
+        marker = metadata.get(f"runtime.{summary_key}_invalidated_from_chapter")
+        return marker not in (None, "")
 
     def _chapter_source_version(
         self,
         novel_id: str,
         chapter_start: int,
         chapter_end: int,
+        *,
+        source_chapter_numbers: Any = None,
     ) -> str:
         if self.chapter_repository is None:
             return ""
@@ -3392,10 +3439,28 @@ class ContinuousPlanningService:
             chapters = self.chapter_repository.list_by_novel(NovelId(novel_id))
         except Exception:
             return ""
+        expected_numbers: Optional[list[int]] = None
+        if source_chapter_numbers is not None:
+            if not isinstance(source_chapter_numbers, list) or not source_chapter_numbers:
+                return ""
+            try:
+                expected_numbers = [int(number) for number in source_chapter_numbers]
+            except (TypeError, ValueError):
+                return ""
+            if (
+                any(number < 1 for number in expected_numbers)
+                or expected_numbers != sorted(set(expected_numbers))
+                or expected_numbers[0] < int(chapter_start)
+                or expected_numbers[-1] > int(chapter_end)
+            ):
+                return ""
+        expected_set = set(expected_numbers or [])
         source_rows = []
         for chapter in sorted(chapters or [], key=lambda item: int(getattr(item, "number", 0) or 0)):
             number = int(getattr(chapter, "number", 0) or 0)
-            if number < chapter_start or number > chapter_end:
+            if expected_numbers is None and (number < chapter_start or number > chapter_end):
+                continue
+            if expected_numbers is not None and number not in expected_set:
                 continue
             content = str(getattr(chapter, "content", "") or "")
             content_sha256 = str(getattr(chapter, "content_sha256", "") or "")
@@ -3404,6 +3469,8 @@ class ContinuousPlanningService:
             source_rows.append(
                 f"{number}:{content_sha256}:{int(getattr(chapter, 'content_revision', 0) or 0)}"
             )
+        if expected_numbers is not None and len(source_rows) != len(expected_numbers):
+            return ""
         if not source_rows:
             return ""
         return hashlib.sha256("|".join(source_rows).encode("utf-8")).hexdigest()
