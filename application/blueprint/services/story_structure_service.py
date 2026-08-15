@@ -15,6 +15,9 @@ from application.blueprint.services.chapter_book_structure_sync import (
     purge_chapter_book_rows_not_matching_structure,
 )
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+from infrastructure.persistence.database.planning_authority_guard import (
+    assert_story_node_write_allowed,
+)
 
 if TYPE_CHECKING:
     from application.novel.chapter_renumber.coordinator import ChapterRenumberCoordinator
@@ -204,6 +207,13 @@ class StoryStructureService:
         node = await self.repository.get_by_id(node_id)
         if not node:
             return False
+        get_connection = getattr(self.repository, "_get_connection", None)
+        if callable(get_connection):
+            assert_story_node_write_allowed(
+                get_connection(),
+                node.novel_id,
+                operation="structure delete",
+            )
 
         deleted_any = False
         if self._chapter_repository is not None:

@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from domain.novel.entities.novel import NovelStage
+from infrastructure.persistence.database.planning_authority_guard import (
+    is_manifest_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -608,7 +611,13 @@ class AutopilotRecoveryPolicy:
             )
             lightweight_outline = ""
             metadata: dict[str, Any] = {}
-            if row:
+            get_connection = getattr(db, "get_connection", None)
+            connection = get_connection() if callable(get_connection) else getattr(db, "conn", None)
+            manifest_mode = (
+                connection is not None
+                and is_manifest_authority(connection, novel_id)
+            )
+            if row and not manifest_mode:
                 metadata = self._json_object(row.get("metadata"))
                 act_plan = metadata.get("act_chapter_plan")
                 if isinstance(act_plan, dict) and act_plan:

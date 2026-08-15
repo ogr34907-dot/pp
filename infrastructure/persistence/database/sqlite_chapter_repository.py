@@ -9,6 +9,9 @@ from domain.novel.value_objects.chapter_id import ChapterId
 from domain.novel.value_objects.novel_id import NovelId
 from domain.novel.repositories.chapter_repository import ChapterRepository
 from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.planning_authority_guard import (
+    assert_story_node_write_allowed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +198,11 @@ class SqliteChapterRepository(ChapterRepository):
     ) -> None:
         d = deleted_number
         off = self._RENUMBER_OFFSET
+        assert_story_node_write_allowed(
+            conn,
+            novel_id,
+            operation="chapter delete/reorder",
+        )
 
         conn.execute(
             """

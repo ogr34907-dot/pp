@@ -12,6 +12,9 @@ from uuid import uuid4
 from application.core.async_bridge import run_coroutine_sync
 from application.manuscript.reindex_job import reindex_chapter_entity_mentions
 from domain.novel.value_objects.novel_id import NovelId
+from infrastructure.persistence.database.planning_authority_guard import (
+    is_manifest_authority,
+)
 from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
 
 logger = logging.getLogger(__name__)
@@ -628,6 +631,10 @@ class ChapterRewriteCoordinator:
         )
 
     def _invalidate_story_nodes(self, conn: Any, novel_id: str, chapter_number: int) -> None:
+        if is_manifest_authority(conn, novel_id):
+            # The manifest projection is rebuilt only by a confirmed Worldline
+            # transaction; ordinary rewrite invalidation must not mutate it.
+            return
         columns = self._table_columns(conn, "story_nodes")
         if not {"id", "novel_id", "node_type", "metadata"} <= columns:
             return

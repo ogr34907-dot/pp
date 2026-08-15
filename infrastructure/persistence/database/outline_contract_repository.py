@@ -27,6 +27,9 @@ from domain.structure.outline_plan import (
     PlanningHead,
     canonical_plan_digest,
 )
+from infrastructure.persistence.database.planning_authority_guard import (
+    assert_legacy_planning_mutation_allowed,
+)
 
 
 class OutlineGateError(ValueError):
@@ -71,6 +74,11 @@ class OutlineContractRepository:
         from infrastructure.persistence.database.connection import get_database
 
         return get_database(self.db_path).get_connection()
+
+    def _assert_legacy_mutation(self, novel_id: str, operation: str) -> None:
+        assert_legacy_planning_mutation_allowed(
+            self._connection(), novel_id, operation=operation
+        )
 
     @staticmethod
     def _now() -> str:
@@ -796,6 +804,7 @@ class OutlineContractRepository:
         return self._slot_from_row(row) if row is not None else None
 
     def ensure_root(self, novel_id: str) -> OutlineContractSlot:
+        self._assert_legacy_mutation(novel_id, "ensure_root")
         conn = self._connection()
         row = conn.execute(
             """
@@ -827,6 +836,7 @@ class OutlineContractRepository:
         parent_contract_id: str,
         story_node_id: Optional[str] = None,
     ) -> OutlineContractSlot:
+        self._assert_legacy_mutation(novel_id, "create_contract")
         parent = self.get_slot(parent_contract_id)
         if parent.novel_id != novel_id:
             raise OutlineGateError("parent outline belongs to another novel")
@@ -859,6 +869,7 @@ class OutlineContractRepository:
         source: OutlineSource = OutlineSource.AI,
     ) -> OutlineContractSlot:
         slot = self.get_slot(contract_id)
+        self._assert_legacy_mutation(slot.novel_id, "save_draft")
         parent_digest = ""
         if slot.parent_contract_id:
             parent = self.get_slot(slot.parent_contract_id)
@@ -975,6 +986,7 @@ class OutlineContractRepository:
         """Atomically make the chosen draft current and regenerate its projection."""
 
         slot = self.get_slot(contract_id)
+        self._assert_legacy_mutation(slot.novel_id, "publish_and_sync")
         conn = self._connection()
         if idempotency_key:
             operation = "publish_and_sync"
@@ -1202,7 +1214,8 @@ class OutlineContractRepository:
     ) -> dict[str, Any]:
         """Create one durable streamed-draft attempt before calling an LLM."""
 
-        self.get_slot(contract_id)
+        slot = self.get_slot(contract_id)
+        self._assert_legacy_mutation(slot.novel_id, "start_generation_attempt")
         snapshot = dict(prompt_snapshot or {})
         if retry_of_attempt_id:
             previous = self.get_generation_attempt(retry_of_attempt_id)
@@ -1284,10 +1297,17 @@ class OutlineContractRepository:
             return self.get_generation_attempt(attempt_id)
         conn = self._connection()
         row = conn.execute(
-            "SELECT status FROM outline_generation_attempts WHERE id = ?", (attempt_id,)
+            """
+            SELECT attempt.status, contract.novel_id
+            FROM outline_generation_attempts AS attempt
+            JOIN outline_contracts AS contract ON contract.id = attempt.contract_id
+            WHERE attempt.id = ?
+            """,
+            (attempt_id,),
         ).fetchone()
         if row is None:
             raise KeyError(f"outline generation attempt not found: {attempt_id}")
+        self._assert_legacy_mutation(str(row["novel_id"]), "append_generation_attempt_delta")
         if row["status"] != "running":
             raise OutlineGateError("outline generation attempt is no longer running")
         try:
@@ -1337,10 +1357,17 @@ class OutlineContractRepository:
             raise ValueError("invalid outline generation attempt status")
         conn = self._connection()
         row = conn.execute(
-            "SELECT status FROM outline_generation_attempts WHERE id = ?", (attempt_id,)
+            """
+            SELECT attempt.status, contract.novel_id
+            FROM outline_generation_attempts AS attempt
+            JOIN outline_contracts AS contract ON contract.id = attempt.contract_id
+            WHERE attempt.id = ?
+            """,
+            (attempt_id,),
         ).fetchone()
         if row is None:
             raise KeyError(f"outline generation attempt not found: {attempt_id}")
+        self._assert_legacy_mutation(str(row["novel_id"]), "finish_generation_attempt")
         if row["status"] != "running":
             return self.get_generation_attempt(attempt_id)
         now = self._now()

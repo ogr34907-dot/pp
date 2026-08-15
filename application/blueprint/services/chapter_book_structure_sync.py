@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING, Iterable, Optional, Set
 
 from domain.novel.value_objects.chapter_id import ChapterId
 from domain.novel.value_objects.novel_id import NovelId
+from infrastructure.persistence.database.planning_authority_guard import (
+    PlanningAuthorityError,
+    is_manifest_authority,
+)
 
 if TYPE_CHECKING:
     from domain.novel.repositories.chapter_repository import ChapterRepository
@@ -67,6 +71,12 @@ def purge_chapter_book_rows_not_matching_structure(
     """
     if chapter_repository is None:
         return 0
+    get_connection = getattr(story_node_repo, "_get_connection", None)
+    connection = get_connection() if callable(get_connection) else None
+    if connection is not None and is_manifest_authority(connection, novel_id):
+        raise PlanningAuthorityError(
+            "manifest planning authority forbids tree-driven chapter purge"
+        )
     structure_nums = collect_structure_chapter_numbers(story_node_repo, novel_id)
     novel_vo = NovelId(novel_id)
     orphaned = []

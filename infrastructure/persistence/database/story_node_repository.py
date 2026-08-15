@@ -5,12 +5,18 @@
 import sqlite3
 import json
 import logging
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 from domain.structure.story_node import StoryNode, NodeType, StoryTree, PlanningStatus, PlanningSource
+from infrastructure.persistence.database.planning_authority_guard import (
+    PlanningAuthorityError,
+    ProjectionWriteCapability,
+    assert_story_node_write_allowed,
+    is_manifest_authority,
+)
 
 
 class StoryNodeRepository:
@@ -47,9 +53,125 @@ class StoryNodeRepository:
         """不再在方法末尾 close：db_path 模式也走全局 DatabaseConnection，避免误关线程本地连接。"""
         return False
 
-    def save_sync(self, node: StoryNode) -> StoryNode:
+    def _assert_write_allowed(
+        self,
+        novel_id: str,
+        *,
+        operation: str,
+        capability: Optional[ProjectionWriteCapability] = None,
+    ) -> None:
+        assert_story_node_write_allowed(
+            self._get_connection(),
+            novel_id,
+            operation=operation,
+            capability=capability,
+        )
+
+    @staticmethod
+    def _json_object(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not raw:
+            return {}
+        try:
+            value = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _runtime_only_update(self, node: StoryNode) -> bool:
+        """Allow the manifest runtime whitelist without a full planning upsert."""
+
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM story_nodes WHERE id = ? AND novel_id = ?",
+            (node.id, node.novel_id),
+        ).fetchone()
+        if row is None:
+            return False
+        current = dict(row)
+        protected_values = {
+            "parent_id": node.parent_id,
+            "node_type": node.node_type.value,
+            "number": node.number,
+            "title": node.title,
+            "description": node.description,
+            "order_index": node.order_index,
+            "planning_status": node.planning_status.value,
+            "planning_source": node.planning_source.value,
+            "chapter_start": node.chapter_start,
+            "chapter_end": node.chapter_end,
+            "chapter_count": node.chapter_count,
+            "suggested_chapter_count": node.suggested_chapter_count,
+            "content": node.content,
+            "outline": node.outline,
+            "themes": json.dumps(node.themes),
+            "key_events": json.dumps(node.key_events),
+            "narrative_arc": node.narrative_arc,
+            "conflicts": json.dumps(node.conflicts),
+            "pov_character_id": node.pov_character_id,
+            "timeline_start": node.timeline_start,
+            "timeline_end": node.timeline_end,
+        }
+        for column, expected in protected_values.items():
+            if current.get(column) != expected:
+                return False
+        old_metadata = self._json_object(current.get("metadata"))
+        new_metadata = self._json_object(node.metadata)
+        protected_metadata = {
+            key
+            for key in set(old_metadata) | set(new_metadata)
+            if not str(key).startswith("runtime.")
+        }
+        return all(old_metadata.get(key) == new_metadata.get(key) for key in protected_metadata)
+
+    def update_runtime_fields(
+        self,
+        node_id: str,
+        *,
+        word_count: Optional[int] = None,
+        status: Optional[str] = None,
+        runtime_metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Update only display/runtime fields while preserving planning fields."""
+
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT novel_id, metadata FROM story_nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        metadata = self._json_object(row["metadata"] if isinstance(row, sqlite3.Row) else row[1])
+        for key, value in (runtime_metadata or {}).items():
+            if not str(key).startswith("runtime."):
+                raise ValueError("runtime metadata keys must start with runtime.")
+            metadata[str(key)] = value
+        sets: list[str] = ["metadata = ?", "updated_at = ?"]
+        params: list[Any] = [json.dumps(metadata, ensure_ascii=False, sort_keys=True), datetime.now().isoformat()]
+        if word_count is not None:
+            sets.append("word_count = ?")
+            params.append(int(word_count))
+        if status is not None:
+            sets.append("status = ?")
+            params.append(str(status))
+        params.append(node_id)
+        conn.execute(f"UPDATE story_nodes SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        conn.commit()
+        return True
+
+    def save_sync(
+        self,
+        node: StoryNode,
+        *,
+        _capability: Optional[ProjectionWriteCapability] = None,
+    ) -> StoryNode:
         """同步保存（供 NovelService 等非 async 调用链使用）。"""
         conn = self._get_connection()
+        self._assert_write_allowed(
+            node.novel_id,
+            operation="save_sync",
+            capability=_capability,
+        )
         try:
             cursor = conn.cursor()
             cursor.execute("""
@@ -92,7 +214,8 @@ class StoryNodeRepository:
                 node.created_at.isoformat(),
                 node.updated_at.isoformat(),
             ))
-            conn.commit()
+            if _capability is None:
+                conn.commit()
             return node
         finally:
             if self._should_close_after_use():
@@ -102,10 +225,32 @@ class StoryNodeRepository:
         """保存节点"""
         return self.save_sync(node)
 
-    async def update(self, node: StoryNode) -> StoryNode:
+    async def update(
+        self,
+        node: StoryNode,
+        *,
+        _capability: Optional[ProjectionWriteCapability] = None,
+    ) -> StoryNode:
         """更新节点"""
         node.updated_at = datetime.now()
         conn = self._get_connection()
+        if _capability is None and self._runtime_only_update(node):
+            self.update_runtime_fields(
+                node.id,
+                word_count=node.word_count,
+                status=node.status,
+                runtime_metadata={
+                    str(key): value
+                    for key, value in self._json_object(node.metadata).items()
+                    if str(key).startswith("runtime.")
+                },
+            )
+            return node
+        self._assert_write_allowed(
+            node.novel_id,
+            operation="update",
+            capability=_capability,
+        )
         try:
             cursor = conn.cursor()
             cursor.execute("""
@@ -164,21 +309,51 @@ class StoryNodeRepository:
                 node.updated_at.isoformat(),
                 node.id,
             ))
-            conn.commit()
+            if _capability is None:
+                conn.commit()
             return node
         finally:
             if self._should_close_after_use():
                 conn.close()
 
-    async def save_batch(self, nodes: List[StoryNode]) -> List[StoryNode]:
+    async def save_batch(
+        self,
+        nodes: List[StoryNode],
+        *,
+        _capability: Optional[ProjectionWriteCapability] = None,
+    ) -> List[StoryNode]:
         """批量保存节点"""
         if not nodes:
             return nodes
         conn = self._get_connection()
+        if _capability is None:
+            for node in nodes:
+                if is_manifest_authority(conn, node.novel_id) and self._runtime_only_update(node):
+                    self.update_runtime_fields(
+                        node.id,
+                        word_count=node.word_count,
+                        status=node.status,
+                        runtime_metadata={
+                            str(key): value
+                            for key, value in self._json_object(node.metadata).items()
+                            if str(key).startswith("runtime.")
+                        },
+                    )
+                    continue
+                self._assert_write_allowed(node.novel_id, operation="save_batch")
+        else:
+            for node in nodes:
+                self._assert_write_allowed(
+                    node.novel_id,
+                    operation="save_batch",
+                    capability=_capability,
+                )
         try:
             cursor = conn.cursor()
             for node in nodes:
                 try:
+                    if _capability is None and is_manifest_authority(conn, node.novel_id) and self._runtime_only_update(node):
+                        continue
                     cursor.execute("""
                         INSERT INTO story_nodes (
                             id, novel_id, parent_id, node_type, number, title, description, order_index,
@@ -255,7 +430,8 @@ class StoryNodeRepository:
                             )
                             continue
                     raise
-            conn.commit()
+            if _capability is None:
+                conn.commit()
             return nodes
         finally:
             if self._should_close_after_use():
@@ -342,13 +518,29 @@ class StoryNodeRepository:
             if self._should_close_after_use():
                 conn.close()
 
-    async def delete(self, node_id: str) -> bool:
+    async def delete(
+        self,
+        node_id: str,
+        *,
+        _capability: Optional[ProjectionWriteCapability] = None,
+    ) -> bool:
         """删除节点（级联删除子节点）"""
         conn = self._get_connection()
         try:
+            row = cursor = conn.execute(
+                "SELECT novel_id FROM story_nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+            if row is not None:
+                novel_id = row["novel_id"] if isinstance(row, sqlite3.Row) else row[0]
+                self._assert_write_allowed(
+                    str(novel_id),
+                    operation="delete",
+                    capability=_capability,
+                )
             cursor = conn.cursor()
             cursor.execute("DELETE FROM story_nodes WHERE id = ?", (node_id,))
-            conn.commit()
+            if _capability is None:
+                conn.commit()
             return cursor.rowcount > 0
         finally:
             if self._should_close_after_use():
@@ -366,7 +558,14 @@ class StoryNodeRepository:
             if self._should_close_after_use():
                 conn.close()
 
-    async def apply_merge_plan(self, creates: List[dict], updates: List[dict], deletes: List[str]) -> None:
+    async def apply_merge_plan(
+        self,
+        creates: List[dict],
+        updates: List[dict],
+        deletes: List[str],
+        *,
+        _capability: Optional[ProjectionWriteCapability] = None,
+    ) -> None:
         """应用宏观规划合并计划（原子性事务）
 
         Args:
@@ -375,8 +574,33 @@ class StoryNodeRepository:
             deletes: 需要删除的节点 ID 列表
         """
         conn = self._get_connection()
+        novels = {
+            str(item.get("novel_id"))
+            for item in creates
+            if item.get("novel_id")
+        }
+        lookup_ids = deletes + [str(item.get("id")) for item in updates if item.get("id")]
+        if lookup_ids:
+            rows = conn.execute(
+                "SELECT DISTINCT novel_id FROM story_nodes WHERE id IN (%s)"
+                % ",".join("?" for _ in lookup_ids),
+                tuple(lookup_ids),
+            ).fetchall() if lookup_ids else []
+            novels.update(str(row[0]) for row in rows)
+        if (creates or updates or deletes) and not novels:
+            raise PlanningAuthorityError(
+                "cannot determine StoryNode novel scope for merge plan"
+            )
+        for novel_id in novels:
+            self._assert_write_allowed(
+                novel_id,
+                operation="apply_merge_plan",
+                capability=_capability,
+            )
         try:
-            conn.execute("BEGIN")
+            owns_transaction = _capability is None
+            if owns_transaction:
+                conn.execute("BEGIN")
             cursor = conn.cursor()
 
             # 1. 批量删除
@@ -452,9 +676,11 @@ class StoryNodeRepository:
                         datetime.now().isoformat(),
                     ))
 
-            conn.commit()
+            if owns_transaction:
+                conn.commit()
         except Exception as e:
-            conn.rollback()
+            if _capability is None:
+                conn.rollback()
             raise e
         finally:
             if self._should_close_after_use():
@@ -506,6 +732,7 @@ class StoryNodeRepository:
     async def update_chapter_ranges(self, novel_id: str) -> None:
         """根据子节点的 chapter_start/chapter_end 更新父节点的章节范围"""
         conn = self._get_connection()
+        self._assert_write_allowed(novel_id, operation="update_chapter_ranges")
         try:
             cursor = conn.cursor()
             cursor.execute("""
@@ -561,6 +788,7 @@ class StoryNodeRepository:
         if not old_name or old_name == new_name:
             return 0
         conn = self._get_connection()
+        self._assert_write_allowed(novel_id, operation="bulk_replace_text_sync")
         try:
             cursor = conn.cursor()
             cursor.execute(
