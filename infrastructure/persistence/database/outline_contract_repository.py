@@ -2058,6 +2058,7 @@ class OutlineContractRepository:
         plan_revision_id: str,
         parent_logical_node_id: str,
         level: OutlineLevel,
+        require_unexpanded: bool = True,
     ) -> OutlinePlanRevision:
         plan = self.get_plan_revision(plan_revision_id, _connection=conn)
         head = self.get_planning_head(plan.novel_id)
@@ -2077,7 +2078,9 @@ class OutlineContractRepository:
         )
         if parent is None or parent.level.child_level != level:
             raise OutlineGateError("manifest cohort attempt parent does not own this level")
-        if any(item.parent_logical_node_id == parent_logical_node_id for item in plan.items):
+        if require_unexpanded and any(
+            item.parent_logical_node_id == parent_logical_node_id for item in plan.items
+        ):
             raise OutlineGateError(
                 "manifest cohort attempt requires an unexpanded parent; "
                 "future replanning must use the impact-closure workflow"
@@ -2258,6 +2261,7 @@ class OutlineContractRepository:
                 plan_revision_id=str(row["plan_revision_id"]),
                 parent_logical_node_id=str(row["parent_logical_node_id"]),
                 level=OutlineLevel(str(row["level"])),
+                require_unexpanded=False,
             )
             now = self._now()
             conn.execute(
