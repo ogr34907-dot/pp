@@ -1,5 +1,9 @@
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload
-from domain.structure.outline_plan_validation import validate_sibling_cohort
+from domain.structure.outline_plan import OutlinePlanItem
+from domain.structure.outline_plan_validation import (
+    compute_replan_impact_closure,
+    validate_sibling_cohort,
+)
 
 
 def _payload(*, start: int, end: int, entry: str, exit: str) -> OutlinePayload:
@@ -56,3 +60,36 @@ def test_sibling_cohort_requires_parent_boundary_coverage():
     assert "chapter_range:first_start_mismatch:expected=1:actual=2" in result.blockers
     assert "handoff:first_entry_state_mismatch" in result.blockers
 
+
+def test_replan_impact_closure_includes_downstream_and_later_siblings():
+    items = (
+        OutlinePlanItem(
+            logical_node_id="root", version_id="vr", version_digest="dr",
+            level=OutlineLevel.OUTLINE, sibling_index=0,
+        ),
+        OutlinePlanItem(
+            logical_node_id="part-a", version_id="va", version_digest="da",
+            level=OutlineLevel.PART, sibling_index=0, parent_logical_node_id="root",
+            validated_parent_digest="dr",
+        ),
+        OutlinePlanItem(
+            logical_node_id="part-b", version_id="vb", version_digest="db",
+            level=OutlineLevel.PART, sibling_index=1, parent_logical_node_id="root",
+            validated_parent_digest="dr", validated_previous_sibling_digest="da",
+        ),
+        OutlinePlanItem(
+            logical_node_id="volume-a", version_id="vva", version_digest="dva",
+            level=OutlineLevel.VOLUME, sibling_index=0, parent_logical_node_id="part-a",
+            validated_parent_digest="da",
+        ),
+        OutlinePlanItem(
+            logical_node_id="volume-b", version_id="vvb", version_digest="dvb",
+            level=OutlineLevel.VOLUME, sibling_index=0, parent_logical_node_id="part-b",
+            validated_parent_digest="db",
+        ),
+    )
+
+    impact = compute_replan_impact_closure(items, "part-b")
+
+    assert impact.invalidated_logical_node_ids == ("part-b", "volume-b")
+    assert impact.ancestor_logical_node_ids == ("root",)
