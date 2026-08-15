@@ -1,170 +1,132 @@
-# PlotPilot（墨枢）架构
+# PlotPilot 架构
 
-> **PlotPilot（墨枢）** 是面向长篇 AI 创作的剧情引擎内核。代码结构采用 DDD 分层，并在传统四层之外保留独立的 `engine/` 运行内核，用于承载生产守护进程、章节写作管线和题材扩展。产品说明与启动入口见根目录 [README.md](../README.md)。
+PlotPilot 是面向长篇小说创作的本地工作台。当前新书写作以五级大纲、
+Candidate-first、Canonical 章后同步和版本化长期记忆为主线。`engine/` 中的
+StoryPipeline/daemon 仍作为兼容实现保留，但不是新书正文的写入权威。
 
-## 系统概览
+产品说明和日常启动方式见 [README.md](../README.md)，章节状态机和直接写入口
+分类见 [CHAPTER_LIFECYCLE.md](CHAPTER_LIFECYCLE.md)。
 
-- **输入**：书名、梗概、类型、章数、每章目标字数、风格提示。
-- **输出**：完整的小说项目，包含 Bible（设定库）、Outline（大纲）、Beat Sheets（章纲）、Chapters（正文）。
+## 真实创作链路
 
-## 架构分层
-
-```
-（项目根目录）/
-├── domain/                 # 领域层 - 小说、Bible、人物、知识、记忆、道具等纯业务模型
-│   ├── novel/             # 小说聚合根、章节、故事线、伏笔、因果与张力值对象
-│   ├── bible/             # 设定库、人物档案、地点、世界设定
-│   ├── character/         # 人物实体与关系能力
-│   ├── knowledge/         # 知识图谱三元组
-│   ├── memory/            # 叙事记忆与上下文长期状态
-│   ├── prop/              # 道具生命周期与事件
-│   └── shared/            # 共享内核（基类、异常、事件、ID）
-│
-├── application/           # 应用层 - 用例编排，协调领域模型、引擎运行时与基础设施
-│   ├── core/              # 小说 / 章节 / 导出等基础用例
-│   ├── onboarding/        # 新书向导、Bible 初始化、前置设定生成
-│   ├── blueprint/         # 宏观规划、连续规划、Beat Sheet、故事结构
-│   ├── engine/            # 上下文构建、章后管线、治理预算、AI 调用编排
-│   ├── governance/        # 叙事治理、质量约束、章节预算
-│   ├── audit/             # 章节审阅、宏观重构、章节元素分析
-│   ├── analyst/           # 文风、张力、伏笔账本、叙事状态分析
-│   ├── world/             # Bible、知识图谱、世界观与人物关系服务
-│   └── workflows/         # 自动生成工作流、兼容编排与后台任务
-│
-├── engine/                # 剧情引擎内核 - 生产运行时、章节写作管线与题材扩展
-│   ├── runtime/           # EngineDaemon、StoryPipelineRunner、守护进程委托、质量守门
-│   ├── pipeline/          # BaseStoryPipeline 十步章节生成管线
-│   ├── pipelines/         # 题材 Pipeline 注册与扩展
-│   ├── core/              # 引擎侧实体、端口、服务契约
-│   └── infrastructure/    # 引擎事件、记忆编排、checkpoint 适配
-│
-├── infrastructure/        # 基础设施层 - 技术实现
-│   ├── ai/                # LLM Provider、Prompt Packages、向量存储、嵌入服务
-│   ├── persistence/       # SQLite 仓储、迁移、Write Dispatch 单写者调度器
-│   ├── export/            # DOCX / EPUB / PDF 导出
-│   └── runtime/           # 数据目录、日志环境与进程级运行配置
-│
-├── interfaces/            # 接口层 - FastAPI、依赖注入、运行状态与外部边界
-│   └── api/v1/            # REST API（core / world / blueprint / engine / audit / analyst 等）
-│
-├── frontend/              # 官方工作台 - Vue 3 + TypeScript + Tauri 桌面壳
-└── shared/                # 跨端共享配置与分类体系资源
+```text
+Novel + Bible（时代、世界、人物、地点、规则、故事核心、题材、目标）
+  -> 已发布且 synced 的总纲
+  -> 部纲 -> 卷纲 -> 幕纲 -> 章纲
+  -> GenerationStartPreflight
+  -> ContextBuilder / ContextBudgetAllocator
+  -> DAG V2
+  -> Candidate + machine audit
+  -> 作者批准（chapter_review）或机器批准（continuous）
+  -> ChapterCandidateRepository.commit_formal()
+  -> ChapterAftermathPipeline
+  -> ChapterNarrativeSync + exact-version MemoryEngine
+  -> ChapterCandidateRepository.mark_sync_succeeded()
+  -> 下一章 Candidate
 ```
 
-## 核心模块
+两个模式都必须先产生 Candidate。人工模式在作者批准前停止；连续模式也只有在
+Formal、Canonical 和 Memory 全部 ready 后才推进。Candidate、草稿、未发布大纲
+和旧正文 revision 都不能进入下一章上下文。
 
-### Domain 层
+## 业务权威
 
-| 模块 | 职责 |
-|------|------|
-| `novel/` | 小说聚合根、章节实体、故事线、伏笔注册表 |
-| `bible/` | 设定库、人物实体（含 POV 防火墙）、地点、时间线 |
-| `character/` | 人物实体、关系与调度相关模型 |
-| `knowledge/` | 知识三元组、故事知识 |
-| `memory/` | 长期记忆、叙事状态与上下文相关模型 |
-| `prop/` | 道具生命周期与道具事件 |
-| `ai/` | LLM 服务接口、提示词值对象、Token 使用统计 |
+| 业务事实 | 唯一权威 |
+|---|---|
+| Planning | `OutlineContractRepository` / `OutlineContractService` 的已发布五级链 |
+| Candidate | `CandidateChapterWorkflowService` + `ChapterCandidateRepository` |
+| Formal write | `ChapterCandidateRepository.commit_formal()` |
+| Formal rewrite | `ChapterRewriteCoordinator` |
+| Canonical commit | `ChapterNarrativeSync` + `SqliteChapterNarrativeCommitRepository` |
+| Canonical visibility | 当前 `content_sha256 + content_revision` 关联的 committed 投影 |
+| Memory | `MemoryEngine.update_canonical_version_from_chapter()`，受 narrative claim 约束 |
+| Recovery | Candidate run/cursor、narrative claim 和 generation epoch |
+| Runtime state | `novel_generation_runs` 与 Candidate repository |
+| Observability | 持久化 DAG run / attempt / event；UI 和 shared state 只读投影 |
+| Worldline | `WorldlineRegenerationService` + `WorldlineRebuildService` |
 
-### Application 层
+## 分层
 
-| 模块 | 职责 |
-|------|------|
-| `core/` | 小说/章节的 CRUD 服务 |
-| `blueprint/` | 宏观规划（部-卷-幕）、幕级规划（章节规划）|
-| `engine/` | 上下文构建、章后管线、治理预算、AI 调用编排 |
-| `governance/` | 叙事治理、章节预算、质量约束 |
-| `world/` | Bible 管理、知识图谱构建、人物关系 |
-| `audit/` | 章节审阅、宏观重构、陈词滥调扫描 |
-
-### Engine 层
-
-| 模块 | 职责 |
-|------|------|
-| `runtime/` | `EngineDaemon`、`StoryPipelineRunner`、守护进程委托与质量守门 |
-| `pipeline/` | `BaseStoryPipeline` 十步章节生成管线 |
-| `pipelines/` | 题材 Pipeline 注册与扩展 |
-| `core/` | 引擎侧实体、端口和服务契约 |
-
-### Infrastructure 层
-
-| 模块 | 职责 |
-|------|------|
-| `ai/llm_client.py` | 方舟 SDK 封装 |
-| `ai/chromadb_vector_store.py` | ChromaDB 向量存储 |
-| `ai/local_embedding_service.py` | 本地嵌入模型 |
-| `persistence/database/` | SQLite 仓储实现 |
-
-## 数据流
-
-### 自动驾驶模式
-
-```
-1. 宏观规划 → 生成部-卷-幕结构
-2. 幕级规划 → 为当前幕生成章节大纲
-3. EngineDaemon → StoryPipelineRunner 调度章节写作
-4. BaseStoryPipeline → 治理预算、章节计划、上下文装配、正文生成
-5. 章后管线 → 摘要、事件、因果边、伏笔、人物状态、知识图谱与向量索引更新
-6. 审阅审计 → 文风检测、张力评分、一致性检查、状态落库
-7. 循环至完成
+```text
+domain/          领域实体、值对象、仓储协议和业务异常
+application/     用例编排：新书初始化、五级规划、Context、Candidate、章后处理
+infrastructure/  SQLite 仓储、LLM Provider、向量存储、导出和运行时适配
+interfaces/      FastAPI、依赖装配、REST/SSE 边界
+engine/          旧 daemon/StoryPipeline 兼容内核和题材扩展
+frontend/        Vue 3 工作台
+shared/          跨端配置和分类资源
 ```
 
-### 人工辅助模式
+主要应用模块：
 
-```
-用户创建小说 → 手动规划 → 手动撰写 → AI 辅助生成
-```
+| 目录 | 职责 |
+|---|---|
+| `application/onboarding/` | 新书向导与 Bible 初始化 |
+| `application/blueprint/` | 五级大纲、发布/同步 Barrier、章节节奏合同 |
+| `application/engine/` | Context、DAG V2、Candidate、Aftermath、恢复与 Worldline |
+| `application/world/` | Narrative sync、Canonical 状态、人物/因果/伏笔/KG |
+| `application/core/` | 小说/章节 CRUD 与正式正文 Rewrite |
+| `infrastructure/persistence/database/` | Formal/Candidate/Canonical/Memory 持久化权威 |
 
-## 入口点
+## 规划和上下文边界
 
-在**仓库根目录**（含 `application/`、`interfaces/`；本文件在 `docs/` 下）执行：
+正文规划只有：
 
-```bash
-# 推荐：与 README 一致，端口 8005
-uvicorn interfaces.main:app --host 127.0.0.1 --port 8005 --reload
-```
-
-可选方式：
-
-```bash
-# 直接运行 FastAPI 模块（默认 0.0.0.0:8000，与 README 的 8005 不同，需自行改端口或改用 uvicorn）
-python interfaces/main.py
-
-# EngineDaemon 守护进程（当前维护入口）
-python scripts/start_daemon.py
+```text
+总纲 -> 部纲 -> 卷纲 -> 幕纲 -> 章纲
 ```
 
-## Web 前端（Vue 3）
+下级生成和发布必须通过已发布、已同步父级 Barrier。章纲中的
+`chapter_function`、`intensity_curve`、`chapter_goal`、`chapter_delta`、
+`ending_hook`，以及按章节功能要求的 `decisive_choice`、`cost_or_risk`、
+`turn_or_payoff` 会进入 Candidate 的 Beat/Context。旧 `story_nodes` 可保存兼容
+投影，但其未发布描述不是正文规划输入。
 
-- **目录**：`frontend/`
-- **技术栈**：Vue 3 + Vite + Naive UI + ECharts
-- **默认端口**：3000
-- **API 代理**：`/api` → `http://localhost:8005`
+Context Assembly 保留 Bible、人物、地点、规则、已发布大纲、当前章纲、最近正式
+章节、Canonical State、最近 500 条 `completed_beats`、已揭示线索、伏笔、叙事债、
+长期 Memory 和 Vector Recall。任何一项状态投影都不能反向决定业务提交。
 
-```bash
-cd frontend
-npm install
-npm run dev
+## 兼容运行时
+
+`EngineDaemon`、`BaseStoryPipeline`、PersistenceQueue、StatePublisher、
+`AutoNovelGenerationWorkflow` 和旧 continuation 尚被兼容代码引用，因此没有按文件
+长度或静态命中直接删除。它们不拥有新书正式正文：
+
+- 旧 autopilot start/resume API 返回 `410`，要求使用 generation API。
+- 旧 prose invocation 返回 `410 candidate_first_required`。
+- daemon/StoryPipeline 的 completed 写入有无条件 Candidate-first 守卫。
+- `StateSnapshotManager.AtomicStateTransaction` 和
+  `ChapterGenerationWorkspace.commit_to_chapter()` 当前无生产调用者，不是 Recovery
+  或 Formal authority。
+
+## 服务入口
+
+日常本机使用只启动 FastAPI，由 8005 直接托管已构建前端：
+
+```powershell
+tools\start-local.vbs
 ```
 
-## 测试
+访问 `http://127.0.0.1:8005/`，OpenAPI 为
+`http://127.0.0.1:8005/docs`。仅修改 Vue 源码时才另外运行：
 
-```bash
-# 运行所有测试
-python -m pytest tests -v
-
-# 单元测试
-python -m pytest tests/unit -v
-
-# 集成测试
-python -m pytest tests/integration -v
+```powershell
+tools\start-frontend-dev.bat
 ```
 
-## 环境变量
+开发模式使用 3000，并将 `/api` 代理到 8005。
 
-以根目录 **[.env.example](../.env.example)** 为准（方舟 `ARK_*`、嵌入 `EMBEDDING_*`、`LOG_*`、`PLOTPILOT_PROD_DATA_DIR` 等；旧名 `AITEXT_PROD_DATA_DIR` 仍兼容）。复制为 `.env` 后按需填写，勿提交密钥。
+## 数据和验证
 
-## 数据库与数据目录
+- 主数据库：默认 `data/plotpilot.db`，实际目录由 `application.paths.DATA_DIR` 解析。
+- 向量存储：默认 `data/chromadb/`。
+- 日志：默认 `logs/plotpilot.log`。
+- 配置：以 [.env.example](../.env.example) 为准，密钥不得提交。
 
-- **主数据库**：默认 SQLite 文件名为 `data/plotpilot.db`（旧版为 `aitext.db`，`get_db_path()` 会自动沿用）；实际目录由 `application.paths.DATA_DIR` 解析（未设置 `PLOTPILOT_PROD_DATA_DIR` / 旧名 `AITEXT_PROD_DATA_DIR` 且非冻结运行时指向仓库内 `data/`）。
-- **向量存储**：默认在 `data/chromadb/` 下持久化（实现为本地 FAISS + 元数据，与 `.env` 中 `VECTOR_STORE_TYPE=chromadb` 对应）。
-- **应用日志**：默认 `logs/plotpilot.log`（由 `LOG_FILE` 控制，见 `.env.example`）。
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\ -v
+Set-Location frontend
+npm run lint
+npm run test:unit
+npm run build
+```
