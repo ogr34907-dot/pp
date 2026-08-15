@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload
 from domain.structure.outline_plan import OutlinePlanItem
@@ -68,6 +68,35 @@ def compute_replan_impact_closure(
         invalidated_logical_node_ids=ordered_invalidated,
         ancestor_logical_node_ids=tuple(reversed(ancestors)),
     )
+
+
+def merge_author_locked_payload(
+    authored: OutlinePayload, inferred: OutlinePayload
+) -> tuple[OutlinePayload, tuple[str, ...]]:
+    """Preserve author fields while allowing AI to fill missing structure."""
+
+    authored_values = authored.canonical_dict()
+    inferred_values = inferred.canonical_dict()
+    extra = dict(authored_values.get("extra") or {})
+    provenance = dict(extra.get("_field_provenance") or {})
+    conflicts: list[str] = []
+    for field, inferred_value in inferred_values.items():
+        if field == "extra":
+            continue
+        authored_value = authored_values.get(field)
+        rule = provenance.get(field)
+        locked = isinstance(rule, dict) and bool(rule.get("locked"))
+        if locked:
+            if inferred_value not in (None, "", [], {}) and inferred_value != authored_value:
+                conflicts.append(field)
+            continue
+        if authored_value in (None, "", [], {}):
+            authored_values[field] = inferred_value
+            if inferred_value not in (None, "", [], {}):
+                provenance[field] = {"source": "ai", "locked": False}
+    extra["_field_provenance"] = provenance
+    authored_values["extra"] = extra
+    return OutlinePayload.from_dict(authored_values), tuple(conflicts)
 
 
 def validate_sibling_cohort(

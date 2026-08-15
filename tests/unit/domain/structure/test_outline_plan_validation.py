@@ -2,6 +2,7 @@ from domain.structure.outline_contract import OutlineLevel, OutlinePayload
 from domain.structure.outline_plan import OutlinePlanItem
 from domain.structure.outline_plan_validation import (
     compute_replan_impact_closure,
+    merge_author_locked_payload,
     validate_sibling_cohort,
 )
 
@@ -93,3 +94,21 @@ def test_replan_impact_closure_includes_downstream_and_later_siblings():
 
     assert impact.invalidated_logical_node_ids == ("part-b", "volume-b")
     assert impact.ancestor_logical_node_ids == ("root",)
+
+
+def test_author_locked_payload_preserves_author_text_and_ai_fills_only_unlocked_fields():
+    authored = OutlinePayload.from_dict(
+        {
+            "title": "作者标题",
+            "narrative_text": "作者逐字梗概",
+            "extra": {"_field_provenance": {"title": {"source": "author", "locked": True}, "narrative_text": {"source": "author", "locked": True}}},
+        }
+    )
+    ai = OutlinePayload(title="AI 标题", narrative_text="AI 改写", creative_goal="AI 补全目标")
+
+    merged, conflicts = merge_author_locked_payload(authored, ai)
+
+    assert merged.title == "作者标题"
+    assert merged.narrative_text == "作者逐字梗概"
+    assert merged.creative_goal == "AI 补全目标"
+    assert conflicts == ("title", "narrative_text")
