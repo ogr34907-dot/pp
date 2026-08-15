@@ -33,10 +33,48 @@ class PlanReconciliationStatus(str, Enum):
     AUTHOR_DECISION_REQUIRED = "author_decision_required"
 
 
+class OutlineExpansionRequired(ValueError):
+    """The next chapter is not planned yet and needs a sibling cohort."""
+
+
 class BackfillStatus(str, Enum):
     MIGRATED = "migrated"
     ALREADY_BACKFILLED = "already_backfilled"
     PLANNING_MIGRATION_REQUIRED = "planning_migration_required"
+
+
+@dataclass(frozen=True)
+class CanonicalPrefix:
+    """Deterministic formal-history prefix plus independent readiness gates."""
+
+    novel_id: str
+    requested_through: int
+    formal_head: int
+    digest: str
+    identities: tuple[Mapping[str, Any], ...] = ()
+    formal_ready: bool = False
+    canonical_ready: bool = False
+    memory_ready: bool = False
+    blockers: tuple[str, ...] = ()
+
+    @property
+    def ready(self) -> bool:
+        return self.formal_ready and self.canonical_ready and self.memory_ready
+
+
+@dataclass(frozen=True)
+class PlanReconciliationReport:
+    """Comparison of a sealed plan boundary against persisted history."""
+
+    plan_revision_id: str
+    status: PlanReconciliationStatus
+    expected_formal_head: int
+    actual_formal_head: int
+    expected_prefix_digest: str
+    actual_prefix_digest: str
+    canonical_ready: bool
+    memory_ready: bool
+    blockers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -166,4 +204,18 @@ def canonical_plan_digest(
         ],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def canonical_history_digest(identities: Iterable[Mapping[str, Any]]) -> str:
+    """Hash only stable formal/canonical identities, never runtime epochs."""
+
+    ordered = sorted(
+        (dict(identity) for identity in identities),
+        key=lambda identity: (
+            int(identity.get("chapter_number") or 0),
+            str(identity.get("chapter_id") or ""),
+        ),
+    )
+    encoded = json.dumps(ordered, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

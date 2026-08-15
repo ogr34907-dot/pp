@@ -85,6 +85,10 @@ class ChapterCandidateRepository:
             status=CandidateStatus(str(row["status"])),
             outline_chain=json.loads(row["outline_chain_json"] or "{}"),
             outline_chain_digest=str(row["outline_chain_digest"] or ""),
+            planning_authority_generation=int(row["planning_authority_generation"] or 0),
+            plan_revision_id=row["plan_revision_id"],
+            plan_digest=str(row["plan_digest"] or ""),
+            chapter_outline_digest=str(row["chapter_outline_digest"] or ""),
             llm_content=str(row["llm_content"] or ""),
             author_content=row["author_content"],
             content_revision=int(row["content_revision"] or 0),
@@ -289,6 +293,69 @@ class ChapterCandidateRepository:
             return False
         return True
 
+    @staticmethod
+    def _legacy_plan_pin() -> tuple[int, Optional[str], str]:
+        return 0, None, ""
+
+    def _current_plan_pin(
+        self, conn: sqlite3.Connection, novel_id: str
+    ) -> tuple[int, Optional[str], str]:
+        """Read the book-level planning Head inside the caller's transaction."""
+
+        try:
+            row = conn.execute(
+                """
+                SELECT authority_mode, authority_generation,
+                       active_plan_revision_id, active_plan_digest,
+                       projection_generation
+                FROM outline_planning_heads
+                WHERE novel_id = ?
+                """,
+                (novel_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Isolated legacy databases created before migration 031 retain
+            # the old Candidate contract and therefore have no plan Head.
+            return self._legacy_plan_pin()
+        if row is None or str(row["authority_mode"] or "legacy") != "manifest":
+            return self._legacy_plan_pin()
+        plan_id = row["active_plan_revision_id"]
+        digest = str(row["active_plan_digest"] or "")
+        generation = int(row["authority_generation"] or 0)
+        if not plan_id or not digest or int(row["projection_generation"] or 0) != generation:
+            raise CandidateGateError("manifest planning Head is not synced")
+        plan = conn.execute(
+            """
+            SELECT sealed_at, digest, status
+            FROM outline_plan_revisions
+            WHERE id = ? AND novel_id = ?
+            """,
+            (str(plan_id), novel_id),
+        ).fetchone()
+        if (
+            plan is None
+            or not plan["sealed_at"]
+            or str(plan["digest"] or "") != digest
+            or str(plan["status"] or "") != "published"
+        ):
+            raise CandidateGateError("manifest planning Head is not backed by a sealed plan")
+        return generation, str(plan_id), digest
+
+    def _assert_plan_pin_current(
+        self, conn: sqlite3.Connection, candidate: ChapterCandidate
+    ) -> None:
+        generation, plan_id, digest = self._current_plan_pin(conn, candidate.novel_id)
+        if candidate.plan_revision_id is None:
+            if plan_id is not None:
+                raise CandidateGateError("candidate has no current plan pin")
+            return
+        if (
+            plan_id != candidate.plan_revision_id
+            or digest != candidate.plan_digest
+            or generation != candidate.planning_authority_generation
+        ):
+            raise CandidateGateError("candidate plan pin is stale")
+
     def _assert_candidate_authority(
         self,
         conn: sqlite3.Connection,
@@ -321,6 +388,8 @@ class ChapterCandidateRepository:
             or str(run.canonical_sync_status or "ready") != "ready"
         ):
             raise CandidateGateError("candidate no longer belongs to the active generation authority")
+
+        self._assert_plan_pin_current(conn, candidate)
 
         baseline = self._validated_pre_candidate_baseline(conn, candidate.novel_id)
         self._ensure_no_unproven_completed_chapters(
@@ -824,6 +893,12 @@ class ChapterCandidateRepository:
                     "generation run formal cursor does not match the persisted formal head"
                 )
             self._formal_slot_placeholder_id(conn, novel_id, chapter_number)
+            planning_generation, plan_revision_id, plan_digest = self._current_plan_pin(
+                conn, novel_id
+            )
+            chapter_outline_digest = str(
+                (outline_chain.get("chapter") or {}).get("digest") or ""
+            )
             open_row = conn.execute(
                 """
                 SELECT id FROM chapter_candidates
@@ -839,9 +914,11 @@ class ChapterCandidateRepository:
                 """
                 INSERT INTO chapter_candidates
                     (id, novel_id, chapter_number, title, generation_epoch, status,
-                     outline_chain_json, outline_chain_digest, llm_content, content_revision,
+                     outline_chain_json, outline_chain_digest,
+                     planning_authority_generation, plan_revision_id, plan_digest,
+                     chapter_outline_digest, llm_content, content_revision,
                      created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'streaming', ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'streaming', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate_id,
@@ -851,6 +928,10 @@ class ChapterCandidateRepository:
                     run.generation_epoch,
                     outline_json,
                     outline_digest,
+                    planning_generation,
+                    plan_revision_id,
+                    plan_digest,
+                    chapter_outline_digest,
                     llm_content,
                     content_revision,
                     now,
@@ -884,6 +965,7 @@ class ChapterCandidateRepository:
     def set_generated_content(self, candidate_id: str, llm_content: str) -> ChapterCandidate:
         candidate = self.get_candidate(candidate_id)
         self._ensure_current_generation(candidate)
+        self._assert_plan_pin_current(self._connection(), candidate)
         if candidate.status not in {CandidateStatus.STREAMING, CandidateStatus.REGENERATING}:
             raise CandidateGateError("generated content can only be written while candidate is streaming")
         revision = candidate.content_revision + 1
@@ -911,6 +993,7 @@ class ChapterCandidateRepository:
     def mark_auditing(self, candidate_id: str) -> ChapterCandidate:
         candidate = self.get_candidate(candidate_id)
         self._ensure_current_generation(candidate)
+        self._assert_plan_pin_current(self._connection(), candidate)
         if candidate.status not in {
             CandidateStatus.STREAMING,
             CandidateStatus.REGENERATING,
@@ -942,6 +1025,7 @@ class ChapterCandidateRepository:
     ) -> ChapterCandidate:
         candidate = self.get_candidate(candidate_id)
         self._ensure_current_generation(candidate)
+        self._assert_plan_pin_current(self._connection(), candidate)
         if candidate.status != CandidateStatus.AUDITING:
             raise CandidateGateError("candidate must be auditing before an audit can finish")
         if not candidate.final_content.strip():
@@ -1440,6 +1524,50 @@ class ChapterCandidateRepository:
         conn.commit()
         return self.get_run(novel_id)
 
+    def wait_for_outline_expansion(self, novel_id: str, reason: str = "") -> GenerationRun:
+        """Persist a normal planning pause after all current barriers are ready."""
+
+        run = self.get_run(novel_id)
+        if run.current_candidate_id or run.canonical_sync_status != "ready":
+            raise CandidateGateError(
+                "outline expansion is blocked until the current Candidate and Canonical sync are ready"
+            )
+        conn = self._connection()
+        if run.current_formal_chapter > 0:
+            row = conn.execute(
+                """
+                SELECT status, memory_status
+                FROM chapter_narrative_commits
+                WHERE novel_id = ? AND chapter_number = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (novel_id, run.current_formal_chapter),
+            ).fetchone()
+            if row is not None and (
+                str(row["status"] or "") != "committed"
+                or str(row["memory_status"] or "not_required")
+                not in {"committed", "not_required"}
+            ):
+                raise CandidateGateError(
+                    "outline expansion is blocked until Canonical and Memory are ready"
+                )
+        now = self._now()
+        conn.execute(
+            """
+            UPDATE novel_generation_runs
+            SET state = 'waiting_planning', next_action = 'expand_outline_cohort',
+                last_error = ?, updated_at = ?
+            WHERE novel_id = ? AND current_candidate_id IS NULL
+              AND canonical_sync_status = 'ready'
+            """,
+            (reason, now, novel_id),
+        )
+        if conn.execute("SELECT changes()").fetchone()[0] != 1:
+            raise CandidateGateError("generation run changed before planning pause")
+        conn.commit()
+        return self.get_run(novel_id)
+
     def complete_run(self, novel_id: str) -> GenerationRun:
         """Mark a target-complete run only after all formal sync is ready."""
 
@@ -1483,6 +1611,7 @@ class ChapterCandidateRepository:
     def approve_for_commit(self, candidate_id: str, *, continue_after_commit: bool) -> ChapterCandidate:
         candidate = self.get_candidate(candidate_id)
         self._ensure_current_generation(candidate)
+        self._assert_plan_pin_current(self._connection(), candidate)
         if candidate.status != CandidateStatus.AWAITING_REVIEW:
             raise CandidateGateError("candidate is not awaiting author review")
         if not candidate.audit_is_current or not candidate.commit_plan_is_current:

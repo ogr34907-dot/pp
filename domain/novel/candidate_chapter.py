@@ -15,6 +15,7 @@ class RunMode(str, Enum):
 class GenerationRunState(str, Enum):
     IDLE = "idle"
     RUNNING = "running"
+    WAITING_PLANNING = "waiting_planning"
     WAITING_REVIEW = "waiting_review"
     PAUSED = "paused"
     STOPPED = "stopped"
@@ -63,6 +64,10 @@ class ChapterCandidate:
     status: CandidateStatus
     outline_chain: dict[str, Any] = field(default_factory=dict)
     outline_chain_digest: str = ""
+    planning_authority_generation: int = 0
+    plan_revision_id: Optional[str] = None
+    plan_digest: str = ""
+    chapter_outline_digest: str = ""
     llm_content: str = ""
     author_content: Optional[str] = None
     content_revision: int = 0

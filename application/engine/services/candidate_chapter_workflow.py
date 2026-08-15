@@ -14,6 +14,7 @@ from typing import Any, Callable, Protocol
 
 from application.audit.services.chapter_ai_review_service import normalize_evidence_text
 from domain.novel.candidate_chapter import CandidateStatus, ChapterCandidate, GenerationRunState, RunMode
+from domain.structure.outline_plan import OutlineExpansionRequired
 from infrastructure.persistence.database.chapter_candidate_repository import (
     CandidateGateError,
     ChapterCandidateRepository,
@@ -81,6 +82,9 @@ class CandidateChapterWorkflowService:
             node, outline_chain = self.outline_service.next_published_chapter_context(
                 novel_id, after_chapter=run.current_formal_chapter
             )
+        except OutlineExpansionRequired as exc:
+            self.repository.wait_for_outline_expansion(novel_id, str(exc))
+            return None
         except Exception as exc:
             self.repository.fail_run(novel_id, f"outline_chain_not_ready:{exc}")
             raise CandidateWorkflowError(f"published outline chain is not ready: {exc}") from exc

@@ -94,6 +94,165 @@ def test_new_book_has_no_pre_candidate_head(tmp_path):
     assert ChapterCandidateRepository(db).formal_chapter_head("new-book") == 0
 
 
+def test_manifest_candidate_persists_plan_pin_at_creation(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "candidate-plan-pin.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-pin", "Manifest Pin", "manifest-pin", 20),
+    )
+    conn.execute(
+        "INSERT INTO outline_plan_revisions "
+        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
+        "VALUES ('plan-pin-1', 'manifest-pin', 1, 'published', 'plan-digest', '', CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "INSERT INTO outline_planning_heads "
+        "(novel_id, authority_mode, authority_generation, active_plan_revision_id, "
+        "active_plan_digest, projection_generation) "
+        "VALUES ('manifest-pin', 'manifest', 4, 'plan-pin-1', 'plan-digest', 4)"
+    )
+    conn.commit()
+    repo = ChapterCandidateRepository(db)
+    repo.start_run("manifest-pin", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
+
+    candidate = repo.create_streaming_candidate(
+        novel_id="manifest-pin",
+        chapter_number=1,
+        title="第一章",
+        outline_chain={
+            "chapter": {
+                "contract_id": "chapter-slot",
+                "digest": "chapter-digest",
+                "payload": {"title": "第一章"},
+            }
+        },
+    )
+
+    assert candidate.planning_authority_generation == 4
+    assert candidate.plan_revision_id == "plan-pin-1"
+    assert candidate.plan_digest == "plan-digest"
+    assert candidate.chapter_outline_digest == "chapter-digest"
+
+
+def test_manifest_candidate_is_rejected_after_head_switch_before_formal_commit(
+    candidates,
+):
+    repo, db = candidates
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO outline_plan_revisions "
+        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
+        "VALUES ('plan-old', 'novel-1', 1, 'published', 'old-digest', '', CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "INSERT INTO outline_plan_revisions "
+        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
+        "VALUES ('plan-new', 'novel-1', 2, 'published', 'new-digest', '', CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "INSERT INTO outline_planning_heads "
+        "(novel_id, authority_mode, authority_generation, active_plan_revision_id, "
+        "active_plan_digest, projection_generation) "
+        "VALUES ('novel-1', 'manifest', 1, 'plan-old', 'old-digest', 1)"
+    )
+    conn.commit()
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain={"chapter": {"digest": "chapter-digest", "payload": {}}},
+    )
+    repo.set_generated_content(candidate.id, "候选正文")
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_generation = 2, "
+        "active_plan_revision_id = 'plan-new', active_plan_digest = 'new-digest', "
+        "projection_generation = 2 WHERE novel_id = 'novel-1'"
+    )
+    conn.commit()
+
+    with pytest.raises(CandidateGateError, match="plan"):
+        repo.revalidate_candidate_generation_authority(candidate.id)
+
+
+def test_manifest_plan_pin_is_rechecked_at_approval_and_formal_cas(candidates):
+    repo, db = candidates
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO outline_plan_revisions "
+        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
+        "VALUES ('plan-old', 'novel-1', 1, 'published', 'old-digest', '', CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "INSERT INTO outline_plan_revisions "
+        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
+        "VALUES ('plan-new', 'novel-1', 2, 'published', 'new-digest', '', CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "INSERT INTO outline_planning_heads "
+        "(novel_id, authority_mode, authority_generation, active_plan_revision_id, "
+        "active_plan_digest, projection_generation) "
+        "VALUES ('novel-1', 'manifest', 1, 'plan-old', 'old-digest', 1)"
+    )
+    conn.commit()
+    repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain={"chapter": {"digest": "chapter-digest", "payload": {}}},
+    )
+    candidate = repo.get_current_candidate("novel-1")
+    repo.set_generated_content(candidate.id, "候选正文")
+    repo.mark_auditing(candidate.id)
+    candidate = repo.finish_audit(
+        candidate.id,
+        audit={"hard_blocks": [], "required_events_complete": True},
+        commit_plan={},
+        require_author_review=True,
+    )
+
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_generation = 2, "
+        "active_plan_revision_id = 'plan-new', active_plan_digest = 'new-digest', "
+        "projection_generation = 2 WHERE novel_id = 'novel-1'"
+    )
+    conn.commit()
+    with pytest.raises(CandidateGateError, match="plan"):
+        repo.approve_for_commit(candidate.id, continue_after_commit=False)
+
+    repo.reject_and_stop(candidate.id)
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
+    repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain={"chapter": {"digest": "chapter-digest", "payload": {}}},
+    )
+    second = repo.get_current_candidate("novel-1")
+    repo.set_generated_content(second.id, "候选正文")
+    repo.mark_auditing(second.id)
+    second = repo.finish_audit(
+        second.id,
+        audit={"hard_blocks": [], "required_events_complete": True},
+        commit_plan={},
+        require_author_review=True,
+    )
+    repo.approve_for_commit(second.id, continue_after_commit=False)
+    conn.execute(
+        "INSERT INTO outline_plan_revisions "
+        "(id, novel_id, revision, status, digest, canonical_prefix_digest, sealed_at) "
+        "VALUES ('plan-third', 'novel-1', 3, 'published', 'third-digest', '', CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_generation = 3, "
+        "active_plan_revision_id = 'plan-third', active_plan_digest = 'third-digest', "
+        "projection_generation = 3 WHERE novel_id = 'novel-1'"
+    )
+    conn.commit()
+    with pytest.raises(CandidateGateError, match="plan"):
+        repo.commit_formal(second.id)
+
+
 @pytest.mark.parametrize("run_mode", [RunMode.CHAPTER_REVIEW, RunMode.CONTINUOUS])
 def test_start_run_rejects_unproven_completed_legacy_history(tmp_path, run_mode):
     db = DatabaseConnection(str(tmp_path / "unproven-legacy-start.db"))

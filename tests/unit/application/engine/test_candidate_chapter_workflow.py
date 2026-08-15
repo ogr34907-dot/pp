@@ -8,6 +8,7 @@ from application.engine.services.candidate_chapter_workflow import (
     CandidateChapterWorkflowService,
     CandidateWorkflowError,
 )
+from application.blueprint.services.outline_contract_service import OutlineExpansionRequired
 from application.engine.dag.engine import DAGEngine
 from application.engine.dag.models import DAGRunResult, NodeResult, get_default_dag
 from domain.novel.candidate_chapter import CandidateStatus, GenerationRunState, RunMode
@@ -60,6 +61,11 @@ class _NoRequiredEventOutlines(_Outlines):
         )
         chain["chapter"]["payload"]["required_events"] = []
         return node, chain
+
+
+class _NeedsOutlineExpansion:
+    def next_published_chapter_context(self, novel_id: str, *, after_chapter: int):
+        raise OutlineExpansionRequired("next sibling cohort is not expanded")
 
 
 class _DraftGenerator:
@@ -170,6 +176,25 @@ async def test_review_mode_has_exactly_one_candidate_and_no_next_llm_call_until_
     candidate_two = await service.generate_next("novel-1")
     assert candidate_two.chapter_number == 2
     assert drafts.calls == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_missing_future_cohort_pauses_for_planning_without_consuming_n_plus_one_llm(
+    workflow,
+):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    service = CandidateChapterWorkflowService(
+        repo, _NeedsOutlineExpansion(), drafts, aftermath
+    )
+
+    result = await service.generate_next("novel-1")
+
+    assert result is None
+    run = repo.get_run("novel-1")
+    assert run.state == GenerationRunState.WAITING_PLANNING
+    assert run.next_action == "expand_outline_cohort"
+    assert drafts.calls == []
 
 
 @pytest.mark.asyncio

@@ -201,6 +201,50 @@ class OutlineContractRepository:
             return None
         return self.get_plan_revision(str(row["active_plan_revision_id"]))
 
+    def active_plan_items_with_payload(self, novel_id: str) -> list[dict[str, Any]]:
+        """Return the immutable active manifest topology and sealed payloads."""
+
+        head = self.get_planning_head(novel_id)
+        if head.authority_mode != PlanningAuthorityMode.MANIFEST:
+            raise OutlineGateError("novel is not using manifest planning authority")
+        if not head.active_plan_revision_id:
+            raise OutlineGateError("manifest planning Head has no active revision")
+        plan = self.get_plan_revision(head.active_plan_revision_id)
+        if not plan.sealed_at or plan.digest != head.active_plan_digest:
+            raise OutlineGateError("manifest planning Head is not synced to its sealed revision")
+        if plan.status != PlanRevisionStatus.PUBLISHED:
+            raise OutlineGateError(f"active manifest revision is {plan.status.value}")
+        rows = self._connection().execute(
+            """
+            SELECT item.id AS item_id, item.logical_node_id,
+                   item.parent_logical_node_id, item.level, item.sibling_index,
+                   item.expansion_state, item.validated_parent_digest,
+                   item.validated_previous_sibling_digest, item.is_reused,
+                   contract.novel_id, contract.story_node_id,
+                   contract.parent_contract_id, contract.author_locked,
+                   version.id AS version_id, version.revision AS version_revision,
+                   version.digest AS version_digest, version.payload_json,
+                   version.source AS version_source,
+                   version.status AS version_status
+            FROM outline_plan_revision_items AS item
+            JOIN outline_contracts AS contract
+              ON contract.id = item.logical_node_id
+             AND contract.novel_id = ?
+            JOIN outline_contract_versions AS version
+              ON version.id = item.version_id
+            WHERE item.plan_revision_id = ?
+            ORDER BY CASE item.level
+                WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
+                WHEN 'act' THEN 3 ELSE 4 END,
+                COALESCE(item.parent_logical_node_id, ''), item.sibling_index,
+                item.logical_node_id
+            """,
+            (novel_id, plan.id),
+        ).fetchall()
+        if len(rows) != len(plan.items):
+            raise OutlineGateError("active manifest item set is incomplete")
+        return [dict(row) for row in rows]
+
     def _validate_plan_items(
         self, novel_id: str, items: Sequence[OutlinePlanItem]
     ) -> tuple[OutlinePlanItem, ...]:

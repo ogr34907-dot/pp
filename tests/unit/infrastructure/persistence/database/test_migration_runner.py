@@ -265,6 +265,9 @@ def test_current_schema_installs_outline_manifest_storage_idempotently(tmp_path)
         row[1]
         for row in conn.execute("PRAGMA table_info(outline_generation_attempts)")
     }
+    run_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'novel_generation_runs'"
+    ).fetchone()[0]
     applied_count = conn.execute(
         "SELECT COUNT(*) FROM migrations_applied "
         "WHERE migration_file = '031_outline_plan_manifests.sql'"
@@ -293,3 +296,8 @@ def test_current_schema_installs_outline_manifest_storage_idempotently(tmp_path)
         "cohort_level",
     } <= attempt_columns
     assert applied_count == 1
+    assert "waiting_planning" in run_sql
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migrations_applied "
+        "WHERE migration_file = '032_generation_waiting_planning.sql'"
+    ).fetchone()[0] == 1
