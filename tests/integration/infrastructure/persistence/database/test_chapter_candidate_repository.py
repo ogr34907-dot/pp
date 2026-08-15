@@ -65,6 +65,24 @@ class _BeginBarrierConnection:
         return getattr(self._connection, name)
 
 
+class _BeforeBeginConnection:
+    """Run one competing commit immediately before the wrapped transaction."""
+
+    def __init__(self, connection, before_begin):
+        self._connection = connection
+        self._before_begin = before_begin
+        self._called = False
+
+    def execute(self, sql, params=()):
+        if not self._called and sql.strip().upper() in {"BEGIN", "BEGIN IMMEDIATE"}:
+            self._called = True
+            self._before_begin()
+        return self._connection.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 def test_new_book_has_no_pre_candidate_head(tmp_path):
     db = DatabaseConnection(str(tmp_path / "new-book.db"))
     db.execute(
@@ -1189,3 +1207,36 @@ def test_service_restart_releases_abandoned_memory_claim(candidates):
         pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
         content_revision=syncing.content_revision,
     ) == "claimed"
+
+
+def test_service_restart_does_not_regress_sync_published_before_recovery_transaction(candidates):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选",
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    repo.approve_for_commit(candidate.id, continue_after_commit=True)
+    repo.commit_formal(candidate.id)
+
+    publishing_db = DatabaseConnection(db.db_path)
+    publishing_repo = ChapterCandidateRepository(publishing_db)
+    wrapped = _BeforeBeginConnection(
+        db.get_connection(),
+        lambda: publishing_repo.mark_sync_succeeded(candidate.id),
+    )
+    repo._connection = lambda: wrapped
+
+    recovered = repo.recover_after_service_restart("novel-1")
+
+    assert repo.get_candidate(candidate.id).status == CandidateStatus.COMMITTED
+    assert recovered.current_formal_chapter == 1
+    assert recovered.canonical_sync_status == "ready"
+    assert db.fetch_one(
+        "SELECT sync_status FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+        (candidate.id,),
+    )["sync_status"] == "ready"

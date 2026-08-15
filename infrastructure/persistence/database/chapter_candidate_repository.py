@@ -1230,18 +1230,24 @@ class ChapterCandidateRepository:
         epoch.  Review candidates remain actionable, while a formal chapter
         awaiting canonical aftermath is kept intact and made retryable.
         """
-        run = self.get_run(novel_id)
         conn = self._connection()
-        candidate_row = None
-        if run.current_candidate_id:
-            candidate_row = conn.execute(
-                "SELECT * FROM chapter_candidates WHERE id = ?",
-                (run.current_candidate_id,),
-            ).fetchone()
         now = self._now()
         interruption = "service_restart_interrupted"
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute(
+                "SELECT * FROM novel_generation_runs WHERE novel_id = ?",
+                (novel_id,),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"generation run not found: {novel_id}")
+            run = self._run_from_row(run_row)
+            candidate_row = None
+            if run.current_candidate_id:
+                candidate_row = conn.execute(
+                    "SELECT * FROM chapter_candidates WHERE id = ?",
+                    (run.current_candidate_id,),
+                ).fetchone()
             status = str(candidate_row["status"]) if candidate_row is not None else ""
             candidate_id = str(candidate_row["id"]) if candidate_row is not None else ""
 
