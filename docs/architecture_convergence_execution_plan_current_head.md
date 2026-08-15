@@ -182,6 +182,67 @@ prefixes can no longer preview/execute.
 
 ## Phase 4 - Remove Redundant Candidate DAG Planning Call
 
+> **Superseded execution order:** Do not start this phase until Phase 3A below
+> is complete. The five-level Manifest publish transaction is a Planning
+> Authority P0; DAG call reduction is not.
+
+## Phase 3A - Atomic Manifest Publish and Candidate Pin Barrier
+
+**Goal:** Publish a sealed, aligned Manifest revision, update its physical
+StoryNode projection, stale only affected non-Formal Candidates, and switch
+the active Head in one SQLite transaction.
+
+**Current problem:** `PlanProjectionWriter.apply_atomic()` owns projection and
+Head CAS, while `ChapterCandidateRepository.stale_candidates_for_outline_contract()`
+commits separately. The legacy route therefore has a publish-to-stale window
+in which an old Candidate can still be approved or enter Formal.
+
+**Code evidence:**
+
+- `infrastructure/persistence/database/plan_projection_writer.py::apply_atomic`
+- `infrastructure/persistence/database/chapter_candidate_repository.py::stale_candidates_for_outline_contract`
+- `interfaces/api/v1/blueprint/outline_routes.py`
+
+**Files:**
+
+- Test: existing Manifest projection/write-guard and Candidate repository test
+  modules, plus one focused Manifest publish integration test when necessary.
+- Production: `plan_projection_writer.py`, the smallest Candidate repository
+  helper needed for transaction-owned scoped stale, and a Manifest publish
+  application service or adapter. The legacy outline route may only delegate
+  or reject; it must not retain a second publishing transaction.
+
+**Allowed:** Extend the existing projection writer's private transaction so it
+can invoke a narrowly typed, same-connection stale operation before Head
+activation; preserve Formal Candidate provenance; reject incomplete, stale,
+unsealed, unaligned, or non-current-CAS publish attempts.
+
+**Forbidden:** Expose `ProjectionWriteCapability`; restore node-level planning
+authority; change Candidate-first, Formal/Canonical/Memory algorithms, Prompt
+contracts, Worldline semantics, or stale a Formal Candidate solely because a
+future plan changed.
+
+**Tests:**
+
+- Publish failure leaves old Head, projection, and Candidates unchanged.
+- A Candidate whose exact chapter chain is unchanged remains usable after a
+  future-only replan.
+- A pending Candidate whose pinned chain is affected becomes stale in the same
+  transaction as the Head switch; an injected concurrent approve/Formal
+  attempt is rejected.
+- A Formal Candidate remains provenance-only and is never retracted by plan
+  publication.
+- Head digest/generation/CAS mismatch rolls back projection and candidate
+  changes together.
+
+**Completion:** A single begin/commit boundary owns projection DML, scoped
+Candidate stale, and Head activation. No API route can publish a Manifest then
+call stale in a second transaction.
+
+**Rollback:** Revert the phase if a future-only plan change needlessly stales
+an unchanged current Candidate, or if a projection/Head failure can leave a
+partially switched plan.
+
 **Goal:** Candidate DAG executes published required events/rhythm once without
 an unused second outline-decomposition LLM call.
 
