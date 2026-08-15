@@ -913,6 +913,72 @@ def test_plan_items_require_valid_parent_level_and_parent_digest(plan_repo):
         )
 
 
+def test_plan_sealing_rejects_a_complete_sibling_cohort_with_a_chapter_gap(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    root = repository.ensure_root("novel-1")
+    items = [root_item]
+    previous_digest = ""
+    for index, (start, end, entry, exit) in enumerate(
+        ((1, 3, "旧秩序仍然完整", "中段状态"), (5, 10, "中段状态", "新秩序建立但付出代价"))
+    ):
+        contract = repository.create_contract(
+            novel_id="novel-1",
+            level=root.level.child_level,
+            parent_contract_id=root.id,
+        )
+        draft = repository.save_draft(
+            contract.id,
+            OutlinePayload(
+                title=f"第{index + 1}部",
+                narrative_text="人物在冲突中作出不可逆的选择。",
+                creative_goal="推动全书阶段目标",
+                entry_state=entry,
+                exit_state=exit,
+                conflicts=["主要冲突升级"],
+                state_changes={"主角": [{"change": "承担代价"}]},
+                handoff_conditions=["后续阶段承接未完成任务"],
+                chapter_start=start,
+                chapter_end=end,
+            ),
+        )
+        published = repository.publish_and_sync(
+            contract.id, expected_revision=draft.draft.revision
+        )
+        row = database.get_connection().execute(
+            "SELECT id, digest FROM outline_contract_versions WHERE id = "
+            "(SELECT active_version_id FROM outline_contracts WHERE id = ?)",
+            (published.id,),
+        ).fetchone()
+        items.append(
+            OutlinePlanItem(
+                logical_node_id=published.id,
+                version_id=str(row["id"]),
+                version_digest=str(row["digest"]),
+                level=published.level,
+                sibling_index=index,
+                parent_logical_node_id=root_item.logical_node_id,
+                validated_parent_digest=root_item.version_digest,
+                validated_previous_sibling_digest=previous_digest,
+                expansion_state="unexpanded",
+            )
+        )
+        previous_digest = str(row["digest"])
+
+    draft = repository.create_plan_draft(
+        novel_id="novel-1",
+        items=tuple(items),
+        canonical_prefix_digest="",
+        canonical_boundary={"formal_head": 0},
+    )
+
+    with pytest.raises(OutlineGateError, match="chapter_range:gap:expected=4:actual=5"):
+        repository.seal_plan_revision(draft.id)
+
+    assert repository.get_plan_revision(draft.id).sealed_at is None
+    assert repository.get_planning_head("novel-1").working_plan_revision_id == draft.id
+
+
 def test_legacy_publish_invalidates_only_the_shadow_pointer_then_rebackfills(plan_repo):
     database, repository = plan_repo
     _published_root(database, repository, title="总纲 v1")

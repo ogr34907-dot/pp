@@ -27,6 +27,7 @@ from domain.structure.outline_plan import (
     PlanningHead,
     canonical_plan_digest,
 )
+from domain.structure.outline_plan_validation import validate_sibling_cohort
 from infrastructure.persistence.database.planning_authority_guard import (
     assert_legacy_planning_mutation_allowed,
 )
@@ -421,6 +422,52 @@ class OutlineContractRepository:
         return tuple(normalized)
 
     @staticmethod
+    def _validate_plan_cohorts(
+        conn: sqlite3.Connection,
+        items: Sequence[OutlinePlanItem],
+    ) -> None:
+        """Validate expanded sibling payloads only when a plan is finalized."""
+
+        by_logical_id = {item.logical_node_id: item for item in items}
+        groups: dict[tuple[str, OutlineLevel], list[OutlinePlanItem]] = {}
+        for item in items:
+            if item.parent_logical_node_id:
+                groups.setdefault((item.parent_logical_node_id, item.level), []).append(item)
+        for siblings in groups.values():
+            if len(siblings) < 2:
+                continue
+            siblings.sort(key=lambda item: item.sibling_index)
+            parent = by_logical_id[siblings[0].parent_logical_node_id or ""]
+            payloads = []
+            for sibling in siblings:
+                row = conn.execute(
+                    "SELECT payload_json FROM outline_contract_versions WHERE id = ?",
+                    (sibling.version_id,),
+                ).fetchone()
+                if row is None:
+                    raise OutlineGateError("outline plan cohort payload is missing")
+                payloads.append(
+                    OutlinePayload.from_dict(json.loads(str(row["payload_json"] or "{}")))
+                )
+            parent_row = conn.execute(
+                "SELECT payload_json FROM outline_contract_versions WHERE id = ?",
+                (parent.version_id,),
+            ).fetchone()
+            if parent_row is None:
+                raise OutlineGateError("outline plan cohort parent payload is missing")
+            result = validate_sibling_cohort(
+                level=siblings[0].level,
+                parent_payload=OutlinePayload.from_dict(
+                    json.loads(str(parent_row["payload_json"] or "{}"))
+                ),
+                siblings=payloads,
+            )
+            if result.blockers:
+                raise OutlineGateError(
+                    "outline plan cohort validation failed: " + ",".join(result.blockers)
+                )
+
+    @staticmethod
     def _insert_plan_items(
         conn: sqlite3.Connection,
         plan_revision_id: str,
@@ -568,6 +615,7 @@ class OutlineContractRepository:
             normalized_items = self._validate_plan_items(
                 plan.novel_id, plan.items, conn=conn
             )
+            self._validate_plan_cohorts(conn, normalized_items)
             digest = canonical_plan_digest(
                 canonical_prefix_digest=plan.canonical_prefix_digest,
                 items=normalized_items,
