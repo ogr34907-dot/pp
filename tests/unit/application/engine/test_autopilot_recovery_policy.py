@@ -114,6 +114,24 @@ class _Db:
         self.conn.commit()
 
 
+class _NoAuthorityConnectionDb:
+    """Database adapter that deliberately exposes no SQLite authority connection."""
+
+    def __init__(self, backing: _Db):
+        self._backing = backing
+        self.executed_sql: list[str] = []
+
+    def execute(self, sql, params=()):
+        self.executed_sql.append(sql)
+        return self._backing.execute(sql, params)
+
+    def fetch_one(self, sql, params=()):
+        return self._backing.fetch_one(sql, params)
+
+    def commit(self):
+        self._backing.commit()
+
+
 def test_recovery_policy_retries_writing_and_discards_transient_generation():
     db = _Db()
     db.execute("INSERT INTO novels (id, current_stage) VALUES ('novel-1', 'writing')")
@@ -412,6 +430,52 @@ def test_recovery_cleanup_discards_transient_chapter_preplan_for_writing_retry()
     assert "主事件：轻量主事件" in chapter["outline"]
     assert preplan_flags == {"v-preplan-outline": 0, "v-preplan-context": 0}
     assert act_flag == 1
+
+
+def test_recovery_cleanup_without_authority_connection_never_writes_story_node_projection():
+    backing = _Db()
+    preplan_metadata = {
+        "act_chapter_plan": {"number": 1, "title": "第1章", "main_event": "轻量主事件"},
+        "chapter_preplan": {"detail_outline": "临时七段细纲"},
+    }
+    backing.execute(
+        """
+        INSERT INTO story_nodes (id, novel_id, number, node_type, outline, metadata)
+        VALUES ('sn-1', 'novel-1', 1, 'chapter', '临时七段细纲', ?)
+        """,
+        (json.dumps(preplan_metadata, ensure_ascii=False),),
+    )
+    backing.execute(
+        """
+        INSERT INTO chapters (id, novel_id, number, status, content)
+        VALUES ('c1', 'novel-1', 1, 'draft', '半章草稿')
+        """
+    )
+    backing.execute(
+        """
+        INSERT INTO variable_values
+          (id, variable_key, scope_level, scope_key, value_json, is_current, source_node_key)
+        VALUES
+          ('v-preplan-outline', 'chapter.outline', 'chapter', 'novel_id:novel-1|chapter_number:1', '"七段细纲"', 1, 'planning-chapter-preplan')
+        """
+    )
+    db = _NoAuthorityConnectionDb(backing)
+
+    AutopilotRecoveryPolicy(db)._discard_transient_chapter_preplan("novel-1", 1)
+
+    story_node = backing.fetch_one("SELECT outline, metadata FROM story_nodes WHERE id = 'sn-1'")
+    chapter = backing.fetch_one("SELECT outline, content, word_count, status FROM chapters WHERE id = 'c1'")
+    preplan_flag = backing.fetch_one("SELECT is_current FROM variable_values WHERE id = 'v-preplan-outline'")
+    story_node_dml = [
+        sql for sql in db.executed_sql
+        if "story_nodes" in sql.lower() and sql.lstrip().lower().startswith(("update", "insert", "delete"))
+    ]
+
+    assert story_node_dml == []
+    assert story_node["outline"] == "临时七段细纲"
+    assert "chapter_preplan" in json.loads(story_node["metadata"])
+    assert chapter == {"outline": "", "content": "", "word_count": 0, "status": "draft"}
+    assert preplan_flag["is_current"] == 0
 
 
 def test_recovery_cleanup_cancels_only_retryable_pending_invocations():

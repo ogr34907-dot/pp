@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -600,45 +601,40 @@ class AutopilotRecoveryPolicy:
         """
         try:
             db = self._get_db()
-            row = db.fetch_one(
-                """
-                SELECT id, outline, metadata
-                FROM story_nodes
-                WHERE novel_id = ? AND node_type = 'chapter' AND number = ?
-                LIMIT 1
-                """,
-                (novel_id, int(chapter_number)),
-            )
             lightweight_outline = ""
-            metadata: dict[str, Any] = {}
-            get_connection = getattr(db, "get_connection", None)
-            connection = get_connection() if callable(get_connection) else getattr(db, "conn", None)
-            manifest_mode = (
-                connection is not None
-                and is_manifest_authority(connection, novel_id)
-            )
-            if row and not manifest_mode:
-                metadata = self._json_object(row.get("metadata"))
-                act_plan = metadata.get("act_chapter_plan")
-                if isinstance(act_plan, dict) and act_plan:
-                    from application.blueprint.services.chapter_plan_renderer import (
-                        render_lightweight_act_chapter_outline,
-                    )
+            if self._has_verified_legacy_planning_authority(db, novel_id):
+                row = db.fetch_one(
+                    """
+                    SELECT id, outline, metadata
+                    FROM story_nodes
+                    WHERE novel_id = ? AND node_type = 'chapter' AND number = ?
+                    LIMIT 1
+                    """,
+                    (novel_id, int(chapter_number)),
+                )
+                metadata: dict[str, Any] = {}
+                if row:
+                    metadata = self._json_object(row.get("metadata"))
+                    act_plan = metadata.get("act_chapter_plan")
+                    if isinstance(act_plan, dict) and act_plan:
+                        from application.blueprint.services.chapter_plan_renderer import (
+                            render_lightweight_act_chapter_outline,
+                        )
 
-                    lightweight_outline = render_lightweight_act_chapter_outline(act_plan)
-                if metadata.pop("chapter_preplan", None) is not None:
-                    db.execute(
-                        """
-                        UPDATE story_nodes
-                        SET outline = ?, metadata = ?, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                        """,
-                        (
-                            lightweight_outline,
-                            json.dumps(metadata, ensure_ascii=False, sort_keys=True),
-                            row["id"],
-                        ),
-                    )
+                        lightweight_outline = render_lightweight_act_chapter_outline(act_plan)
+                    if metadata.pop("chapter_preplan", None) is not None:
+                        db.execute(
+                            """
+                            UPDATE story_nodes
+                            SET outline = ?, metadata = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (
+                                lightweight_outline,
+                                json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                                row["id"],
+                            ),
+                        )
 
             db.execute(
                 """
@@ -677,6 +673,19 @@ class AutopilotRecoveryPolicy:
                 chapter_number,
                 exc,
             )
+
+    @staticmethod
+    def _has_verified_legacy_planning_authority(db: Any, novel_id: str) -> bool:
+        """Allow physical plan cleanup only through an explicit legacy connection."""
+        try:
+            get_connection = getattr(db, "get_connection", None)
+            connection = get_connection() if callable(get_connection) else getattr(db, "conn", None)
+            if not isinstance(connection, sqlite3.Connection):
+                return False
+            connection.execute("SELECT 1").fetchone()
+            return not is_manifest_authority(connection, novel_id)
+        except Exception:
+            return False
 
     @staticmethod
     def _json_object(raw: Any) -> dict[str, Any]:

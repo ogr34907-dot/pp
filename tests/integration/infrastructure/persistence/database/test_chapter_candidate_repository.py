@@ -1,6 +1,7 @@
 """A candidate chapter must never become a formal chapter before approval + sync."""
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import hashlib
 import json
 import sqlite3
@@ -18,7 +19,7 @@ from application.world.services.chapter_narrative_sync import (
     CHAPTER_NARRATIVE_PIPELINE_VERSION,
 )
 from domain.novel.candidate_chapter import CandidateStatus, GenerationRunState, RunMode
-from domain.structure.outline_contract import OutlinePayload, OutlineSource
+from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
 from domain.structure.story_node import NodeType, StoryNode
 from infrastructure.persistence.database.chapter_candidate_repository import (
     CandidateGateError,
@@ -272,6 +273,77 @@ def _manifest_candidate_for_pin_boundary(tmp_path, *, boundary: str):
         )
         candidate = repo.approve_for_commit(candidate.id, continue_after_commit=False)
     return db, repo, candidate
+
+
+def _switch_to_changed_manifest_head(
+    db: DatabaseConnection,
+    *,
+    active_plan_id: str,
+    retain_candidate_chain: bool = False,
+    activate: bool = True,
+):
+    """Create a sealed successor that either retains or replaces this chapter chain."""
+
+    contracts = OutlineContractRepository(db)
+    active = contracts.get_plan_revision(active_plan_id)
+    changed_items = tuple(
+        replace(
+            item,
+            id="",
+            is_reused=True,
+            expansion_state=(
+                "unexpanded"
+                if not retain_candidate_chain and item.level == OutlineLevel.ACT
+                else item.expansion_state
+            ),
+        )
+        for item in active.items
+        if retain_candidate_chain or item.level != OutlineLevel.CHAPTER
+    )
+    draft = contracts.create_plan_draft(
+        novel_id=active.novel_id,
+        items=changed_items,
+        canonical_prefix_digest=active.canonical_prefix_digest,
+        canonical_boundary=active.canonical_boundary,
+        parent_plan_revision_id=active.id,
+        base_plan_digest=active.digest,
+        replan_start_chapter=1,
+    )
+    changed = contracts.seal_plan_revision(draft.id)
+    if activate:
+        _activate_manifest_head(db, changed)
+    return changed
+
+
+def _activate_manifest_head(db: DatabaseConnection, plan) -> None:
+    """Use an isolated writer to model a completed concurrent Head publication."""
+
+    conn = db.get_connection()
+    head = conn.execute(
+        """
+        SELECT authority_generation, projection_generation
+        FROM outline_planning_heads WHERE novel_id = ?
+        """,
+        (plan.novel_id,),
+    ).fetchone()
+    assert head is not None
+    next_generation = int(head["authority_generation"]) + 1
+    conn.execute(
+        """
+        UPDATE outline_planning_heads
+        SET active_plan_revision_id = ?, active_plan_digest = ?,
+            authority_generation = ?, projection_generation = ?
+        WHERE novel_id = ?
+        """,
+        (
+            plan.id,
+            plan.digest,
+            next_generation,
+            next_generation,
+            plan.novel_id,
+        ),
+    )
+    conn.commit()
 
 
 class _LegacyPreflightOutline:
@@ -876,6 +948,153 @@ def test_formal_commit_revalidates_stored_manifest_chain_before_prose_write(tmp_
     assert db.get_connection().execute(
         "SELECT COUNT(*) AS total FROM chapters WHERE novel_id = 'manifest-formal'"
     ).fetchone()["total"] == 0
+
+
+def test_future_head_with_the_same_exact_chain_retains_candidate_authority(tmp_path):
+    """A future-only replan keeps a Candidate when its exact chain is retained."""
+
+    db, repo, candidate = _manifest_candidate_for_pin_boundary(
+        tmp_path, boundary="revalidation"
+    )
+    original_plan_id = candidate.plan_revision_id
+    original_plan_digest = candidate.plan_digest
+    changed = _switch_to_changed_manifest_head(
+        db,
+        active_plan_id=str(candidate.plan_revision_id),
+        retain_candidate_chain=True,
+    )
+
+    persisted = repo.set_generated_content(candidate.id, "仍应可保存的当前章候选正文")
+
+    assert persisted.status == CandidateStatus.STREAMING
+    assert persisted.plan_revision_id == original_plan_id
+    assert persisted.plan_digest == original_plan_digest
+    assert persisted.plan_revision_id != changed.id
+
+
+@pytest.mark.parametrize("operation", ("edit", "regenerate"))
+def test_changed_manifest_head_cannot_revive_a_stale_candidate(tmp_path, operation):
+    """A replaced exact chain cannot be turned back into active review work."""
+
+    db, repo, candidate = _manifest_candidate_for_pin_boundary(
+        tmp_path, boundary="revalidation"
+    )
+    _switch_to_changed_manifest_head(db, active_plan_id=str(candidate.plan_revision_id))
+    conn = db.get_connection()
+    conn.execute(
+        """
+        UPDATE chapter_candidates
+        SET status = 'stale', failure_reason = 'outline_revision_changed'
+        WHERE id = ?
+        """,
+        (candidate.id,),
+    )
+    conn.execute(
+        """
+        UPDATE novel_generation_runs
+        SET state = 'paused', next_action = 'regenerate_stale_candidate',
+            last_error = 'outline_revision_changed'
+        WHERE novel_id = ?
+        """,
+        (candidate.novel_id,),
+    )
+    conn.commit()
+
+    with pytest.raises(CandidateGateError, match="active plan|plan pin|outline chain"):
+        if operation == "edit":
+            repo.edit_content(candidate.id, "不得重新启用的作者改稿")
+        else:
+            repo.request_regeneration(candidate.id, feedback="不得重新生成")
+
+    persisted = repo.get_candidate(candidate.id)
+    run = repo.get_run(candidate.novel_id)
+    assert persisted.status == CandidateStatus.STALE
+    assert run.state == GenerationRunState.PAUSED
+
+
+@pytest.mark.parametrize(
+    ("operation", "boundary"),
+    (
+        ("mark_auditing", "revalidation"),
+        ("finish_audit", "revalidation"),
+        ("update_commit_plan", "approval"),
+        ("edit", "approval"),
+        ("regenerate", "approval"),
+        ("begin_dag_revision", "revalidation"),
+    ),
+)
+def test_authority_transition_rechecks_manifest_head_inside_write_transaction(
+    tmp_path, operation, boundary
+):
+    """A Head switch after preflight cannot revive a Candidate or run cursor."""
+
+    db, repo, candidate = _manifest_candidate_for_pin_boundary(tmp_path, boundary=boundary)
+    if operation == "finish_audit":
+        candidate = repo.mark_auditing(candidate.id)
+    successor = _switch_to_changed_manifest_head(
+        db,
+        active_plan_id=str(candidate.plan_revision_id),
+        activate=False,
+    )
+    before_candidate = repo.get_candidate(candidate.id)
+    before_run = repo.get_run(candidate.novel_id)
+    competing_db = DatabaseConnection(db.db_path)
+    switched = False
+
+    def publish_changed_head() -> None:
+        nonlocal switched
+        _activate_manifest_head(competing_db, successor)
+        switched = True
+
+    wrapped = _BeforeBeginConnection(db.get_connection(), publish_changed_head)
+    repo._connection = lambda: wrapped
+
+    with pytest.raises(CandidateGateError, match="active plan|plan pin|outline chain"):
+        if operation == "mark_auditing":
+            repo.mark_auditing(candidate.id)
+        elif operation == "finish_audit":
+            repo.finish_audit(candidate.id, audit={}, commit_plan={}, require_author_review=True)
+        elif operation == "update_commit_plan":
+            repo.update_commit_plan(candidate.id, {"summary": "不得覆写旧计划"})
+        elif operation == "edit":
+            repo.edit_content(candidate.id, "不得在旧计划下保存改稿")
+        elif operation == "regenerate":
+            repo.request_regeneration(candidate.id, feedback="不得在旧计划下重试")
+        else:
+            repo.begin_dag_revision(candidate.id, feedback="不得在旧计划下重试")
+
+    assert switched is True
+    after_candidate = ChapterCandidateRepository(db).get_candidate(candidate.id)
+    after_run = ChapterCandidateRepository(db).get_run(candidate.novel_id)
+    assert after_candidate.status == before_candidate.status
+    assert after_candidate.content_revision == before_candidate.content_revision
+    assert after_candidate.audit_revision == before_candidate.audit_revision
+    assert after_candidate.commit_plan_revision == before_candidate.commit_plan_revision
+    assert after_run.state == before_run.state
+    assert after_run.generation_epoch == before_run.generation_epoch
+    assert after_run.current_candidate_id == before_run.current_candidate_id
+
+
+def test_nonformal_worker_failure_can_be_recovered_by_regeneration(candidates):
+    """A non-formal worker failure retains the author-visible retry path."""
+
+    repo, _ = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="失败前的候选正文",
+    )
+    failed = repo.fail_candidate(candidate.id, "draft_worker_failed")
+
+    assert failed.status == CandidateStatus.FAILED
+    assert repo.get_run(candidate.novel_id).state == GenerationRunState.ERROR
+
+    retrying = repo.request_regeneration(candidate.id, feedback="重试生成")
+
+    assert retrying.status == CandidateStatus.REGENERATING
+    assert repo.get_run(candidate.novel_id).state == GenerationRunState.RUNNING
 
 
 @pytest.mark.parametrize("run_mode", [RunMode.CHAPTER_REVIEW, RunMode.CONTINUOUS])
@@ -1588,6 +1807,29 @@ def test_mark_sync_succeeded_rejects_not_required_memory_even_with_exact_summary
 
     with pytest.raises(CandidateGateError, match="canonical aftermath"):
         repo.mark_sync_succeeded(syncing.id)
+
+
+def test_mark_sync_succeeded_rejects_candidate_formal_slot_drift(candidates):
+    """Cursor publication must bind the Candidate slot to its Formal commit row."""
+
+    repo, db = candidates
+    syncing = _syncing_candidate(repo)
+    _persist_durable_aftermath(db, syncing)
+    db.execute(
+        "UPDATE chapter_candidates SET formal_chapter_id = 'wrong-formal-slot' WHERE id = ?",
+        (syncing.id,),
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(CandidateGateError, match="candidate formal version changed"):
+        repo.mark_sync_succeeded(syncing.id)
+
+    assert repo.get_candidate(syncing.id).status == CandidateStatus.SYNCING
+    assert db.fetch_one(
+        "SELECT sync_status FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+        (syncing.id,),
+    )["sync_status"] == "syncing"
+    assert repo.get_run(syncing.novel_id).current_formal_chapter == 0
 
 
 @pytest.mark.parametrize("mismatch", ["hash", "revision", "pipeline"])
