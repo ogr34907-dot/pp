@@ -15,6 +15,7 @@ from infrastructure.persistence.database.outline_contract_repository import (
 from infrastructure.persistence.database.plan_projection_writer import PlanProjectionWriter
 from infrastructure.persistence.database.planning_authority_guard import (
     PlanningAuthorityError,
+    assert_story_node_write_allowed,
 )
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 from infrastructure.persistence.database.sqlite_chapter_repository import SqliteChapterRepository
@@ -246,9 +247,9 @@ def test_atomic_writer_exposes_no_capability_or_transaction_callback(manifest_bo
     writer = PlanProjectionWriter(repository)
 
     assert callable(writer.apply_atomic)
-    assert not hasattr(writer, "transaction")
+    assert callable(writer.projection_transaction)
     assert not hasattr(writer, "capability_for")
-    assert not hasattr(writer, "activate_head")
+    assert callable(writer.activate_head)
     assert not hasattr(writer, "save_sync")
     assert not hasattr(writer, "repository")
 
@@ -256,7 +257,7 @@ def test_atomic_writer_exposes_no_capability_or_transaction_callback(manifest_bo
         ProjectionWriteCapability,
     )
 
-    with pytest.raises(TypeError, match="disabled"):
+    with pytest.raises(TypeError, match="private"):
         ProjectionWriteCapability(
             novel_id="novel-1",
             plan_revision_id=plan_id,
@@ -267,30 +268,59 @@ def test_atomic_writer_exposes_no_capability_or_transaction_callback(manifest_bo
         repository.save_sync(_node())
 
 
-def test_private_projection_permit_path_is_disabled(manifest_book):
-    database, _, _, plan_id = manifest_book
-    from infrastructure.persistence.database.planning_authority_guard import (
-        _mint_projection_capability,
-    )
-
+def test_projection_capability_is_transaction_bound_and_private(manifest_book):
+    database, repository, _, plan_id = manifest_book
     head = _head_snapshot(database)
+    writer = PlanProjectionWriter(repository)
+    with writer.projection_transaction(
+        novel_id="novel-1",
+        plan_revision_id=plan_id,
+        operation="restore",
+        expected_active_plan_revision_id=head["plan_id"],
+        expected_active_plan_digest=head["digest"],
+        expected_authority_generation=head["authority_generation"],
+        expected_projection_generation=head["projection_generation"],
+    ) as capability:
+        repository.save_sync(_node("capability-node"), _capability=capability)
+        other_connection = sqlite3.connect(database.db_path)
+        other_connection.row_factory = sqlite3.Row
+        try:
+            with pytest.raises(PlanningAuthorityError, match="out of scope"):
+                assert_story_node_write_allowed(
+                    other_connection,
+                    "novel-1",
+                    operation="cross_connection",
+                    capability=capability,
+                )
+        finally:
+            other_connection.close()
+        writer.activate_head(capability)
+
+    with pytest.raises(PlanningAuthorityError, match="expired"):
+        repository.save_sync(_node("post-commit-node"), _capability=capability)
+
+
+def test_projection_capability_rejects_commit_rebegin_reuse(manifest_book):
+    database, repository, _, plan_id = manifest_book
+    head = _head_snapshot(database)
+    writer = PlanProjectionWriter(repository)
     conn = database.get_connection()
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        with pytest.raises(PlanningAuthorityError, match="disabled"):
-            _mint_projection_capability(
-                conn,
-                novel_id="novel-1",
-                plan_revision_id=plan_id,
-                designated_operation="projection",
-                authority_generation=head["authority_generation"],
-                projection_generation=head["projection_generation"],
-                expected_active_plan_revision_id=head["plan_id"],
-                expected_active_plan_digest=head["digest"],
+    with pytest.raises(PlanningAuthorityError, match="transaction has ended"):
+        with writer.projection_transaction(
+            novel_id="novel-1",
+            plan_revision_id=plan_id,
+            operation="restore",
+            expected_active_plan_revision_id=head["plan_id"],
+            expected_active_plan_digest=head["digest"],
+            expected_authority_generation=head["authority_generation"],
+            expected_projection_generation=head["projection_generation"],
+        ) as capability:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("PRAGMA defer_foreign_keys = ON")
+            repository.save_sync(
+                _node("reused-after-commit"), _capability=capability
             )
-    finally:
-        if conn.in_transaction:
-            conn.rollback()
 
 
 def test_atomic_projection_rejects_a_sealed_non_active_plan_before_projection_dml(
@@ -340,24 +370,23 @@ def test_atomic_projection_rejects_every_caller_batch_before_node_writes(
 
 def test_atomic_publish_rejects_caller_batch_before_head_cas(manifest_book):
     database, repository, _, _ = manifest_book
-    replacement = "publish-target"
-    _insert_sealed_plan(database, replacement, digest="publish-target-digest")
+    replacement = _head_snapshot(database)["plan_id"]
     conn = database.get_connection()
     conn.execute(
         """
         CREATE TRIGGER reject_test_head_switch
         BEFORE UPDATE ON outline_planning_heads
-        WHEN NEW.active_plan_revision_id = 'publish-target'
+        WHEN NEW.active_plan_revision_id = ?
         BEGIN
             SELECT RAISE(ABORT, 'forced Head failure');
         END
-        """
+        """.replace("?", repr(replacement))
     )
     conn.commit()
     before = _head_snapshot(database)
     writer = PlanProjectionWriter(repository)
 
-    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+    with pytest.raises(PlanningAuthorityError, match="forced Head failure"):
         _apply_atomic(
             writer,
             database,
@@ -373,14 +402,14 @@ def test_atomic_publish_rejects_caller_batch_before_head_cas(manifest_book):
     assert _head_snapshot(database) == before
 
 
-def test_atomic_publish_cannot_switch_head_without_declared_projection(manifest_book):
+def test_atomic_publish_rejects_manifest_without_plan_items(manifest_book):
     database, repository, _, _ = manifest_book
     replacement = "publish-target"
     _insert_sealed_plan(database, replacement, digest="publish-target-digest")
     writer = PlanProjectionWriter(repository)
 
     before = _head_snapshot(database)
-    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+    with pytest.raises(PlanningAuthorityError, match="no sealed plan items"):
         _apply_atomic(
             writer,
             database,
@@ -415,12 +444,12 @@ def test_atomic_writer_rejects_stale_head_and_non_publishable_target_before_dml(
     database, repository, _, active_plan_id = manifest_book
     writer = PlanProjectionWriter(repository)
 
-    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+    with pytest.raises(PlanningAuthorityError, match="planning Head generation changed"):
         _apply_atomic(
             writer,
             database,
             active_plan_id,
-            operation="projection",
+            operation="publish",
             expected_authority_generation=99,
             creates=(_node("stale-head-node"),),
         )
@@ -433,7 +462,7 @@ def test_atomic_writer_rejects_stale_head_and_non_publishable_target_before_dml(
         status="ready_for_review",
         reconciliation_status="author_decision_required",
     )
-    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+    with pytest.raises(PlanningAuthorityError, match="sealed aligned"):
         _apply_atomic(
             writer,
             database,
@@ -446,7 +475,7 @@ def test_atomic_writer_rejects_stale_head_and_non_publishable_target_before_dml(
     assert asyncio.run(repository.get_by_id("non-publishable-node")) is None
 
 
-def test_atomic_cutover_is_disabled_without_declared_projection(legacy_plan_book):
+def test_atomic_cutover_switches_head_atomically(legacy_plan_book):
     database, repository, _, plan_id = legacy_plan_book
     writer = PlanProjectionWriter(repository)
     assert _head_snapshot(database) == {
@@ -457,14 +486,13 @@ def test_atomic_cutover_is_disabled_without_declared_projection(legacy_plan_book
         "projection_generation": 0,
     }
 
-    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
-        _apply_atomic(
-            writer,
-            database,
-            plan_id,
-            operation="cutover",
-            creates=(_node("cutover-part"),),
-        )
+    _apply_atomic(
+        writer,
+        database,
+        plan_id,
+        operation="cutover",
+        creates=(_node("cutover-part"),),
+    )
 
     fresh = DatabaseConnection(database.db_path).get_connection()
     head = fresh.execute(
@@ -474,10 +502,10 @@ def test_atomic_cutover_is_disabled_without_declared_projection(legacy_plan_book
         FROM outline_planning_heads WHERE novel_id = 'novel-1'
         """
     ).fetchone()
-    assert tuple(head) == ("legacy", None, 0, 0)
+    assert tuple(head) == ("manifest", plan_id, 1, 1)
     assert fresh.execute(
         "SELECT COUNT(*) FROM story_nodes WHERE id = 'cutover-part'"
-    ).fetchone()[0] == 0
+    ).fetchone()[0] == 1
 
 
 def test_manifest_runtime_whitelist_does_not_allow_planning_changes(manifest_book):

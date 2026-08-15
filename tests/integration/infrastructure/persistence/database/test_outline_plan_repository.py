@@ -593,6 +593,7 @@ def test_active_manifest_read_rejects_a_tampered_sealed_payload(plan_repo):
     # Simulate a database created before immutability hardening or an offline
     # corruption repair. The read path itself must still reject the mismatch.
     conn.execute("DROP TRIGGER trg_outline_contract_versions_sealed_global_update")
+    conn.execute("DROP TRIGGER trg_outline_contract_versions_sealed_global_update_v2")
     conn.execute("DROP TRIGGER trg_outline_contract_versions_manifest_sealed_update")
     conn.execute(
         "UPDATE outline_contract_versions SET payload_json = ? WHERE id = ?",
@@ -618,6 +619,7 @@ def test_active_manifest_read_rejects_an_unsealed_content_version(plan_repo):
     conn.commit()
 
     conn.execute("DROP TRIGGER trg_outline_contract_versions_sealed_global_update")
+    conn.execute("DROP TRIGGER trg_outline_contract_versions_sealed_global_update_v2")
     conn.execute("DROP TRIGGER trg_outline_contract_versions_manifest_sealed_update")
     conn.execute(
         "UPDATE outline_contract_versions SET sealed_at = NULL WHERE id = ?",
@@ -691,6 +693,8 @@ def test_active_manifest_read_rejects_mismatched_head_digest(plan_repo):
 
     conn.execute("DROP TRIGGER trg_outline_planning_heads_active_update")
     conn.execute("DROP TRIGGER trg_outline_planning_heads_publishable_update")
+    conn.execute("DROP TRIGGER trg_outline_planning_heads_publishable_update_v2")
+    conn.execute("DROP TRIGGER trg_outline_planning_heads_topology_update_v2")
     conn.execute(
         "UPDATE outline_planning_heads SET active_plan_digest = 'tampered' "
         "WHERE novel_id = 'novel-1'"
@@ -835,6 +839,7 @@ def test_manifest_head_rejects_sealed_plan_requiring_author_decision(plan_repo):
     )
     target = repository.seal_plan_revision(draft.id)
 
+    conn.execute("DROP TRIGGER trg_outline_planning_heads_topology_update_v2")
     with pytest.raises(sqlite3.IntegrityError, match="ready_for_review.*aligned"):
         conn.execute(
             "UPDATE outline_planning_heads "
