@@ -2,6 +2,7 @@ import sqlite3
 from pathlib import Path
 
 from infrastructure.persistence.database.migration_runner import apply_migration_files
+from infrastructure.persistence.database.connection import DatabaseConnection
 
 
 def test_apply_migration_files_is_idempotent(tmp_path):
@@ -239,3 +240,56 @@ def test_apply_migration_files_skips_a_comment_prefixed_diagnostic_with_paramete
 
     assert marked == [("001_diagnostic.sql",)]
     assert table == ("applied_after_diagnostic",)
+
+
+def test_current_schema_installs_outline_manifest_storage_idempotently(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "outline-manifest.db"))
+    conn = database.get_connection()
+    migrations = Path("infrastructure/persistence/database/migrations")
+
+    apply_migration_files(conn, migrations)
+
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    head_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(outline_planning_heads)")
+    }
+    candidate_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(chapter_candidates)")
+    }
+    attempt_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(outline_generation_attempts)")
+    }
+    applied_count = conn.execute(
+        "SELECT COUNT(*) FROM migrations_applied "
+        "WHERE migration_file = '031_outline_plan_manifests.sql'"
+    ).fetchone()[0]
+
+    assert {
+        "outline_planning_heads",
+        "outline_plan_revisions",
+        "outline_plan_revision_items",
+    } <= tables
+    assert {
+        "active_plan_revision_id",
+        "working_plan_revision_id",
+        "authority_generation",
+        "projection_generation",
+    } <= head_columns
+    assert {
+        "planning_authority_generation",
+        "plan_revision_id",
+        "plan_digest",
+        "chapter_outline_digest",
+    } <= candidate_columns
+    assert {
+        "plan_revision_id",
+        "cohort_parent_logical_node_id",
+        "cohort_level",
+    } <= attempt_columns
+    assert applied_count == 1

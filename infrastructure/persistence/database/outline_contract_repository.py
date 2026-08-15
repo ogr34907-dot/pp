@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import sqlite3
-from typing import Any, Optional, Union
+from typing import Any, Mapping, Optional, Sequence, Union
 from uuid import uuid4
 
 from domain.structure.outline_contract import (
@@ -15,6 +15,17 @@ from domain.structure.outline_contract import (
     OutlinePayload,
     OutlineSource,
     OutlineStatus,
+)
+from domain.structure.outline_plan import (
+    BackfillResult,
+    BackfillStatus,
+    OutlinePlanItem,
+    OutlinePlanRevision,
+    PlanReconciliationStatus,
+    PlanRevisionStatus,
+    PlanningAuthorityMode,
+    PlanningHead,
+    canonical_plan_digest,
 )
 
 
@@ -64,6 +75,649 @@ class OutlineContractRepository:
     @staticmethod
     def _now() -> str:
         return datetime.now().isoformat()
+
+    @staticmethod
+    def _head_from_row(row: sqlite3.Row) -> PlanningHead:
+        values = dict(row)
+        return PlanningHead(
+            novel_id=str(values["novel_id"]),
+            authority_mode=PlanningAuthorityMode(str(values["authority_mode"])),
+            authority_generation=int(values["authority_generation"]),
+            active_plan_revision_id=values.get("active_plan_revision_id"),
+            active_plan_digest=str(values.get("active_plan_digest") or ""),
+            working_plan_revision_id=values.get("working_plan_revision_id"),
+            projection_generation=int(values.get("projection_generation") or 0),
+            auto_publish_repairable=bool(values.get("auto_publish_repairable")),
+        )
+
+    def ensure_planning_head(self, novel_id: str) -> PlanningHead:
+        conn = self._connection()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO outline_planning_heads (novel_id)
+            VALUES (?)
+            """,
+            (novel_id,),
+        )
+        conn.commit()
+        return self.get_planning_head(novel_id)
+
+    def get_planning_head(self, novel_id: str) -> PlanningHead:
+        row = self._connection().execute(
+            "SELECT * FROM outline_planning_heads WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outline planning head not found: {novel_id}")
+        return self._head_from_row(row)
+
+    def _plan_items_from_rows(
+        self, rows: Sequence[sqlite3.Row]
+    ) -> tuple[OutlinePlanItem, ...]:
+        return tuple(
+            OutlinePlanItem(
+                id=str(row["id"]),
+                logical_node_id=str(row["logical_node_id"]),
+                version_id=str(row["version_id"]),
+                version_digest=str(row["version_digest"]),
+                parent_logical_node_id=row["parent_logical_node_id"],
+                level=OutlineLevel(str(row["level"])),
+                sibling_index=int(row["sibling_index"]),
+                expansion_state=str(row["expansion_state"]),
+                validated_parent_digest=str(row["validated_parent_digest"] or ""),
+                validated_previous_sibling_digest=str(
+                    row["validated_previous_sibling_digest"] or ""
+                ),
+                is_reused=bool(row["is_reused"]),
+            )
+            for row in rows
+        )
+
+    def get_plan_revision(self, plan_revision_id: str) -> OutlinePlanRevision:
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT * FROM outline_plan_revisions WHERE id = ?",
+            (plan_revision_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"outline plan revision not found: {plan_revision_id}")
+        item_rows = conn.execute(
+            """
+            SELECT item.*, version.digest AS version_digest
+            FROM outline_plan_revision_items AS item
+            JOIN outline_contract_versions AS version ON version.id = item.version_id
+            WHERE item.plan_revision_id = ?
+            ORDER BY CASE item.level
+                WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
+                WHEN 'act' THEN 3 ELSE 4 END,
+                COALESCE(item.parent_logical_node_id, ''), item.sibling_index,
+                item.logical_node_id
+            """,
+            (plan_revision_id,),
+        ).fetchall()
+        values = dict(row)
+        return OutlinePlanRevision(
+            id=str(values["id"]),
+            novel_id=str(values["novel_id"]),
+            revision=int(values["revision"]),
+            parent_plan_revision_id=values.get("parent_plan_revision_id"),
+            status=PlanRevisionStatus(str(values["status"])),
+            digest=str(values["digest"] or ""),
+            base_plan_digest=str(values["base_plan_digest"] or ""),
+            replan_start_chapter=values.get("replan_start_chapter"),
+            canonical_prefix_digest=str(values["canonical_prefix_digest"] or ""),
+            canonical_boundary=json.loads(values["canonical_boundary_json"] or "{}"),
+            reconciliation_status=PlanReconciliationStatus(
+                str(values["reconciliation_status"])
+            ),
+            reconciliation_report=json.loads(
+                values["reconciliation_report_json"] or "{}"
+            ),
+            author_intent=str(values["author_intent"] or ""),
+            created_by=str(values["created_by"] or ""),
+            publish_idempotency_key=str(
+                values["publish_idempotency_key"] or ""
+            ),
+            created_at=str(values["created_at"] or ""),
+            updated_at=str(values["updated_at"] or ""),
+            sealed_at=values.get("sealed_at"),
+            items=self._plan_items_from_rows(item_rows),
+        )
+
+    def get_active_plan(self, novel_id: str) -> Optional[OutlinePlanRevision]:
+        row = self._connection().execute(
+            "SELECT active_plan_revision_id FROM outline_planning_heads WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        if row is None or not row["active_plan_revision_id"]:
+            return None
+        return self.get_plan_revision(str(row["active_plan_revision_id"]))
+
+    def _validate_plan_items(
+        self, novel_id: str, items: Sequence[OutlinePlanItem]
+    ) -> tuple[OutlinePlanItem, ...]:
+        if not items:
+            raise OutlineGateError("outline plan requires at least one item")
+        conn = self._connection()
+        normalized: list[OutlinePlanItem] = []
+        logical_ids: set[str] = set()
+        positions: set[tuple[str, str, int]] = set()
+        for item in items:
+            row = conn.execute(
+                """
+                SELECT contract.novel_id, contract.level, version.contract_id,
+                       version.digest
+                FROM outline_contracts AS contract
+                JOIN outline_contract_versions AS version
+                  ON version.contract_id = contract.id
+                WHERE contract.id = ? AND version.id = ?
+                """,
+                (item.logical_node_id, item.version_id),
+            ).fetchone()
+            if row is None or str(row["novel_id"]) != novel_id:
+                raise OutlineGateError("outline plan item does not belong to the novel")
+            if str(row["level"]) != item.level.value:
+                raise OutlineGateError("outline plan item level does not match its contract")
+            if str(row["digest"]) != item.version_digest:
+                raise OutlineGateError("outline plan item version digest mismatch")
+            position = (
+                item.parent_logical_node_id or "",
+                item.level.value,
+                item.sibling_index,
+            )
+            if item.logical_node_id in logical_ids:
+                raise OutlineGateError("duplicate logical node in outline plan")
+            if position in positions:
+                raise OutlineGateError("duplicate sibling position in outline plan")
+            logical_ids.add(item.logical_node_id)
+            positions.add(position)
+            normalized.append(item)
+        for item in normalized:
+            if item.parent_logical_node_id and item.parent_logical_node_id not in logical_ids:
+                raise OutlineGateError("outline plan item parent is missing from the plan")
+        return tuple(normalized)
+
+    @staticmethod
+    def _insert_plan_items(
+        conn: sqlite3.Connection,
+        plan_revision_id: str,
+        items: Sequence[OutlinePlanItem],
+        now: str,
+    ) -> None:
+        for item in items:
+            conn.execute(
+                """
+                INSERT INTO outline_plan_revision_items
+                    (id, plan_revision_id, logical_node_id, version_id,
+                     parent_logical_node_id, level, sibling_index,
+                     expansion_state, validated_parent_digest,
+                     validated_previous_sibling_digest, is_reused, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.id or f"outline-plan-item-{uuid4()}",
+                    plan_revision_id,
+                    item.logical_node_id,
+                    item.version_id,
+                    item.parent_logical_node_id,
+                    item.level.value,
+                    item.sibling_index,
+                    item.expansion_state,
+                    item.validated_parent_digest,
+                    item.validated_previous_sibling_digest,
+                    int(item.is_reused),
+                    now,
+                ),
+            )
+
+    def create_plan_draft(
+        self,
+        *,
+        novel_id: str,
+        items: Sequence[OutlinePlanItem],
+        canonical_prefix_digest: str,
+        canonical_boundary: Mapping[str, Any],
+        parent_plan_revision_id: Optional[str] = None,
+        base_plan_digest: str = "",
+        replan_start_chapter: Optional[int] = None,
+        reconciliation_status: PlanReconciliationStatus = (
+            PlanReconciliationStatus.ALIGNED
+        ),
+        reconciliation_report: Optional[Mapping[str, Any]] = None,
+        author_intent: str = "",
+        created_by: str = "system",
+        publish_idempotency_key: str = "",
+    ) -> OutlinePlanRevision:
+        head = self.ensure_planning_head(novel_id)
+        if head.working_plan_revision_id:
+            raise OutlineGateError("an outline plan draft is already open")
+        normalized = self._validate_plan_items(novel_id, items)
+        if parent_plan_revision_id:
+            parent = self.get_plan_revision(parent_plan_revision_id)
+            if parent.novel_id != novel_id or not parent.sealed_at:
+                raise OutlineGateError("parent outline plan must be a sealed revision")
+        digest = canonical_plan_digest(
+            canonical_prefix_digest=canonical_prefix_digest,
+            items=normalized,
+        )
+        conn = self._connection()
+        revision = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) + 1 AS revision "
+                "FROM outline_plan_revisions WHERE novel_id = ?",
+                (novel_id,),
+            ).fetchone()["revision"]
+        )
+        plan_id = f"outline-plan-{uuid4()}"
+        now = self._now()
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                """
+                INSERT INTO outline_plan_revisions
+                    (id, novel_id, revision, parent_plan_revision_id, status,
+                     digest, base_plan_digest, replan_start_chapter,
+                     canonical_prefix_digest, canonical_boundary_json,
+                     reconciliation_status, reconciliation_report_json,
+                     author_intent, created_by, publish_idempotency_key,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan_id,
+                    novel_id,
+                    revision,
+                    parent_plan_revision_id,
+                    digest,
+                    base_plan_digest,
+                    replan_start_chapter,
+                    canonical_prefix_digest,
+                    json.dumps(dict(canonical_boundary), ensure_ascii=False, sort_keys=True),
+                    PlanReconciliationStatus(reconciliation_status).value,
+                    json.dumps(
+                        dict(reconciliation_report or {}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    author_intent,
+                    created_by,
+                    publish_idempotency_key,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_plan_items(conn, plan_id, normalized, now)
+            conn.execute(
+                """
+                UPDATE outline_planning_heads
+                SET working_plan_revision_id = ?, updated_at = ?
+                WHERE novel_id = ? AND working_plan_revision_id IS NULL
+                """,
+                (plan_id, now, novel_id),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise OutlineGateError("an outline plan draft is already open")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return self.get_plan_revision(plan_id)
+
+    def seal_plan_revision(self, plan_revision_id: str) -> OutlinePlanRevision:
+        plan = self.get_plan_revision(plan_revision_id)
+        if plan.sealed_at:
+            return plan
+        if plan.status not in {
+            PlanRevisionStatus.DRAFT,
+            PlanRevisionStatus.GENERATING,
+            PlanRevisionStatus.VALIDATING,
+        }:
+            raise OutlineGateError("only an editable outline plan can be sealed")
+        digest = canonical_plan_digest(
+            canonical_prefix_digest=plan.canonical_prefix_digest,
+            items=plan.items,
+        )
+        if digest != plan.digest:
+            raise OutlineGateError("outline plan digest changed before sealing")
+        conn = self._connection()
+        now = self._now()
+        try:
+            conn.execute("BEGIN")
+            existing = conn.execute(
+                """
+                SELECT id FROM outline_plan_revisions
+                WHERE novel_id = ? AND digest = ? AND sealed_at IS NOT NULL
+                  AND id <> ?
+                """,
+                (plan.novel_id, plan.digest, plan.id),
+            ).fetchone()
+            if existing is not None:
+                conn.execute(
+                    """
+                    UPDATE outline_planning_heads
+                    SET working_plan_revision_id = NULL, updated_at = ?
+                    WHERE novel_id = ? AND working_plan_revision_id = ?
+                    """,
+                    (now, plan.novel_id, plan.id),
+                )
+                conn.execute(
+                    "DELETE FROM outline_plan_revisions WHERE id = ?",
+                    (plan.id,),
+                )
+                conn.commit()
+                return self.get_plan_revision(str(existing["id"]))
+            conn.execute(
+                """
+                UPDATE outline_plan_revisions
+                SET status = 'ready_for_review', sealed_at = ?, updated_at = ?
+                WHERE id = ? AND sealed_at IS NULL
+                """,
+                (now, now, plan.id),
+            )
+            conn.execute(
+                """
+                UPDATE outline_contract_versions
+                SET sealed_at = COALESCE(sealed_at, ?)
+                WHERE id IN (
+                    SELECT version_id FROM outline_plan_revision_items
+                    WHERE plan_revision_id = ?
+                )
+                """,
+                (now, plan.id),
+            )
+            conn.execute(
+                """
+                UPDATE outline_planning_heads
+                SET working_plan_revision_id = NULL, updated_at = ?
+                WHERE novel_id = ? AND working_plan_revision_id = ?
+                """,
+                (now, plan.novel_id, plan.id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return self.get_plan_revision(plan.id)
+
+    def _legacy_projection_items(self, novel_id: str) -> tuple[OutlinePlanItem, ...]:
+        conn = self._connection()
+        rows = conn.execute(
+            """
+            SELECT contract.id AS logical_node_id,
+                   contract.level,
+                   contract.parent_contract_id,
+                   contract.story_node_id,
+                   contract.status AS contract_status,
+                   contract.active_version_id,
+                   version.id AS version_id,
+                   version.digest AS version_digest,
+                   version.payload_json AS version_payload_json,
+                   version.status AS version_status,
+                   version.previous_sibling_digest,
+                   projection.version_id AS projection_version_id,
+                   projection.digest AS projection_digest,
+                   projection.payload_json AS projection_payload_json,
+                   node.order_index,
+                   node.number
+            FROM outline_contracts AS contract
+            JOIN outline_contract_versions AS version
+              ON version.id = contract.active_version_id
+            JOIN outline_plan_projections AS projection
+              ON projection.contract_id = contract.id
+             AND projection.is_active = 1
+            LEFT JOIN story_nodes AS node ON node.id = contract.story_node_id
+            WHERE contract.novel_id = ?
+            """,
+            (novel_id,),
+        ).fetchall()
+        expected_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM outline_contracts
+                WHERE novel_id = ? AND status = 'synced'
+                  AND active_version_id IS NOT NULL
+                """,
+                (novel_id,),
+            ).fetchone()["count"]
+        )
+        if not rows or len(rows) != expected_count:
+            raise OutlineGateError("legacy projection set is incomplete")
+
+        by_id = {str(row["logical_node_id"]): row for row in rows}
+        if len(by_id) != len(rows):
+            raise OutlineGateError("legacy projection contains duplicate active rows")
+        roots = [
+            row
+            for row in rows
+            if row["level"] == OutlineLevel.OUTLINE.value
+            and row["parent_contract_id"] is None
+        ]
+        if len(roots) != 1:
+            raise OutlineGateError("legacy projection requires exactly one outline root")
+
+        children: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            logical_node_id = str(row["logical_node_id"])
+            parent_id = row["parent_contract_id"]
+            if str(row["contract_status"]) != OutlineStatus.SYNCED.value:
+                raise OutlineGateError("legacy projection contains an unsynced contract")
+            if str(row["active_version_id"]) != str(row["projection_version_id"]):
+                raise OutlineGateError("legacy projection version does not match active version")
+            version_digest = str(row["version_digest"] or "")
+            if version_digest != str(row["projection_digest"] or ""):
+                raise OutlineGateError("legacy projection digest does not match active version")
+            try:
+                version_payload = OutlinePayload.from_dict(
+                    json.loads(row["version_payload_json"] or "{}")
+                )
+                projection_payload = OutlinePayload.from_dict(
+                    json.loads(row["projection_payload_json"] or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise OutlineGateError("legacy projection payload is invalid") from exc
+            if version_payload.digest != version_digest:
+                raise OutlineGateError("legacy version payload digest is invalid")
+            if projection_payload.digest != version_digest:
+                raise OutlineGateError("legacy projection payload digest is invalid")
+            if parent_id is not None:
+                parent = by_id.get(str(parent_id))
+                if parent is None:
+                    raise OutlineGateError("legacy projection parent is missing")
+                parent_level = OutlineLevel(str(parent["level"]))
+                if parent_level.child_level != OutlineLevel(str(row["level"])):
+                    raise OutlineGateError("legacy projection level hierarchy is invalid")
+                children.setdefault(str(parent_id), []).append(row)
+            elif logical_node_id != str(roots[0]["logical_node_id"]):
+                raise OutlineGateError("legacy projection contains an orphan root")
+
+        sibling_indexes: dict[str, int] = {str(roots[0]["logical_node_id"]): 0}
+        previous_digests: dict[str, str] = {}
+        for sibling_rows in children.values():
+            ordered = sorted(
+                sibling_rows,
+                key=lambda row: (
+                    int(row["order_index"]) if row["order_index"] is not None else 2**31,
+                    int(row["number"]) if row["number"] is not None else 2**31,
+                    str(row["logical_node_id"]),
+                ),
+            )
+            previous_digest = ""
+            for index, row in enumerate(ordered):
+                logical_node_id = str(row["logical_node_id"])
+                sibling_indexes[logical_node_id] = index
+                previous_digests[logical_node_id] = previous_digest
+                recorded = str(row["previous_sibling_digest"] or "")
+                if recorded and recorded != previous_digest:
+                    raise OutlineGateError("legacy sibling digest is inconsistent")
+                previous_digest = str(row["version_digest"])
+
+        result: list[OutlinePlanItem] = []
+        for row in rows:
+            logical_node_id = str(row["logical_node_id"])
+            parent_id = row["parent_contract_id"]
+            parent_digest = (
+                str(by_id[str(parent_id)]["version_digest"])
+                if parent_id is not None
+                else ""
+            )
+            result.append(
+                OutlinePlanItem(
+                    logical_node_id=logical_node_id,
+                    version_id=str(row["version_id"]),
+                    version_digest=str(row["version_digest"]),
+                    parent_logical_node_id=(str(parent_id) if parent_id is not None else None),
+                    level=OutlineLevel(str(row["level"])),
+                    sibling_index=sibling_indexes[logical_node_id],
+                    expansion_state=(
+                        "expanded" if logical_node_id in children else "unexpanded"
+                    ),
+                    validated_parent_digest=parent_digest,
+                    validated_previous_sibling_digest=previous_digests.get(
+                        logical_node_id, ""
+                    ),
+                )
+            )
+        return self._validate_plan_items(novel_id, result)
+
+    def backfill_initial_plan(self, novel_id: str) -> BackfillResult:
+        head = self.ensure_planning_head(novel_id)
+        if head.active_plan_revision_id:
+            return BackfillResult(
+                status=BackfillStatus.ALREADY_BACKFILLED,
+                head=head,
+                plan=self.get_plan_revision(head.active_plan_revision_id),
+            )
+        conn = self._connection()
+        formal_row = conn.execute(
+            """
+            SELECT 1 FROM chapters
+            WHERE novel_id = ? AND trim(COALESCE(content, '')) <> ''
+            LIMIT 1
+            """,
+            (novel_id,),
+        ).fetchone()
+        if formal_row is not None:
+            return BackfillResult(
+                status=BackfillStatus.PLANNING_MIGRATION_REQUIRED,
+                head=head,
+                reason="formal history requires canonical reconciliation",
+            )
+        try:
+            items = self._legacy_projection_items(novel_id)
+        except OutlineGateError as exc:
+            return BackfillResult(
+                status=BackfillStatus.PLANNING_MIGRATION_REQUIRED,
+                head=head,
+                reason=str(exc),
+            )
+
+        canonical_prefix_digest = ""
+        digest = canonical_plan_digest(
+            canonical_prefix_digest=canonical_prefix_digest,
+            items=items,
+        )
+        existing = conn.execute(
+            """
+            SELECT id FROM outline_plan_revisions
+            WHERE novel_id = ? AND digest = ? AND sealed_at IS NOT NULL
+            """,
+            (novel_id, digest),
+        ).fetchone()
+        now = self._now()
+        if existing is not None:
+            plan = self.get_plan_revision(str(existing["id"]))
+            conn.execute(
+                """
+                UPDATE outline_planning_heads
+                SET active_plan_revision_id = ?, active_plan_digest = ?,
+                    working_plan_revision_id = NULL, updated_at = ?
+                WHERE novel_id = ?
+                """,
+                (plan.id, plan.digest, now, novel_id),
+            )
+            conn.commit()
+            updated_head = self.get_planning_head(novel_id)
+            return BackfillResult(
+                status=BackfillStatus.MIGRATED,
+                head=updated_head,
+                plan=plan,
+            )
+
+        revision = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) + 1 AS revision "
+                "FROM outline_plan_revisions WHERE novel_id = ?",
+                (novel_id,),
+            ).fetchone()["revision"]
+        )
+        plan_id = f"outline-plan-{uuid4()}"
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                """
+                INSERT INTO outline_plan_revisions
+                    (id, novel_id, revision, status, digest,
+                     canonical_prefix_digest, canonical_boundary_json,
+                     reconciliation_status, reconciliation_report_json,
+                     created_by, created_at, updated_at)
+                VALUES (?, ?, ?, 'draft', ?, ?, ?, 'aligned', '{}',
+                        'legacy_backfill', ?, ?)
+                """,
+                (
+                    plan_id,
+                    novel_id,
+                    revision,
+                    digest,
+                    canonical_prefix_digest,
+                    json.dumps({"formal_head": 0}, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            self._insert_plan_items(conn, plan_id, items, now)
+            conn.execute(
+                """
+                UPDATE outline_contract_versions
+                SET sealed_at = COALESCE(sealed_at, ?)
+                WHERE id IN (
+                    SELECT version_id FROM outline_plan_revision_items
+                    WHERE plan_revision_id = ?
+                )
+                """,
+                (now, plan_id),
+            )
+            conn.execute(
+                """
+                UPDATE outline_plan_revisions
+                SET status = 'ready_for_review', sealed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, plan_id),
+            )
+            conn.execute(
+                """
+                UPDATE outline_planning_heads
+                SET active_plan_revision_id = ?, active_plan_digest = ?,
+                    working_plan_revision_id = NULL, updated_at = ?
+                WHERE novel_id = ? AND authority_mode = 'legacy'
+                  AND active_plan_revision_id IS NULL
+                """,
+                (plan_id, digest, now, novel_id),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise OutlineGateError("legacy planning Head changed during backfill")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        plan = self.get_plan_revision(plan_id)
+        updated_head = self.get_planning_head(novel_id)
+        return BackfillResult(
+            status=BackfillStatus.MIGRATED,
+            head=updated_head,
+            plan=plan,
+        )
 
     @staticmethod
     def _as_mapping(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -431,6 +1085,17 @@ class OutlineContractRepository:
                     """,
                     (slot.novel_id, idempotency_key, contract_id, draft.revision, now),
                 )
+            conn.execute(
+                """
+                UPDATE outline_planning_heads
+                SET active_plan_revision_id = NULL,
+                    active_plan_digest = '',
+                    updated_at = ?
+                WHERE novel_id = ? AND authority_mode = 'legacy'
+                  AND active_plan_revision_id IS NOT NULL
+                """,
+                (now, slot.novel_id),
+            )
             conn.commit()
         except Exception:
             conn.rollback()

@@ -6,6 +6,10 @@ from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_novel_repository import (
     SqliteNovelRepository,
 )
+from infrastructure.persistence.database.outline_contract_repository import (
+    OutlineContractRepository,
+)
+from domain.structure.outline_contract import OutlinePayload, OutlineSource
 from infrastructure.persistence.database.write_dispatch import (
     startup_sqlite_writes_bypass_queue,
 )
@@ -108,3 +112,59 @@ def test_delete_removes_all_novel_scoped_rows_even_without_legacy_fk_enforcement
         )["count"]
         assert deleted_count == 0, table
         assert retained_count == 1, table
+
+
+def test_delete_manifest_book_removes_sealed_plan_history_without_orphans(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "delete-manifest-novel.db"))
+    novels = SqliteNovelRepository(database)
+    outlines = OutlineContractRepository(database)
+    novel_id = "novel-manifest-delete"
+
+    with startup_sqlite_writes_bypass_queue():
+        _save_novel(novels, novel_id)
+        root = outlines.ensure_root(novel_id)
+        draft = outlines.save_draft(
+            root.id,
+            OutlinePayload(
+                title="总纲",
+                narrative_text="完整规划",
+                creative_goal="完成全书目标",
+                entry_state="开始",
+                exit_state="结束",
+            ),
+            source=OutlineSource.AUTHOR,
+        )
+        outlines.publish_and_sync(root.id, expected_revision=draft.draft.revision)
+        backfill = outlines.backfill_initial_plan(novel_id)
+        connection = database.get_connection()
+        connection.execute(
+            """
+            UPDATE outline_planning_heads
+            SET authority_mode = 'manifest', authority_generation = 1,
+                projection_generation = 1
+            WHERE novel_id = ?
+            """,
+            (novel_id,),
+        )
+        connection.commit()
+
+        novels.delete(NovelId(novel_id))
+
+    assert backfill.plan is not None
+    assert database.fetch_one(
+        "SELECT COUNT(*) AS count FROM outline_planning_heads WHERE novel_id = ?",
+        (novel_id,),
+    )["count"] == 0
+    assert database.fetch_one(
+        "SELECT COUNT(*) AS count FROM outline_plan_revisions WHERE novel_id = ?",
+        (novel_id,),
+    )["count"] == 0
+    assert database.fetch_one(
+        "SELECT COUNT(*) AS count FROM outline_plan_revision_items "
+        "WHERE plan_revision_id = ?",
+        (backfill.plan.id,),
+    )["count"] == 0
+    assert database.fetch_one(
+        "SELECT COUNT(*) AS count FROM outline_contract_versions WHERE contract_id = ?",
+        (root.id,),
+    )["count"] == 0

@@ -13,10 +13,18 @@
 
 import argparse
 import itertools
+import json
 import sqlite3
 import sys
 import time
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from domain.structure.outline_contract import OutlineLevel
+from domain.structure.outline_plan import OutlinePlanItem, canonical_plan_digest
 
 # =============================================================================
 # 分类规则：
@@ -423,6 +431,321 @@ def copy_chapters(
         id_map[old_id] = new_id
 
     return id_map
+
+
+def _source_outline_snapshot(
+    conn: sqlite3.Connection,
+    novel_id: str,
+) -> tuple[dict, list[dict]] | None:
+    """Return the current logical plan, never draft/history/runtime rows."""
+
+    required = {
+        "outline_contracts",
+        "outline_contract_versions",
+        "outline_plan_projections",
+        "outline_plan_revisions",
+        "outline_plan_revision_items",
+        "outline_planning_heads",
+    }
+    if not all(table_exists(conn, table) for table in required):
+        return None
+    head = conn.execute(
+        "SELECT * FROM outline_planning_heads WHERE novel_id = ?",
+        (novel_id,),
+    ).fetchone()
+    if head and head["active_plan_revision_id"]:
+        plan = conn.execute(
+            "SELECT * FROM outline_plan_revisions WHERE id = ? AND novel_id = ?",
+            (head["active_plan_revision_id"], novel_id),
+        ).fetchone()
+        rows = conn.execute(
+            """
+            SELECT item.*, version.digest AS version_digest
+            FROM outline_plan_revision_items AS item
+            JOIN outline_contract_versions AS version ON version.id = item.version_id
+            WHERE item.plan_revision_id = ?
+            """,
+            (head["active_plan_revision_id"],),
+        ).fetchall()
+        if plan is None or not rows:
+            raise ValueError("active outline manifest is incomplete")
+        return dict(plan), [dict(row) for row in rows]
+
+    rows = conn.execute(
+        """
+        SELECT contract.id AS logical_node_id,
+               contract.parent_contract_id AS parent_logical_node_id,
+               contract.level,
+               version.id AS version_id,
+               version.digest AS version_digest,
+               version.previous_sibling_digest,
+               node.order_index,
+               node.number
+        FROM outline_contracts AS contract
+        JOIN outline_contract_versions AS version
+          ON version.id = contract.active_version_id
+        JOIN outline_plan_projections AS projection
+          ON projection.contract_id = contract.id
+         AND projection.version_id = version.id
+         AND projection.is_active = 1
+        LEFT JOIN story_nodes AS node ON node.id = contract.story_node_id
+        WHERE contract.novel_id = ? AND contract.status = 'synced'
+        """,
+        (novel_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    items = [dict(row) for row in rows]
+    by_id = {str(item["logical_node_id"]): item for item in items}
+    children: dict[str, list[dict]] = {}
+    for item in items:
+        parent_id = item["parent_logical_node_id"]
+        if parent_id is not None:
+            if str(parent_id) not in by_id:
+                raise ValueError("legacy outline projection has a missing parent")
+            children.setdefault(str(parent_id), []).append(item)
+    roots = [
+        item
+        for item in items
+        if item["level"] == "outline"
+        and item["parent_logical_node_id"] is None
+    ]
+    if len(roots) != 1:
+        raise ValueError("legacy outline projection requires one root")
+    roots[0]["sibling_index"] = 0
+    roots[0]["validated_parent_digest"] = ""
+    roots[0]["validated_previous_sibling_digest"] = ""
+    for sibling_rows in children.values():
+        ordered = sorted(
+            sibling_rows,
+            key=lambda item: (
+                int(item["order_index"])
+                if item["order_index"] is not None
+                else 2**31,
+                int(item["number"]) if item["number"] is not None else 2**31,
+                str(item["logical_node_id"]),
+            ),
+        )
+        previous_digest = ""
+        for index, item in enumerate(ordered):
+            parent = by_id[str(item["parent_logical_node_id"])]
+            item["sibling_index"] = index
+            item["validated_parent_digest"] = str(parent["version_digest"])
+            item["validated_previous_sibling_digest"] = previous_digest
+            previous_digest = str(item["version_digest"])
+    for item in items:
+        item["expansion_state"] = (
+            "expanded" if str(item["logical_node_id"]) in children else "unexpanded"
+        )
+        item["is_reused"] = 0
+    return {
+        "author_intent": "",
+        "reconciliation_report_json": "{}",
+    }, items
+
+
+def copy_outline_planning(
+    conn: sqlite3.Connection,
+    old_novel_id: str,
+    new_novel_id: str,
+    id_counter: itertools.count,
+    story_node_id_map: dict[str, str],
+) -> dict[str, int]:
+    """Clone one active planning snapshot with new logical identities."""
+
+    snapshot = _source_outline_snapshot(conn, old_novel_id)
+    if snapshot is None:
+        return {"contracts": 0, "versions": 0, "items": 0}
+    source_plan, source_items = snapshot
+    logical_ids = {str(item["logical_node_id"]) for item in source_items}
+    version_ids = {str(item["version_id"]) for item in source_items}
+    placeholders = ", ".join("?" for _ in logical_ids)
+    contract_rows = conn.execute(
+        f"SELECT * FROM outline_contracts WHERE id IN ({placeholders})",
+        tuple(sorted(logical_ids)),
+    ).fetchall()
+    placeholders = ", ".join("?" for _ in version_ids)
+    version_rows = conn.execute(
+        f"SELECT * FROM outline_contract_versions WHERE id IN ({placeholders})",
+        tuple(sorted(version_ids)),
+    ).fetchall()
+    if len(contract_rows) != len(logical_ids) or len(version_rows) != len(version_ids):
+        raise ValueError("active outline snapshot references missing content")
+
+    contract_map = {
+        old_id: _uid("outline", next(id_counter)) for old_id in sorted(logical_ids)
+    }
+    version_map = {
+        old_id: _uid("outlinev", next(id_counter)) for old_id in sorted(version_ids)
+    }
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    contract_columns = [
+        desc[0]
+        for desc in conn.execute("SELECT * FROM outline_contracts LIMIT 0").description
+    ]
+    for source_row in contract_rows:
+        row = dict(source_row)
+        old_contract_id = str(row["id"])
+        old_story_node_id = row.get("story_node_id")
+        if old_story_node_id and old_story_node_id not in story_node_id_map:
+            raise ValueError("outline contract references an unmapped StoryNode")
+        row["id"] = contract_map[old_contract_id]
+        row["novel_id"] = new_novel_id
+        row["story_node_id"] = (
+            story_node_id_map.get(old_story_node_id) if old_story_node_id else None
+        )
+        row["parent_contract_id"] = (
+            contract_map.get(str(row["parent_contract_id"]))
+            if row.get("parent_contract_id")
+            else None
+        )
+        row["active_version_id"] = version_map[str(row["active_version_id"])]
+        row["draft_version_id"] = None
+        row["status"] = "synced"
+        row["created_at"] = now
+        row["updated_at"] = now
+        conn.execute(
+            f"INSERT INTO outline_contracts ({', '.join(contract_columns)}) "
+            f"VALUES ({', '.join('?' for _ in contract_columns)})",
+            [row[column] for column in contract_columns],
+        )
+
+    version_columns = [
+        desc[0]
+        for desc in conn.execute(
+            "SELECT * FROM outline_contract_versions LIMIT 0"
+        ).description
+    ]
+    source_version_by_id = {str(row["id"]): dict(row) for row in version_rows}
+    new_version_to_source: dict[str, dict] = {}
+    for old_version_id, source_row in source_version_by_id.items():
+        row = dict(source_row)
+        row["id"] = version_map[old_version_id]
+        row["contract_id"] = contract_map[str(row["contract_id"])]
+        row["status"] = "synced"
+        row["created_at"] = now
+        row["updated_at"] = now
+        if "sealed_at" in row:
+            row["sealed_at"] = now
+        conn.execute(
+            f"INSERT INTO outline_contract_versions ({', '.join(version_columns)}) "
+            f"VALUES ({', '.join('?' for _ in version_columns)})",
+            [row[column] for column in version_columns],
+        )
+        new_version_to_source[row["id"]] = source_row
+
+    cloned_items = tuple(
+        OutlinePlanItem(
+            logical_node_id=contract_map[str(item["logical_node_id"])],
+            version_id=version_map[str(item["version_id"])],
+            version_digest=str(item["version_digest"]),
+            parent_logical_node_id=(
+                contract_map[str(item["parent_logical_node_id"])]
+                if item.get("parent_logical_node_id")
+                else None
+            ),
+            level=OutlineLevel(str(item["level"])),
+            sibling_index=int(item["sibling_index"]),
+            expansion_state=str(item.get("expansion_state") or "unexpanded"),
+            validated_parent_digest=str(item.get("validated_parent_digest") or ""),
+            validated_previous_sibling_digest=str(
+                item.get("validated_previous_sibling_digest") or ""
+            ),
+        )
+        for item in source_items
+    )
+    plan_id = _uid("outlineplan", next(id_counter))
+    plan_digest = canonical_plan_digest(
+        canonical_prefix_digest="",
+        items=cloned_items,
+    )
+    conn.execute(
+        """
+        INSERT INTO outline_plan_revisions
+            (id, novel_id, revision, status, digest, canonical_prefix_digest,
+             canonical_boundary_json, reconciliation_status,
+             reconciliation_report_json, author_intent, created_by,
+             publish_idempotency_key, created_at, updated_at)
+        VALUES (?, ?, 1, 'draft', ?, '', ?, 'aligned', '{}', ?,
+                'novel_clone', '', ?, ?)
+        """,
+        (
+            plan_id,
+            new_novel_id,
+            plan_digest,
+            json.dumps({"formal_head": 0}, sort_keys=True),
+            str(source_plan.get("author_intent") or ""),
+            now,
+            now,
+        ),
+    )
+    for item in cloned_items:
+        conn.execute(
+            """
+            INSERT INTO outline_plan_revision_items
+                (id, plan_revision_id, logical_node_id, version_id,
+                 parent_logical_node_id, level, sibling_index, expansion_state,
+                 validated_parent_digest, validated_previous_sibling_digest,
+                 is_reused, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                _uid("outlineitem", next(id_counter)),
+                plan_id,
+                item.logical_node_id,
+                item.version_id,
+                item.parent_logical_node_id,
+                item.level.value,
+                item.sibling_index,
+                item.expansion_state,
+                item.validated_parent_digest,
+                item.validated_previous_sibling_digest,
+                now,
+            ),
+        )
+        source_version = new_version_to_source[item.version_id]
+        conn.execute(
+            """
+            INSERT INTO outline_plan_projections
+                (id, novel_id, contract_id, version_id, digest, payload_json,
+                 is_active, synced_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                _uid("outlineproj", next(id_counter)),
+                new_novel_id,
+                item.logical_node_id,
+                item.version_id,
+                item.version_digest,
+                source_version["payload_json"],
+                now,
+                now,
+            ),
+        )
+    conn.execute(
+        """
+        UPDATE outline_plan_revisions
+        SET status = 'ready_for_review', sealed_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (now, now, plan_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO outline_planning_heads
+            (novel_id, authority_mode, authority_generation,
+             active_plan_revision_id, active_plan_digest,
+             projection_generation, auto_publish_repairable, updated_at)
+        VALUES (?, 'manifest', 1, ?, ?, 1, 0, ?)
+        """,
+        (new_novel_id, plan_id, plan_digest, now),
+    )
+    return {
+        "contracts": len(contract_rows),
+        "versions": len(version_rows),
+        "items": len(cloned_items),
+    }
 
 
 def copy_relation_tables(
@@ -893,10 +1216,24 @@ def backup_novel(
         # 4. 复制规划表（世界观、角色、大纲等）
         print("\n[4/6] 复制世界观与结构数据...")
         planning_stats, id_maps = copy_planning_tables(conn, old_novel_id, new_novel_id, id_counter)
+        outline_stats = copy_outline_planning(
+            conn,
+            old_novel_id,
+            new_novel_id,
+            id_counter,
+            story_node_id_map,
+        )
         total_copied = sum(planning_stats.values())
         tables_copied = sum(1 for v in planning_stats.values() if v > 0)
         print(f"  合计: {tables_copied} 个规划表, 共 {total_copied} 条记录, "
               f"{len(id_maps)} 个表已建立 ID 映射")
+        if outline_stats["items"]:
+            print(
+                "  outline manifest: "
+                f"{outline_stats['contracts']} contracts, "
+                f"{outline_stats['versions']} versions, "
+                f"{outline_stats['items']} items"
+            )
 
         # 修复自引用 parent_id（storylines、bible_locations 等有父子层级）
         _fixup_parent_ids(conn, new_novel_id, id_maps)

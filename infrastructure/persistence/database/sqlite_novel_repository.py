@@ -390,9 +390,9 @@ class SqliteNovelRepository(NovelRepository):
     def delete(self, novel_id: NovelId) -> None:
         """删除小说及其全部按 novel_id 归属的数据。"""
         conn = self.db.get_connection()
-        # Foreign-key enforcement is per SQLite connection. Older migrations
-        # also contain novel-scoped tables without a foreign key, so remove
-        # every direct novel_id row before deleting the aggregate root.
+        # Foreign-key enforcement is per SQLite connection. Delete the
+        # aggregate root first so SQLite can respect the complete dependency
+        # graph, then remove rows from legacy tables that lack a foreign key.
         conn.execute("PRAGMA foreign_keys = ON")
 
         table_rows = conn.execute(
@@ -416,13 +416,13 @@ class SqliteNovelRepository(NovelRepository):
                 novel_scoped_tables.append(table_name)
 
         with self.db.transaction() as transaction:
+            transaction.execute("DELETE FROM novels WHERE id = ?", (novel_id.value,))
             for table_name in novel_scoped_tables:
                 quoted_table = table_name.replace('"', '""')
                 transaction.execute(
                     f'DELETE FROM "{quoted_table}" WHERE novel_id = ?',
                     (novel_id.value,),
                 )
-            transaction.execute("DELETE FROM novels WHERE id = ?", (novel_id.value,))
 
         logger.info(
             "Deleted novel and %d novel-scoped tables: %s",
