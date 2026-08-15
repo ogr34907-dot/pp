@@ -94,27 +94,6 @@ class ContextAssembler:
         """
         lines = ["【全书主线锚点（绝不可忘）】"]
 
-        if self.story_node_repo:
-            try:
-                nodes = self.story_node_repo.get_by_novel_sync(novel_id)
-
-                root_nodes = [n for n in nodes if n.node_type.value == "root"]
-                act_nodes = [n for n in nodes if n.node_type.value == "act"]
-
-                if root_nodes:
-                    root = root_nodes[0]
-                    if root.description:
-                        lines.append(f"世界观：{root.description[:100]}")
-                    if root.narrative_arc:
-                        lines.append(f"主线方向：{root.narrative_arc[:100]}")
-
-                if act_nodes:
-                    first_act = act_nodes[0]
-                    if first_act.narrative_arc:
-                        lines.append(f"起始目标：{first_act.narrative_arc[:80]}")
-            except Exception as e:
-                logger.warning("构建全书主线锚点（结构树）失败: %s", e)
-
         substantive = "\n".join(lines[1:]).strip()
         if len(substantive) < 80 and self.storyline_repo:
             try:

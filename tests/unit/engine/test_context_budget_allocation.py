@@ -8,6 +8,7 @@ from application.engine.services.context_budget_allocator import (
     ContextBudgetAllocator,
     ContextBudgetExceededError,
 )
+from application.engine.services.context_assembler import ContextAssembler
 from application.engine.services.context_budget_models import ContextSlot, PriorityTier
 from application.engine.services.memory_engine import MemoryStateUnavailableError
 
@@ -28,6 +29,31 @@ def _allocator_with_slots(monkeypatch, slots):
     monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 100)
     monkeypatch.setattr(allocator, "_collect_all_slots", lambda *_args, **_kwargs: slots)
     return allocator
+
+
+def test_story_anchor_excludes_raw_story_node_planning_text():
+    raw_marker = "UNPUBLISHED_STORY_NODE_PLAN"
+    assembler = ContextAssembler(
+        story_node_repo=SimpleNamespace(
+            get_by_novel_sync=lambda _novel_id: [
+                SimpleNamespace(
+                    node_type=SimpleNamespace(value="root"),
+                    description=raw_marker,
+                    narrative_arc=raw_marker,
+                )
+            ]
+        ),
+        novel_repository=SimpleNamespace(
+            get_by_id=lambda _novel_id: SimpleNamespace(
+                premise="AUTHOR_PREMISE_SENTINEL"
+            )
+        ),
+    )
+
+    anchor = assembler.build_story_anchor("novel-1")
+
+    assert raw_marker not in anchor
+    assert "AUTHOR_PREMISE_SENTINEL" in anchor
 
 
 def test_mixed_language_token_estimate_adds_language_costs_directly():
