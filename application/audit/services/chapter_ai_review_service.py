@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
@@ -18,6 +20,19 @@ IssueSeverity = Literal["critical", "warning", "suggestion"]
 
 class ChapterAIReviewContractError(RuntimeError):
     """LLM 审阅结果不满足结构契约。"""
+
+
+def normalize_evidence_text(text: Any) -> str:
+    """Normalize layout and Unicode letters/digits for deterministic evidence checks."""
+
+    normalized: list[str] = []
+    for char in str(text or ""):
+        category = unicodedata.category(char)
+        if category[0] in {"L", "N"}:
+            normalized.append(unicodedata.normalize("NFKC", char))
+        else:
+            normalized.append(char)
+    return re.sub(r"\s+", " ", "".join(normalized)).strip()
 
 
 @dataclass(frozen=True)
@@ -306,7 +321,12 @@ class ChapterAIReviewService:
             item = by_event.get(event, {})
             evidence = str(item.get("evidence") or "").strip()
             status = str(item.get("status") or "unverified").strip().lower()
-            completed = status == "completed" and bool(evidence) and evidence in chapter_content
+            completed = (
+                status == "completed"
+                and bool(evidence)
+                and normalize_evidence_text(evidence)
+                in normalize_evidence_text(chapter_content)
+            )
             coverage.append(
                 {
                     "event": event,

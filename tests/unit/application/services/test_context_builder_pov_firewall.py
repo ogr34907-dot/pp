@@ -17,12 +17,15 @@ def mock_dependencies():
     chapter_repository = Mock()
     chapter_repository.list_by_novel.return_value = []
 
+    novel = Mock()
+    novel.target_chapters = 100
+
     return {
         "bible_service": Mock(),
         "storyline_manager": storyline_manager,
         "relationship_engine": Mock(),
         "vector_store": None,
-        "novel_repository": Mock(),
+        "novel_repository": Mock(get_by_id=Mock(return_value=novel)),
         "chapter_repository": chapter_repository,
         "plot_arc_repository": None,
         "embedding_service": None,
@@ -59,7 +62,7 @@ def test_layer2_excludes_hidden_before_reveal(context_builder, mock_dependencies
     )
 
     mock_dependencies["bible_service"].get_bible_by_novel.return_value = bible_dto
-    mock_dependencies["novel_repository"].get_by_id.return_value = None
+    mock_dependencies["novel_repository"].get_by_id.return_value = Mock(target_chapters=100)
 
     # Act
     result = context_builder.build_structured_context(
@@ -101,7 +104,7 @@ def test_layer2_includes_hidden_after_reveal(context_builder, mock_dependencies)
     )
 
     mock_dependencies["bible_service"].get_bible_by_novel.return_value = bible_dto
-    mock_dependencies["novel_repository"].get_by_id.return_value = None
+    mock_dependencies["novel_repository"].get_by_id.return_value = Mock(target_chapters=100)
 
     # Act
     result = context_builder.build_structured_context(
@@ -143,7 +146,7 @@ def test_layer2_includes_hidden_when_no_reveal_chapter(context_builder, mock_dep
     )
 
     mock_dependencies["bible_service"].get_bible_by_novel.return_value = bible_dto
-    mock_dependencies["novel_repository"].get_by_id.return_value = None
+    mock_dependencies["novel_repository"].get_by_id.return_value = Mock(target_chapters=100)
 
     # Act
     result = context_builder.build_structured_context(
@@ -184,7 +187,7 @@ def test_layer2_uses_public_profile_always(context_builder, mock_dependencies):
     )
 
     mock_dependencies["bible_service"].get_bible_by_novel.return_value = bible_dto
-    mock_dependencies["novel_repository"].get_by_id.return_value = None
+    mock_dependencies["novel_repository"].get_by_id.return_value = Mock(target_chapters=100)
 
     # Act - 测试多个章节
     for chapter_num in [1, 25, 49, 50, 100]:
@@ -222,7 +225,7 @@ def test_layer2_backward_compatible_with_old_data(context_builder, mock_dependen
     )
 
     mock_dependencies["bible_service"].get_bible_by_novel.return_value = bible_dto
-    mock_dependencies["novel_repository"].get_by_id.return_value = None
+    mock_dependencies["novel_repository"].get_by_id.return_value = Mock(target_chapters=100)
 
     # Act
     result = context_builder.build_structured_context(
@@ -282,7 +285,7 @@ def test_layer2_multiple_characters_with_different_reveal_chapters(context_build
     )
 
     mock_dependencies["bible_service"].get_bible_by_novel.return_value = bible_dto
-    mock_dependencies["novel_repository"].get_by_id.return_value = None
+    mock_dependencies["novel_repository"].get_by_id.return_value = Mock(target_chapters=100)
 
     # Act - 章节 75（在 char1 reveal 之后，char2 reveal 之前）
     result = context_builder.build_structured_context(

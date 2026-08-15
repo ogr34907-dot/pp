@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from application.engine.services.context_lifecycle import (
     DEFAULT_PHASE_THRESHOLDS,
     build_lifecycle_directive,
@@ -23,47 +25,21 @@ class FakeRegistry:
         return self.directives
 
 
-class FakeStoryNodeRepository:
-    def __init__(self, nodes):
-        self.nodes = nodes
+class FakeNovelRepository:
+    def __init__(self, target_chapters):
+        self.target_chapters = target_chapters
 
-    def get_by_novel_sync(self, _novel_id):
-        return self.nodes
+    def get_by_id(self, _novel_id):
+        return SimpleNamespace(target_chapters=self.target_chapters)
 
-
-def _node(node_type, *, chapter_end=None, suggested_chapter_count=None, number=None):
-    return SimpleNamespace(
-        node_type=SimpleNamespace(value=node_type),
-        chapter_end=chapter_end,
-        suggested_chapter_count=suggested_chapter_count,
-        number=number,
-    )
+def test_total_chapters_comes_only_from_persisted_novel_target():
+    assert estimate_total_chapters(FakeNovelRepository(120), "novel-1") == 120
 
 
-def test_estimate_total_chapters_prefers_part_end_then_suggested_count():
-    assert estimate_total_chapters(
-        FakeStoryNodeRepository([_node("part", chapter_end=80)]),
-        "novel-1",
-    ) == 80
-
-    assert estimate_total_chapters(
-        FakeStoryNodeRepository(
-            [
-                _node("part", suggested_chapter_count=30),
-                _node("part", suggested_chapter_count=40),
-            ]
-        ),
-        "novel-1",
-    ) == 70
-
-
-def test_estimate_total_chapters_falls_back_from_chapter_nodes():
-    total = estimate_total_chapters(
-        FakeStoryNodeRepository([_node("chapter", number=50)]),
-        "novel-1",
-    )
-
-    assert total == 60
+@pytest.mark.parametrize("target_chapters", [None, 0, True, 1.5, "invalid"])
+def test_total_chapters_rejects_invalid_persisted_novel_target(target_chapters):
+    with pytest.raises(ValueError, match="target_chapters"):
+        estimate_total_chapters(FakeNovelRepository(target_chapters), "novel-1")
 
 
 def test_phase_thresholds_and_classification_are_configurable():
@@ -82,8 +58,7 @@ def test_phase_thresholds_and_classification_are_configurable():
 
 def test_build_lifecycle_directive_renders_directive_and_extra():
     directive = build_lifecycle_directive(
-        story_node_repository=FakeStoryNodeRepository([_node("part", chapter_end=100)]),
-        novel_id="novel-1",
+        target_chapters=100,
         chapter_number=92,
         thresholds=DEFAULT_PHASE_THRESHOLDS,
         registry=FakeRegistry(

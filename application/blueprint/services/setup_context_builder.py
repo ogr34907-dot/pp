@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from application.core.services.novel_service import NovelService
 from application.engine.theme.fusion_profile import FusionProfile, get_fusion_profile
 from application.world.services.bible_service import BibleService
+from domain.novel.target_chapters import positive_integer_or_none
 
 
 class SetupContextBuilder:
@@ -15,11 +16,15 @@ class SetupContextBuilder:
 
     def build_context(self, novel_id: str) -> Dict[str, Any]:
         novel = self._novel_service.get_novel(novel_id)
-        variable_context = self._load_variable_context(novel_id)
+        target_chapters = positive_integer_or_none(
+            getattr(novel, "target_chapters", None)
+        )
+        if target_chapters is None:
+            raise ValueError("novels.target_chapters must be a positive integer")
 
+        variable_context = self._load_variable_context(novel_id)
         title = str(variable_context.get("novel_title") or "").strip()
         premise = str(variable_context.get("premise") or "").strip()
-        target_chapters = self._as_int(variable_context.get("target_chapters"), default=100)
         target_words_per_chapter = self._as_int(variable_context.get("target_words_per_chapter"), default=0)
         theme_metadata = self._theme_metadata_from_novel(novel)
         theme_metadata.update(variable_context.get("theme_metadata") or {})

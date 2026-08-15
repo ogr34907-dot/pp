@@ -36,6 +36,42 @@ def test_mixed_language_token_estimate_adds_language_costs_directly():
     assert allocator.estimate_tokens("中文ab") == 2
 
 
+@pytest.mark.parametrize("target_chapters", [None, 0, True, 1.5, "invalid"])
+def test_allocator_rejects_invalid_persisted_target_before_collecting_context(
+    monkeypatch, target_chapters
+):
+    novel_repository = SimpleNamespace(
+        get_by_id=lambda _novel_id: SimpleNamespace(target_chapters=target_chapters)
+    )
+    allocator = ContextBudgetAllocator(novel_repository=novel_repository)
+    monkeypatch.setattr(
+        allocator,
+        "_collect_all_slots",
+        lambda *_args, **_kwargs: pytest.fail("context slots must not be collected"),
+    )
+
+    with pytest.raises(ValueError, match="target_chapters"):
+        allocator.allocate("novel-1", 1, "outline")
+
+
+def test_allocator_uses_persisted_target_for_lifecycle_progress():
+    allocator = ContextBudgetAllocator(
+        novel_repository=SimpleNamespace(
+            get_by_id=lambda _novel_id: SimpleNamespace(target_chapters=120)
+        ),
+        story_node_repository=SimpleNamespace(
+            get_by_novel_sync=lambda _novel_id: [
+                SimpleNamespace(
+                    node_type=SimpleNamespace(value="part"),
+                    chapter_end=30,
+                )
+            ]
+        ),
+    )
+
+    assert allocator._estimate_total_chapters("novel-1") == 120
+
+
 def test_t3_reservation_reduces_t2_content_not_only_statistics(monkeypatch):
     slots = {
         "recent": _slot("recent", PriorityTier.T2_DYNAMIC, "r" * 396, 99),
@@ -104,6 +140,122 @@ def test_allocator_raises_clear_error_when_critical_header_cannot_fit(monkeypatc
 
     with pytest.raises(ContextBudgetExceededError, match="context budget"):
         allocator.allocate("novel-1", 2, "outline", total_budget=1)
+
+
+def test_allocator_fails_closed_when_minimal_fact_lock_cannot_fit(monkeypatch):
+    compact_fact_lock = "\n".join(
+        f"[第1章] 甲硬事实行{i}: 甲的不可逆状态{i}" for i in range(1, 8)
+    )
+    slots = {
+        "fact_lock": ContextSlot(
+            name="FACT_LOCK",
+            tier=PriorityTier.T0_CRITICAL,
+            content=compact_fact_lock,
+            tokens=100,
+            max_tokens=100,
+            priority=120,
+        ),
+    }
+    allocator = _allocator_with_slots(monkeypatch, slots)
+
+    with pytest.raises(ContextBudgetExceededError, match="context budget"):
+        allocator.allocate("novel-1", 800, "甲", total_budget=20)
+
+
+def test_allocator_fails_closed_when_fact_lock_budget_only_fits_header(monkeypatch):
+    header = "【绝对事实边界（一旦违背即为废稿）】"
+    fact_row = "   [第1章] 甲的右臂已断，不能再双手持剑。"
+    allocator = ContextBudgetAllocator()
+    slots = {
+        "fact_lock": ContextSlot(
+            name="FACT_LOCK",
+            tier=PriorityTier.T0_CRITICAL,
+            content=f"{header}\n{fact_row}",
+            tokens=allocator.estimate_tokens(f"{header}\n{fact_row}"),
+            max_tokens=allocator.estimate_tokens(header),
+            priority=120,
+        ),
+    }
+    allocator = _allocator_with_slots(monkeypatch, slots)
+
+    with pytest.raises(ContextBudgetExceededError, match="complete FACT_LOCK fact row"):
+        allocator.allocate("novel-1", 2, "甲", total_budget=1000)
+
+
+def test_unrelated_completed_beats_can_be_compressed_without_removing_minimal_fact_lock(
+    monkeypatch,
+):
+    compact_fact_lock = "\n".join(
+        f"[第1章] 甲硬事实行{i}: 甲的不可逆状态{i}" for i in range(1, 8)
+    )
+    slots = {
+        "fact_lock": ContextSlot(
+            name="FACT_LOCK",
+            tier=PriorityTier.T0_CRITICAL,
+            content=compact_fact_lock,
+            tokens=100,
+            max_tokens=100,
+            priority=120,
+        ),
+        "completed_beats": ContextSlot(
+            name="COMPLETED_BEATS",
+            tier=PriorityTier.T1_COMPRESSIBLE,
+            content="\n".join(f"[第{i}章] 无关旧节拍{i}" for i in range(1, 801)),
+            tokens=800,
+            max_tokens=800,
+            priority=76,
+        ),
+    }
+    allocator = _allocator_with_slots(monkeypatch, slots)
+
+    allocation = allocator.allocate("novel-1", 800, "甲", total_budget=210)
+
+    assert compact_fact_lock in allocation.get_final_context()
+    assert allocation.slots["completed_beats"].tokens < 800
+
+
+def test_8k_budget_preserves_fact_lock_and_leaves_body_context_capacity(monkeypatch):
+    compact_fact_lock = "\n".join(
+        f"[第1章] 甲硬事实行{i}: 甲的不可逆状态{i}" for i in range(1, 31)
+    )
+    slots = {
+        "lifecycle": _slot("生命周期", PriorityTier.T0_CRITICAL, "节奏引导" * 100, 600, 130),
+        "anchor": _slot("主线锚点", PriorityTier.T0_CRITICAL, "主线" * 50, 300, 125),
+        "promise": _slot("叙事承诺", PriorityTier.T0_CRITICAL, "承诺" * 70, 420, 123),
+        "contract": _slot("创作契约", PriorityTier.T0_CRITICAL, "作者硬约束" * 200, 1400, 122),
+        "fact_lock": ContextSlot(
+            name="FACT_LOCK",
+            tier=PriorityTier.T0_CRITICAL,
+            content=compact_fact_lock,
+            tokens=1000,
+            max_tokens=1000,
+            priority=120,
+        ),
+        "chapter_task": ContextSlot(
+            name="CURRENT_CHAPTER_TASK",
+            tier=PriorityTier.T2_DYNAMIC,
+            content="本章章纲：甲必须带着代价完成选择并留下下一章钩子。",
+            tokens=40,
+            max_tokens=40,
+            priority=50,
+        ),
+        "soft_character": ContextSlot(
+            name="CHARACTER_SOFT_CONTEXT",
+            tier=PriorityTier.T1_COMPRESSIBLE,
+            content="甲的呼吸、动作和对话节奏。" * 30,
+            tokens=100,
+            max_tokens=100,
+            priority=40,
+        ),
+    }
+    allocator = _allocator_with_slots(monkeypatch, slots)
+
+    allocation = allocator.allocate("novel-1", 800, "甲", total_budget=8000)
+
+    assert compact_fact_lock in allocation.get_final_context()
+    assert "本章章纲：甲必须带着代价完成选择并留下下一章钩子。" in allocation.get_final_context()
+    assert "甲的呼吸、动作和对话节奏" in allocation.get_final_context()
+    assert allocator.estimate_tokens(allocation.get_final_context()) <= 8000
 
 
 def test_allocator_propagates_configured_memory_engine_fact_lock_failure(monkeypatch):

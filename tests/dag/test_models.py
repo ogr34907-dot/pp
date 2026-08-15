@@ -36,6 +36,12 @@ class TestNodeDefinition:
         node = NodeDefinition(id="test_node", type="ctx_blueprint")
         assert node.position == {"x": 0.0, "y": 0.0}
 
+    def test_runtime_overrides_are_omitted_until_explicitly_configured(self):
+        node = NodeDefinition(id="test_node", type="ctx_blueprint")
+
+        assert node.config.timeout_seconds is None
+        assert node.config.max_retries is None
+
     def test_custom_config(self):
         config = NodeConfig(
             temperature=0.5,
@@ -46,6 +52,15 @@ class TestNodeDefinition:
         node = NodeDefinition(id="test_node", type="val_style", config=config)
         assert node.config.temperature == 0.5
         assert node.config.max_retries == 3
+
+    def test_legacy_serialized_timeout_remains_an_explicit_override(self):
+        node = NodeDefinition.model_validate({
+            "id": "test_node",
+            "type": "ctx_blueprint",
+            "config": {"timeout_seconds": 60},
+        })
+
+        assert node.config.timeout_seconds == 60
 
 
 class TestEdgeDefinition:
@@ -125,6 +140,14 @@ class TestDAGDefinition:
         dag2.nodes.append(
             NodeDefinition(id="val_style", type="val_style", label="文风检查")
         )
+        assert dag1.fingerprint() != dag2.fingerprint()
+
+    def test_fingerprint_changes_with_node_runtime_config(self):
+        dag1 = self._make_simple_dag()
+        dag2 = self._make_simple_dag()
+        dag2.get_node("ctx_blueprint").config.timeout_seconds = 120
+        dag2.get_node("ctx_blueprint").config.max_retries = 3
+
         assert dag1.fingerprint() != dag2.fingerprint()
 
 

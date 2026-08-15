@@ -179,7 +179,12 @@ class SetupMainPlotSuggestionService:
         ctx: Dict[str, Any],
         options: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        target_chapters = int(ctx.get("target_chapters") or 100)
+        try:
+            target_chapters = int(ctx.get("target_chapters"))
+        except (TypeError, ValueError) as exc:
+            raise MainPlotSuggestionContractError("目标章节数无效") from exc
+        if target_chapters <= 0:
+            raise MainPlotSuggestionContractError("目标章节数无效")
         axis = ctx.get("fusion_axis") or {}
         core_promise = str(axis.get("core_promise") or "").strip()
         central_conflict = str(axis.get("central_conflict") or "").strip()

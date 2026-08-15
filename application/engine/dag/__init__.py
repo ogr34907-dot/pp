@@ -3,11 +3,11 @@
 核心模块：
 - models: DAG 定义、节点/边模型、执行结果
 - registry: 节点类型注册表（工厂模式）
-- engine: DAG 执行引擎（LangGraph 编排 + 拓扑并行）
+- engine: DAG 执行引擎（原生拓扑并行）
 - validator: DAG 校验引擎（环检测、端口兼容性、可达性分析）
 - version_manager: DAG 版本管理（保存/回滚/对比）
 - daemon_runner: DAG 守护进程运行器（替代 AutopilotDaemon 隐式状态机）
-- ipc_adapter: LangGraph 节点与现有 IPC 通道的适配器
+- ipc_adapter: DAG 节点与现有 IPC 通道的适配器
 - event_aggregator: SSE 节点事件聚合器（节流 + 批量推送）
 - error_classifier: 节点错误分类器
 - prompt_validator: Prompt 模板安全校验器

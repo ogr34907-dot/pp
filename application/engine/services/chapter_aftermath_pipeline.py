@@ -278,19 +278,6 @@ class ChapterAftermathPipeline:
             logger.debug("aftermath 跳过：正文为空 novel=%s ch=%s", novel_id, chapter_number)
             return out
 
-        # 0) 章间衔接锚点。放在统一章后管线里，确保 HTTP 保存、托管连写、
-        # 自动驾驶最终都会产出同一种前章桥段资产。
-        try:
-            await _timed_aftermath_stage(
-                "bridge_extract",
-                novel_id,
-                chapter_number,
-                lambda: self._extract_chapter_bridge(novel_id, chapter_number, content),
-            )
-            out["bridge_extracted"] = True
-        except Exception as e:
-            logger.warning("章节桥段提取失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
-
         # 1) 叙事 + 向量 + 故事线 + 张力 + 对话 + 因果边 + 人物状态 + 债务
         try:
             from application.world.services.chapter_narrative_sync import (
@@ -359,6 +346,9 @@ class ChapterAftermathPipeline:
             logger.warning(
                 "叙事同步/向量失败 novel=%s ch=%s: %s", novel_id, chapter_number, e
             )
+
+        if not out["narrative_sync_ok"]:
+            return out
 
         # MemoryEngine is part of the writing context, so it must consume the
         # same final chapter version only after the canonical sync has committed.
@@ -639,6 +629,22 @@ class ChapterAftermathPipeline:
                             chapter_number,
                             exc,
                         )
+
+        if not out["narrative_sync_ok"]:
+            return out
+
+        # 0) 章间衔接锚点。只有 canonical 与 durable Memory 都 ready 后，
+        # 才允许写入下一章会读取的前章桥段资产。
+        try:
+            await _timed_aftermath_stage(
+                "bridge_extract",
+                novel_id,
+                chapter_number,
+                lambda: self._extract_chapter_bridge(novel_id, chapter_number, content),
+            )
+            out["bridge_extracted"] = True
+        except Exception as e:
+            logger.warning("章节桥段提取失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
 
         # 1b) 角色叙事内核对账：cast plan vs 正文，自动投影状态与风险。
         try:
@@ -966,13 +972,23 @@ class ChapterAftermathPipeline:
                 return True
             commit_record = db.fetch_one(
                 """
-                SELECT 1
+                SELECT chapter_id, content_sha256, content_revision
                 FROM chapter_candidate_formal_commits
                 WHERE novel_id = ? AND chapter_number = ? AND chapter_id = ?
                 """,
                 (novel_id, int(chapter_number), str(getattr(current, "id", "") or "")),
             )
-            return commit_record is not None
+            if commit_record is None:
+                return False
+            actual_sha256 = hashlib.sha256(
+                str(getattr(current, "content", "") or "").encode("utf-8")
+            ).hexdigest()
+            return (
+                str(getattr(current, "content_sha256", "") or "") == actual_sha256
+                and str(commit_record["content_sha256"] or "") == actual_sha256
+                and int(commit_record["content_revision"] or 0)
+                == int(getattr(current, "content_revision", 0) or 0)
+            )
         except Exception:
             logger.exception(
                 "canonical chapter check failed; discard aftermath novel=%s ch=%s",

@@ -23,6 +23,7 @@ from domain.novel.value_objects.chapter_id import ChapterId
 from domain.novel.value_objects.generation_preferences import GenerationPreferences
 from domain.novel.repositories.chapter_repository import ChapterRepository
 from domain.novel.repositories.novel_repository import NovelRepository
+from domain.novel.target_chapters import positive_integer_or_none
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 from infrastructure.persistence.database.chapter_element_repository import ChapterElementRepository
 from domain.ai.services.llm_service import LLMService, GenerationConfig
@@ -153,7 +154,9 @@ def calculate_structure_params(target_chapters: int) -> Dict:
             "reasoning": str,           # 计算理由（用于日志）
         }
     """
-    t = max(target_chapters, 10)
+    t = positive_integer_or_none(target_chapters)
+    if t is None:
+        raise ValueError("目标章节数必须为正整数")
 
     if t <= 30:
         # 短篇：1部1卷3幕，每幕约10章（三幕剧刚好是一个完整故事）
@@ -503,10 +506,11 @@ class ContinuousPlanningService:
     async def generate_macro_plan(
         self,
         novel_id: str,
-        target_chapters: int,
+        target_chapters: Optional[int] = None,
         structure_preference: Optional[Dict[str, int]] = None,
     ) -> Dict:
         """生成宏观规划"""
+        target_chapters = self.require_persisted_target_chapters(novel_id)
         import time
         start_time = time.time()
 
@@ -1358,8 +1362,8 @@ class ContinuousPlanningService:
 
         不再硬编码 3 幕！改用 calculate_structure_params 动态计算。
         """
-        target = max(int(target_chapters or 30), 1)
-        params = calculate_structure_params(target)
+        params = calculate_structure_params(target_chapters)
+        target = int(target_chapters)
         parts_count = params["parts"]
         volumes_per_part = params["volumes_per_part"]
         acts_per_volume = params["acts_per_volume"]
@@ -1560,12 +1564,15 @@ class ContinuousPlanningService:
         act_node = await self.story_node_repo.get_by_id(act_id)
         if not act_node:
             raise ValueError(f"幕节点不存在: {act_id}")
-        _default_cpa = calculate_structure_params(100)["chapters_per_act"]
-        chapter_count = custom_chapter_count or act_node.suggested_chapter_count or _default_cpa
+        chapter_count = custom_chapter_count or act_node.suggested_chapter_count
         if not custom_chapter_count and not act_node.suggested_chapter_count:
+            target_limit = self._target_chapter_limit(act_node.novel_id)
+            if target_limit is None:
+                raise ValueError("小说目标章节数无效，无法规划幕章节")
+            chapter_count = calculate_structure_params(target_limit)["chapters_per_act"]
             logger.info(
                 f"[ActPlanning] act={act_id} 无自定义章数且无 suggested_chapter_count，"
-                f"使用引擎推荐值 {_default_cpa}"
+                f"使用目标章节数 {target_limit} 推导的引擎推荐值 {chapter_count}"
             )
         nodes = await self._get_story_nodes(act_node.novel_id)
         remaining_capacity = self._remaining_parent_volume_capacity(
@@ -1748,7 +1755,9 @@ class ContinuousPlanningService:
             return None
         try:
             novel = self.novel_repository.get_by_id(NovelId(novel_id))
-            limit = int(getattr(novel, "target_chapters", 0) or 0)
+            limit = positive_integer_or_none(
+                getattr(novel, "target_chapters", None)
+            )
         except (TypeError, ValueError, AttributeError) as exc:
             logger.warning(
                 "[ActPlanning] 无法读取小说目标章节数 novel=%s: %s",
@@ -1756,7 +1765,13 @@ class ContinuousPlanningService:
                 exc,
             )
             return None
-        return limit if limit > 0 else None
+        return limit
+
+    def require_persisted_target_chapters(self, novel_id: str) -> int:
+        target_chapters = self._target_chapter_limit(novel_id)
+        if target_chapters is None:
+            raise ValueError("小说目标章节数无效；请先设置 novels.target_chapters 正整数")
+        return target_chapters
 
     async def _evaluate_act_alignment(self, act_node: StoryNode, chapters: List[Dict]) -> Optional[Dict]:
         if self.alignment_gate is None:
@@ -2060,7 +2075,7 @@ class ContinuousPlanningService:
         novel_id: str,
         current_act: StoryNode,
         parent_volume_id: Optional[str],
-    ) -> str:
+    ) -> tuple[str, int]:
         """Validate the same structural boundaries used before daemon act planning."""
         if current_act.node_type != NodeType.ACT or current_act.novel_id != novel_id:
             raise ValueError(f"当前幕不属于小说: {current_act.id}")
@@ -2088,33 +2103,34 @@ class ContinuousPlanningService:
             raise ValueError(f"父卷已无剩余章节容量: {parent_volume.id}")
 
         target_limit = self._target_chapter_limit(novel_id)
-        if target_limit is not None:
-            highest_planned_chapter = max(
-                (
-                    int(node.number)
-                    for node in nodes
-                    if node.node_type == NodeType.CHAPTER
-                ),
-                default=0,
+        if target_limit is None:
+            raise ValueError("小说目标章节数无效，无法创建下一幕")
+        highest_planned_chapter = max(
+            (
+                int(node.number)
+                for node in nodes
+                if node.node_type == NodeType.CHAPTER
+            ),
+            default=0,
+        )
+        if highest_planned_chapter >= target_limit:
+            raise ValueError(
+                f"已规划至目标章节数 {target_limit}，不能继续创建新幕"
             )
-            if highest_planned_chapter >= target_limit:
-                raise ValueError(
-                    f"已规划至目标章节数 {target_limit}，不能继续创建新幕"
-                )
 
-            # Explicit volume capacity is the executable contract. The recommended
-            # act count remains a fallback only for legacy volumes without one.
-            if remaining_capacity is None:
-                acts_per_volume = calculate_structure_params(target_limit)["acts_per_volume"]
-                act_count = sum(
-                    1
-                    for node in nodes
-                    if node.node_type == NodeType.ACT and node.parent_id == parent_volume.id
+        # Explicit volume capacity is the executable contract. The recommended
+        # act count remains a fallback only for legacy volumes without one.
+        if remaining_capacity is None:
+            acts_per_volume = calculate_structure_params(target_limit)["acts_per_volume"]
+            act_count = sum(
+                1
+                for node in nodes
+                if node.node_type == NodeType.ACT and node.parent_id == parent_volume.id
+            )
+            if act_count >= acts_per_volume:
+                raise ValueError(
+                    f"父卷已达到幕容量 {acts_per_volume}，请先创建或选择下一卷"
                 )
-                if act_count >= acts_per_volume:
-                    raise ValueError(
-                        f"父卷已达到幕容量 {acts_per_volume}，请先创建或选择下一卷"
-                    )
 
         next_act_number = int(current_act.number) + 1
         if any(
@@ -2123,7 +2139,7 @@ class ContinuousPlanningService:
         ):
             raise ValueError(f"第 {next_act_number} 幕已存在，不能重复创建")
 
-        return parent_volume.id
+        return parent_volume.id, target_limit
 
     async def create_next_act_auto(
         self,
@@ -2138,14 +2154,16 @@ class ContinuousPlanningService:
         if not current_act:
             raise ValueError(f"当前幕不存在: {current_act_id}")
 
-        parent_id = await self._preflight_next_act_creation(
+        parent_id, target_limit = await self._preflight_next_act_creation(
             novel_id=novel_id,
             current_act=current_act,
             parent_volume_id=parent_volume_id,
         )
 
         bible_context = self._get_bible_context(novel_id)
-        next_act_info = await self._generate_next_act_info(novel_id, current_act, bible_context)
+        next_act_info = await self._generate_next_act_info(
+            novel_id, current_act, bible_context, target_limit
+        )
         nodes = list(await self.story_node_repo.get_by_novel(novel_id))
         remaining_capacity = self._remaining_parent_volume_capacity(nodes, parent_id)
         if remaining_capacity is not None:
@@ -2166,7 +2184,8 @@ class ContinuousPlanningService:
                 "number": current_act.number + 1,
                 "title": next_act_info["title"],
                 "description": next_act_info["description"],
-                "suggested_chapter_count": next_act_info.get("suggested_chapter_count", 5),
+                "suggested_chapter_count": next_act_info.get("suggested_chapter_count")
+                or calculate_structure_params(target_limit)["chapters_per_act"],
                 "key_events": next_act_info.get("key_events", []),
                 "narrative_arc": next_act_info.get("narrative_arc"),
                 "conflicts": next_act_info.get("conflicts", []),
@@ -3405,7 +3424,13 @@ class ContinuousPlanningService:
         acts = [n for n in tree.nodes if n.node_type == NodeType.ACT and n.number == current_act.number + 1]
         return acts[0] if acts else None
 
-    async def _generate_next_act_info(self, novel_id: str, current_act: StoryNode, bible_context: Dict) -> Dict:
+    async def _generate_next_act_info(
+        self,
+        novel_id: str,
+        current_act: StoryNode,
+        bible_context: Dict,
+        target_chapters: int,
+    ) -> Dict:
         """生成下一幕信息（双轨融合版）
         
         轨道一：宏观摘要线
@@ -3416,9 +3441,8 @@ class ContinuousPlanningService:
         - 强制注入待回收伏笔
         - 注入角色当前状态锚点
         """
-        # 使用结构计算引擎获取推荐每幕章数（替代硬编码的 5）
-        # 通过 current_act 的 novel_id 查找小说目标章节数
-        _default_cpa = calculate_structure_params(100)["chapters_per_act"]  # 保守默认值
+        # 由已验证的持久化目标章节数推导建议章数。
+        _default_cpa = calculate_structure_params(target_chapters)["chapters_per_act"]
 
         # 收集双轨上下文
         dual_track_context = await self._collect_dual_track_context(novel_id, current_act, bible_context)

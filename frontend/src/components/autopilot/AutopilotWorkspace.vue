@@ -12,7 +12,6 @@
       <GenerationModeLauncher
         class="ap-workspace__candidate-launcher"
         :novel-id="novelId"
-        :target-chapters="targetChapters"
         @status-change="onCandidateStatusChange"
       />
       <CandidateGenerationProgress :run="candidateRun" />
@@ -68,7 +67,6 @@ const AutopilotOperationsView = defineAsyncComponent(() => import('./AutopilotOp
 
 const props = defineProps<{
   novelId: string
-  targetChapters?: number
 }>()
 
 const emit = defineEmits<{

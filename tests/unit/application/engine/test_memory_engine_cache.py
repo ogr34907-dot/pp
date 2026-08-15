@@ -161,6 +161,54 @@ def test_memory_engine_does_not_treat_invalid_persisted_json_as_empty_history(tm
         engine.get_revealed_clues_section("novel-1")
 
 
+def test_memory_engine_loads_only_the_recent_persisted_memory_window(tmp_path):
+    from infrastructure.persistence.database.connection import DatabaseConnection
+
+    database = DatabaseConnection(str(tmp_path / "memory-window.db"))
+    engine = MemoryEngine(
+        llm_service=object(),
+        bible_repository=object(),
+        db_connection=database,
+    )
+    persisted_state = {
+        "completed_beats": [
+            {"beat_id": f"beat-{chapter}", "chapter": chapter, "summary": f"节拍-{chapter}"}
+            for chapter in range(1, 506)
+        ],
+        "revealed_clues": [
+            {
+                "clue_id": f"clue-{chapter}",
+                "revealed_at_chapter": chapter,
+                "content": f"线索-{chapter}",
+            }
+            for chapter in range(1, 806)
+        ],
+    }
+    database.execute(
+        "INSERT INTO memory_engine_state "
+        "(novel_id, state_json, last_updated_chapter, updated_at) "
+        "VALUES (?, ?, ?, datetime('now'))",
+        ("novel-1", json.dumps(persisted_state), 805),
+    )
+    database.commit()
+
+    state = engine._get_or_load_state("novel-1")
+
+    assert len(state.completed_beats) == 500
+    assert state.completed_beats[0]["beat_id"] == "beat-6"
+    assert state.completed_beats[-1]["beat_id"] == "beat-505"
+    assert len(state.revealed_clues) == 800
+    assert state.revealed_clues[0]["clue_id"] == "clue-6"
+    assert state.revealed_clues[-1]["clue_id"] == "clue-805"
+    raw_state = json.loads(
+        database.execute(
+            "SELECT state_json FROM memory_engine_state WHERE novel_id = ?", ("novel-1",)
+        ).fetchone()[0]
+    )
+    assert len(raw_state["completed_beats"]) == 505
+    assert len(raw_state["revealed_clues"]) == 805
+
+
 def test_completed_beats_render_recent_entries_within_the_context_slot_budget():
     engine = _engine()
     state = MemoryState(
@@ -244,6 +292,136 @@ def test_memory_state_discards_old_entries_after_soft_storage_limits():
     assert len(state.revealed_clues) == 800
     assert state.revealed_clues[0]["clue_id"] == "clue-6"
     assert state.revealed_clues[-1]["clue_id"] == "clue-805"
+
+
+@pytest.mark.asyncio
+async def test_memory_engine_skips_items_without_final_affirmative_evidence(monkeypatch):
+    class BibleRepository:
+        def get_by_novel_id(self, novel_id):
+            return None
+
+    class LLMService:
+        async def generate(self, prompt, config):
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "completed_beats": [
+                            {
+                                "beat_id": "missing-evidence",
+                                "summary": "林澈杀死反派甲",
+                                "chapter": 1,
+                            },
+                            {
+                                "beat_id": "forged-evidence",
+                                "summary": "林澈得到密钥",
+                                "chapter": 1,
+                                "evidence_text": "正文中不存在的密钥",
+                            },
+                            {
+                                "beat_id": "negated-evidence",
+                                "summary": "林澈杀死反派甲",
+                                "chapter": 1,
+                                "evidence_text": "林澈没有杀死反派甲。",
+                            },
+                            {
+                                "beat_id": "unsupported-evidence",
+                                "summary": "林澈杀死反派甲",
+                                "chapter": 1,
+                                "evidence_text": "林澈站在城门前。",
+                            },
+                            {
+                                "beat_id": "verified-beat",
+                                "summary": "林澈在城门前交出铜铃",
+                                "chapter": 1,
+                                "evidence_text": "林澈在城门前交出铜铃。",
+                            },
+                        ],
+                        "revealed_clues": [
+                            {
+                                "clue_id": "missing-evidence",
+                                "content": "反派甲已经死亡",
+                                "revealed_at_chapter": 1,
+                            },
+                            {
+                                "clue_id": "forged-evidence",
+                                "content": "密钥藏在塔顶",
+                                "revealed_at_chapter": 1,
+                                "evidence_text": "正文中不存在的密钥",
+                            },
+                            {
+                                "clue_id": "negated-evidence",
+                                "content": "反派甲已经死亡",
+                                "revealed_at_chapter": 1,
+                                "evidence_text": "林澈没有杀死反派甲。",
+                            },
+                            {
+                                "clue_id": "unsupported-evidence",
+                                "content": "反派甲已经死亡",
+                                "revealed_at_chapter": 1,
+                                "evidence_text": "林澈站在城门前。",
+                            },
+                            {
+                                "clue_id": "verified-clue",
+                                "content": "铜铃能打开城门",
+                                "revealed_at_chapter": 1,
+                                "evidence_text": "守卫说：铜铃能打开城门。",
+                            },
+                        ],
+                        "fact_violations": [],
+                    }
+                )
+            )
+
+    monkeypatch.setattr(
+        "application.engine.services.memory_engine.get_prompt_gateway",
+        lambda: SimpleNamespace(
+            render=lambda *args, **kwargs: SimpleNamespace(prompt="memory prompt")
+        ),
+    )
+    engine = MemoryEngine(LLMService(), BibleRepository())
+
+    result = await engine.update_from_chapter(
+        "n1",
+        1,
+        "林澈没有杀死反派甲。林澈在城门前交出铜铃。守卫说：铜铃能打开城门。",
+        "大纲",
+    )
+
+    state = engine._get_or_load_state("n1")
+    assert [beat["beat_id"] for beat in state.completed_beats] == ["verified-beat"]
+    assert [clue["clue_id"] for clue in state.revealed_clues] == ["verified-clue"]
+    assert result["unverified_beats"] == 4
+    assert result["unverified_clues"] == 4
+
+
+def test_memory_engine_evidence_rejects_an_unrelated_final_quote():
+    beats, skipped_beats = MemoryEngine._verified_memory_items(
+        [
+            CompletedBeatItem(
+                beat_id="unsupported-beat",
+                summary="林澈杀死反派甲",
+                chapter=1,
+                evidence_text="林澈站在城门前。",
+            )
+        ],
+        "林澈站在城门前。",
+    )
+    clues, skipped_clues = MemoryEngine._verified_memory_items(
+        [
+            RevealedClueItem(
+                clue_id="unsupported-clue",
+                content="反派甲已经死亡",
+                revealed_at_chapter=1,
+                evidence_text="林澈站在城门前。",
+            )
+        ],
+        "林澈站在城门前。",
+    )
+
+    assert beats == []
+    assert clues == []
+    assert skipped_beats == 1
+    assert skipped_clues == 1
 
 
 @pytest.mark.asyncio

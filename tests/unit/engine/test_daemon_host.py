@@ -6,6 +6,8 @@ import pytest
 
 from application.engine.services.autopilot_daemon import AutopilotDaemon
 from domain.novel.entities.chapter import ChapterStatus
+from domain.novel.entities.novel import AutopilotStatus, NovelStage
+from domain.novel.value_objects.novel_id import NovelId
 from domain.structure.story_node import NodeType, StoryNode
 from engine.runtime.daemon_host import DaemonHostMixin
 from engine.runtime.runner import StoryPipelineRunner
@@ -100,6 +102,47 @@ def test_parent_volume_selection_does_not_overflow_last_full_volume():
     )
 
     assert parent is None
+
+
+@pytest.mark.asyncio
+async def test_daemon_completed_save_pauses_before_a_candidate_run_exists():
+    """A legacy coroutine must not formalize prose before Candidate-first starts."""
+    chapter_lookup = MagicMock(side_effect=AssertionError("formal write must be blocked"))
+    host = SimpleNamespace(
+        chapter_repository=SimpleNamespace(
+            db=SimpleNamespace(fetch_one=MagicMock(return_value=None)),
+            get_by_novel_and_number=chapter_lookup,
+        ),
+        _save_chapter_ephemeral=MagicMock(),
+        _queue_sql=MagicMock(),
+        _update_shared_state=MagicMock(),
+        _flush_novel=MagicMock(),
+    )
+    novel = SimpleNamespace(novel_id=NovelId("candidate-novel"), generation_prefs=None)
+    chapter_node = SimpleNamespace(number=1, id="chapter-1", title="第1章", outline="")
+
+    result = await DaemonHostMixin._upsert_chapter_content(
+        host,
+        novel,
+        chapter_node,
+        "旧协程已经生成的正文。",
+        status="completed",
+    )
+
+    assert result is False
+    chapter_lookup.assert_not_called()
+    host._save_chapter_ephemeral.assert_not_called()
+    host._queue_sql.assert_not_called()
+    assert novel.autopilot_status == AutopilotStatus.STOPPED
+    assert novel.current_stage == NovelStage.PAUSED_FOR_REVIEW
+    host._update_shared_state.assert_called_once_with(
+        "candidate-novel",
+        current_stage="paused_for_review",
+        writing_substep="candidate_first_required",
+        writing_substep_label="候选稿流程正在管理正式章节",
+        autopilot_pause_reason="candidate_first_required",
+    )
+    host._flush_novel.assert_called_once_with(novel)
 
 
 @pytest.mark.asyncio

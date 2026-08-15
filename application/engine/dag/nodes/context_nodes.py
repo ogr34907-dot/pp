@@ -87,7 +87,6 @@ class BlueprintNode(BaseNode):
             if context.get("candidate_mode"):
                 return NodeResult(
                     outputs={
-                        "world_rules": str(context.get("outline_text") or ""),
                         "taboos": "",
                         "atmosphere": "",
                     },
@@ -329,7 +328,7 @@ class MemoryNode(BaseNode):
         try:
             if context.get("candidate_mode"):
                 return NodeResult(
-                    outputs={"fact_lock": str(context.get("outline_text") or ""), "entity_memory": ""},
+                    outputs={"entity_memory": ""},
                     status=NodeStatus.SUCCESS,
                     duration_ms=int((time.time() - start) * 1000),
                 )

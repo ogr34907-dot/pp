@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from application.engine.services.context_budget_models import ContextSlot
+from application.engine.services.context_budget_models import (
+    ContextBudgetExceededError,
+    ContextSlot,
+)
 
 
 def _clear_slot(slot: ContextSlot) -> None:
@@ -26,26 +29,38 @@ def truncate_t0_slots(
     *,
     chars_per_token_zh: float,
 ) -> int:
-    """Keep T0 slots in insertion order and truncate the first overflowing slot."""
-    total = 0
-    exhausted = False
-    for slot in t0_slots.values():
-        if exhausted:
-            _clear_slot(slot)
-            continue
-        if total + slot.tokens <= budget:
-            total += slot.tokens
-            continue
+    """Compress T0 slots without crossing any declared minimum floor."""
+    floors = {
+        id(slot): max(0, int(slot.min_tokens or 0))
+        for slot in t0_slots.values()
+    }
+    floor_total = sum(floors.values())
+    if floor_total > budget:
+        raise ContextBudgetExceededError(
+            f"context budget {budget} cannot fit T0 minimum floors ({floor_total} tokens)"
+        )
 
-        remaining = budget - total
-        if remaining > 0:
-            target_chars = int(remaining * chars_per_token_zh)
-            slot.content = slot.content[:target_chars] + "..."
-            slot.tokens = remaining
-            total += remaining
-        else:
-            _clear_slot(slot)
-        exhausted = True
+    extra_budget = budget - floor_total
+    total = 0
+    for slot in t0_slots.values():
+        floor = floors[id(slot)]
+        current = max(0, int(slot.tokens or 0))
+        if current < floor:
+            raise ContextBudgetExceededError(
+                f"context slot {slot.name!r} is below its minimum floor "
+                f"({current} < {floor} tokens)"
+            )
+
+        extra = current - floor
+        kept_extra = min(extra, extra_budget)
+        target = floor + kept_extra
+        if target < current:
+            if target <= 0:
+                _clear_slot(slot)
+            else:
+                _cap_slot(slot, target, chars_per_token_zh=chars_per_token_zh)
+        total += target
+        extra_budget -= kept_extra
     return total
 
 

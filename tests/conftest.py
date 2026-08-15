@@ -5,6 +5,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Keep pytest's API imports from sharing the repository log with another process.
+os.environ.setdefault(
+    "LOG_FILE",
+    str(Path(tempfile.gettempdir()) / f"plotpilot-pytest-{os.getpid()}.log"),
+)
+
 # Add paths immediately at module import time
 _root = Path(__file__).resolve().parent.parent
 _parent = _root.parent

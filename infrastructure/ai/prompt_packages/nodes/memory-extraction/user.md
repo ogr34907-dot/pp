@@ -27,7 +27,8 @@
       "beat_id": "ch5-confrontation-gaming-hall",
       "summary": "谁做了什么，并导致什么变化",
       "chapter": {chapter_number},
-      "characters_involved": ["角色名"]
+      "characters_involved": ["角色名"],
+      "evidence_text": "正文中连续、逐字出现且正向证明该事件已经发生的短原句"
     }
   ],
   "revealed_clues": [
@@ -36,7 +37,8 @@
       "content": "本章首次揭露的信息或真相",
       "revealed_at_chapter": {chapter_number},
       "category": "truth",
-      "is_still_valid": true
+      "is_still_valid": true,
+      "evidence_text": "正文中连续、逐字出现且正向证明该信息已揭露的短原句"
     }
   ],
   "fact_violations": [

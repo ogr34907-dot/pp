@@ -195,9 +195,9 @@ async function unwrap<T>(path: string, options: Parameters<typeof fetchJson>[1] 
 
 export const generationApi = {
   getState: (novelId: string) => unwrap<GenerationRun>(apiRoutes.generation.state(novelId)),
-  start: (novelId: string, runMode: RunMode, targetChapters: number) =>
+  start: (novelId: string, runMode: RunMode) =>
     unwrap<GenerationRun>(apiRoutes.generation.start(novelId), {
-      method: 'POST', body: { run_mode: runMode, target_chapters: targetChapters },
+      method: 'POST', body: { run_mode: runMode },
     }),
   generateNext: (novelId: string) =>
     unwrap<ChapterCandidate | null>(apiRoutes.generation.generateNext(novelId), { method: 'POST' }),

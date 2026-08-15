@@ -231,7 +231,10 @@ def test_allocator_includes_current_part_and_volume_contract_in_t0_context():
     )
     chapter = _node("chapter-1", NodeType.CHAPTER, 1, parent_id=act.id)
     allocator = ContextBudgetAllocator(
-        story_node_repository=_StoryNodeRepository([part, volume, act, chapter])
+        story_node_repository=_StoryNodeRepository([part, volume, act, chapter]),
+        novel_repository=SimpleNamespace(
+            get_by_id=lambda _novel_id: SimpleNamespace(target_chapters=3)
+        ),
     )
 
     allocation = allocator.allocate(

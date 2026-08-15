@@ -15,10 +15,15 @@ from application.core.services.chapter_rewrite_coordinator import (
 from application.core.services.chapter_service import ChapterService
 from application.engine.services.memory_engine import MemoryEngine
 from application.engine.services.memory_engine_settings import MemoryEngineRuntimeSettings
+from application.engine.services.worldline_rebuild_service import WorldlineRebuildService
+from domain.novel.candidate_chapter import RunMode
 from domain.novel.entities.chapter import Chapter, ChapterStatus
 from domain.novel.value_objects.novel_id import NovelId
 from infrastructure.persistence.database.chapter_draft_repository import (
     ChapterDraftRepository,
+)
+from infrastructure.persistence.database.chapter_candidate_repository import (
+    ChapterCandidateRepository,
 )
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_chapter_repository import (
@@ -447,3 +452,73 @@ def test_invalidate_story_nodes_tolerates_legacy_table_without_updated_at():
         conn.execute("SELECT metadata FROM story_nodes WHERE id = 'act-1'").fetchone()[0]
     )
     assert metadata["summary_status"] == "stale"
+
+
+def test_manual_rewrite_advances_existing_formal_authority_and_pauses_for_rebuild(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "candidate-formal-rewrite.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-1", "Rewrite", "rewrite", 5),
+    )
+    db.get_connection().commit()
+    candidates = ChapterCandidateRepository(db)
+    candidates.start_run(
+        "novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=5
+    )
+    candidate = candidates.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain={
+            "outline": {"contract_id": "root", "revision": 1, "digest": "root-v1"}
+        },
+        llm_content="候选正式正文",
+    )
+    candidates.mark_auditing(candidate.id)
+    candidates.finish_audit(candidate.id, audit={}, commit_plan={})
+    candidates.approve_for_commit(candidate.id, continue_after_commit=False)
+    candidate = candidates.commit_formal(candidate.id)
+    candidates.mark_sync_failed(candidate.id, "canonical sync failed")
+
+    chapters = SqliteChapterRepository(db)
+    chapter = chapters.get_by_novel_and_number(NovelId("novel-1"), 1)
+    result = ChapterRewriteCoordinator(
+        db=db,
+        chapter_repository=chapters,
+    ).rewrite(chapter, "作者人工改写正文")
+
+    rewritten = db.fetch_one(
+        "SELECT content_sha256, content_revision FROM chapters WHERE id = ?",
+        (candidate.formal_chapter_id,),
+    )
+    authority = db.fetch_one(
+        "SELECT candidate_id, content_sha256, content_revision, provenance, sync_status, failure_reason "
+        "FROM chapter_candidate_formal_commits WHERE chapter_id = ?",
+        (candidate.formal_chapter_id,),
+    )
+    assert result.requires_rebuild is True
+    assert dict(authority) == {
+        "candidate_id": candidate.id,
+        "content_sha256": rewritten["content_sha256"],
+        "content_revision": rewritten["content_revision"],
+        "provenance": "author_rewrite",
+        "sync_status": "syncing",
+        "failure_reason": "",
+    }
+    assert candidates.get_candidate(candidate.id).status.value == "syncing"
+    retained = WorldlineRebuildService._retained_formal_chapters(
+        db.get_connection(), "novel-1"
+    )
+    assert [row["number"] for row in retained] == [1]
+    assert db.fetch_one("SELECT COUNT(*) AS total FROM chapter_candidates")["total"] == 1
+    assert db.fetch_one("SELECT COUNT(*) AS total FROM chapter_candidate_formal_commits")["total"] == 1
+    assert db.fetch_one("SELECT COUNT(*) AS total FROM chapter_narrative_commits")["total"] == 0
+    run = db.fetch_one(
+        "SELECT state, canonical_sync_status, next_action FROM novel_generation_runs "
+        "WHERE novel_id = 'novel-1'"
+    )
+    assert (run["state"], run["canonical_sync_status"], run["next_action"]) == (
+        "paused",
+        "rebuilding",
+        "rebuild_worldline",
+    )

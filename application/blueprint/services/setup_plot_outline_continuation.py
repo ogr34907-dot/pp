@@ -11,6 +11,9 @@ from application.ai_invocation.output_binding_resolution import (
     extract_bound_output_values,
     load_session_output_bindings,
 )
+from application.blueprint.services.setup_target_authority import (
+    load_persisted_target_chapters as _persisted_target_chapters,
+)
 
 _PHASE_SCHEMA = [
     {"phase": "opening", "label": "开篇阶段", "range_percent": "1-15%"},
@@ -243,16 +246,8 @@ def _coerce_legacy_stage_plan(raw_stage_plan: Mapping[str, Any]) -> list[dict[st
 
 
 def _target_chapters(context: ContinuationContext) -> int:
-    aliases = context.session.variable_plan.aliases if context.session.variable_plan is not None else {}
-    setup_context = context.session.context.get("setup_context") if isinstance(context.session.context.get("setup_context"), Mapping) else {}
-    raw = aliases.get("novel.target_chapters") if isinstance(aliases, Mapping) else None
-    if raw in (None, "", 0):
-        raw = setup_context.get("target_chapters")
-    try:
-        value = int(raw or 0)
-    except (TypeError, ValueError):
-        value = 0
-    return max(1, value or 100)
+    novel_id = str(context.session.context.get("novel_id") or "")
+    return _persisted_target_chapters(novel_id)
 
 
 def _chapter_ranges(target_chapters: int) -> list[tuple[int, int]]:
@@ -413,6 +408,7 @@ def normalize_setup_plot_outline_payload(
 
 
 def setup_plot_outline_handler(context: ContinuationContext) -> Mapping[str, Any]:
+    target_chapters = _target_chapters(context)
     payload = _parse_json_object(context.decision.accepted_content or "")
     bound_outline = _coerce_bound_outline(payload, context=context)
     legacy_outline = _coerce_legacy_outline(payload)
@@ -426,7 +422,6 @@ def setup_plot_outline_handler(context: ContinuationContext) -> Mapping[str, Any
     if not isinstance(raw_outline, Mapping):
         raise ValueError("缺少 plot_outline 对象")
 
-    target_chapters = _target_chapters(context)
     normalized_outline = normalize_setup_plot_outline_payload(raw_outline, target_chapters=target_chapters)
     result: dict[str, Any] = {
         "novel_id": str(context.session.context.get("novel_id") or ""),

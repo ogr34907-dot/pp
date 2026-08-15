@@ -1,4 +1,8 @@
 """DAG 执行引擎测试"""
+import asyncio
+import logging
+import time
+
 import pytest
 from application.engine.dag.engine import DAGEngine, DAGExecutionError
 from application.engine.dag.models import (
@@ -135,6 +139,84 @@ class _ExplicitErrorNode(BaseNode):
         return True
 
 
+class _TimeoutProbeNode(BaseNode):
+    meta = NodeMeta(
+        node_type="test_timeout_probe",
+        display_name="timeout probe",
+        category=NodeCategory.EXECUTION,
+    )
+
+    def get_timeout(self):
+        # Keep this RED test fast without changing production validation bounds.
+        return 0.01
+
+    async def execute(self, inputs, context):
+        events = context["shared_state"]["timeout_probe_events"]
+        events.append("started")
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+        events.append("after_sleep")
+        return NodeResult(outputs={"timeout_probe_output": "completed"})
+
+    def validate_inputs(self, inputs):
+        return True
+
+
+class _TimeoutBranchNode(BaseNode):
+    branch_name = ""
+    meta = NodeMeta(
+        node_type="test_timeout_branch",
+        display_name="timeout branch",
+        category=NodeCategory.EXECUTION,
+    )
+
+    async def execute(self, inputs, context):
+        context["shared_state"]["timeout_branch_calls"].append(self.branch_name)
+        return NodeResult(outputs={})
+
+    def validate_inputs(self, inputs):
+        return True
+
+
+class _TimeoutErrorBranchNode(_TimeoutBranchNode):
+    branch_name = "error"
+    meta = NodeMeta(
+        node_type="test_timeout_error_branch",
+        display_name="timeout error branch",
+        category=NodeCategory.EXECUTION,
+    )
+
+
+class _TimeoutSuccessBranchNode(_TimeoutBranchNode):
+    branch_name = "success"
+    meta = NodeMeta(
+        node_type="test_timeout_success_branch",
+        display_name="timeout success branch",
+        category=NodeCategory.EXECUTION,
+    )
+
+
+class _TimeoutAlwaysBranchNode(_TimeoutBranchNode):
+    branch_name = "always"
+    meta = NodeMeta(
+        node_type="test_timeout_always_branch",
+        display_name="timeout always branch",
+        category=NodeCategory.EXECUTION,
+    )
+
+
+class _TimeoutIndependentNode(_TimeoutBranchNode):
+    branch_name = "independent"
+    meta = NodeMeta(
+        node_type="test_timeout_independent",
+        display_name="timeout independent",
+        category=NodeCategory.EXECUTION,
+    )
+
+
 NodeRegistry.register("test_route_source")(_RouteSourceNode)
 NodeRegistry.register("test_matched_branch")(_MatchedBranchNode)
 NodeRegistry.register("test_unmatched_branch")(_UnmatchedBranchNode)
@@ -142,10 +224,28 @@ NodeRegistry.register("test_port_source")(_PortSourceNode)
 NodeRegistry.register("test_port_target")(_PortTargetNode)
 NodeRegistry.register("test_retry_writer")(_RetryWriterNode)
 NodeRegistry.register("test_explicit_error")(_ExplicitErrorNode)
+NodeRegistry.register("test_timeout_probe")(_TimeoutProbeNode)
+NodeRegistry.register("test_timeout_error_branch")(_TimeoutErrorBranchNode)
+NodeRegistry.register("test_timeout_success_branch")(_TimeoutSuccessBranchNode)
+NodeRegistry.register("test_timeout_always_branch")(_TimeoutAlwaysBranchNode)
+NodeRegistry.register("test_timeout_independent")(_TimeoutIndependentNode)
 
 
 class TestDAGEngine:
     """DAG 执行引擎测试"""
+
+    def test_langgraph_availability_does_not_claim_to_change_the_runtime(self, caplog, monkeypatch):
+        """LangGraph may be installed, but production execution remains native."""
+        monkeypatch.setattr(
+            "application.engine.dag.engine._is_langgraph_available", lambda: True
+        )
+
+        with caplog.at_level(logging.INFO):
+            engine = DAGEngine()
+
+        assert engine._use_langgraph is True
+        assert "原生拓扑执行器" in caplog.text
+        assert "使用 LangGraph 编排" not in caplog.text
 
     def test_engine_creation(self):
         engine = DAGEngine()
@@ -291,6 +391,107 @@ class TestDAGEngine:
         assert result.status == "error"
         assert result.error_count == 1
         assert result.final_state["_errors"]["error_node"] == "explicit node failure"
+
+    @pytest.mark.asyncio
+    async def test_native_engine_enforces_node_timeout_and_routes_error_only(self):
+        engine = DAGEngine()
+        engine._use_langgraph = False
+        dag = DAGDefinition(
+            id="dag_timeout_contract",
+            name="超时合同",
+            nodes=[
+                NodeDefinition(id="slow", type="test_timeout_probe"),
+                NodeDefinition(id="error_branch", type="test_timeout_error_branch"),
+                NodeDefinition(id="success_branch", type="test_timeout_success_branch"),
+                NodeDefinition(id="always_branch", type="test_timeout_always_branch"),
+                NodeDefinition(id="independent", type="test_timeout_independent"),
+            ],
+            edges=[
+                EdgeDefinition(
+                    id="edge_timeout_error",
+                    source="slow",
+                    target="error_branch",
+                    condition=EdgeCondition.ON_ERROR,
+                ),
+                EdgeDefinition(
+                    id="edge_timeout_success",
+                    source="slow",
+                    target="success_branch",
+                    condition=EdgeCondition.ON_SUCCESS,
+                ),
+                EdgeDefinition(
+                    id="edge_timeout_always",
+                    source="slow",
+                    target="always_branch",
+                    condition=EdgeCondition.ALWAYS,
+                ),
+            ],
+        )
+        state = {
+            "novel_id": "test_novel",
+            "timeout_probe_events": [],
+            "timeout_branch_calls": [],
+        }
+
+        started_at = time.perf_counter()
+        result = await engine.run(dag, state)
+        elapsed = time.perf_counter() - started_at
+
+        assert result.status == "error"
+        assert "timed out" in result.final_state["_errors"]["slow"]
+        assert result.final_state.get("timeout_probe_output") is None
+        assert result.final_state["timeout_probe_events"] == ["started", "cancelled"]
+        assert set(result.final_state["timeout_branch_calls"]) == {"error", "independent"}
+        assert "success" not in result.final_state["timeout_branch_calls"]
+        assert "always" not in result.final_state["timeout_branch_calls"]
+        assert "after_sleep" not in result.final_state["timeout_probe_events"]
+        assert elapsed < 0.15
+
+    @pytest.mark.asyncio
+    async def test_failed_node_does_not_run_always_child_but_runs_explicit_error_child(
+        self,
+    ):
+        engine = DAGEngine()
+        calls = []
+
+        async def execute(node, _state, _inputs=None):
+            calls.append(node.id)
+            if node.id == "source":
+                raise RuntimeError("source failed")
+            return {}
+
+        engine._execute_node = execute
+        dag = DAGDefinition(
+            id="dag_failed_edges",
+            name="失败边语义",
+            nodes=[
+                NodeDefinition(id="source", type="test_explicit_error"),
+                NodeDefinition(id="success_child", type="test_explicit_error"),
+                NodeDefinition(id="error_child", type="test_explicit_error"),
+            ],
+            edges=[
+                EdgeDefinition(
+                    id="edge_success",
+                    source="source",
+                    target="success_child",
+                    condition=EdgeCondition.ALWAYS,
+                ),
+                EdgeDefinition(
+                    id="edge_error",
+                    source="source",
+                    target="error_child",
+                    condition=EdgeCondition.ON_ERROR,
+                ),
+            ],
+        )
+
+        result = await engine._run_with_topological_sort(
+            dag,
+            {"novel_id": "test_novel"},
+        )
+
+        assert result["status"] == "error"
+        assert calls == ["source", "error_child"]
 
     def test_default_dag_passes_its_own_validator(self):
         result = DAGValidator().validate(get_default_dag())

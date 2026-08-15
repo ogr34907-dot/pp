@@ -254,9 +254,48 @@ class ChapterRewriteCoordinator:
                 if cursor.rowcount != 1:
                     raise ChapterRewriteConflictError("chapter changed during rewrite commit")
 
+                authority = conn.execute(
+                    "SELECT candidate_id FROM chapter_candidate_formal_commits "
+                    "WHERE novel_id = ? AND chapter_number = ? AND chapter_id = ?",
+                    (novel_id, chapter_number, chapter_id),
+                ).fetchone()
+                if authority is not None:
+                    cursor = conn.execute(
+                        """
+                        UPDATE chapter_candidate_formal_commits
+                        SET content_sha256 = ?, content_revision = ?,
+                            provenance = 'author_rewrite', sync_status = 'syncing',
+                            failure_reason = '', synced_at = NULL
+                        WHERE novel_id = ? AND chapter_number = ? AND chapter_id = ?
+                        """,
+                        (
+                            new_hash,
+                            actual_revision + 1,
+                            novel_id,
+                            chapter_number,
+                            chapter_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ChapterRewriteConflictError(
+                            "formal authority changed during rewrite commit"
+                        )
                 changed_ids = self._chapter_ids_from(conn, novel_id, chapter_number)
                 self._invalidate_downstream(conn, novel_id, chapter_number, changed_ids)
                 self._retire_downstream_candidates(conn, novel_id, chapter_number)
+                if authority is not None:
+                    cursor = conn.execute(
+                        """
+                        UPDATE chapter_candidates
+                        SET status = 'syncing', failure_reason = '', updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (str(authority["candidate_id"]),),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ChapterRewriteConflictError(
+                            "formal candidate changed during rewrite commit"
+                        )
                 self._pause_mainline(conn, novel_id)
 
         return self._load_chapter(novel_id, chapter_number, chapter)

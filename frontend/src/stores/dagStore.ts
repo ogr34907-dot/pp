@@ -198,15 +198,6 @@ export const useDAGStore = defineStore('dag', () => {
     }
   }
 
-  async function toggleNode(novelId: string, nodeId: string) {
-    try {
-      const dag = await dagApi.toggleNode(novelId, nodeId)
-      dagDefinition.value = dag
-    } catch (e: unknown) {
-      error.value = e instanceof Error ? e.message : '切换节点状态失败'
-    }
-  }
-
   // ─── SSE 事件处理 ───
 
   function normalizeNumericMetrics(metrics?: Record<string, unknown>): Record<string, number> {
@@ -286,24 +277,6 @@ export const useDAGStore = defineStore('dag', () => {
     viewMode.value = mode
   }
 
-  /** 更新节点运行参数（NodeEditorDrawer 使用，DAG 本身不提供编辑 UI） */
-  async function updateNodeConfig(novelId: string, nodeId: string, config: Record<string, unknown>) {
-    try {
-      // ★ 暂时直接更新内存中的 DAG 定义（不走数据库）
-      const node = dagDefinition.value?.nodes.find(n => n.id === nodeId)
-      if (node && dagDefinition.value) {
-        // 合并配置
-        if (config.temperature !== undefined) node.config.temperature = config.temperature as number
-        if (config.max_tokens !== undefined) node.config.max_tokens = config.max_tokens as number | null
-        if (config.timeout_seconds !== undefined) node.config.timeout_seconds = config.timeout_seconds as number
-        if (config.max_retries !== undefined) node.config.max_retries = config.max_retries as number
-        if (config.model_override !== undefined) node.config.model_override = config.model_override as string | null
-      }
-    } catch (e: unknown) {
-      error.value = e instanceof Error ? e.message : '更新节点配置失败'
-    }
-  }
-
   function resetNodeStates() {
     nodeStates.value.clear()
     edgeFlows.value.clear()
@@ -343,8 +316,6 @@ export const useDAGStore = defineStore('dag', () => {
     hydrateDagForNovel,
     loadDAG,
     loadNodeTypeRegistry,
-    toggleNode,
-    updateNodeConfig,
     handleSSEEvent,
     selectNode,
     switchView,

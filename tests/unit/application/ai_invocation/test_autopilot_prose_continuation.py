@@ -46,6 +46,9 @@ class _Db:
                 status TEXT NOT NULL,
                 PRIMARY KEY (novel_id, chapter_number)
             );
+            CREATE TABLE novel_generation_runs (
+                novel_id TEXT PRIMARY KEY
+            );
             CREATE TABLE novels (
                 id TEXT PRIMARY KEY,
                 autopilot_status TEXT DEFAULT 'running',
@@ -116,7 +119,7 @@ def test_autopilot_beat_prose_commit_is_idempotent(monkeypatch):
     }
 
 
-def test_autopilot_full_chapter_accept_completes_once_and_moves_to_audit(monkeypatch):
+def test_autopilot_full_chapter_continuation_pauses_before_candidate_run_exists(monkeypatch):
     db = _Db()
     _patch_db(monkeypatch, db)
     register_autopilot_continuations()
@@ -136,8 +139,7 @@ def test_autopilot_full_chapter_accept_completes_once_and_moves_to_audit(monkeyp
         accepted_content="完整章节正文。",
     )
 
-    execute_continuation(ContinuationContext(session=session, decision=decision))
-    execute_continuation(ContinuationContext(session=session, decision=decision))
+    result = execute_continuation(ContinuationContext(session=session, decision=decision))
 
     chapter = db.fetch_one("SELECT content, status, word_count FROM chapters WHERE novel_id = ? AND number = ?", ("novel-1", 2))
     novel = db.fetch_one(
@@ -147,12 +149,51 @@ def test_autopilot_full_chapter_accept_completes_once_and_moves_to_audit(monkeyp
         """,
         ("novel-1",),
     )
-    assert chapter == {"content": "完整章节正文。", "status": "completed", "word_count": 7}
+    assert result["reason"] == "candidate_first_required"
+    assert chapter is None
     assert novel == {
-        "current_stage": "auditing",
-        "current_auto_chapters": 1,
-        "current_chapter_in_act": 1,
+        "current_stage": "paused_for_review",
+        "current_auto_chapters": 0,
+        "current_chapter_in_act": 0,
         "current_beat_index": 0,
+    }
+
+
+def test_autopilot_full_chapter_continuation_pauses_for_candidate_first_run(monkeypatch):
+    db = _Db()
+    db.execute("INSERT INTO novel_generation_runs (novel_id) VALUES ('novel-1')")
+    db.commit()
+    _patch_db(monkeypatch, db)
+    register_autopilot_continuations()
+    session = InvocationSession(
+        id="session-candidate-first",
+        operation="autopilot.chapter.prose",
+        node_key="chapter-prose-generation",
+        policy=InvocationPolicy.AUTOPILOT_PAUSE,
+        status=InvocationSessionStatus.AWAITING_COMMIT,
+        context={"novel_id": "novel-1", "chapter_number": 3, "beat_index": 0},
+        continuation=ContinuationRef(handler_key="autopilot_prose_generation"),
+    )
+    decision = AdoptionDecision(
+        id="decision-candidate-first",
+        session_id="session-candidate-first",
+        attempt_id="attempt-candidate-first",
+        accepted_content="旧任务迟到的完整章节正文。",
+    )
+
+    result = execute_continuation(ContinuationContext(session=session, decision=decision))
+
+    assert result["reason"] == "candidate_first_required"
+    assert db.fetch_one(
+        "SELECT content FROM chapters WHERE novel_id = ? AND number = ?",
+        ("novel-1", 3),
+    ) is None
+    assert db.fetch_one(
+        "SELECT autopilot_status, current_stage FROM novels WHERE id = ?",
+        ("novel-1",),
+    ) == {
+        "autopilot_status": "stopped",
+        "current_stage": "paused_for_review",
     }
 
 
@@ -187,7 +228,7 @@ def test_autopilot_draft_write_allows_draft_and_rejects_formal_bypass(monkeypatc
         "novel-1", 11, "旁路覆盖", append=False, status="completed"
     )
     assert result["skipped"] is True
-    assert "ChapterRewriteCoordinator" in result["reason"]
+    assert result["reason"] == "candidate_first_required"
     assert db.fetch_one(
         "SELECT content FROM chapters WHERE novel_id = ? AND number = ?",
         ("novel-1", 11),

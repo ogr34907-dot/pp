@@ -95,7 +95,8 @@ class StructurePreference(BaseModel):
 
 class MacroPlanRequest(BaseModel):
     """宏观规划请求"""
-    target_chapters: int = Field(100, ge=10, le=1000)
+    # Compatibility input only. Persisted novels.target_chapters is authoritative.
+    target_chapters: Optional[int] = Field(None, ge=1, le=1000)
     structure: StructurePreference = Field(default_factory=StructurePreference)
 
 
@@ -166,25 +167,16 @@ async def stream_macro_plan_sse(
       event: error    data: {message}
     """
 
+    try:
+        service.require_persisted_target_chapters(novel_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
     async def _generate():
         runtime_settings = get_planning_runtime_settings()
-        # ─── 读取 target_chapters ───────────────────────────────────
-        target_chapters = 100
-        try:
-            from application.paths import get_db_path
-            from infrastructure.persistence.database.connection import get_database
-            _db = get_database(get_db_path())
-            _row = _db.fetch_one(
-                "SELECT target_chapters FROM novels WHERE id = ?", (novel_id,)
-            )
-            if _row and _row["target_chapters"]:
-                target_chapters = int(_row["target_chapters"])
-        except Exception:
-            pass
-
         yield _sse("status", {"phase": "start", "message": "正在初始化宏观规划…", "percent": 0})
 
         service.initialize_macro_plan_task(novel_id)
@@ -192,7 +184,6 @@ async def stream_macro_plan_sse(
         task: asyncio.Task = asyncio.create_task(
             service.generate_macro_plan(
                 novel_id=novel_id,
-                target_chapters=target_chapters,
                 structure_preference=None,
             )
         )
@@ -309,14 +300,14 @@ async def generate_macro_plan(
     """
     try:
         print(f"[DEBUG] 路由层: 收到请求 novel_id={novel_id}, request={request}")
+        service.require_persisted_target_chapters(novel_id)
         service.initialize_macro_plan_task(novel_id)
 
         async def _generate_task():
             try:
                 result = await service.generate_macro_plan(
                     novel_id=novel_id,
-                    target_chapters=request.target_chapters,
-                    structure_preference=request.structure.dict()
+                    structure_preference=request.structure.model_dump()
                 )
                 service.store_macro_plan_result(novel_id, result)
             except Exception as e:
@@ -336,6 +327,8 @@ async def generate_macro_plan(
             "task_started": True,
             "novel_id": novel_id,
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         import traceback
         print(f"[ERROR] 生成宏观规划失败:")

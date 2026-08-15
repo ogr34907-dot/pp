@@ -36,7 +36,12 @@ router = APIRouter(prefix="/generation", tags=["candidate-generation"])
 
 class StartGenerationRequest(BaseModel):
     run_mode: str = "continuous"
-    target_chapters: int = Field(..., ge=1, le=100000)
+    # Compatibility input only: the persisted novel setting owns the endpoint.
+    target_chapters: int | None = Field(default=None, ge=1, le=100000)
+
+
+class LegacyFormalHistoryImportRequest(BaseModel):
+    confirm: bool = False
 
 
 class ContentRequest(BaseModel):
@@ -162,10 +167,24 @@ def start_generation_run(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="run_mode must be continuous or chapter_review") from exc
         preflight.ensure_startable(novel_id)
-        run = repository.start_run(novel_id, run_mode=mode, target_chapters=body.target_chapters)
+        run = repository.start_run(novel_id, run_mode=mode)
         return {"success": True, "data": _run_to_dict(run)}
     except HTTPException:
         raise
+    except Exception as exc:
+        _raise_candidate_error(exc)
+
+
+@router.post("/novels/{novel_id}/legacy-formal-history/import")
+def import_legacy_formal_history(
+    novel_id: str,
+    body: LegacyFormalHistoryImportRequest,
+    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
+):
+    try:
+        if not body.confirm:
+            raise ValueError("explicit confirmation is required")
+        return {"success": True, "data": repository.import_legacy_formal_history(novel_id)}
     except Exception as exc:
         _raise_candidate_error(exc)
 

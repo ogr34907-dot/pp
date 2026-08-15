@@ -132,6 +132,77 @@ async def test_chapter_ai_review_service_marks_missing_event_coverage_unverified
 
 
 @pytest.mark.asyncio
+async def test_event_evidence_normalizes_format_only_and_preserves_semantic_boundaries():
+    event = "本章完成证据核验"
+    positive_cases = [
+        ("沈岚\r\n在第12章交出证据", "沈岚\n在第12章交出证据"),
+        ("沈岚\r在第12章交出证据", "沈岚\n在第12章交出证据"),
+        ("沈岚\n在第12章交出证据", "沈岚\r\n在第12章交出证据"),
+        ("沈岚  在第12章交出证据", "沈岚 在第12章交出证据"),
+        ("沈岚在第１２章交出Ａ证据", "沈岚在第12章交出A证据"),
+    ]
+    negative_cases = [
+        ("沈岚交出,证据", "沈岚交出，证据"),
+        ('他说"沈岚交出证据"', "他说“沈岚交出证据”"),
+        ("沈岚没有交出证据", "沈岚交出证据"),
+        ("证据由沈岚保管，随后离开", "随后离开，证据由沈岚保管"),
+    ]
+
+    actual_positive = []
+    for content, evidence in positive_cases:
+        result = await ChapterAIReviewService(
+            FakeLLM(
+                {
+                    "status": "approved",
+                    "score": 90,
+                    "summary": "证据已核验。",
+                    "suggestions": ["保留正文行动证据。"],
+                    "event_coverage": [
+                        {"event": event, "status": "completed", "evidence": evidence}
+                    ],
+                }
+            )
+        ).review(
+            chapter_number=6,
+            chapter_title="证据核验",
+            chapter_content=content,
+            required_events=[event],
+        )
+        actual_positive.append(result.event_coverage[0])
+
+    actual_negative = []
+    for content, evidence in negative_cases:
+        result = await ChapterAIReviewService(
+            FakeLLM(
+                {
+                    "status": "approved",
+                    "score": 90,
+                    "summary": "证据需要继续核验。",
+                    "suggestions": ["保留正文行动证据。"],
+                    "event_coverage": [
+                        {"event": event, "status": "completed", "evidence": evidence}
+                    ],
+                }
+            )
+        ).review(
+            chapter_number=6,
+            chapter_title="证据核验",
+            chapter_content=content,
+            required_events=[event],
+        )
+        actual_negative.append(result.event_coverage[0])
+
+    assert actual_positive == [
+        {"event": event, "status": "completed", "evidence": evidence}
+        for _content, evidence in positive_cases
+    ]
+    assert actual_negative == [
+        {"event": event, "status": "unverified", "evidence": ""}
+        for _content, _evidence in negative_cases
+    ]
+
+
+@pytest.mark.asyncio
 async def test_transition_rhythm_can_pass_without_a_climax_when_progress_and_handoff_are_evidenced():
     llm = FakeLLM(
         {

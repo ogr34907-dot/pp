@@ -18,6 +18,9 @@ from infrastructure.persistence.database.outline_contract_repository import (
 )
 
 
+_STREAM_DELTA_FLUSH_CHARS = 512
+
+
 class OutlineDraftGenerationError(ValueError):
     """A generation result cannot safely become an outline draft."""
 
@@ -48,7 +51,7 @@ class OutlineDraftGenerationService:
     async def stream_generate_draft(
         self, contract_id: str, *, retry_attempt_id: str | None = None
     ) -> AsyncIterator[dict[str, Any]]:
-        """Persist each stream event so reconnecting authors see the real attempt."""
+        """Persist bounded stream batches while preserving responsive live deltas."""
 
         slot = self.repository.get_slot(contract_id)
         prompt = self._build_prompt(slot)
@@ -64,6 +67,19 @@ class OutlineDraftGenerationService:
         )
         attempt_id = attempt["id"]
         terminal = False
+        pending_delta_parts: list[str] = []
+        pending_delta_chars = 0
+
+        def flush_pending_delta() -> None:
+            nonlocal pending_delta_chars
+            if not pending_delta_parts:
+                return
+            self.repository.append_generation_attempt_delta(
+                attempt_id, "".join(pending_delta_parts)
+            )
+            pending_delta_parts.clear()
+            pending_delta_chars = 0
+
         try:
             yield {
                 "type": "started",
@@ -75,8 +91,12 @@ class OutlineDraftGenerationService:
             async for chunk in self.llm_service.stream_generate(prompt, GenerationConfig(temperature=0.7)):
                 text = str(chunk or "")
                 if text:
-                    self.repository.append_generation_attempt_delta(attempt_id, text)
+                    pending_delta_parts.append(text)
+                    pending_delta_chars += len(text)
+                    if pending_delta_chars >= _STREAM_DELTA_FLUSH_CHARS:
+                        flush_pending_delta()
                     yield {"type": "delta", "attempt_id": attempt_id, "text": text, "level": slot.level.value}
+            flush_pending_delta()
             persisted = self.repository.get_generation_attempt(attempt_id)
             drafted = self._save_generated(slot, persisted["accumulated_text"])
             completed = self.repository.complete_generation_attempt(
@@ -94,6 +114,7 @@ class OutlineDraftGenerationService:
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
+            flush_pending_delta()
             if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
                 self.repository.cancel_generation_attempt(attempt_id)
                 terminal = True
@@ -108,6 +129,12 @@ class OutlineDraftGenerationService:
     def _build_prompt(self, slot: OutlineContractSlot) -> Prompt:
         parent_context = self._published_parent_context(slot)
         sibling_context = self._previous_sibling_context(slot)
+        bible_context = self._root_bible_context(slot.novel_id) if slot.level.value == "outline" else {}
+        bible_prompt_context = (
+            f"作者 Bible（仅总纲事实约束）：{json.dumps(bible_context, ensure_ascii=False, sort_keys=True)}\n"
+            if bible_context
+            else ""
+        )
         novel = self.db.get_connection().execute(
             "SELECT title, premise, target_chapters FROM novels WHERE id = ?", (slot.novel_id,)
         ).fetchone()
@@ -129,6 +156,7 @@ class OutlineDraftGenerationService:
             f"创意：{novel['premise'] or ''}\n"
             f"目标章节数：{novel['target_chapters'] or 0}\n"
             f"现在只生成：{level_label}\n"
+            f"{bible_prompt_context}"
             f"已发布父级契约：{json.dumps(parent_context, ensure_ascii=False, sort_keys=True)}\n\n"
             f"上一同级已发布交接：{json.dumps(sibling_context, ensure_ascii=False, sort_keys=True)}\n\n"
             "JSON 至少包含 title、narrative_text、creative_goal、entry_state、exit_state、"
@@ -146,6 +174,41 @@ class OutlineDraftGenerationService:
                 "setup/reveal 必须有可观察推进，不能只解释设定。"
             )
         return Prompt(system=system, user=user)
+
+    def _root_bible_context(self, novel_id: str) -> dict[str, list[dict[str, str]]]:
+        """Read the existing Bible aggregate without creating another context authority."""
+
+        conn = self.db.get_connection()
+        if conn.execute("SELECT 1 FROM bibles WHERE novel_id = ?", (novel_id,)).fetchone() is None:
+            return {}
+        tables = (
+            ("world_settings", "bible_world_settings"),
+            ("characters", "unified_characters"),
+            ("locations", "bible_locations"),
+        )
+        context: dict[str, list[dict[str, str]]] = {}
+        for key, table in tables:
+            rows = conn.execute(
+                f"SELECT name, description FROM {table} WHERE novel_id = ? ORDER BY id LIMIT 5",
+                (novel_id,),
+            ).fetchall()
+            if rows:
+                context[key] = [
+                    {"name": str(row["name"] or ""), "description": str(row["description"] or "")}
+                    for row in rows
+                ]
+        timeline_rows = conn.execute(
+            "SELECT event AS name, description FROM bible_timeline_notes "
+            "WHERE novel_id = ? AND COALESCE(source_type, 'bible') = 'bible' "
+            "ORDER BY sort_order, id LIMIT 5",
+            (novel_id,),
+        ).fetchall()
+        if timeline_rows:
+            context["timeline_notes"] = [
+                {"name": str(row["name"] or ""), "description": str(row["description"] or "")}
+                for row in timeline_rows
+            ]
+        return context
 
     def _published_parent_context(self, slot: OutlineContractSlot) -> list[dict[str, Any]]:
         """Walk only active synced ancestors, rejecting stale/draft parent access."""

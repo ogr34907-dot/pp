@@ -327,7 +327,26 @@ class ContextBudgetAllocator:
         slots: Dict[str, ContextSlot],
         compression_log: List[str],
     ) -> None:
+        fact_lock = slots.get("fact_lock")
+        if fact_lock and fact_lock.content.strip():
+            compact = self._compact_fact_lock_content(
+                fact_lock.content,
+                fact_lock.max_tokens,
+            )
+            if not compact:
+                raise ContextBudgetExceededError(
+                    "context budget cannot fit a complete FACT_LOCK fact row"
+                )
+            fact_lock.content = compact
+            fact_lock.tokens = self.estimate_tokens(compact)
+            fact_lock.min_tokens = fact_lock.tokens
+            compression_log.append(
+                f"FACT_LOCK 完整事实行压缩至 {fact_lock.tokens} tokens"
+            )
+
         for name, slot in slots.items():
+            if name == "fact_lock":
+                continue
             if slot.max_tokens is None or slot.max_tokens < 0 or slot.tokens <= slot.max_tokens:
                 continue
             original_tokens = slot.tokens
@@ -336,6 +355,40 @@ class ContextBudgetAllocator:
             compression_log.append(
                 f"槽位上限 {name}: {original_tokens} → {slot.tokens} tokens"
             )
+
+    def _compact_fact_lock_content(
+        self,
+        content: str,
+        max_tokens: Optional[int],
+    ) -> str:
+        """Keep complete FACT_LOCK lines before generic slot compression."""
+        value = str(content or "").strip()
+        if not value or max_tokens is None or max_tokens < 0:
+            return value
+        if self.estimate_tokens(value) <= max_tokens:
+            return value
+
+        fact_rows = [
+            line
+            for line in value.splitlines()
+            if line.strip()
+            and (line[:1].isspace() or line.lstrip().startswith("[第"))
+        ]
+        kept: List[str] = []
+        for line in value.splitlines():
+            candidate = "\n".join([*kept, line])
+            if self.estimate_tokens(candidate) <= max_tokens:
+                kept.append(line)
+        if fact_rows and not any(line in fact_rows for line in kept):
+            return next(
+                (
+                    line.strip()
+                    for line in fact_rows
+                    if self.estimate_tokens(line.strip()) <= max_tokens
+                ),
+                "",
+            )
+        return "\n".join(kept).strip()
 
     def _ensure_critical_header_can_fit(
         self,
@@ -588,6 +641,15 @@ class ContextBudgetAllocator:
         for slot in candidates:
             if allocation.used_tokens <= allocation.total_budget or not slot.content.strip():
                 continue
+            if slot.min_tokens > 0:
+                if slot.tokens < slot.min_tokens:
+                    raise ContextBudgetExceededError(
+                        f"context slot {slot.name!r} fell below its minimum floor "
+                        f"({slot.tokens} < {slot.min_tokens} tokens)"
+                    )
+                # A positive floor is a complete protected block.  Compress
+                # lower-priority slots first and never add an ellipsis here.
+                continue
             floor = protected_t3.get(id(slot), 0)
             if floor and slot.tokens <= floor:
                 deferred_protected_t3.append(slot)
@@ -749,11 +811,9 @@ class ContextBudgetAllocator:
         )
 
         # ── T0-5: 编辑手记（CONTEXT_BRIEF）—— priority=100 ──
-        # V9 核心创新：用一段自然语言"编辑手记"替代 8 个结构化 T0 槽位
-        # 合并：SCARS + DEBT_DUE + BRIDGE_DIRECTIVE + PREVIOUSLY_ON +
-        #        COMPLETED_BEATS(精简) + REVEALED_CLUES(精简) +
-        #        ACTIVE_ENTITY_MEMORY + CHARACTER_STATE_LOCK
-        # 设计哲学：一段自然语言比 8 个 === xxx === 分隔符更容易被 LLM 融入创作
+        # CONTEXT_BRIEF 只承载作者指令、前章 bridge、少量角色与债务软提示；
+        # completed beats、revealed clues 和 active memory 由各自权威槽位提供，
+        # 不在这里复制，避免小预算下重复挤占正文上下文。
         context_brief = self._build_context_brief(novel_id, chapter_number, outline)
         slots["context_brief"] = ContextSlot(
             name="编辑手记(CONTEXT_BRIEF)",
@@ -1128,13 +1188,10 @@ class ContextBudgetAllocator:
         chapter_number: int,
         outline: str,
     ) -> str:
-        """V9 减法改革核心：构建自然语言编辑手记
+        """构建作者指令、bridge、少量角色与债务的自然语言软提示。
 
-        替代原来 8 个独立的 T0 结构化槽位（SCARS/DEBT/BRIDGE/PREVIOUSLY_ON/
-        COMPLETED_BEATS/REVEALED_CLUES/ACTIVE_ENTITY_MEMORY/CHARACTER_STATE_LOCK），
-        用一段 200-400 字的自然语言"编辑手记"告诉 AI 当前状态。
-
-        用户手写的 generation_hint 作为最高优先级约束前置插入，直接覆盖自动推断。
+        完成节拍、揭露线索和 active memory 不在此重复；用户手写的
+        generation_hint 作为最高优先级约束前置插入。
         """
         return build_context_brief(
             context_assembler=self.context_assembler,
@@ -2676,15 +2733,8 @@ class ContextBudgetAllocator:
     # ==================== V7 全局收敛沙漏方法 ====================
     
     def _estimate_total_chapters(self, novel_id: str) -> int:
-        """估算目标总章节数
-        
-        优先级：
-        1. 结构树根节点（part）的 chapter_end 字段
-        2. 各 part 节点 suggested_chapter_count 之和
-        3. 已有最大章节号 × 1.2（保守估算，假设已完成 80%+）
-        4. 兜底返回 100
-        """
-        return estimate_total_chapters(self.story_node_repo, novel_id)
+        """读取 Novel 聚合上的权威目标总章节数。"""
+        return estimate_total_chapters(self.novel_repository, novel_id)
     
     # Phase 3: 沙漏阶段默认阈值
     _DEFAULT_PHASE_THRESHOLDS = DEFAULT_PHASE_THRESHOLDS
@@ -2710,8 +2760,7 @@ class ContextBudgetAllocator:
     def _build_lifecycle_directive(self, novel_id: str, chapter_number: int) -> str:
         """构建生命周期行为准则文本（指令来自 CPMS lifecycle-phase-directives）。"""
         return build_lifecycle_directive(
-            story_node_repository=self.story_node_repo,
-            novel_id=novel_id,
+            target_chapters=self._estimate_total_chapters(novel_id),
             chapter_number=chapter_number,
             thresholds=self._phase_thresholds,
             registry=get_prompt_registry(),

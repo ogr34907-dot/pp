@@ -84,6 +84,55 @@ async def test_ai_draft_is_json_normalized_and_uses_only_synced_parent_context(t
 
 
 @pytest.mark.asyncio
+async def test_root_outline_prompt_includes_author_bible_but_child_uses_published_parent(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "outline-root-bible.db"))
+    db.execute("INSERT INTO novels (id, title, slug) VALUES ('novel-1', '大纲小说', 'outline-root-bible')")
+    db.execute("INSERT INTO bibles (id, novel_id) VALUES ('bible-1', 'novel-1')")
+    db.execute(
+        "INSERT INTO bible_world_settings (id, novel_id, name, description) "
+        "VALUES ('world-1', 'novel-1', '灵潮规则', '灵脉枯竭后不得无代价施法')"
+    )
+    db.execute(
+        "INSERT INTO unified_characters (id, novel_id, name, description) "
+        "VALUES ('character-1', 'novel-1', '沈烬', '为救妹妹不得不与仇家同行')"
+    )
+    db.execute(
+        "INSERT INTO bible_locations (id, novel_id, name, description) "
+        "VALUES ('location-1', 'novel-1', '落日城', '最后一座仍能交易灵石的边城')"
+    )
+    db.execute(
+        "INSERT INTO bible_timeline_notes (id, novel_id, event, time_point, description) "
+        "VALUES ('timeline-1', 'novel-1', '灵潮枯竭', '三年前', '沈烬失去修为后才踏上复仇路')"
+    )
+    db.get_connection().commit()
+    repo = OutlineContractRepository(db)
+    root = repo.ensure_root("novel-1")
+    llm = _LLM('{"title":"总纲","creative_goal":"让沈烬付出代价"}')
+    service = OutlineDraftGenerationService(repo, llm, db)
+
+    drafted = await service.generate_draft(root.id)
+
+    root_prompt = llm.prompts[-1].user
+    assert "灵潮规则" in root_prompt
+    assert "沈烬" in root_prompt
+    assert "落日城" in root_prompt
+    assert "不得无代价施法" in root_prompt
+    assert "灵潮枯竭" in root_prompt
+
+    repo.publish_and_sync(root.id, expected_revision=drafted.draft.revision)
+    child = repo.create_contract(
+        novel_id="novel-1", level=OutlineLevel.PART, parent_contract_id=root.id
+    )
+    llm.content = '{"title":"第一部","narrative_text":"承接总纲"}'
+    await service.generate_draft(child.id)
+
+    child_prompt = llm.prompts[-1].user
+    assert "总纲" in child_prompt
+    assert "灵潮规则" not in child_prompt
+    assert "灵潮枯竭" not in child_prompt
+
+
+@pytest.mark.asyncio
 async def test_outline_draft_requires_a_json_object(tmp_path):
     db = DatabaseConnection(str(tmp_path / "outline-draft-invalid.db"))
     db.execute("INSERT INTO novels (id, title, slug) VALUES ('novel-1', '大纲小说', 'outline-draft-invalid')")
@@ -175,8 +224,134 @@ async def test_streaming_outline_draft_persists_replayable_attempt_events(tmp_pa
     persisted = repo.get_generation_attempt(attempt_id, after_sequence=1)
     assert persisted["status"] == "completed"
     assert persisted["accumulated_text"] == '{"title":"流式总纲","creative_goal":"推进"}'
-    assert [event["type"] for event in persisted["events"]] == ["delta", "delta", "completed"]
+    assert [event["type"] for event in persisted["events"]] == ["delta", "completed"]
+    assert persisted["events"][0]["text"] == '{"title":"流式总纲","creative_goal":"推进"}'
     assert persisted["draft_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_outline_delta_commits_once_and_preserves_text_and_events(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "outline-stream-commit-count.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', '大纲小说', 'outline-stream-commit-count')"
+    )
+    db.get_connection().commit()
+    repo = OutlineContractRepository(db)
+    root = repo.ensure_root("novel-1")
+    sql_trace: list[str] = []
+    db.get_connection().set_trace_callback(sql_trace.append)
+    llm = _StreamingLLM(['{"title":"流式', '总纲","creative_goal":"推进"}'])
+
+    events = [event async for event in OutlineDraftGenerationService(repo, llm, db).stream_generate_draft(root.id)]
+
+    attempt_id = events[0]["attempt_id"]
+    persisted = repo.get_generation_attempt(attempt_id)
+    assert [event["type"] for event in events] == ["started", "delta", "delta", "completed"]
+    assert persisted["status"] == "completed"
+    assert persisted["accumulated_text"] == '{"title":"流式总纲","creative_goal":"推进"}'
+    assert [event["type"] for event in persisted["events"]] == ["started", "delta", "completed"]
+    assert [event["text"] for event in persisted["events"] if event["type"] == "delta"] == [
+        '{"title":"流式总纲","creative_goal":"推进"}',
+    ]
+    assert events[-1]["payload"]["title"] == "流式总纲"
+
+    # Fixed non-delta commits: start attempt, started event, draft, terminal event.
+    # The two live fragments share one durable delta transaction.
+    commit_count = sum(1 for statement in sql_trace if statement.strip().upper() == "COMMIT")
+    assert commit_count == 5
+
+
+@pytest.mark.asyncio
+async def test_streaming_outline_batches_tiny_deltas_without_losing_live_or_durable_text(tmp_path):
+    """A thousand provider fragments must not become a thousand SQLite commits."""
+
+    db = DatabaseConnection(str(tmp_path / "outline-stream-batched.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', '大纲小说', 'outline-stream-batched')"
+    )
+    db.get_connection().commit()
+    repo = OutlineContractRepository(db)
+    root = repo.ensure_root("novel-1")
+    payload = '{"title":"' + ("长" * 1000) + '","creative_goal":"推进"}'
+    sql_trace: list[str] = []
+    db.get_connection().set_trace_callback(sql_trace.append)
+
+    events = [
+        event
+        async for event in OutlineDraftGenerationService(
+            repo, _StreamingLLM(list(payload)), db
+        ).stream_generate_draft(root.id)
+    ]
+
+    attempt_id = events[0]["attempt_id"]
+    persisted = repo.get_generation_attempt(attempt_id)
+    durable_deltas = [event for event in persisted["events"] if event["type"] == "delta"]
+    commit_count = sum(1 for statement in sql_trace if statement.strip().upper() == "COMMIT")
+
+    assert "".join(event["text"] for event in events if event["type"] == "delta") == payload
+    assert persisted["accumulated_text"] == payload
+    assert 1 < len(durable_deltas) < 10
+    assert commit_count < 20
+
+
+def test_streaming_outline_delta_event_failure_rolls_back_text(tmp_path, monkeypatch):
+    db = DatabaseConnection(str(tmp_path / "outline-stream-delta-rollback.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', '大纲小说', 'outline-stream-delta-rollback')"
+    )
+    db.get_connection().commit()
+    repo = OutlineContractRepository(db)
+    root = repo.ensure_root("novel-1")
+    attempt = repo.start_generation_attempt(
+        root.id,
+        prompt_snapshot={"system": "outline", "user": "draft"},
+        context_digest="outline-delta-rollback",
+    )
+
+    def fail_delta_event(*_args, **_kwargs):
+        raise RuntimeError("delta event write failed")
+
+    monkeypatch.setattr(repo, "_append_generation_attempt_event", fail_delta_event)
+
+    with pytest.raises(RuntimeError, match="delta event write failed"):
+        repo.append_generation_attempt_delta(attempt["id"], "未完成片段")
+
+    persisted = repo.get_generation_attempt(attempt["id"])
+    assert persisted["accumulated_text"] == ""
+    assert [event["type"] for event in persisted["events"]] == ["started"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_failure_does_not_leave_completed_status_without_event(
+    tmp_path, monkeypatch
+):
+    db = DatabaseConnection(str(tmp_path / "outline-stream-terminal-rollback.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', '大纲小说', 'outline-stream-terminal-rollback')"
+    )
+    db.get_connection().commit()
+    repo = OutlineContractRepository(db)
+    root = repo.ensure_root("novel-1")
+    original_append_event = repo._append_generation_attempt_event
+
+    def fail_completed_event(attempt_id, event, **kwargs):
+        if event.get("type") == "completed":
+            raise RuntimeError("completed event write failed")
+        return original_append_event(attempt_id, event, **kwargs)
+
+    monkeypatch.setattr(repo, "_append_generation_attempt_event", fail_completed_event)
+    llm = _StreamingLLM(['{"title":"终态大纲","creative_goal":"推进"}'])
+
+    events = [event async for event in OutlineDraftGenerationService(repo, llm, db).stream_generate_draft(root.id)]
+
+    attempt = repo.get_generation_attempt(events[0]["attempt_id"])
+    slot = repo.get_slot(root.id)
+    assert slot.draft is not None
+    assert slot.active is None
+    assert attempt["status"] == "failed"
+    assert [event["type"] for event in attempt["events"]] == ["started", "delta", "error"]
+    assert all(event["type"] != "completed" for event in attempt["events"])
+    assert events[-1]["type"] == "error"
 
 
 @pytest.mark.asyncio

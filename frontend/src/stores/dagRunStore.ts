@@ -1,19 +1,18 @@
 /**
- * DAG 运行状态管理 — 运行控制、历史记录、SSE 事件连接
+ * DAG 运行状态管理 — 权威状态投影、历史记录、SSE 事件连接
  */
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref } from 'vue'
 import type { DAGRunResult, DAGStatusResponse, NodeEvent, NodeStatus } from '@/types/dag'
 import { dagApi } from '@/api/dag'
 import { autopilotApi } from '@/api/autopilot'
 import { runtimePerformance } from '@/config/performance'
 
-export type DAGRunStatus = 'idle' | 'running' | 'stopping' | 'completed' | 'error'
+export type DAGRunStatus = 'idle' | 'running' | 'completed' | 'error'
 
 export const useDAGRunStore = defineStore('dagRun', () => {
   // ─── 运行状态 ───
   const runStatus = ref<DAGRunStatus>('idle')
-  const currentRunId = ref<string | null>(null)
   const dagEnabled = ref(false)
   const currentVersion = ref(0)
 
@@ -34,39 +33,6 @@ export const useDAGRunStore = defineStore('dagRun', () => {
   let _lastEventId: string | null = null
   const _seenEventIds = new Set<string>()
   const maxSeenEventIds = Math.max(100, runtimePerformance.dagSse.maxQueueSize * 4)
-
-  // ─── 计算属性 ───
-  const isRunning = computed(() => runStatus.value === 'running')
-  const canStart = computed(() => runStatus.value === 'idle' || runStatus.value === 'completed' || runStatus.value === 'error')
-  const canStop = computed(() => runStatus.value === 'running')
-
-  // ─── 运行控制 ───
-
-  async function startRun(novelId: string) {
-    if (!canStart.value) return
-    try {
-      runStatus.value = 'running'
-      const result = await dagApi.runDAG(novelId)
-      currentRunId.value = result.novel_id
-    } catch (e: unknown) {
-      runStatus.value = 'error'
-      sseError.value = e instanceof Error ? e.message : '启动运行失败'
-      throw e
-    }
-  }
-
-  async function stopRun(novelId: string) {
-    if (!canStop.value) return
-    try {
-      runStatus.value = 'stopping'
-      await dagApi.stopDAG(novelId)
-      runStatus.value = 'idle'
-    } catch (e: unknown) {
-      sseError.value = e instanceof Error ? e.message : '停止运行失败'
-      // 即使停止失败，也标记为 idle 以避免 UI 卡住
-      runStatus.value = 'idle'
-    }
-  }
 
   async function fetchStatus(novelId: string) {
     try {
@@ -374,7 +340,6 @@ export const useDAGRunStore = defineStore('dagRun', () => {
 
   function resetForNovel(novelId: string) {
     runStatus.value = 'idle'
-    currentRunId.value = null
     latestResult.value = null
     nodeStates.value = {}
     sseError.value = null
@@ -387,7 +352,6 @@ export const useDAGRunStore = defineStore('dagRun', () => {
   return {
     // State
     runStatus,
-    currentRunId,
     dagEnabled,
     currentVersion,
     nodeStates,
@@ -396,14 +360,7 @@ export const useDAGRunStore = defineStore('dagRun', () => {
     sseConnected,
     sseError,
 
-    // Computed
-    isRunning,
-    canStart,
-    canStop,
-
     // Actions
-    startRun,
-    stopRun,
     fetchStatus,
     connectSSE,
     disconnectSSE,

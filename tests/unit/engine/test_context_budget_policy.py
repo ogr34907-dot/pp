@@ -1,4 +1,10 @@
-from application.engine.services.context_budget_models import ContextSlot, PriorityTier
+import pytest
+
+from application.engine.services.context_budget_models import (
+    ContextBudgetExceededError,
+    ContextSlot,
+    PriorityTier,
+)
 from application.engine.services.context_budget_policy import allocate_tier, truncate_t0_slots
 
 
@@ -57,7 +63,7 @@ def test_allocate_tier_applies_slot_maximum_before_tier_budget():
     assert slots["capped"].content == "限" * 10
 
 
-def test_truncate_t0_slots_stops_at_first_overflowing_slot():
+def test_truncate_t0_slots_allocates_remaining_budget_to_floor_free_slots():
     slots = {
         "first": ContextSlot(
             name="first",
@@ -84,6 +90,28 @@ def test_truncate_t0_slots_stops_at_first_overflowing_slot():
     assert used == 15
     assert slots["first"].tokens == 10
     assert slots["second"].tokens == 5
-    assert slots["second"].content.endswith("...")
+    assert slots["second"].content == "二" * 5
     assert slots["third"].tokens == 0
     assert slots["third"].content == ""
+
+
+def test_truncate_t0_slots_fails_closed_when_declared_floors_exceed_budget():
+    slots = {
+        "fact_lock": ContextSlot(
+            name="fact_lock",
+            tier=PriorityTier.T0_CRITICAL,
+            content="甲" * 10,
+            tokens=10,
+            min_tokens=10,
+        ),
+        "required_bridge": ContextSlot(
+            name="required_bridge",
+            tier=PriorityTier.T0_CRITICAL,
+            content="乙" * 10,
+            tokens=10,
+            min_tokens=10,
+        ),
+    }
+
+    with pytest.raises(ContextBudgetExceededError, match="cannot fit T0 minimum floors"):
+        truncate_t0_slots(slots, 15, chars_per_token_zh=1.0)

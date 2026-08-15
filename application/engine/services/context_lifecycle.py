@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from domain.novel.target_chapters import positive_integer_or_none
+from domain.novel.value_objects.novel_id import NovelId
 from engine.core.entities.story import StoryPhase
 
 logger = logging.getLogger(__name__)
@@ -16,38 +18,22 @@ DEFAULT_PHASE_THRESHOLDS: Dict[str, float] = {
 }
 
 
-def estimate_total_chapters(story_node_repository: Any, novel_id: str) -> int:
-    """Estimate target chapter count from the story structure."""
-    if not story_node_repository:
-        return 100
-
+def estimate_total_chapters(novel_repository: Any, novel_id: str) -> int:
+    """Load the authoritative full-book target from the Novel aggregate."""
+    if novel_repository is None:
+        raise ValueError("novels.target_chapters must be a positive integer")
     try:
-        nodes = story_node_repository.get_by_novel_sync(novel_id)
-        if not nodes:
-            return 100
-
-        part_nodes = [node for node in nodes if node.node_type.value == "part"]
-        for part in part_nodes:
-            if part.chapter_end and part.chapter_end > 0:
-                return part.chapter_end
-
-        total_suggested = sum(
-            (part.suggested_chapter_count or 0)
-            for part in part_nodes
-            if part.suggested_chapter_count
-        )
-        if total_suggested > 0:
-            return total_suggested
-
-        chapter_nodes = [node for node in nodes if node.node_type.value == "chapter"]
-        if chapter_nodes:
-            max_chapter = max(node.number for node in chapter_nodes)
-            if max_chapter > 0:
-                return max(int(max_chapter * 1.2), max_chapter + 10)
+        novel = novel_repository.get_by_id(NovelId(novel_id))
     except Exception as exc:
-        logger.warning("估算总章节数失败: %s", exc)
-
-    return 100
+        raise ValueError(
+            "novels.target_chapters could not be loaded"
+        ) from exc
+    target_chapters = positive_integer_or_none(
+        getattr(novel, "target_chapters", None)
+    )
+    if target_chapters is None:
+        raise ValueError("novels.target_chapters must be a positive integer")
+    return target_chapters
 
 
 def load_phase_thresholds(
@@ -101,15 +87,16 @@ def get_phase_directives(registry: Any, prompt_id: str) -> Dict[StoryPhase, str]
 
 def build_lifecycle_directive(
     *,
-    story_node_repository: Any,
-    novel_id: str,
+    target_chapters: int,
     chapter_number: int,
     thresholds: Dict[str, float],
     registry: Any,
     prompt_id: str,
 ) -> str:
     """Render the lifecycle behavior directive block."""
-    total = estimate_total_chapters(story_node_repository, novel_id)
+    total = positive_integer_or_none(target_chapters)
+    if total is None:
+        raise ValueError("novels.target_chapters must be a positive integer")
     progress = chapter_number / max(total, 1)
     phase = classify_phase(progress, thresholds)
 

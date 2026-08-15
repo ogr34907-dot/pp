@@ -15,6 +15,22 @@ from application.blueprint.services.setup_plot_outline_continuation import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _persisted_targets(monkeypatch):
+    targets = {
+        "novel-1": 80,
+        "novel-legacy": 50,
+        "novel-short-legacy": 100,
+        "novel-custom-binding": 100,
+        "novel-extra": 40,
+    }
+    monkeypatch.setattr(
+        "application.blueprint.services.setup_plot_outline_continuation._persisted_target_chapters",
+        lambda novel_id: targets.get(novel_id, 100),
+        raising=False,
+    )
+
+
 def test_setup_plot_outline_continuation_returns_normalized_outline():
     overview = (
         "主角在旧秩序里原本还能拖延核心问题，但一次外部冲击把隐患提前推到台前。"
@@ -67,6 +83,73 @@ def test_setup_plot_outline_continuation_returns_normalized_outline():
     assert result["plot_outline"]["stage_plan"][-1]["chapter_end"] == 80
     assert result["expected_ending"]
     assert result["core_conflict"]
+
+
+def test_setup_plot_outline_continuation_ignores_stale_session_target(monkeypatch):
+    session = InvocationSession(
+        id="session-stale-target",
+        operation="setup.plot_outline",
+        node_key="planning-plot-outline",
+        policy=InvocationPolicy.FULL_INTERACTIVE,
+        context={"novel_id": "novel-stale", "setup_context": {"target_chapters": 20}},
+        continuation=ContinuationRef(handler_key="setup_plot_outline"),
+        variable_plan=VariablePlan(aliases={"novel.target_chapters": 30}),
+    )
+    decision = AdoptionDecision(
+        id="decision-stale-target",
+        session_id=session.id,
+        attempt_id="attempt-stale-target",
+        accepted_content=(
+            '{"plot_outline":{"main_story_overview":"主角在持续升级的危机中承担代价并完成主线。",'
+            '"stage_plan":['
+            '{"phase":"opening","summary":"开篇"},'
+            '{"phase":"development","summary":"发展"},'
+            '{"phase":"deepening","summary":"深化"},'
+            '{"phase":"climax","summary":"高潮"},'
+            '{"phase":"ending","summary":"收尾"}],'
+            '"expected_ending":"完成结局。","core_conflict":"主角与旧秩序冲突。"}}'
+        ),
+    )
+    monkeypatch.setattr(
+        "application.blueprint.services.setup_plot_outline_continuation._persisted_target_chapters",
+        lambda _novel_id: 120,
+        raising=False,
+    )
+
+    result = setup_plot_outline_handler(ContinuationContext(session=session, decision=decision))
+
+    assert result["plot_outline"]["stage_plan"][-1]["chapter_end"] == 120
+
+
+def test_setup_plot_outline_rejects_invalid_target_before_output_binding_work(monkeypatch):
+    session = InvocationSession(
+        id="session-invalid-persisted-target",
+        operation="setup.plot_outline",
+        node_key="planning-plot-outline",
+        policy=InvocationPolicy.FULL_INTERACTIVE,
+        context={"novel_id": "novel-invalid", "setup_context": {"target_chapters": 100}},
+        continuation=ContinuationRef(handler_key="setup_plot_outline"),
+        variable_plan=VariablePlan(aliases={"novel.target_chapters": 100}),
+    )
+    decision = AdoptionDecision(
+        id="decision-invalid-persisted-target",
+        session_id=session.id,
+        attempt_id="attempt-invalid-persisted-target",
+        accepted_content='{"plot_outline": {}}',
+    )
+    monkeypatch.setattr(
+        "application.blueprint.services.setup_plot_outline_continuation._persisted_target_chapters",
+        lambda _novel_id: (_ for _ in ()).throw(
+            ValueError("novels.target_chapters must be a positive integer")
+        ),
+    )
+    monkeypatch.setattr(
+        "application.blueprint.services.setup_plot_outline_continuation._parse_json_object",
+        lambda _raw: pytest.fail("accepted output must not be parsed"),
+    )
+
+    with pytest.raises(ValueError, match="target_chapters"):
+        setup_plot_outline_handler(ContinuationContext(session=session, decision=decision))
 
 
 def test_setup_plot_outline_continuation_accepts_legacy_outline_shape():

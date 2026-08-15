@@ -50,9 +50,9 @@ async def test_candidate_context_nodes_are_read_only_and_preserve_published_outl
         assert result.status.value in {"success", "warning"}
         outputs.update(result.outputs)
 
-    assert outputs["world_rules"] == "已发布五级大纲"
+    assert "world_rules" not in outputs
     assert "旧承诺" in outputs["foreshadowing_block"]
-    assert outputs["fact_lock"] == "已发布五级大纲"
+    assert "fact_lock" not in outputs
 
 
 @pytest.mark.asyncio

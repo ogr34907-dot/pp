@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import json
 from typing import Any, Protocol, Union
 
@@ -94,19 +95,39 @@ class WorldlineRebuildService:
         else:
             rows = conn.execute(
                 """
-                SELECT c.number, c.content, c.content_sha256, c.content_revision, c.outline
+                SELECT c.number, c.content, c.content_sha256, c.content_revision, c.outline,
+                       commit_record.candidate_id,
+                       commit_record.content_sha256 AS authority_content_sha256,
+                       commit_record.content_revision AS authority_content_revision
                 FROM chapter_candidate_formal_commits AS commit_record
                 JOIN chapter_candidates AS candidate ON candidate.id = commit_record.candidate_id
                 JOIN chapters AS c ON c.id = commit_record.chapter_id
                 WHERE commit_record.novel_id = ?
-                  AND commit_record.sync_status = 'ready'
-                  AND candidate.status = 'committed'
+                  AND (
+                    (commit_record.sync_status = 'ready' AND candidate.status = 'committed')
+                    OR (
+                      commit_record.provenance = 'author_rewrite'
+                      AND commit_record.sync_status = 'syncing'
+                      AND candidate.status = 'syncing'
+                    )
+                  )
                   AND c.status = 'completed'
                   AND TRIM(COALESCE(c.content, '')) <> ''
                 ORDER BY c.number
                 """,
                 (novel_id,),
             ).fetchall()
+            for row in rows:
+                actual_sha256 = hashlib.sha256(
+                    str(row["content"] or "").encode("utf-8")
+                ).hexdigest()
+                if (
+                    str(row["content_sha256"] or "") != actual_sha256
+                    or str(row["authority_content_sha256"] or "") != actual_sha256
+                    or int(row["content_revision"] or 0)
+                    != int(row["authority_content_revision"] or 0)
+                ):
+                    raise WorldlineRebuildError("formal chapter authority mismatch")
 
         prefix = []
         for row in rows:
@@ -139,12 +160,31 @@ class WorldlineRebuildService:
 
         job = conn.execute(
             "SELECT archive_id FROM worldline_rebuild_jobs "
-            "WHERE novel_id = ? AND generation_epoch = ? "
-            "AND archive_id IS NOT NULL LIMIT 1",
+            "WHERE novel_id = ? AND generation_epoch = ? LIMIT 1",
             (novel_id, epoch),
         ).fetchone()
-        if job is None or not job["archive_id"]:
+        if job is None:
             raise WorldlineRebuildError("rebuild_archive_missing")
+        if not job["archive_id"]:
+            author_rewrite = conn.execute(
+                """
+                SELECT 1
+                FROM chapter_candidate_formal_commits AS formal_commit
+                JOIN chapter_candidates AS candidate ON candidate.id = formal_commit.candidate_id
+                JOIN chapters AS chapter ON chapter.id = formal_commit.chapter_id
+                WHERE formal_commit.novel_id = ?
+                  AND formal_commit.provenance = 'author_rewrite'
+                  AND formal_commit.sync_status = 'syncing'
+                  AND candidate.status = 'syncing'
+                  AND formal_commit.content_sha256 = chapter.content_sha256
+                  AND formal_commit.content_revision = chapter.content_revision
+                LIMIT 1
+                """,
+                (novel_id,),
+            ).fetchone()
+            if author_rewrite is None:
+                raise WorldlineRebuildError("rebuild_archive_missing")
+            return
         archive_id = str(job["archive_id"])
         retained = max((int(row["number"]) for row in rows), default=0)
         if retained == 0:
@@ -388,6 +428,29 @@ class WorldlineRebuildService:
             raise WorldlineRebuildError(failure) from exc
         now = self._now()
         self._ensure_epoch(conn, novel_id, epoch)
+        for chapter in rows:
+            if "candidate_id" not in chapter.keys():
+                continue
+            candidate_id = str(chapter["candidate_id"] or "")
+            if not candidate_id:
+                continue
+            conn.execute(
+                """
+                UPDATE chapter_candidate_formal_commits
+                SET sync_status = 'ready', failure_reason = '', synced_at = ?
+                WHERE candidate_id = ? AND provenance = 'author_rewrite'
+                  AND sync_status = 'syncing'
+                """,
+                (now, candidate_id),
+            )
+            conn.execute(
+                """
+                UPDATE chapter_candidates
+                SET status = 'committed', failure_reason = '', updated_at = ?
+                WHERE id = ? AND status = 'syncing'
+                """,
+                (now, candidate_id),
+            )
         conn.execute(
             """
             UPDATE worldline_rebuild_jobs

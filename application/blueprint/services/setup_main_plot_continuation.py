@@ -11,20 +11,28 @@ from application.ai_invocation.output_binding_resolution import (
     parse_accepted_json,
 )
 from application.blueprint.services.setup_main_plot_suggestion_service import (
+    MainPlotSuggestionContractError,
     normalize_main_plot_options,
     normalize_main_plot_options_data,
+)
+from application.blueprint.services.setup_target_authority import (
+    load_persisted_target_chapters as _persisted_target_chapters,
 )
 
 
 def _context_from_session(context: ContinuationContext) -> dict[str, Any]:
+    novel_id = str(context.session.context.get("novel_id") or "")
+    try:
+        target_chapters = _persisted_target_chapters(novel_id)
+    except ValueError as exc:
+        raise MainPlotSuggestionContractError("目标章节数无效") from exc
     raw = context.session.context.get("setup_context")
     setup_context = dict(raw) if isinstance(raw, Mapping) else {}
     aliases = context.session.variable_plan.aliases if context.session.variable_plan is not None else {}
     if not isinstance(aliases, Mapping):
         aliases = {}
-
     return {
-        "target_chapters": aliases.get("novel.target_chapters", setup_context.get("target_chapters", 100)),
+        "target_chapters": target_chapters,
         "fusion_axis": setup_context.get("fusion_axis", {}),
         "fusion_contract": aliases.get("plot.fusion_contract", setup_context.get("fusion_contract", "")),
         "protagonist": aliases.get("characters.protagonist", {}),

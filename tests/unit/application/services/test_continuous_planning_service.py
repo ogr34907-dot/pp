@@ -12,6 +12,7 @@ from application.blueprint.services.continuous_planning_service import (
     _extract_outer_json_value,
     _incremental_macro_parts_trustworthy,
     _try_parse_parts_from_llm_buffer,
+    calculate_structure_params,
     get_macro_plan_progress,
 )
 from application.blueprint.services.chapter_planning_policy import (
@@ -142,6 +143,105 @@ def test_quick_macro_prompt_for_long_book_uses_leading_volume_detail():
     assert "后续卷的幕节点留给写作过程中动态生成" in prompt.system
     assert "开篇前导卷标题" in prompt.user
     assert "前 1-2 部" not in prompt.system
+
+
+@pytest.mark.parametrize("target_chapters", [None, 0, -1, 1.5, "not-a-number"])
+def test_calculate_structure_params_rejects_invalid_target_chapters(target_chapters):
+    with pytest.raises(ValueError, match="目标章节数"):
+        calculate_structure_params(target_chapters)
+
+
+@pytest.mark.parametrize("target_chapters", [None, 0, -1])
+def test_minimal_macro_structure_rejects_invalid_target_chapters(target_chapters):
+    with pytest.raises(ValueError, match="目标章节数"):
+        _make_service().build_minimal_macro_structure(target_chapters)
+
+
+@pytest.mark.asyncio
+async def test_resolve_act_planning_requires_persisted_target_before_defaulting():
+    act = _story_node("act-1", NodeType.ACT, 1, parent_id="volume-1")
+    service = ContinuousPlanningService(
+        story_node_repo=SimpleNamespace(
+            get_by_id=AsyncMock(return_value=act),
+            get_by_novel=AsyncMock(return_value=[act]),
+        ),
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+        novel_repository=SimpleNamespace(
+            get_by_id=Mock(return_value=SimpleNamespace(target_chapters=0))
+        ),
+    )
+
+    with pytest.raises(ValueError, match="目标章节数"):
+        await service.resolve_act_planning_chapter_count(act.id)
+
+
+@pytest.mark.asyncio
+async def test_create_next_act_requires_persisted_target_before_invoking_llm():
+    volume = _story_node("volume-1", NodeType.VOLUME, 1)
+    current = _story_node("act-1", NodeType.ACT, 1, parent_id=volume.id)
+    service, story_repo = _next_act_service([volume, current], target_chapters=0)
+
+    with pytest.raises(ValueError, match="目标章节数"):
+        await service.create_next_act_auto("novel-1", current.id)
+
+    assert story_repo.saved == []
+    service._generate_next_act_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generate_macro_plan_uses_persisted_target_instead_of_caller_value():
+    service = ContinuousPlanningService(
+        story_node_repo=Mock(),
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+        novel_repository=SimpleNamespace(
+            get_by_id=Mock(return_value=SimpleNamespace(target_chapters=12))
+        ),
+    )
+    service._get_bible_context = Mock(return_value={})
+    service._generate_precise_macro_plan = AsyncMock(return_value={"parts": []})
+    service._evaluate_macro_plan_quality = Mock(return_value={})
+
+    await service.generate_macro_plan(
+        "novel-1",
+        target_chapters=999,
+        structure_preference={"parts": 1, "volumes_per_part": 1, "acts_per_volume": 1},
+    )
+
+    service._generate_precise_macro_plan.assert_awaited_once_with(
+        novel_id="novel-1",
+        bible_context={},
+        target_chapters=12,
+        structure_preference={"parts": 1, "volumes_per_part": 1, "acts_per_volume": 1},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_chapters", [None, 0, True, 1.5, "invalid"])
+async def test_generate_macro_plan_rejects_invalid_persisted_target_before_side_effects(
+    target_chapters,
+):
+    service = ContinuousPlanningService(
+        story_node_repo=Mock(),
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+        novel_repository=SimpleNamespace(
+            get_by_id=Mock(return_value=SimpleNamespace(target_chapters=target_chapters))
+        ),
+    )
+    service._clear_macro_llm_stream = Mock()
+    service._update_macro_progress = Mock()
+    service._get_bible_context = Mock()
+    service._stream_macro_llm_text = AsyncMock()
+
+    with pytest.raises(ValueError, match="目标章节数"):
+        await service.generate_macro_plan("novel-1", target_chapters=100)
+
+    service._clear_macro_llm_stream.assert_not_called()
+    service._update_macro_progress.assert_not_called()
+    service._get_bible_context.assert_not_called()
+    service._stream_macro_llm_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -966,6 +1066,9 @@ async def test_generate_macro_plan_precise_mode_repairs_missing_act_fields_and_r
         story_node_repo=Mock(),
         chapter_element_repo=Mock(),
         llm_service=llm_service,
+        novel_repository=SimpleNamespace(
+            get_by_id=Mock(return_value=SimpleNamespace(target_chapters=100))
+        ),
     )
     svc._get_bible_context = Mock(return_value={})
 
@@ -1303,7 +1406,9 @@ async def test_create_next_act_creates_the_next_act_after_passing_preflight():
     assert len(story_repo.saved) == 1
     assert story_repo.saved[0].parent_id == volume.id
     assert story_repo.saved[0].number == 2
-    service._generate_next_act_info.assert_awaited_once()
+    service._generate_next_act_info.assert_awaited_once_with(
+        "novel-1", current, {}, 30
+    )
 
 
 def test_parse_llm_response_logs_safe_metadata_without_raw_planning_content(

@@ -5,6 +5,7 @@ import logging
 from typing import Any, Dict, List, Mapping
 
 from domain.novel.entities.novel import Novel, NovelStage, AutopilotStatus
+from domain.novel.target_chapters import positive_integer_or_none
 from domain.structure.story_node import StoryNode, NodeType, PlanningStatus, PlanningSource
 from application.engine.services.hierarchical_narrative_alignment_gate import (
     HierarchicalNarrativeAlignmentGate,
@@ -196,6 +197,20 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
     if not host._is_still_running(novel):
         return
 
+    target_chapters = positive_integer_or_none(
+        getattr(novel, "target_chapters", None)
+    )
+    if target_chapters is None:
+        novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+        novel.autopilot_status = AutopilotStatus.STOPPED
+        host._update_shared_state(
+            novel.novel_id.value,
+            current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+            autopilot_pause_reason="target_chapters_required",
+        )
+        host._flush_novel(novel)
+        return
+
     host._update_shared_state(
         novel.novel_id.value,
         writing_substep="act_planning",
@@ -207,7 +222,6 @@ async def run_act_planning(host: Any, novel: Novel) -> None:
 
     from application.blueprint.services.continuous_planning_service import calculate_structure_params
 
-    target_chapters = novel.target_chapters or 100
     struct_params = calculate_structure_params(target_chapters)
     rec_chapters_per_act = struct_params["chapters_per_act"]
     rec_acts_per_volume = struct_params["acts_per_volume"]

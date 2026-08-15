@@ -580,7 +580,7 @@ class OutlineContractRepository:
         return self.get_generation_attempt(attempt_id)
 
     def _append_generation_attempt_event(
-        self, attempt_id: str, event: dict[str, Any]
+        self, attempt_id: str, event: dict[str, Any], *, commit: bool = True
     ) -> None:
         conn = self._connection()
         row = conn.execute(
@@ -609,7 +609,8 @@ class OutlineContractRepository:
                 self._now(),
             ),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
     def append_generation_attempt_delta(self, attempt_id: str, text: str) -> dict[str, Any]:
         """Persist a streamed delta before it is exposed to a reconnecting client."""
@@ -624,16 +625,24 @@ class OutlineContractRepository:
             raise KeyError(f"outline generation attempt not found: {attempt_id}")
         if row["status"] != "running":
             raise OutlineGateError("outline generation attempt is no longer running")
-        conn.execute(
-            """
-            UPDATE outline_generation_attempts
-            SET accumulated_text = accumulated_text || ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (text, self._now(), attempt_id),
-        )
-        conn.commit()
-        self._append_generation_attempt_event(attempt_id, {"type": "delta", "text": text})
+        try:
+            conn.execute(
+                """
+                UPDATE outline_generation_attempts
+                SET accumulated_text = accumulated_text || ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (text, self._now(), attempt_id),
+            )
+            self._append_generation_attempt_event(
+                attempt_id,
+                {"type": "delta", "text": text},
+                commit=False,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return self.get_generation_attempt(attempt_id)
 
     def complete_generation_attempt(
@@ -670,21 +679,25 @@ class OutlineContractRepository:
         if row["status"] != "running":
             return self.get_generation_attempt(attempt_id)
         now = self._now()
-        conn.execute(
-            """
-            UPDATE outline_generation_attempts
-            SET status = ?, draft_revision = ?, error = ?, completed_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (status, draft_revision, error, now, now, attempt_id),
-        )
-        conn.commit()
         event = {"type": "completed" if status == "completed" else ("cancelled" if status == "cancelled" else "error")}
         if draft_revision is not None:
             event["draft_revision"] = draft_revision
         if error:
             event["message"] = error
-        self._append_generation_attempt_event(attempt_id, event)
+        try:
+            conn.execute(
+                """
+                UPDATE outline_generation_attempts
+                SET status = ?, draft_revision = ?, error = ?, completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, draft_revision, error, now, now, attempt_id),
+            )
+            self._append_generation_attempt_event(attempt_id, event, commit=False)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return self.get_generation_attempt(attempt_id)
 
     def get_generation_attempt(

@@ -8,7 +8,10 @@ import pytest
 
 from application.engine.services.chapter_aftermath_pipeline import ChapterAftermathPipeline
 from application.engine.services.memory_engine import MemoryEngine
-from application.engine.services.worldline_rebuild_service import WorldlineRebuildService
+from application.engine.services.worldline_rebuild_service import (
+    WorldlineRebuildError,
+    WorldlineRebuildService,
+)
 from application.engine.services.worldline_regeneration_service import WorldlineRegenerationService
 from application.world.services.knowledge_service import KnowledgeService
 from infrastructure.persistence.database.connection import DatabaseConnection
@@ -160,6 +163,70 @@ async def test_rebuild_replays_retained_prefix_before_mode_can_resume(tmp_path):
     )["total"] == 5
 
 
+def test_candidate_first_rebuild_rejects_chapter_version_outside_formal_authority(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-authority-mismatch.db"))
+    _seed(db)
+    conn = db.get_connection()
+    accepted_hash = hashlib.sha256("正文1".encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO chapter_candidates "
+        "(id, novel_id, chapter_number, generation_epoch, status, llm_content) "
+        "VALUES ('candidate-1', 'novel-1', 1, 0, 'committed', '正文1')"
+    )
+    conn.execute(
+        "INSERT INTO chapter_candidate_formal_commits "
+        "(candidate_id, novel_id, chapter_number, chapter_id, content_sha256, "
+        "content_revision, provenance, sync_status) "
+        "VALUES ('candidate-1', 'novel-1', 1, 'chapter-1', ?, 1, 'candidate_commit', 'ready')",
+        (accepted_hash,),
+    )
+    conn.execute(
+        "UPDATE chapters SET content = '越权正文', content_sha256 = ?, content_revision = 2 "
+        "WHERE id = 'chapter-1'",
+        (hashlib.sha256("越权正文".encode("utf-8")).hexdigest(),),
+    )
+    conn.commit()
+
+    with pytest.raises(WorldlineRebuildError, match="formal chapter authority mismatch"):
+        WorldlineRebuildService._retained_formal_chapters(conn, "novel-1")
+
+
+@pytest.mark.asyncio
+async def test_rebuild_promotes_author_rewrite_authority_only_after_replay(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-author-rewrite.db"))
+    _seed(db)
+    conn = db.get_connection()
+    content_hash = hashlib.sha256("正文1".encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO chapter_candidates "
+        "(id, novel_id, chapter_number, generation_epoch, status, llm_content) "
+        "VALUES ('candidate-1', 'novel-1', 1, 0, 'syncing', '旧候选正文')"
+    )
+    conn.execute(
+        "INSERT INTO chapter_candidate_formal_commits "
+        "(candidate_id, novel_id, chapter_number, chapter_id, content_sha256, "
+        "content_revision, provenance, sync_status) "
+        "VALUES ('candidate-1', 'novel-1', 1, 'chapter-1', ?, 1, "
+        "'author_rewrite', 'syncing')",
+        (content_hash,),
+    )
+    conn.commit()
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="chapter_review")
+
+    result = await WorldlineRebuildService(db, _Aftermath(db)).rebuild("novel-1")
+
+    assert result["status"] == "completed"
+    assert db.fetch_one(
+        "SELECT sync_status FROM chapter_candidate_formal_commits "
+        "WHERE candidate_id = 'candidate-1'"
+    )["sync_status"] == "ready"
+    assert db.fetch_one(
+        "SELECT status FROM chapter_candidates WHERE id = 'candidate-1'"
+    )["status"] == "committed"
+
+
 @pytest.mark.asyncio
 async def test_cancelled_rebuild_cannot_resume_or_overwrite_the_new_epoch(tmp_path):
     db = DatabaseConnection(str(tmp_path / "worldline-rebuild-cancel.db"))
@@ -270,9 +337,10 @@ async def test_rebuild_real_aftermath_restores_prefix_state_after_reset(tmp_path
         )
         conn.execute(
             "INSERT INTO chapter_candidate_formal_commits "
-            "(candidate_id, novel_id, chapter_number, chapter_id, sync_status) "
-            "VALUES (?, 'novel-1', ?, ?, 'ready')",
-            (candidate_id, number, f"chapter-{number}"),
+            "(candidate_id, novel_id, chapter_number, chapter_id, content_sha256, "
+            "content_revision, provenance, sync_status) "
+            "VALUES (?, 'novel-1', ?, ?, ?, 1, 'candidate_commit', 'ready')",
+            (candidate_id, number, f"chapter-{number}", content_hash),
         )
     conn.commit()
 
@@ -310,14 +378,20 @@ async def test_rebuild_real_aftermath_restores_prefix_state_after_reset(tmp_path
                 content=json.dumps(
                     {
                         "completed_beats": [
-                            {"beat_id": f"{prefix}-beat", "summary": f"第{chapter}章状态", "chapter": chapter}
+                            {
+                                "beat_id": f"{prefix}-beat",
+                                "summary": f"第{chapter}章关键选择",
+                                "chapter": chapter,
+                                "evidence_text": f"第{chapter}章关键选择",
+                            }
                         ],
                         "revealed_clues": [
                             {
                                 "clue_id": f"{prefix}-clue",
-                                "content": f"第{chapter}章线索",
+                                "content": f"第{chapter}章关键选择",
                                 "revealed_at_chapter": chapter,
                                 "category": "truth",
+                                "evidence_text": f"第{chapter}章关键选择",
                             }
                         ],
                         "fact_violations": [],
@@ -343,7 +417,7 @@ async def test_rebuild_real_aftermath_restores_prefix_state_after_reset(tmp_path
                     "character_name": "hero",
                     "mutation_type": "motivation",
                     "source_event": f"第{chapter_number}章关键选择",
-                    "impact_or_description": f"第{chapter_number}章状态",
+                    "impact_or_description": content.split("；", 1)[-1],
                     "sensitivity_tags_or_priority": 8,
                     "evidence_text": content,
                 }
@@ -488,3 +562,36 @@ async def test_rebuild_real_aftermath_restores_prefix_state_after_reset(tmp_path
         )["state_json"]
     )
     assert [item["beat_id"] for item in retry_memory["completed_beats"]].count("prefix-beat") == 1
+
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM worldline_archive_entries "
+        "WHERE archive_id = ? AND source_table = 'chapter_candidate_formal_commits'",
+        (reset_result.archive_id,),
+    )["total"] == 1
+    restored = reset.restore(
+        "novel-1",
+        archive_id=reset_result.archive_id,
+        run_mode="chapter_review",
+    )
+    assert restored.generation_epoch == 2
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM chapter_candidate_formal_commits "
+        "WHERE novel_id = 'novel-1' AND chapter_number = 2"
+    )["total"] == 1
+
+    memory.llm_service.calls = 0
+    restored_result = await WorldlineRebuildService(db, pipeline).rebuild("novel-1")
+
+    assert restored_result["status"] == "completed"
+    assert db.fetch_one(
+        "SELECT last_updated_chapter FROM memory_engine_state WHERE novel_id = 'novel-1'"
+    )["last_updated_chapter"] == 2
+    restored_run = db.fetch_one(
+        "SELECT state, canonical_sync_status, next_action FROM novel_generation_runs "
+        "WHERE novel_id = 'novel-1'"
+    )
+    assert (
+        restored_run["state"],
+        restored_run["canonical_sync_status"],
+        restored_run["next_action"],
+    ) == ("paused", "ready", "select_run_mode")

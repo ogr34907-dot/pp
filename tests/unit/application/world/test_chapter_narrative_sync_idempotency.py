@@ -1,5 +1,6 @@
 import hashlib
 import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,6 +13,8 @@ from domain.novel.entities.chapter import Chapter
 from domain.novel.value_objects.novel_id import NovelId
 
 from application.world.services.chapter_narrative_sync import (
+    _try_resolve_causal_edges,
+    persist_bundle_extras,
     persist_bundle_triples_and_foreshadows,
     persist_causal_edges,
     persist_character_end_states,
@@ -109,6 +112,26 @@ class _DebtRepo:
 
     def mark_overdue_batch(self, novel_id, chapter_number):
         return 0
+
+
+class _StorylineRepo:
+    def __init__(self):
+        self.storylines = []
+
+    def get_by_novel_id(self, _novel_id):
+        return list(self.storylines)
+
+    def save(self, storyline):
+        if storyline not in self.storylines:
+            self.storylines.append(storyline)
+
+
+class _NarrativeEventRepo:
+    def __init__(self):
+        self.events = {}
+
+    def upsert_event(self, **event):
+        self.events[event["event_id"]] = event
 
 
 def _canonical_bundle(summary="章末摘要"):
@@ -246,12 +269,16 @@ def test_terminal_recovery_reclaims_only_expired_stale_or_in_progress_claims(tmp
 
 
 def test_chapter_narrative_artifacts_are_idempotent_across_audit_retries():
+    content = (
+        "林澈持有铜铃。铜铃将在雨夜响起。铜铃丢失，林澈追查真相。"
+        "林澈因铜铃丢失而执念追查真相，林澈在章末仍保持警觉。"
+    )
     bundle = {
-        "relation_triples": [{"data": {"subject": "林澈", "predicate": "持有", "object": "铜铃"}, "status": "pending"}],
-        "foreshadow_hints": [{"data": {"description": "铜铃将在雨夜响起", "suggested_resolve_offset": 3, "importance": "high"}}],
-        "causal_edges": [{"data": {"source_event": "铜铃丢失", "target_event": "林澈追查真相", "causal_type": "motivates", "strength": 0.8}}],
-        "character_mutations": [{"data": {"character_name": "林澈", "mutation_type": "motivation", "source_event": "铜铃丢失", "impact_or_description": "追查真相", "sensitivity_tags_or_priority": 8}}],
-        "character_states": [{"character_name": "林澈", "mental_state": "警觉"}],
+        "relation_triples": [{"data": {"subject": "林澈", "predicate": "持有", "object": "铜铃", "evidence_text": "林澈持有铜铃"}, "status": "pending"}],
+        "foreshadow_hints": [{"data": {"description": "铜铃将在雨夜响起", "suggested_resolve_offset": 3, "importance": "high", "evidence_text": "铜铃将在雨夜响起"}}],
+        "causal_edges": [{"data": {"source_event": "铜铃丢失", "target_event": "林澈追查真相", "causal_type": "motivates", "strength": 0.8, "evidence_text": "铜铃丢失，林澈追查真相"}}],
+        "character_mutations": [{"data": {"character_name": "林澈", "mutation_type": "motivation", "source_event": "铜铃丢失", "impact_or_description": "追查真相", "sensitivity_tags_or_priority": 8, "evidence_text": "林澈因铜铃丢失而执念追查真相"}}],
+        "character_states": [{"character_name": "林澈", "mental_state": "警觉", "evidence_text": "林澈在章末仍保持警觉"}],
     }
     triple_repo = _TripleRepo()
     foreshadow_repo = _ForeshadowRepo()
@@ -260,11 +287,11 @@ def test_chapter_narrative_artifacts_are_idempotent_across_audit_retries():
     debt_repo = _DebtRepo()
 
     for _ in range(2):
-        persist_bundle_triples_and_foreshadows("novel-1", 4, bundle, triple_repo, foreshadow_repo)
-        persist_causal_edges("novel-1", 4, bundle, causal_repo)
-        persist_character_mutations("novel-1", 4, bundle, state_repo)
-        persist_character_end_states("novel-1", 4, bundle, state_repo)
-        update_narrative_debts("novel-1", 4, bundle, debt_repo, causal_repo)
+        persist_bundle_triples_and_foreshadows("novel-1", 4, bundle, triple_repo, foreshadow_repo, content=content)
+        persist_causal_edges("novel-1", 4, bundle, causal_repo, content=content)
+        persist_character_mutations("novel-1", 4, bundle, state_repo, content=content)
+        persist_character_end_states("novel-1", 4, bundle, state_repo, content=content)
+        update_narrative_debts("novel-1", 4, bundle, debt_repo, causal_repo, content=content)
 
     assert len(triple_repo._kr.rows) == 1
     assert len(foreshadow_repo.registry.foreshadowings) == 1
@@ -273,6 +300,164 @@ def test_chapter_narrative_artifacts_are_idempotent_across_audit_retries():
     state = state_repo.states[("novel-1", "林澈")]
     assert len(state.motivations) == 1
     assert len(state.emotional_arc) == 1
+
+
+def test_narrative_debts_reject_negated_evidence():
+    debt_repo = _DebtRepo()
+    bundle = {
+        "causal_edges": [
+            {
+                "data": {
+                    "source_event": "杀死反派甲",
+                    "target_event": "林澈复仇完成",
+                    "strength": 0.9,
+                    "evidence_text": "林澈没有杀死反派甲",
+                }
+            }
+        ],
+        "character_mutations": [
+            {
+                "data": {
+                    "character_name": "林澈",
+                    "mutation_type": "motivation",
+                    "source_event": "杀死反派甲",
+                    "impact_or_description": "复仇完成后的轻松",
+                    "sensitivity_tags_or_priority": 9,
+                    "evidence_text": "林澈没有杀死反派甲",
+                }
+            }
+        ],
+    }
+
+    assert (
+        update_narrative_debts(
+            "novel-1",
+            4,
+            bundle,
+            debt_repo,
+            content="林澈没有杀死反派甲，仍把刀收回鞘中。",
+        )
+        == 0
+    )
+    assert debt_repo.debts == {}
+
+
+def test_consumed_foreshadow_requires_object_evidence():
+    from domain.novel.value_objects.foreshadowing import (
+        Foreshadowing,
+        ForeshadowingStatus,
+        ImportanceLevel,
+    )
+
+    repo = _ForeshadowRepo()
+    registry = repo.get_by_novel_id(NovelId("novel-1"))
+    registry.register(
+        Foreshadowing(
+            id="rain-bell",
+            planted_in_chapter=1,
+            description="铜铃将在雨夜响起",
+            importance=ImportanceLevel.HIGH,
+            status=ForeshadowingStatus.PLANTED,
+        )
+    )
+    content = "雨夜里，铜铃终于响起，守门人现身。"
+
+    persist_bundle_triples_and_foreshadows(
+        "novel-1",
+        4,
+        {
+            "consumed_foreshadows": [
+                {
+                    "description": "铜铃将在雨夜响起",
+                    "evidence_text": "雨夜里，铜铃终于响起",
+                }
+            ]
+        },
+        None,
+        repo,
+        content=content,
+    )
+
+    assert repo.registry.foreshadowings[0].status == ForeshadowingStatus.RESOLVED
+
+
+def test_consumed_foreshadow_rejects_a_reworded_pending_description():
+    """A prose quote cannot compensate for identifying the wrong pending clue."""
+    from domain.novel.value_objects.foreshadowing import (
+        Foreshadowing,
+        ForeshadowingStatus,
+        ImportanceLevel,
+    )
+
+    repo = _ForeshadowRepo()
+    registry = repo.get_by_novel_id(NovelId("novel-1"))
+    registry.register(
+        Foreshadowing(
+            id="rain-bell",
+            planted_in_chapter=1,
+            description="铜铃雨夜响起",
+            importance=ImportanceLevel.HIGH,
+            status=ForeshadowingStatus.PLANTED,
+        )
+    )
+    content = "铜铃雨夜响起的伏笔终于应验。"
+
+    persist_bundle_triples_and_foreshadows(
+        "novel-1",
+        4,
+        {
+            "consumed_foreshadows": [
+                {
+                    "description": "铜铃雨夜响起的伏笔",
+                    "evidence_text": "铜铃雨夜响起的伏笔终于应验",
+                }
+            ]
+        },
+        None,
+        repo,
+        content=content,
+    )
+
+    assert repo.registry.foreshadowings[0].status == ForeshadowingStatus.PLANTED
+
+
+def test_causal_resolution_requires_an_affirmative_final_text_match():
+    from domain.novel.value_objects.causal_edge import CausalEdge
+
+    repo = _CausalRepo()
+    edge = CausalEdge(
+        id="kill-edge",
+        novel_id="novel-1",
+        source_event_summary="反派甲威胁林澈",
+        source_chapter=1,
+        target_event_summary="林澈杀死反派甲",
+    )
+    repo.save(edge)
+    bundle = {"summary": "林澈杀死反派甲", "key_events": "击杀反派甲"}
+
+    assert (
+        _try_resolve_causal_edges(
+            "novel-1",
+            4,
+            bundle,
+            repo,
+            content="林澈没有杀死反派甲，仍把刀收回鞘中。",
+        )
+        == 0
+    )
+    assert not repo.edges["kill-edge"].is_resolved
+
+    assert (
+        _try_resolve_causal_edges(
+            "novel-1",
+            4,
+            bundle,
+            repo,
+            content="林澈杀死反派甲，血迹很快被雨水冲淡。",
+        )
+        == 1
+    )
+    assert repo.edges["kill-edge"].is_resolved
 
 
 def test_narrative_event_upsert_uses_stable_event_id(tmp_path):
@@ -293,6 +478,54 @@ def test_narrative_event_upsert_uses_stable_event_id(tmp_path):
     rows = db.fetch_all("SELECT * FROM narrative_events WHERE novel_id = ?", ("novel-1",))
     assert len(rows) == 1
     assert rows[0]["event_id"] == "event-stable"
+
+
+def test_bundle_extras_require_final_evidence_for_storyline_and_dialogue():
+    def persist(content, evidence):
+        storylines = _StorylineRepo()
+        events = _NarrativeEventRepo()
+        persisted = persist_bundle_extras(
+            "novel-1",
+            2,
+            {
+                "storyline_progress": [
+                    {
+                        "type": "主线",
+                        "description": "我亲手杀死了反派甲。",
+                        "evidence_text": evidence,
+                    }
+                ],
+                "dialogues": [
+                    {
+                        "speaker": "林澈",
+                        "content": "我亲手杀死了反派甲。",
+                        "context": "城门前",
+                        "evidence_text": evidence,
+                    }
+                ],
+            },
+            storyline_repository=storylines,
+            narrative_event_repository=events,
+            content=content,
+        )
+        assert persisted
+        return storylines, events
+
+    for content, evidence in (
+        ("林澈站在城门前。", ""),
+        ("林澈站在城门前。", "林澈说：我亲手杀死了反派甲。"),
+        ("林澈说：我没能杀死反派甲。", "林澈说：我没能杀死反派甲。"),
+    ):
+        storylines, events = persist(content, evidence)
+        assert storylines.storylines == []
+        assert events.events == {}
+
+    storylines, events = persist(
+        "林澈说：我亲手杀死了反派甲。",
+        "林澈说：我亲手杀死了反派甲。",
+    )
+    assert len(storylines.storylines) == 1
+    assert len(events.events) == 1
 
 
 @pytest.mark.asyncio
@@ -1275,10 +1508,17 @@ async def test_canonical_summary_is_durable_when_dispatch_only_accepts_the_batch
 async def test_canonical_dialogue_event_is_durable_when_dispatch_only_accepts_batch(
     tmp_path, monkeypatch
 ):
-    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    db, chapter_repo, chapter, knowledge = _canonical_services(
+        tmp_path, "林澈说：城门会在子时关闭。"
+    )
     bundle = _canonical_bundle()
     bundle["dialogues"] = [
-        {"speaker": "林澈", "content": "城门会在子时关闭。", "context": "城门"}
+        {
+            "speaker": "林澈",
+            "content": "城门会在子时关闭。",
+            "context": "城门",
+            "evidence_text": "林澈说：城门会在子时关闭。",
+        }
     ]
     monkeypatch.setattr(
         "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
@@ -1422,7 +1662,9 @@ async def test_stale_extraction_cannot_replace_the_newer_canonical_summary(
     tmp_path, monkeypatch
 ):
     """An older async extraction must lose its CAS race before touching summaries."""
-    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    db, chapter_repo, chapter, knowledge = _canonical_services(
+        tmp_path, "旧角色说：旧版本事件。"
+    )
     old_content = chapter.content
     old_started = asyncio.Event()
     release_old = asyncio.Event()
@@ -1434,13 +1676,23 @@ async def test_stale_extraction_cannot_replace_the_newer_canonical_summary(
             return {
                 **_canonical_bundle(summary="旧版本摘要"),
                 "dialogues": [
-                    {"speaker": "旧角色", "content": "旧版本事件", "context": "旧场景"}
+                    {
+                        "speaker": "旧角色",
+                        "content": "旧版本事件",
+                        "context": "旧场景",
+                        "evidence_text": "旧角色说：旧版本事件。",
+                    }
                 ],
             }
         return {
             **_canonical_bundle(summary="新版本摘要"),
             "dialogues": [
-                {"speaker": "新角色", "content": "新版本事件", "context": "新场景"}
+                {
+                    "speaker": "新角色",
+                    "content": "新版本事件",
+                    "context": "新场景",
+                    "evidence_text": "新角色说：新版本事件。",
+                }
             ],
         }
 
@@ -1464,7 +1716,7 @@ async def test_stale_extraction_cannot_replace_the_newer_canonical_summary(
     )
     await old_started.wait()
 
-    chapter = _rewrite(chapter_repo, chapter, "第二版正文")
+    chapter = _rewrite(chapter_repo, chapter, "新角色说：新版本事件。")
     newer = await sync_chapter_narrative_after_save(
         "novel-1",
         1,
@@ -1496,3 +1748,86 @@ async def test_stale_extraction_cannot_replace_the_newer_canonical_summary(
         "AND chapter_number = ? ORDER BY event_summary",
         ("novel-1", 1),
     )] == ["新角色: 新版本事件"]
+
+
+@pytest.mark.asyncio
+async def test_rewrite_after_stale_claim_before_summary_write_persists_no_old_summary(
+    tmp_path, monkeypatch
+):
+    """A source rewrite between the last claim check and SQLite write must win."""
+    db, chapter_repo, chapter, knowledge = _canonical_services(tmp_path)
+    db.commit()
+    old_content = chapter.content
+    before_summary_write = threading.Event()
+    release_summary_write = threading.Event()
+    result = {}
+    error = {}
+    original_save = knowledge.knowledge_repository.save_canonical_chapter_summary
+
+    def blocked_save(*args, **kwargs):
+        before_summary_write.set()
+        assert release_summary_write.wait(timeout=5)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(
+        knowledge.knowledge_repository, "save_canonical_chapter_summary", blocked_save
+    )
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=_canonical_bundle(summary="旧版本摘要")),
+    )
+    from domain.novel.value_objects.tension_dimensions import TensionDimensions
+
+    class NoopTensionScoringService:
+        def __init__(self, _llm):
+            pass
+
+        async def score_chapter(self, **_kwargs):
+            return TensionDimensions.unevaluated()
+
+    monkeypatch.setattr(
+        "application.analyst.services.tension_scoring_service.TensionScoringService",
+        NoopTensionScoringService,
+    )
+
+    async def skip_tension(*args, **kwargs):
+        raise RuntimeError("not relevant to canonical write race")
+
+    monkeypatch.setattr(
+        "application.analyst.services.tension_scoring_service.TensionScoringService.score_chapter",
+        skip_tension,
+    )
+
+    def run_old_sync():
+        try:
+            result["value"] = asyncio.run(
+                sync_chapter_narrative_after_save(
+                    "novel-1",
+                    1,
+                    old_content,
+                    knowledge,
+                    None,
+                    SimpleNamespace(),
+                    chapter_repository=chapter_repo,
+                )
+            )
+        except BaseException as exc:
+            error["value"] = exc
+
+    old_sync = threading.Thread(target=run_old_sync)
+    old_sync.start()
+    if not before_summary_write.wait(timeout=5):
+        release_summary_write.set()
+        old_sync.join(timeout=5)
+        pytest.fail(f"old sync did not reach summary write: {error!r} {result!r}")
+    _rewrite(chapter_repo, chapter, "第二版正文")
+    release_summary_write.set()
+    old_sync.join(timeout=5)
+
+    assert not old_sync.is_alive()
+    assert error == {}
+    assert result["value"].failure_reason == "source_hash_mismatch"
+    assert db.fetch_one(
+        "SELECT summary FROM chapter_summaries WHERE chapter_number = ?",
+        (1,),
+    ) is None

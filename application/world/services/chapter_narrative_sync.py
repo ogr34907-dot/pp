@@ -25,6 +25,7 @@ from domain.novel.value_objects.foreshadowing import (
     ImportanceLevel,
 )
 from domain.novel.value_objects.novel_id import NovelId
+from domain.shared.final_text_evidence import is_affirmative_final_text_evidence
 from domain.structure.story_node import NodeType
 from application.ai.structured_json_pipeline import (
     _retry_delay_seconds,
@@ -40,29 +41,52 @@ logger = logging.getLogger(__name__)
 CHAPTER_NARRATIVE_PIPELINE_VERSION = "chapter-narrative-sync:v1"
 
 
-def _has_final_text_evidence(content: str, item: Any, *terms: str) -> bool:
-    """Allow a derived fact only when its candidate text appears in final正文."""
-    if not content:
-        return True
-    candidates: list[str] = []
-    if isinstance(item, dict):
-        evidence = str(item.get("evidence_text") or "").strip()
-        if evidence:
-            candidates.append(evidence)
-    candidates.extend(str(term).strip() for term in terms if str(term).strip())
-    return any(candidate in content for candidate in candidates)
-
-
 def _final_text_evidence(content: str, item: Any, *terms: str) -> str:
-    if isinstance(item, dict):
-        evidence = str(item.get("evidence_text") or "").strip()
-        if evidence and evidence in content:
-            return evidence[:500]
-    for term in terms:
-        candidate = str(term).strip()
-        if candidate and candidate in content:
-            return candidate[:500]
-    return ""
+    """Return a verbatim, affirmative quote from the accepted final text only."""
+    if not isinstance(content, str) or not content.strip() or not isinstance(item, dict):
+        return ""
+    raw_evidence = item.get("evidence_text")
+    if not isinstance(raw_evidence, str):
+        return ""
+    evidence = raw_evidence.strip()
+    return evidence[:500] if is_affirmative_final_text_evidence(content, evidence, terms) else ""
+
+
+def _has_final_text_evidence(content: str, item: Any, *terms: str) -> bool:
+    """Fail closed unless the extraction carries an affirmative final-text quote."""
+    return bool(_final_text_evidence(content, item, *terms))
+
+
+_FORESHADOW_CONNECTOR_CHARS = set("将在会将即终于在的了着过被把从向与和或并且而但却仍还已经")
+
+
+def _normalized_foreshadow_text(value: Any) -> str:
+    """Normalize only spacing/punctuation for matching an existing clue."""
+    return re.sub(r"[\W_]+", "", str(value or "").casefold(), flags=re.UNICODE)
+
+
+def _foreshadow_anchor_terms(description: Any, evidence: Any) -> tuple[str, ...]:
+    """Find stable two-character anchors shared by the clue and final quote."""
+    source = _normalized_foreshadow_text(description)
+    quote = _normalized_foreshadow_text(evidence)
+    source_bigrams = {
+        source[index : index + 2]
+        for index in range(max(0, len(source) - 1))
+        if not any(char in _FORESHADOW_CONNECTOR_CHARS for char in source[index : index + 2])
+    }
+    shared = tuple(sorted(term for term in source_bigrams if term in quote))
+    required = 1 if len(source_bigrams) == 1 else 2
+    return shared if len(shared) >= required else ()
+
+
+def _has_final_text_foreshadow_evidence(
+    content: str, item: Any, description: Any
+) -> bool:
+    """Accept natural prose only when stable clue anchors are affirmative."""
+    if not isinstance(item, dict):
+        return False
+    terms = _foreshadow_anchor_terms(description, item.get("evidence_text"))
+    return bool(terms) and _has_final_text_evidence(content, item, *terms)
 
 
 @dataclass(frozen=True)
@@ -469,7 +493,14 @@ async def llm_chapter_extract_bundle(
         # 后续 UI 界面可以展示 pending 项让作者确认/修改
         "relation_triples": [{"data": t, "status": "pending"} for t in triples_raw[:8]],
         "foreshadow_hints": [{"data": h, "status": "pending"} for h in hints_raw[:4]],
-        "consumed_foreshadows": [str(c).strip() for c in consumed_raw[:5] if str(c).strip()],
+        "consumed_foreshadows": [
+            {
+                "description": str(item.get("description") or "").strip(),
+                "evidence_text": item.get("evidence_text"),
+            }
+            for item in consumed_raw[:5]
+            if isinstance(item, dict) and str(item.get("description") or "").strip()
+        ],
         "storyline_progress": storyline_raw[:5],
         "dialogues": dialogues_raw[:10],
         "timeline_events": timeline_raw[:5],
@@ -486,7 +517,7 @@ async def llm_chapter_extract_bundle(
 
 
 def _fuzzy_match_foreshadow(consumed_desc: str, pending_list: List[Any]) -> Optional[Any]:
-    """模糊匹配消费的伏笔描述与待回收列表。
+    """Match a consumed clue to its registered description deterministically.
     
     Args:
         consumed_desc: LLM 返回的消费伏笔描述
@@ -498,29 +529,11 @@ def _fuzzy_match_foreshadow(consumed_desc: str, pending_list: List[Any]) -> Opti
     if not consumed_desc or not pending_list:
         return None
     
-    consumed_lower = consumed_desc.lower().strip()
-    
-    # 优先精确匹配
+    consumed_normalized = _normalized_foreshadow_text(consumed_desc)
     for f in pending_list:
         desc = getattr(f, 'description', None) or getattr(f, 'question', None)
-        if desc and desc.lower().strip() == consumed_lower:
+        if desc and _normalized_foreshadow_text(desc) == consumed_normalized:
             return f
-    
-    # 其次模糊匹配（包含关系）
-    for f in pending_list:
-        desc = getattr(f, 'description', None) or getattr(f, 'question', None)
-        if desc:
-            desc_lower = desc.lower().strip()
-            # 检查是否有足够的重叠
-            if consumed_lower in desc_lower or desc_lower in consumed_lower:
-                return f
-            # 检查关键词重叠（至少 50% 的词匹配）
-            consumed_words = set(consumed_lower)
-            desc_words = set(desc_lower)
-            if consumed_words and desc_words:
-                overlap = len(consumed_words & desc_words) / min(len(consumed_words), len(desc_words))
-                if overlap >= 0.5:
-                    return f
     
     return None
 
@@ -579,7 +592,7 @@ def persist_bundle_triples_and_foreshadows(
                     "entity_type": "character",
                     "note": "",
                 }
-                if content and not _has_final_text_evidence(content, actual_item, s, p, o):
+                if not _has_final_text_evidence(content, actual_item, s, p, o):
                     continue
                 evidence = _final_text_evidence(content, actual_item, s, p, o)
                 if evidence:
@@ -591,7 +604,7 @@ def persist_bundle_triples_and_foreshadows(
                         raise
                     logger.debug("三元组落库跳过: %s", e)
 
-    if foreshadowing_repo and hints:
+    if foreshadowing_repo and (hints or consumed):
         try:
             registry = foreshadowing_repo.get_by_novel_id(NovelId(novel_id))
             if not registry:
@@ -675,7 +688,7 @@ def persist_bundle_triples_and_foreshadows(
                         suggested_resolve,
                         importance_val,
                     )
-                    if content and not _has_final_text_evidence(content, h, desc):
+                    if not _has_final_text_evidence(content, h, desc):
                         continue
                     registry.register(
                         Foreshadowing(
@@ -702,13 +715,24 @@ def persist_bundle_triples_and_foreshadows(
                 pending_subtext = registry.get_pending_subtext_entries()
                 
                 consumed_count = 0
-                for consumed_desc in consumed:
+                for consumed_item in consumed:
+                    if not isinstance(consumed_item, dict):
+                        continue
+                    consumed_desc = str(consumed_item.get("description") or "").strip()
                     if not consumed_desc:
                         continue
                     
                     # 1. 尝试匹配 Foreshadowing 对象
                     matched_foreshadow = _fuzzy_match_foreshadow(consumed_desc, pending_foreshadows)
-                    if matched_foreshadow:
+                    matched_description = (
+                        getattr(matched_foreshadow, "description", None)
+                        or getattr(matched_foreshadow, "question", None)
+                        if matched_foreshadow
+                        else ""
+                    )
+                    if matched_foreshadow and _has_final_text_foreshadow_evidence(
+                        content, consumed_item, matched_description
+                    ):
                         try:
                             registry.mark_resolved(
                                 foreshadowing_id=matched_foreshadow.id,
@@ -727,7 +751,15 @@ def persist_bundle_triples_and_foreshadows(
                     
                     # 2. 尝试匹配 SubtextLedgerEntry 对象
                     matched_entry = _fuzzy_match_foreshadow(consumed_desc, pending_subtext)
-                    if matched_entry:
+                    matched_description = (
+                        getattr(matched_entry, "description", None)
+                        or getattr(matched_entry, "question", None)
+                        if matched_entry
+                        else ""
+                    )
+                    if matched_entry and _has_final_text_foreshadow_evidence(
+                        content, consumed_item, matched_description
+                    ):
                         try:
                             from dataclasses import replace
                             updated_entry = replace(
@@ -826,7 +858,7 @@ def persist_causal_edges(
             involved = [involved]
 
         state_change = str(item.get("state_change", "")).strip()
-        if content and not _has_final_text_evidence(
+        if not _has_final_text_evidence(
             content, item, source_event, target_event, state_change
         ):
             continue
@@ -872,7 +904,13 @@ def persist_causal_edges(
     # ★ 检测因果边闭环：如果本章的事件匹配了某个未闭环因果边的 target_event
     if saved > 0 or bundle.get("summary") or bundle.get("key_events"):
         try:
-            _try_resolve_causal_edges(novel_id, chapter_number, bundle, causal_edge_repository)
+            _try_resolve_causal_edges(
+                novel_id,
+                chapter_number,
+                bundle,
+                causal_edge_repository,
+                content=content,
+            )
         except Exception as e:
             logger.debug("因果边闭环检测失败: %s", e)
 
@@ -887,44 +925,29 @@ def _try_resolve_causal_edges(
     chapter_number: int,
     bundle: dict,
     causal_edge_repository: Any,
+    *,
+    content: str = "",
 ) -> int:
-    """检测本章事件是否闭环了已有的因果边。
-
-    策略：检查 summary + key_events 中是否包含未闭环因果边的 target_event_summary 的关键词。
-    """
+    """Resolve an existing causal edge only when its target is in final text."""
     unresolved = causal_edge_repository.get_unresolved(novel_id)
     if not unresolved:
         return 0
 
-    # 合并章节事件文本
-    chapter_text = " ".join([
-        str(bundle.get("summary", "")),
-        str(bundle.get("key_events", "")),
-        str(bundle.get("open_threads", "")),
-    ]).lower()
-
     resolved_count = 0
     for edge in unresolved:
-        # 简单关键词匹配：target_event 中的核心词出现在章节事件中
-        target_lower = edge.target_event_summary.lower()
-        # 提取关键片段（去掉常见连接词）
-        keywords = [w for w in target_lower.split() if len(w) >= 2]
-        if not keywords:
-            # 对中文，使用整体匹配
-            keywords = [target_lower]
-
-        match_count = sum(1 for kw in keywords if kw in chapter_text)
-        if keywords and match_count / len(keywords) >= 0.5:
-            try:
-                causal_edge_repository.resolve(edge.id, chapter_number)
-                resolved_count += 1
-                logger.info(
-                    "因果边闭环 novel=%s ch=%s edge=%s %s→%s",
-                    novel_id, chapter_number, edge.id[:8],
-                    edge.source_event_summary[:20], edge.target_event_summary[:20],
-                )
-            except Exception as e:
-                logger.debug("因果边闭环失败: %s", e)
+        target = str(edge.target_event_summary or "").strip()
+        if not _has_final_text_evidence(content, {"evidence_text": target}, target):
+            continue
+        try:
+            causal_edge_repository.resolve(edge.id, chapter_number)
+            resolved_count += 1
+            logger.info(
+                "因果边闭环 novel=%s ch=%s edge=%s %s→%s",
+                novel_id, chapter_number, edge.id[:8],
+                edge.source_event_summary[:20], edge.target_event_summary[:20],
+            )
+        except Exception as e:
+            logger.debug("因果边闭环失败: %s", e)
 
     return resolved_count
 
@@ -993,7 +1016,7 @@ def persist_character_mutations(
         impact_or_desc = str(item.get("impact_or_description", "")).strip()
         if not (source_event or impact_or_desc):
             continue
-        if content and not _has_final_text_evidence(
+        if not _has_final_text_evidence(
             content, item, character_name, source_event, impact_or_desc
         ):
             continue
@@ -1193,7 +1216,7 @@ def persist_character_end_states(
             continue
 
         character_id = name_to_id.get(character_name, character_name)
-        if content and not _has_final_text_evidence(content, item, character_name, mental_state):
+        if not _has_final_text_evidence(content, item, character_name, mental_state):
             continue
 
         state = character_state_repository.get(character_id, novel_id)
@@ -1246,6 +1269,7 @@ def persist_bundle_memory_atoms(
     memory_service: Any = None,
     *,
     strict: bool = False,
+    content: str = "",
 ) -> int:
     """Mirror chapter extraction output into the unified MemoryAtom ledger.
 
@@ -1299,7 +1323,8 @@ def persist_bundle_memory_atoms(
         if not isinstance(item, dict):
             continue
         name = str(item.get("character_name", "")).strip()
-        if not name:
+        mental_state = str(item.get("mental_state", "")).strip()
+        if not name or not _has_final_text_evidence(content, item, name, mental_state):
             continue
         importer.remember_bundle_item(
             novel_id,
@@ -1319,7 +1344,13 @@ def persist_bundle_memory_atoms(
         if not isinstance(item, dict):
             continue
         name = str(item.get("character_name", "")).strip()
-        if not name:
+        source_event = str(item.get("source_event", "")).strip()
+        impact = str(
+            item.get("impact_or_description") or item.get("impact") or ""
+        ).strip()
+        if not name or not _has_final_text_evidence(
+            content, item, name, source_event, impact
+        ):
             continue
         mutation_type = str(item.get("mutation_type", "")).strip().lower()
         memory_type = "scar" if mutation_type == "scar" else ("motivation" if mutation_type == "motivation" else "emotion")
@@ -1340,8 +1371,10 @@ def persist_bundle_memory_atoms(
         if not isinstance(dialogue, dict):
             continue
         name = str(dialogue.get("speaker", "")).strip()
-        content = str(dialogue.get("content", "")).strip()
-        if not (name and content):
+        dialogue_content = str(dialogue.get("content", "")).strip()
+        if not (name and dialogue_content) or not _has_final_text_evidence(
+            content, dialogue, name, dialogue_content, "说"
+        ):
             continue
         importer.remember_bundle_item(
             novel_id,
@@ -1361,7 +1394,11 @@ def persist_bundle_memory_atoms(
         if not isinstance(item, dict):
             continue
         subject = str(item.get("subject", "")).strip()
-        if not subject:
+        predicate = str(item.get("predicate", "")).strip()
+        obj = str(item.get("object", "")).strip()
+        if not subject or not _has_final_text_evidence(
+            content, item, subject, predicate, obj
+        ):
             continue
         importer.remember_bundle_item(
             novel_id,
@@ -1379,6 +1416,14 @@ def persist_bundle_memory_atoms(
     for wrapper in bundle.get("causal_edges") or []:
         item = wrapper.get("data") if isinstance(wrapper, dict) and "data" in wrapper else wrapper
         if not isinstance(item, dict):
+            continue
+        source_event = str(item.get("source_event", "")).strip()
+        target_event = str(item.get("target_event", "")).strip()
+        state_change = str(item.get("state_change", "")).strip()
+        description = str(item.get("description", "")).strip()
+        if not _has_final_text_evidence(
+            content, item, source_event, target_event, state_change, description
+        ):
             continue
         involved = item.get("involved_characters") or []
         if isinstance(involved, str):
@@ -1426,6 +1471,8 @@ def update_narrative_debts(
     bundle: dict,
     debt_repository: Any,
     causal_edge_repository: Any = None,
+    *,
+    content: str = "",
 ) -> int:
     """根据本章内容更新叙事债务：新增债务 + 结算已回收债务 + 逾期标记。
 
@@ -1459,6 +1506,11 @@ def update_narrative_debts(
         source_event = str(edge_item.get("source_event", "")).strip()
         target_event = str(edge_item.get("target_event", "")).strip()
         if not (source_event and target_event):
+            continue
+        state_change = str(edge_item.get("state_change", "")).strip()
+        if not _has_final_text_evidence(
+            content, edge_item, source_event, target_event, state_change
+        ):
             continue
 
         try:
@@ -1518,8 +1570,13 @@ def update_narrative_debts(
             continue
 
         character_name = str(mut_item.get("character_name", "")).strip()
+        source_event = str(mut_item.get("source_event", "")).strip()
         impact_or_desc = str(mut_item.get("impact_or_description", "")).strip()
         if not impact_or_desc:
+            continue
+        if not _has_final_text_evidence(
+            content, mut_item, character_name, source_event, impact_or_desc
+        ):
             continue
 
         tags_or_priority = mut_item.get("sensitivity_tags_or_priority", 5)
@@ -1566,10 +1623,15 @@ def update_narrative_debts(
     if consumed:
         try:
             foreshadow_debts = debt_repository.get_by_type(novel_id, DebtType.FORESHADOWING)
-            for consumed_desc in consumed:
-                if not consumed_desc:
+            for consumed_item in consumed:
+                if not isinstance(consumed_item, dict):
                     continue
-                consumed_lower = consumed_desc.lower().strip()
+                consumed_desc = str(consumed_item.get("description") or "").strip()
+                if not consumed_desc or not _has_final_text_evidence(
+                    content, consumed_item, consumed_desc
+                ):
+                    continue
+                consumed_lower = consumed_desc.lower()
                 for debt in foreshadow_debts:
                     if debt.is_resolved:
                         continue
@@ -2085,7 +2147,14 @@ def persist_bundle_extras(
 
     # 3. 故事线进展更新
     # 🔥 核心修复：改用持久化队列写入，避免守护进程长连接写锁阻塞 API
-    storyline_progress = bundle.get("storyline_progress") or []
+    storyline_progress = [
+        item
+        for item in (bundle.get("storyline_progress") or [])
+        if isinstance(item, dict)
+        and _has_final_text_evidence(
+            content, item, str(item.get("description") or "")
+        )
+    ]
     if storyline_repository and storyline_progress:
         try:
             from domain.novel.value_objects.novel_id import NovelId
@@ -2203,15 +2272,17 @@ def persist_bundle_extras(
                 if not isinstance(dialogue, dict):
                     continue
                 speaker = str(dialogue.get("speaker", "")).strip()
-                content = str(dialogue.get("content", "")).strip()
+                dialogue_content = str(dialogue.get("content", "")).strip()
                 context = str(dialogue.get("context", "")).strip()
 
-                if not (speaker and content):
+                if not (speaker and dialogue_content) or not _has_final_text_evidence(
+                    content, dialogue, speaker, dialogue_content
+                ):
                     continue
 
                 # 构建事件摘要
-                event_summary = f"{speaker}: {content[:100]}"
-                if len(content) > 100:
+                event_summary = f"{speaker}: {dialogue_content[:100]}"
+                if len(dialogue_content) > 100:
                     event_summary += "..."
 
                 # 构建 mutations（对话不涉及实体变更，可为空）
@@ -2228,7 +2299,7 @@ def persist_bundle_extras(
                     chapter_number,
                     "dialogue",
                     speaker,
-                    content,
+                    dialogue_content,
                     context,
                 )
                 if hasattr(narrative_event_repository, "upsert_event"):
@@ -2300,7 +2371,7 @@ def persist_bundle_extras(
                 if not event:
                     continue
 
-                if content and not _has_final_text_evidence(content, evt, event, description):
+                if not _has_final_text_evidence(content, evt, event, description):
                     continue
 
                 # 写入 bible_timeline_notes 表
@@ -2675,6 +2746,7 @@ async def _sync_chapter_narrative_after_save_once(
         from infrastructure.persistence.database.write_dispatch import (
             sqlite_writes_bypass_queue,
         )
+        from application.world.services.knowledge_service import KnowledgeService
 
         canonical_payload_sha256 = canonical_summary_payload_sha256(
             summary=summary,
@@ -2684,18 +2756,45 @@ async def _sync_chapter_narrative_after_save_once(
             beat_sections=beat_sections,
             micro_beats=mb_out if mb_out else None,
         )
-        with sqlite_writes_bypass_queue():
-            knowledge_service.upsert_chapter_summary(
+        canonical_writer = getattr(
+            getattr(knowledge_service, "knowledge_repository", None),
+            "save_canonical_chapter_summary",
+            None,
+        )
+        if (
+            getattr(type(knowledge_service), "upsert_chapter_summary", None)
+            is KnowledgeService.upsert_chapter_summary
+            and callable(canonical_writer)
+        ):
+            if not canonical_writer(
                 novel_id=novel_id,
-                chapter_id=chapter_number,
+                chapter_number=chapter_number,
                 summary=summary,
                 key_events=key_events or "（未提取）",
                 open_threads=open_threads or "无",
                 consistency_note=consistency_note,
                 beat_sections=beat_sections,
-                micro_beats=mb_out if mb_out else None,
-                sync_status="in_progress",
-            )
+                micro_beats=mb_out if mb_out else [],
+                content_sha256=content_sha256,
+                content_revision=claim.content_revision,
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                attempt_count=claim.attempt_count,
+                canonical_payload_sha256=canonical_payload_sha256,
+            ):
+                return failed_result("source_hash_mismatch")
+        else:
+            with sqlite_writes_bypass_queue():
+                knowledge_service.upsert_chapter_summary(
+                    novel_id=novel_id,
+                    chapter_id=chapter_number,
+                    summary=summary,
+                    key_events=key_events or "（未提取）",
+                    open_threads=open_threads or "无",
+                    consistency_note=consistency_note,
+                    beat_sections=beat_sections,
+                    micro_beats=mb_out if mb_out else None,
+                    sync_status="in_progress",
+                )
     except Exception as e:
         return failed_result(str(e) or type(e).__name__)
 
@@ -2861,6 +2960,7 @@ async def _sync_chapter_narrative_after_save_once(
                 bundle,
                 bible_repository,
                 strict=True,
+                content=content,
             )
         if memory_saved > 0:
             flags["memory_atoms_stored"] = True
@@ -2877,7 +2977,12 @@ async def _sync_chapter_narrative_after_save_once(
     if debt_repository is not None:
         try:
             new_debts = update_narrative_debts(
-                novel_id, chapter_number, bundle, debt_repository, causal_edge_repository
+                novel_id,
+                chapter_number,
+                bundle,
+                debt_repository,
+                causal_edge_repository,
+                content=content,
             )
             if new_debts >= 0:  # 0 也算成功（可能没有新债务）
                 flags["debt_updated"] = True

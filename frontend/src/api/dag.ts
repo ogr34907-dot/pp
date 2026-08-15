@@ -28,10 +28,6 @@ export const dagApi = {
   getNode: (novelId: string, nodeId: string) =>
     apiClient.get<Record<string, unknown>>(`/dag/${novelId}/nodes/${nodeId}`) as unknown as Promise<Record<string, unknown>>,
 
-  /** POST /api/v1/dag/{novel_id}/nodes/{node_id}/toggle — 切换启用/禁用（唯一写操作） */
-  toggleNode: (novelId: string, nodeId: string) =>
-    apiClient.post<DAGDefinition>(`/dag/${novelId}/nodes/${nodeId}/toggle`, {}) as unknown as Promise<DAGDefinition>,
-
   /** GET /api/v1/dag/{novel_id}/status — 获取运行状态 */
   getStatus: (novelId: string) =>
     apiClient.get<DAGStatusResponse>(`/dag/${novelId}/status`) as unknown as Promise<DAGStatusResponse>,
@@ -65,22 +61,6 @@ export const dagApi = {
   /** GET /api/v1/dag/{novel_id}/nodes/{node_id}/prompt — 获取渲染后的 Prompt（预览） */
   getRenderedPrompt: (novelId: string, nodeId: string) =>
     apiClient.get<{ node_id: string; template: string; variables: Record<string, string>; rendered: string }>(`/dag/${novelId}/nodes/${nodeId}/prompt`) as unknown as Promise<{ node_id: string; template: string; variables: Record<string, string>; rendered: string }>,
-
-  // ─── 运行控制（dagRunStore 使用） ───
-
-  /** POST /api/v1/dag/{novel_id}/run — 启动 DAG 运行 */
-  runDAG: (novelId: string) =>
-    apiClient.post<{ status: string; novel_id: string }>(`/dag/${novelId}/run`, {}) as unknown as Promise<{ status: string; novel_id: string }>,
-
-  /** POST /api/v1/dag/{novel_id}/stop — 停止 DAG 运行 */
-  stopDAG: (novelId: string) =>
-    apiClient.post<{ status: string; novel_id: string }>(`/dag/${novelId}/stop`, {}) as unknown as Promise<{ status: string; novel_id: string }>,
-
-  // ─── 节点配置更新（nodeEditorStore 使用） ───
-
-  /** PUT /api/v1/dag/{novel_id}/nodes/{node_id} — 更新节点配置 */
-  updateNodeConfig: (novelId: string, nodeId: string, config: Record<string, unknown>) =>
-    apiClient.put<DAGDefinition>(`/dag/${novelId}/nodes/${nodeId}`, config) as unknown as Promise<DAGDefinition>,
 
   /** GET /api/v1/dag/events?novel_id=... — DAG SSE 事件流 URL */
   eventsUrl: (novelId: string, afterEventId?: string) =>

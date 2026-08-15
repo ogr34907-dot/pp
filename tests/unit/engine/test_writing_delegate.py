@@ -428,12 +428,54 @@ async def test_run_story_pipeline_writing_pauses_when_required_auxiliary_state_i
 
 
 @pytest.mark.asyncio
-async def test_run_writing_dispatches_legacy_when_pipeline_disabled():
-    host = MagicMock()
-    host.use_story_pipeline_for_writing = False
-    novel = MagicMock()
+async def test_run_writing_blocks_legacy_direct_writers_before_candidate_run_exists():
+    host = SimpleNamespace(
+        use_story_pipeline_for_writing=False,
+        chapter_repository=SimpleNamespace(
+            db=SimpleNamespace(fetch_one=MagicMock(return_value=None))
+        ),
+        _update_shared_state=MagicMock(),
+        _flush_novel=MagicMock(),
+    )
+    novel = SimpleNamespace(novel_id=SimpleNamespace(value="pre-run-novel"))
 
     with patch("engine.runtime.legacy_writing_delegate.run_legacy_writing", new=AsyncMock()) as legacy:
         await run_writing(host, novel)
 
-    legacy.assert_awaited_once_with(host, novel)
+    legacy.assert_not_awaited()
+    host._flush_novel.assert_called_once_with(novel)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pipeline_enabled", [False, True])
+async def test_run_writing_blocks_legacy_direct_writers_for_candidate_first_novel(
+    pipeline_enabled,
+):
+    db = SimpleNamespace(fetch_one=MagicMock(return_value={"state": "running"}))
+    host = SimpleNamespace(
+        use_story_pipeline_for_writing=pipeline_enabled,
+        chapter_repository=SimpleNamespace(db=db),
+        _update_shared_state=MagicMock(),
+        _flush_novel=MagicMock(),
+    )
+    novel = SimpleNamespace(novel_id=SimpleNamespace(value="candidate-novel"))
+
+    with patch(
+        "engine.runtime.writing_delegate.run_story_pipeline_writing",
+        new_callable=AsyncMock,
+    ) as pipeline, patch(
+        "engine.runtime.legacy_writing_delegate.run_legacy_writing",
+        new_callable=AsyncMock,
+    ) as legacy:
+        await run_writing(host, novel)
+
+    pipeline.assert_not_awaited()
+    legacy.assert_not_awaited()
+    host._update_shared_state.assert_called_once_with(
+        "candidate-novel",
+        current_stage="paused_for_review",
+        writing_substep="candidate_first_required",
+        writing_substep_label="候选稿流程正在管理正式章节",
+        autopilot_pause_reason="candidate_first_required",
+    )
+    host._flush_novel.assert_called_once_with(novel)

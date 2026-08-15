@@ -90,3 +90,30 @@ async def test_legacy_required_memory_failure_pauses_without_fallback_context():
         last_audit_narrative_ok=False,
         autopilot_pause_reason=reason,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_chapters", [None, 0, True, 1.5, "invalid"])
+async def test_legacy_writing_refuses_invalid_persisted_target_chapters(target_chapters):
+    host = SimpleNamespace(
+        _is_still_running=MagicMock(return_value=True),
+        _update_shared_state=MagicMock(),
+        _flush_novel=MagicMock(),
+    )
+    novel = SimpleNamespace(
+        novel_id=SimpleNamespace(value="novel-without-target"),
+        target_chapters=target_chapters,
+        current_stage=NovelStage.WRITING,
+        autopilot_status=AutopilotStatus.RUNNING,
+    )
+
+    await run_legacy_writing(host, novel)
+
+    assert novel.current_stage == NovelStage.PAUSED_FOR_REVIEW
+    assert novel.autopilot_status == AutopilotStatus.STOPPED
+    host._update_shared_state.assert_called_once_with(
+        "novel-without-target",
+        current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+        autopilot_pause_reason="target_chapters_required",
+    )
+    host._flush_novel.assert_called_once_with(novel)

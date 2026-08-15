@@ -132,45 +132,6 @@ def _commit_first_chapter(repository: ChapterCandidateRepository) -> None:
     repository.mark_sync_succeeded(candidate.id)
 
 
-def _attach_rebuild_archive(
-    db: DatabaseConnection,
-    novel_id: str,
-    *,
-    start_chapter: int,
-    end_chapter: int,
-    retained_through: int,
-    target_chapters: int,
-) -> None:
-    epoch = int(
-        db.fetch_one(
-            "SELECT generation_epoch FROM novel_generation_runs WHERE novel_id = ?",
-            (novel_id,),
-        )["generation_epoch"]
-    )
-    archive_id = f"test-archive-{epoch}"
-    db.execute(
-        "INSERT INTO worldline_archives "
-        "(id, novel_id, old_generation_epoch, start_chapter, end_chapter, "
-        "retained_through, target_chapters, status, prefix_digest, metadata_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'archived', '', '{}')",
-        (
-            archive_id,
-            novel_id,
-            max(0, epoch - 1),
-            start_chapter,
-            end_chapter,
-            retained_through,
-            target_chapters,
-        ),
-    )
-    db.execute(
-        "UPDATE worldline_rebuild_jobs SET archive_id = ? "
-        "WHERE novel_id = ? AND generation_epoch = ?",
-        (archive_id, novel_id, epoch),
-    )
-    db.commit()
-
-
 @pytest.mark.asyncio
 async def test_rewrite_retires_downstream_candidate_until_canonical_rebuild(tmp_path):
     db = DatabaseConnection(str(tmp_path / "rewrite-candidate-barrier.db"))
@@ -226,15 +187,13 @@ async def test_rewrite_retires_downstream_candidate_until_canonical_rebuild(tmp_
     with pytest.raises(CandidateGateError, match="retired generation epoch"):
         candidates.approve_for_commit(downstream.id, continue_after_commit=True)
 
-    _attach_rebuild_archive(
-        db,
-        "novel-1",
-        start_chapter=1,
-        end_chapter=2,
-        retained_through=0,
-        target_chapters=3,
-    )
-    await WorldlineRebuildService(db, _SuccessfulAftermath(db)).rebuild("novel-1")
+    rebuilt = await WorldlineRebuildService(db, _SuccessfulAftermath(db)).rebuild("novel-1")
+    assert rebuilt["status"] == "completed"
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM worldline_rebuild_jobs "
+        "WHERE novel_id = ? AND generation_epoch = ? AND archive_id IS NULL",
+        ("novel-1", 1),
+    )["total"] == 5
 
     resumed = candidates.start_run(
         "novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3
@@ -319,15 +278,8 @@ async def test_rewrite_rebuilds_a_ready_downstream_formal_tail_before_resuming(t
     assert candidates.get_candidate(downstream.id).status == CandidateStatus.COMMITTED
     assert candidates.get_run("novel-1").canonical_sync_status == "rebuilding"
 
-    _attach_rebuild_archive(
-        db,
-        "novel-1",
-        start_chapter=1,
-        end_chapter=2,
-        retained_through=0,
-        target_chapters=3,
-    )
-    await WorldlineRebuildService(db, _SuccessfulAftermath(db)).rebuild("novel-1")
+    rebuilt = await WorldlineRebuildService(db, _SuccessfulAftermath(db)).rebuild("novel-1")
+    assert rebuilt["status"] == "completed"
 
     resumed = candidates.start_run(
         "novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3
@@ -375,14 +327,6 @@ async def test_worldline_rebuild_replays_only_candidate_first_formal_chapters(tm
     ).rewrite(
         SqliteChapterRepository(db).get_by_novel_and_number(NovelId("novel-1"), 1),
         "第一章重写后的正式正文",
-    )
-    _attach_rebuild_archive(
-        db,
-        "novel-1",
-        start_chapter=1,
-        end_chapter=2,
-        retained_through=0,
-        target_chapters=3,
     )
     aftermath = _RecordingAftermath(db)
 

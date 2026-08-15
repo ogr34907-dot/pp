@@ -180,6 +180,11 @@ def _chapter_content_already_contains(prior: str, addition: str) -> bool:
     return prior == addition or prior.endswith(f"\n\n{addition}") or prior.endswith(addition)
 
 
+def _candidate_first_authority_blocks_completed_write(db: Any, novel_id: str) -> bool:
+    """Legacy continuations never own a completed-chapter transition."""
+    return True
+
+
 def _write_chapter_draft(
     novel_id: str,
     chapter_number: int,
@@ -228,6 +233,36 @@ def _write_chapter_draft(
                     "reason": "empty_content_refuses_append",
                     "duplicate_content": False,
                     "completed_transition": False,
+                }
+            if (
+                status == "completed"
+                and _candidate_first_authority_blocks_completed_write(db, novel_id)
+            ):
+                db.execute(
+                    """
+                    UPDATE novels
+                    SET autopilot_status = 'stopped', current_stage = 'paused_for_review',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (novel_id,),
+                )
+                db.commit()
+                _publish_shared_state(
+                    novel_id,
+                    autopilot_status="stopped",
+                    current_stage="paused_for_review",
+                    writing_substep="candidate_first_required",
+                    writing_substep_label="候选稿流程正在管理正式章节",
+                    autopilot_pause_reason="candidate_first_required",
+                )
+                return {
+                    "word_count": len(prior),
+                    "skipped": True,
+                    "reason": "candidate_first_required",
+                    "duplicate_content": False,
+                    "completed_transition": False,
+                    "status": prior_status,
                 }
             if (
                 row is not None
@@ -533,6 +568,15 @@ def register_autopilot_continuations() -> None:
                 append=not is_full_chapter,
                 status="completed" if is_full_chapter else "draft",
             )
+            if write_result.get("reason") == "candidate_first_required":
+                return {
+                    "content": content,
+                    "beat_content": content,
+                    "chapter_number": chapter_number,
+                    "beat_index": beat_index,
+                    "skipped": True,
+                    "reason": "candidate_first_required",
+                }
             total_words = int(write_result.get("word_count") or 0)
             if is_full_chapter:
                 _clear_invocation_state(

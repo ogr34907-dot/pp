@@ -1,9 +1,13 @@
 """Tail regeneration archives all chapter-derived facts before a new epoch starts."""
 
+import hashlib
 import json
 import pytest
 
 from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.chapter_candidate_repository import (
+    ChapterCandidateRepository,
+)
 from application.engine.services.worldline_regeneration_service import (
     WorldlineRegenerationError,
     WorldlineRegenerationService,
@@ -22,7 +26,13 @@ def _seed(db):
             INSERT INTO chapters (id, novel_id, number, title, content, content_sha256, content_revision, status)
             VALUES (?, 'novel-1', ?, ?, ?, ?, 1, 'completed')
             """,
-            (f"chapter-{number}", number, f"第{number}章", f"正文 {number}", f"hash-{number}"),
+            (
+                f"chapter-{number}",
+                number,
+                f"第{number}章",
+                f"正文 {number}",
+                hashlib.sha256(f"正文 {number}".encode("utf-8")).hexdigest(),
+            ),
         )
         conn.execute(
             """
@@ -39,6 +49,9 @@ def _seed(db):
             (f"atom-{number}", number),
         )
     conn.commit()
+    # These fixtures model an explicitly imported pre-Candidate formal prefix,
+    # rather than silently treating arbitrary completed rows as authority.
+    ChapterCandidateRepository(db).import_legacy_formal_history("novel-1")
 
 
 def _seed_canonical_tail(db):
@@ -82,7 +95,7 @@ def test_regenerate_from_any_chapter_archives_tail_and_preserves_prefix_hash(tmp
     assert result.archive_id
     assert conn.execute(
         "SELECT content_sha256 FROM chapters WHERE novel_id = 'novel-1' AND number = 1"
-    ).fetchone()[0] == "hash-1"
+    ).fetchone()[0] == hashlib.sha256("正文 1".encode("utf-8")).hexdigest()
     assert conn.execute("SELECT COUNT(*) FROM chapters WHERE novel_id = 'novel-1'").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM narrative_events WHERE novel_id = 'novel-1'").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE novel_id = 'novel-1'").fetchone()[0] == 1
@@ -249,7 +262,10 @@ def test_restore_archived_worldline_replaces_new_tail_and_creates_a_new_epoch(tm
     rows = conn.execute(
         "SELECT number, content_sha256 FROM chapters WHERE novel_id = 'novel-1' ORDER BY number"
     ).fetchall()
-    assert [tuple(row) for row in rows] == [(1, "hash-1"), (2, "hash-2"), (3, "hash-3")]
+    assert [tuple(row) for row in rows] == [
+        (number, hashlib.sha256(f"正文 {number}".encode("utf-8")).hexdigest())
+        for number in (1, 2, 3)
+    ]
     assert conn.execute(
         "SELECT status FROM worldline_archives WHERE id = ?", (archived.archive_id,)
     ).fetchone()[0] == "restored"

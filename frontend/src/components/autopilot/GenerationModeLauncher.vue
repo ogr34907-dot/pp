@@ -20,7 +20,6 @@
       </button>
     </div>
     <div class="generation-launcher__controls">
-      <n-input-number v-model:value="targetChapters" :min="1" :max="100000" size="small" aria-label="目标章节数" />
       <n-button type="primary" :loading="starting" @click="start">按此模式开始</n-button>
       <n-button secondary :disabled="!run || run.state === 'stopped'" :loading="stopping" @click="stop">安全停止</n-button>
     </div>
@@ -33,16 +32,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ClipboardOutline, FlashOutline } from '@vicons/ionicons5'
 import { generationApi, getGenerationRunOrNull, type GenerationRun, type RunMode } from '@/api/generation'
 import { getGenerationPresentation } from '@/domain/generationPresentation'
 
-const props = defineProps<{ novelId: string; targetChapters?: number }>()
+const props = defineProps<{ novelId: string }>()
 const emit = defineEmits<{ 'status-change': [run: GenerationRun | null] }>()
 const run = ref<GenerationRun | null>(null)
 const mode = ref<RunMode>('continuous')
-const targetChapters = ref(Math.max(1, props.targetChapters || 1))
 const starting = ref(false)
 const stopping = ref(false)
 const error = ref('')
@@ -55,7 +53,6 @@ async function refresh() {
     run.value = await getGenerationRunOrNull(props.novelId)
     if (run.value) {
       mode.value = run.value.run_mode
-      targetChapters.value = Math.max(run.value.target_chapters || 1, 1)
     }
   } catch (cause) {
     run.value = null
@@ -66,7 +63,7 @@ async function start() {
   starting.value = true
   error.value = ''
   try {
-    run.value = await generationApi.start(props.novelId, mode.value, targetChapters.value)
+    run.value = await generationApi.start(props.novelId, mode.value)
     // Keep the browser responsive while the server persists authority states.
     const advance = mode.value === 'continuous'
       ? generationApi.runContinuous(props.novelId)
@@ -85,12 +82,11 @@ async function stop() {
   catch (cause) { error.value = cause instanceof Error ? cause.message : '停止候选自动驾驶失败' }
   finally { stopping.value = false; emit('status-change', run.value) }
 }
-watch(() => props.targetChapters, value => { if (!run.value && value) targetChapters.value = Math.max(1, value) })
 onMounted(() => { void refresh(); timer = window.setInterval(() => void refresh(), 2500) })
 onUnmounted(() => { if (timer !== null) window.clearInterval(timer) })
 </script>
 
 <style scoped>
-.generation-launcher { display: grid; gap: 12px; padding: 14px 16px; border: 1px solid var(--app-border); border-radius: var(--app-radius-md); background: var(--app-surface-subtle); }.generation-launcher__head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }.generation-launcher__eyebrow { display: block; margin-bottom: 2px; color: var(--color-brand); font-size: 10px; font-weight: 700; letter-spacing: .06em; }.generation-launcher h2 { margin: 0; font-size: 15px; }.generation-launcher__status { padding: 4px 7px; border: 1px solid var(--app-border); border-radius: 999px; color: var(--app-text-secondary); font-size: 11px; white-space: nowrap; }.generation-launcher__status.is-brand { color: var(--color-brand); }.generation-launcher__status.is-warning { color: var(--color-warning); }.generation-launcher__status.is-error { color: var(--color-danger); }.generation-launcher__description { margin: 0; color: var(--app-text-secondary); font-size: 12px; line-height: 1.55; }.generation-launcher__modes { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }.generation-mode { display: grid; gap: 5px; padding: 10px; color: var(--app-text-secondary); text-align: left; border: 1px solid var(--app-border); border-radius: var(--app-radius-sm); background: var(--app-surface); cursor: pointer; }.generation-mode strong { color: var(--app-text-primary); font-size: 12px; }.generation-mode span { font-size: 11px; line-height: 1.45; }.generation-mode.is-selected { border-color: var(--color-brand); box-shadow: inset 0 0 0 1px var(--color-brand); }.generation-launcher__controls { display: flex; align-items: center; gap: 8px; }.generation-launcher__controls :deep(.n-input-number) { width: 112px; }.generation-launcher__links { display: flex; flex-wrap: wrap; gap: 12px; }.generation-launcher__links a { color: var(--color-brand); font-size: 12px; text-decoration: none; }.generation-launcher__links a:hover { text-decoration: underline; }
-@media (max-width: 560px) { .generation-launcher__modes { grid-template-columns: 1fr; }.generation-launcher__controls { align-items: stretch; flex-wrap: wrap; }.generation-launcher__controls :deep(.n-input-number) { flex: 1; }.generation-launcher__controls :deep(.n-button) { flex: 1; } }
+.generation-launcher { display: grid; gap: 12px; padding: 14px 16px; border: 1px solid var(--app-border); border-radius: var(--app-radius-md); background: var(--app-surface-subtle); }.generation-launcher__head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }.generation-launcher__eyebrow { display: block; margin-bottom: 2px; color: var(--color-brand); font-size: 10px; font-weight: 700; letter-spacing: .06em; }.generation-launcher h2 { margin: 0; font-size: 15px; }.generation-launcher__status { padding: 4px 7px; border: 1px solid var(--app-border); border-radius: 999px; color: var(--app-text-secondary); font-size: 11px; white-space: nowrap; }.generation-launcher__status.is-brand { color: var(--color-brand); }.generation-launcher__status.is-warning { color: var(--color-warning); }.generation-launcher__status.is-error { color: var(--color-danger); }.generation-launcher__description { margin: 0; color: var(--app-text-secondary); font-size: 12px; line-height: 1.55; }.generation-launcher__modes { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }.generation-mode { display: grid; gap: 5px; padding: 10px; color: var(--app-text-secondary); text-align: left; border: 1px solid var(--app-border); border-radius: var(--app-radius-sm); background: var(--app-surface); cursor: pointer; }.generation-mode strong { color: var(--app-text-primary); font-size: 12px; }.generation-mode span { font-size: 11px; line-height: 1.45; }.generation-mode.is-selected { border-color: var(--color-brand); box-shadow: inset 0 0 0 1px var(--color-brand); }.generation-launcher__controls { display: flex; align-items: center; gap: 8px; }.generation-launcher__links { display: flex; flex-wrap: wrap; gap: 12px; }.generation-launcher__links a { color: var(--color-brand); font-size: 12px; text-decoration: none; }.generation-launcher__links a:hover { text-decoration: underline; }
+@media (max-width: 560px) { .generation-launcher__modes { grid-template-columns: 1fr; }.generation-launcher__controls { align-items: stretch; flex-wrap: wrap; }.generation-launcher__controls :deep(.n-button) { flex: 1; } }
 </style>

@@ -92,6 +92,31 @@ def test_start_review_mode_exposes_strict_backpressure_state(client, db, test_no
     assert legacy_status.json()["generation"]["state"] == "stopped"
 
 
+def test_legacy_baseline_import_requires_explicit_confirmation(client, db, test_novel_id):
+    db.execute(
+        """
+        INSERT INTO chapters (id, novel_id, number, title, content, status)
+        VALUES ('legacy-api-1', ?, 1, '第一章', '旧书正式正文', 'completed')
+        """,
+        (test_novel_id,),
+    )
+    db.get_connection().commit()
+
+    rejected = client.post(
+        f"/api/v1/generation/novels/{test_novel_id}/legacy-formal-history/import",
+        json={"confirm": False},
+    )
+    accepted = client.post(
+        f"/api/v1/generation/novels/{test_novel_id}/legacy-formal-history/import",
+        json={"confirm": True},
+    )
+
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"] == "explicit confirmation is required"
+    assert accepted.status_code == 200
+    assert accepted.json()["data"] == {"head": 1, "imported": 1, "idempotent": False}
+
+
 def test_start_rejects_a_new_novel_until_its_full_five_level_outline_is_synced(client, test_novel_id):
     response = client.post(
         f"/api/v1/generation/novels/{test_novel_id}/start",
@@ -128,6 +153,41 @@ def test_start_uses_novel_target_chapters_instead_of_request_target(client, db, 
 
     assert response.status_code == 200
     assert response.json()["data"]["target_chapters"] == 500
+
+
+def test_start_accepts_a_mode_without_a_request_target_chapter_count(client, db, test_novel_id):
+    _publish_next_chapter_chain(db, test_novel_id)
+    db.execute(
+        "UPDATE novels SET target_chapters = 500 WHERE id = ?", (test_novel_id,)
+    )
+    db.get_connection().commit()
+
+    response = client.post(
+        f"/api/v1/generation/novels/{test_novel_id}/start",
+        json={"run_mode": "chapter_review"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["target_chapters"] == 500
+
+
+def test_start_allows_an_empty_draft_placeholder_in_the_next_formal_slot(client, db, test_novel_id):
+    _publish_next_chapter_chain(db, test_novel_id)
+    db.execute(
+        """
+        INSERT INTO chapters (id, novel_id, number, title, content, status)
+        VALUES ('empty-draft-placeholder', ?, 1, '占位章', '', 'draft')
+        """,
+        (test_novel_id,),
+    )
+    db.get_connection().commit()
+
+    response = client.post(
+        f"/api/v1/generation/novels/{test_novel_id}/start",
+        json={"run_mode": "chapter_review"},
+    )
+
+    assert response.status_code == 200
 
 
 def test_start_rejects_an_active_full_canonical_resync(client, db, test_novel_id):
@@ -194,6 +254,29 @@ def test_start_rejects_a_conflicting_next_formal_chapter_number(client, db, test
 
     assert response.status_code == 409
     assert response.json()["detail"] == "generation_preflight:next_chapter_number_conflict"
+
+
+def test_start_rejects_unproven_completed_history_before_creating_a_run(client, db, test_novel_id):
+    _publish_next_chapter_chain(db, test_novel_id)
+    db.execute(
+        """
+        INSERT INTO chapters (id, novel_id, number, title, content, status)
+        VALUES ('legacy-completed-2', ?, 2, '旧第二章', '未经候选提交的正式正文', 'completed')
+        """,
+        (test_novel_id,),
+    )
+    db.get_connection().commit()
+
+    response = client.post(
+        f"/api/v1/generation/novels/{test_novel_id}/start",
+        json={"run_mode": "chapter_review"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "generation_preflight:unproven_formal_history"
+    assert db.fetch_one(
+        "SELECT 1 FROM novel_generation_runs WHERE novel_id = ?", (test_novel_id,)
+    ) is None
 
 
 def test_generation_state_returns_idle_before_any_run_starts(client, test_novel_id):

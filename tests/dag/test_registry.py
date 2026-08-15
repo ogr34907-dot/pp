@@ -108,6 +108,82 @@ class TestNodeRegistry:
         instance = NodeRegistry.create_instance("test_node_d", config=config)
         assert instance._config.temperature == 0.3
 
+    @pytest.mark.parametrize(
+        "expected_timeout",
+        [
+            5,
+            120,
+            300,
+        ],
+    )
+    def test_omitted_timeout_uses_node_metadata(self, expected_timeout):
+        class TimeoutDefaultNode(BaseNode):
+            async def execute(self, inputs, context):
+                from application.engine.dag.models import NodeResult
+                return NodeResult(outputs={})
+
+            def validate_inputs(self, inputs):
+                return True
+
+        TimeoutDefaultNode.meta = NodeMeta(
+            node_type="timeout_default_node",
+            display_name="timeout default node",
+            category=NodeCategory.GATEWAY,
+            default_timeout_seconds=expected_timeout,
+        )
+
+        assert TimeoutDefaultNode().get_timeout() == expected_timeout
+
+    def test_explicit_timeout_override_wins_over_node_metadata(self):
+        class TimeoutDefaultNode(BaseNode):
+            meta = NodeMeta(
+                node_type="timeout_default_node",
+                display_name="timeout default node",
+                category=NodeCategory.GATEWAY,
+                default_timeout_seconds=300,
+            )
+
+            async def execute(self, inputs, context):
+                from application.engine.dag.models import NodeResult
+                return NodeResult(outputs={})
+
+            def validate_inputs(self, inputs):
+                return True
+
+        node = TimeoutDefaultNode(NodeConfig(timeout_seconds=120))
+
+        assert node.get_timeout() == 120
+
+    def test_omitted_retry_override_uses_node_metadata(self):
+        class RetryDefaultNode(BaseNode):
+            meta = NodeMeta(
+                node_type="retry_default_node",
+                display_name="retry default node",
+                category=NodeCategory.GATEWAY,
+                default_max_retries=4,
+            )
+
+            async def execute(self, inputs, context):
+                from application.engine.dag.models import NodeResult
+                return NodeResult(outputs={})
+
+            def validate_inputs(self, inputs):
+                return True
+
+        assert RetryDefaultNode().get_max_retries() == 4
+
+    @pytest.mark.asyncio
+    async def test_retry_node_uses_metadata_when_retry_override_is_omitted(self):
+        from application.engine.dag.nodes.gateway_nodes import RetryNode
+
+        result = await RetryNode(NodeConfig(max_retries=None)).execute(
+            {"max_attempts": 4},
+            {"shared_state": {"candidate_revision": 1}},
+        )
+
+        assert result.outputs["retry_requested"] is False
+        assert result.outputs["retry_exhausted"] is True
+
     def test_all_meta(self):
         @NodeRegistry.register("test_node_e")
         class TestNodeE(BaseNode):

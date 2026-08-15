@@ -126,6 +126,52 @@ async def test_act_planning_stops_without_creating_volume_when_act_reservations_
         auto_approve_mode=True,
         consecutive_error_count=0,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_chapters", [None, 0, True, 1.5, "invalid"])
+async def test_act_planning_refuses_invalid_persisted_target_before_creating_structure(
+    monkeypatch, target_chapters
+):
+    repo = _StoryNodeRepo([], {})
+    request = AsyncMock()
+    monkeypatch.setattr(
+        "engine.runtime.act_planning_delegate._request_act_invocation",
+        request,
+    )
+    host = SimpleNamespace(
+        story_node_repo=repo,
+        planning_service=SimpleNamespace(
+            create_next_act_auto=AsyncMock(),
+            confirm_act_planning=AsyncMock(),
+        ),
+        _is_still_running=lambda _novel: True,
+        _update_shared_state=MagicMock(),
+        _flush_novel=MagicMock(),
+    )
+    novel = SimpleNamespace(
+        novel_id=NovelId("invalid-target-act"),
+        target_chapters=target_chapters,
+        current_act=0,
+        current_auto_chapters=0,
+        current_stage=NovelStage.ACT_PLANNING,
+        autopilot_status=AutopilotStatus.RUNNING,
+    )
+
+    await run_act_planning(host, novel)
+
+    assert novel.current_stage == NovelStage.PAUSED_FOR_REVIEW
+    assert novel.autopilot_status == AutopilotStatus.STOPPED
+    assert repo.saved == []
+    request.assert_not_awaited()
+    host.planning_service.create_next_act_auto.assert_not_awaited()
+    host.planning_service.confirm_act_planning.assert_not_awaited()
+    host._update_shared_state.assert_any_call(
+        "invalid-target-act",
+        current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+        autopilot_pause_reason="target_chapters_required",
+    )
+    host._flush_novel.assert_called_once_with(novel)
     host = SimpleNamespace(
         story_node_repo=repo,
         planning_service=SimpleNamespace(create_next_act_auto=AsyncMock()),

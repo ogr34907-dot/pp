@@ -52,11 +52,9 @@
       :x="contextMenu.x"
       :y="contextMenu.y"
       :node-id="contextMenu.nodeId"
-      :node-enabled="contextMenu.nodeEnabled"
       :node-type="contextMenu.nodeType"
       @close="closeContextMenu"
       @detail="handleNodeDetail"
-      @toggle="handleToggleNode"
     />
 
     <!-- ★ 节点详情弹窗（主界面居中弹窗，仿 Dify） -->
@@ -70,7 +68,6 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { useMessage } from 'naive-ui'
 import { useDAGStore } from '@/stores/dagStore'
 import { useDAGRunStore } from '@/stores/dagRunStore'
 import { useAutopilotWorkspaceStore } from '@/stores/autopilotWorkspaceStore'
@@ -89,7 +86,6 @@ const props = defineProps<{
 
 const dagStore = useDAGStore()
 const runStore = useDAGRunStore()
-const message = useMessage()
 
 // ★ 托管模式状态（从后端获取，DAG只是展示层）
 const autopilotStatus = ref<AutopilotDisplayStatus>('idle')
@@ -100,7 +96,6 @@ const contextMenu = reactive({
   x: 0,
   y: 0,
   nodeId: '',
-  nodeEnabled: true,
   nodeType: '',
 })
 
@@ -156,7 +151,7 @@ function closeContextMenu() {
   clearContextMenuCloseHandler()
 }
 
-function handleCanvasContextMenu(event: MouseEvent, nodeId: string, enabled: boolean) {
+function handleCanvasContextMenu(event: MouseEvent, nodeId: string) {
   event.preventDefault()
   clearContextMenuCloseHandler()
   const node = dagStore.dagDefinition?.nodes.find(n => n.id === nodeId)
@@ -164,7 +159,6 @@ function handleCanvasContextMenu(event: MouseEvent, nodeId: string, enabled: boo
   contextMenu.x = event.clientX
   contextMenu.y = event.clientY
   contextMenu.nodeId = nodeId
-  contextMenu.nodeEnabled = enabled
   contextMenu.nodeType = node?.type || ''
 
   const closeHandler = closeContextMenu
@@ -188,12 +182,6 @@ onBeforeUnmount(() => {
 function handleNodeDetail(nodeId: string) {
   selectedDetailNodeId.value = nodeId
   detailPanelVisible.value = true
-}
-
-async function handleToggleNode(nodeId: string) {
-  await dagStore.toggleNode(props.novelId, nodeId)
-  const node = dagStore.dagDefinition?.nodes.find(n => n.id === nodeId)
-  message.success(node?.enabled ? '节点已启用' : '节点已禁用')
 }
 
 /** 切回「监控 · DAG」页的实时日志 */

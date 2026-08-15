@@ -121,34 +121,64 @@ class TestOpenAIProviderLegacy:
             assert result.content == '{"a":\n 1}'
 
     @pytest.mark.anyio
-    async def test_generate_falls_back_to_stream_when_content_is_empty(self, provider):
+    async def test_generate_retries_empty_non_stream_without_stream_replay(self, provider):
         prompt = Prompt(system="You are helpful", user="Hello")
         config = GenerationConfig(model="gpt-5.4", temperature=0, max_tokens=32)
         empty_response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=None))],
             usage=SimpleNamespace(prompt_tokens=19, completion_tokens=15),
         )
-        stream = _FakeStream([
-            SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content="OK"))],
-                usage=None,
-            ),
-            SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content=None))],
-                usage=SimpleNamespace(prompt_tokens=19, completion_tokens=17),
-            ),
-        ])
+        def empty_stream():
+            return _FakeStream([
+                SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content=None))],
+                    usage=SimpleNamespace(prompt_tokens=19, completion_tokens=15),
+                ),
+            ])
 
-        with patch.object(provider.async_client.chat.completions, "create", new_callable=AsyncMock) as mock_create:
-            mock_create.side_effect = [empty_response, stream]
+        with (
+            patch.object(provider.async_client.chat.completions, "create", new_callable=AsyncMock) as mock_create,
+            patch("infrastructure.ai.providers.openai_provider.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_create.side_effect = [item for _ in range(3) for item in (empty_response, empty_stream())]
 
-            result = await provider.generate(prompt, config)
+            with pytest.raises(RuntimeError, match="empty content"):
+                await provider.generate(prompt, config)
 
-            assert result.content == "OK"
-            assert result.token_usage.input_tokens == 19
-            assert result.token_usage.output_tokens == 17
-            assert mock_create.await_count == 2
-            assert mock_create.await_args_list[1].kwargs["stream"] is True
+        assert mock_create.await_count == 3
+        assert all(call.kwargs.get("stream") is not True for call in mock_create.await_args_list)
+
+    @pytest.mark.anyio
+    async def test_generate_empty_structured_chat_does_not_replay_as_stream(self, provider):
+        prompt = Prompt(system="You are helpful", user="Hello")
+        config = GenerationConfig(
+            model="gpt-5.4",
+            response_format={"type": "json_object"},
+        )
+        empty_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=None))],
+            usage=SimpleNamespace(prompt_tokens=19, completion_tokens=15),
+        )
+        def empty_stream():
+            return _FakeStream([
+                SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content=None))],
+                    usage=SimpleNamespace(prompt_tokens=19, completion_tokens=15),
+                ),
+            ])
+
+        with (
+            patch.object(provider.async_client.chat.completions, "create", new_callable=AsyncMock) as mock_create,
+            patch("infrastructure.ai.providers.openai_provider.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_create.side_effect = [item for _ in range(3) for item in (empty_response, empty_stream())]
+
+            with pytest.raises(RuntimeError, match="empty content"):
+                await provider.generate(prompt, config)
+
+        assert mock_create.await_count == 3
+        assert all(call.kwargs.get("stream") is not True for call in mock_create.await_args_list)
+        assert all(call.kwargs["response_format"] == {"type": "json_object"} for call in mock_create.await_args_list)
 
     @pytest.mark.anyio
     async def test_stream_generate(self, provider):
@@ -176,18 +206,14 @@ class TestOpenAIProviderLegacy:
             choices=[SimpleNamespace(message=SimpleNamespace(content=None))],
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
         )
-        empty_stream = _FakeStream([
-            SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content=None))],
-                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-            ),
-        ])
-
         with patch.object(provider.async_client.chat.completions, "create", new_callable=AsyncMock) as mock_create:
-            mock_create.side_effect = [empty_response, empty_stream] * 3
+            mock_create.side_effect = [empty_response] * 3
 
             with pytest.raises(RuntimeError, match="empty content"):
                 await provider.generate(prompt, config)
+
+        assert mock_create.await_count == 3
+        assert all(call.kwargs.get("stream") is not True for call in mock_create.await_args_list)
 
     def test_missing_api_key(self):
         with pytest.raises(ValueError, match="API key is required"):
@@ -398,6 +424,63 @@ class TestOpenAIProviderResponses:
 
         chat_create.assert_not_called()
         assert not OpenAIProvider._fallback_to_chat_cache
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("status_code", "message"),
+        [
+            (405, "Responses endpoint method not allowed"),
+            (501, "Responses endpoint not implemented"),
+        ],
+    )
+    async def test_responses_endpoint_capability_errors_fallback_to_chat_once(
+        self, provider, status_code, message
+    ):
+        prompt = Prompt(system="You are helpful", user="Hello")
+        config = GenerationConfig(model="gpt-4o")
+        chat_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="chat fallback"))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+        with (
+            patch.object(provider.async_client.responses, "create", new_callable=AsyncMock) as responses_create,
+            patch.object(provider.async_client.chat.completions, "create", new_callable=AsyncMock) as chat_create,
+        ):
+            responses_create.side_effect = _api_error(openai.APIStatusError, status_code, message)
+            chat_create.return_value = chat_response
+
+            result = await provider.generate(prompt, config)
+
+        assert result.content == "chat fallback"
+        assert responses_create.await_count == 1
+        assert chat_create.await_count == 1
+
+    @pytest.mark.anyio
+    async def test_responses_model_not_found_does_not_fallback_to_chat(self, provider):
+        prompt = Prompt(system="You are helpful", user="Hello")
+        config = GenerationConfig(model="gpt-4o")
+        chat_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="must not be used"))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+        with (
+            patch.object(provider.async_client.responses, "create", new_callable=AsyncMock) as responses_create,
+            patch.object(provider.async_client.chat.completions, "create", new_callable=AsyncMock) as chat_create,
+        ):
+            responses_create.side_effect = _api_error(
+                openai.NotFoundError,
+                404,
+                "Responses API model deployment not found",
+            )
+            chat_create.return_value = chat_response
+
+            with pytest.raises(RuntimeError, match="model deployment not found"):
+                await provider.generate(prompt, config)
+
+        responses_create.assert_awaited_once()
+        chat_create.assert_not_called()
 
     @pytest.mark.anyio
     async def test_responses_json_schema_falls_back_only_for_explicit_format_unsupported(self, provider):

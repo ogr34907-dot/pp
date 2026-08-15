@@ -197,8 +197,8 @@ class NodeConfig(BaseModel):
     prompt_variables: Dict[str, str] = Field(default_factory=dict)
     thresholds: Dict[str, float] = Field(default_factory=dict)
     model_override: Optional[str] = None
-    max_retries: int = Field(default=1, ge=0, le=5)
-    timeout_seconds: int = Field(default=60, ge=10, le=600)
+    max_retries: Optional[int] = Field(default=None, ge=0, le=5)
+    timeout_seconds: Optional[int] = Field(default=None, ge=10, le=600)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=None, ge=100)
 
@@ -262,7 +262,15 @@ class DAGDefinition(BaseModel):
     def fingerprint(self) -> str:
         """计算 DAG 结构指纹（用于缓存编译结果）"""
         data = {
-            "nodes": [{"id": n.id, "type": n.type, "enabled": n.enabled} for n in sorted(self.nodes, key=lambda n: n.id)],
+            "nodes": [
+                {
+                    "id": n.id,
+                    "type": n.type,
+                    "enabled": n.enabled,
+                    "config": n.config.model_dump(mode="json"),
+                }
+                for n in sorted(self.nodes, key=lambda n: n.id)
+            ],
             "edges": [{"id": e.id, "source": e.source, "target": e.target, "condition": e.condition.value}
                       for e in sorted(self.edges, key=lambda e: e.id)],
         }

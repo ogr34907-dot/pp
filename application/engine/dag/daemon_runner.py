@@ -2,10 +2,9 @@
 
 核心原则：
 1. 复用现有 IPC 通道（StreamingBus、SharedState、PersistenceQueue）
-2. LangGraph StateGraph 运行在守护进程的 asyncio 事件循环中
-3. Checkpoint 使用独立 SQLite 文件
-4. 每个 novel 一个 thread_id，支持并行多本小说
-5. Feature Flag 控制新旧引擎切换
+2. 运行数据库保存的 DAG 定义，且使用原生 DAG 执行语义
+3. 每个 novel 一个 thread_id，支持并行多本小说
+4. Feature Flag 控制新旧引擎切换
 """
 from __future__ import annotations
 
@@ -41,8 +40,9 @@ class DAGDaemonRunner:
         self._pq = persistence_queue
         self._breaker = circuit_breaker
 
-        # DAG 版本管理器
-        self._version_mgr = DAGVersionManager(data_root=data_root)
+        # Persistence moved from a data-root filesystem to the database.  Keep
+        # the argument for legacy callers, but never pass it to the DB manager.
+        self._version_mgr = DAGVersionManager()
 
         # 事件聚合器
         self._aggregator = NodeEventAggregator()
@@ -93,7 +93,7 @@ class DAGDaemonRunner:
             return
 
         # 构建初始状态
-        initial_state = await self._build_initial_state(novel_id)
+        initial_state = await self._build_initial_state(novel_id, dag)
 
         # 构建线程 ID
         thread_id = f"novel_{novel_id}"
@@ -134,27 +134,34 @@ class DAGDaemonRunner:
                 self._breaker.record_failure()
 
     async def resume_novel(self, novel_id: str):
-        """从 checkpoint 恢复执行（断点续写）"""
+        """按已保存 DAG 重新运行。
+
+        The native runtime has no checkpoint resume contract; durable Candidate
+        recovery is handled by its own persisted run trace instead.
+        """
         dag = self._version_mgr.load_latest(novel_id)
         if not dag:
             raise ValueError(f"小说 {novel_id} 无已保存的 DAG 定义")
 
-        initial_state = await self._build_initial_state(novel_id)
+        initial_state = await self._build_initial_state(novel_id, dag)
         thread_id = f"novel_{novel_id}"
 
-        # 使用 engine 的 run_from_node 语义
-        # 实际断点续写由 LangGraph Checkpointer 处理
         dag_result = await self._engine.run(dag, initial_state, thread_id)
-        logger.info(f"DAG 断点续写完成: novel={novel_id}")
+        logger.info(f"DAG 已按保存定义重新运行: novel={novel_id}")
 
-    async def _build_initial_state(self, novel_id: str) -> Dict[str, Any]:
+    async def _build_initial_state(
+        self, novel_id: str, dag: DAGDefinition
+    ) -> Dict[str, Any]:
         """构建初始运行状态"""
         return {
             "novel_id": novel_id,
             "chapter_number": 0,
             "dag_run_id": f"run_{int(time.time()*1000)}",
             "disabled_nodes": [],
-            "node_configs": {},
+            "node_configs": {
+                node.id: node.config.model_dump(mode="json", exclude_none=True)
+                for node in dag.nodes
+            },
         }
 
     # ─── 节点操作 ───

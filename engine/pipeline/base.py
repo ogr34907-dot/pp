@@ -56,6 +56,15 @@ def _writing_progress(
         logger.debug("[%s] writing_progress_sink 失败: %s", getattr(ctx, "novel_id", "?"), e)
 
 
+def _candidate_first_authority_blocks_completed_write(ctx: PipelineContext) -> bool:
+    from engine.runtime.daemon_host import _candidate_first_authority_blocks_completed_write
+
+    return _candidate_first_authority_blocks_completed_write(
+        getattr(getattr(ctx, "chapter_repository", None), "db", None),
+        str(ctx.novel_id),
+    )
+
+
 class BaseStoryPipeline(ABC):
     """写作管线基类 — 继承即扩展，开箱即用
 
@@ -967,6 +976,9 @@ class BaseStoryPipeline(ABC):
         if ctx.chapter_repository is None:
             return StepResult.fail("chapter_repository 未设置，无法保存")
 
+        if _candidate_first_authority_blocks_completed_write(ctx):
+            return StepResult.fail("candidate_first_required")
+
         _writing_progress(
             ctx,
             "chapter_persist",
@@ -990,15 +1002,21 @@ class BaseStoryPipeline(ABC):
                 and str(getattr(existing, "content", "") or "").strip()
                 and str(getattr(existing, "content", "") or "") != ctx.chapter_content
             ):
+                if _candidate_first_authority_blocks_completed_write(ctx):
+                    return StepResult.fail("candidate_first_required")
                 await self._save_chapter_via_repository(ctx)
                 if ctx.metadata.get("rewrite_requires_rebuild"):
                     return StepResult.fail("chapter_rewrite_requires_rebuild")
             self._prepare_chapter_persistence_receipt(ctx)
             # 尝试推持久化队列
+            if _candidate_first_authority_blocks_completed_write(ctx):
+                return StepResult.fail("candidate_first_required")
             pushed = self._push_persistence_command(ctx)
             if pushed:
                 self._wait_for_chapter_persistence(ctx)
                 if not self._chapter_completed_in_repository(ctx):
+                    if _candidate_first_authority_blocks_completed_write(ctx):
+                        return StepResult.fail("candidate_first_required")
                     await self._save_chapter_via_repository(ctx)
                 if not self._chapter_completed_in_repository(ctx):
                     raise RuntimeError("matching_chapter_receipt_unavailable")
@@ -1008,6 +1026,8 @@ class BaseStoryPipeline(ABC):
                 return StepResult.ok()
 
             # 降级：通过 repository 直接写库
+            if _candidate_first_authority_blocks_completed_write(ctx):
+                return StepResult.fail("candidate_first_required")
             await self._save_chapter_via_repository(ctx)
             if not self._chapter_completed_in_repository(ctx):
                 raise RuntimeError("matching_chapter_receipt_unavailable")

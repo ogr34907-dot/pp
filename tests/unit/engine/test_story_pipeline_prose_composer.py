@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -582,7 +582,7 @@ async def test_story_pipeline_uses_chapter_prose_composer_for_auto_approved_flow
 
 
 @pytest.mark.asyncio
-async def test_story_pipeline_save_falls_back_when_queue_write_not_visible(monkeypatch):
+async def test_story_pipeline_save_is_blocked_before_candidate_run_exists(monkeypatch):
     pipeline = _Pipeline()
     ctx = PipelineContext(
         novel_id="novel-save",
@@ -591,6 +591,7 @@ async def test_story_pipeline_save_falls_back_when_queue_write_not_visible(monke
         word_count=2,
     )
     ctx.chapter_repository = SimpleNamespace(
+        db=SimpleNamespace(fetch_one=lambda *_args, **_kwargs: None),
         get_by_novel_and_number=lambda *_args: None,
     )
     saved = []
@@ -615,14 +616,40 @@ async def test_story_pipeline_save_falls_back_when_queue_write_not_visible(monke
 
     result = await pipeline._step_save_chapter(ctx)
 
-    assert result.passed
-    assert saved == [("novel-save", 1, "正文")]
-    assert ctx.chapter_saved is True
-    assert ctx.save_method == "queue"
+    assert not result.passed
+    assert result.message == "candidate_first_required"
+    assert saved == []
+    assert ctx.chapter_saved is False
 
 
 @pytest.mark.asyncio
-async def test_story_pipeline_queue_idle_without_durable_receipt_is_not_saved(monkeypatch):
+async def test_story_pipeline_save_blocks_candidate_first_before_queue_or_repository(monkeypatch):
+    pipeline = _Pipeline()
+    ctx = PipelineContext(
+        novel_id="candidate-novel",
+        chapter_number=1,
+        chapter_content="旧管线已生成的正文。",
+        word_count=10,
+    )
+    ctx.chapter_repository = SimpleNamespace(
+        db=SimpleNamespace(fetch_one=lambda *_args, **_kwargs: {"state": "running"}),
+        get_by_novel_and_number=lambda *_args: None,
+    )
+    pushed = MagicMock(return_value=True)
+    saved = AsyncMock()
+    monkeypatch.setattr(pipeline, "_push_persistence_command", pushed)
+    monkeypatch.setattr(pipeline, "_save_chapter_via_repository", saved)
+
+    result = await pipeline._step_save_chapter(ctx)
+
+    assert not result.passed
+    assert result.message == "candidate_first_required"
+    pushed.assert_not_called()
+    saved.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_save_remains_blocked_when_queue_has_no_receipt(monkeypatch):
     pipeline = _Pipeline()
     ctx = PipelineContext(
         novel_id="novel-save",
@@ -631,6 +658,7 @@ async def test_story_pipeline_queue_idle_without_durable_receipt_is_not_saved(mo
         word_count=2,
     )
     ctx.chapter_repository = SimpleNamespace(
+        db=SimpleNamespace(fetch_one=lambda *_args, **_kwargs: None),
         get_by_novel_and_number=lambda *_args: None,
     )
 
@@ -651,7 +679,7 @@ async def test_story_pipeline_queue_idle_without_durable_receipt_is_not_saved(mo
     result = await pipeline._step_save_chapter(ctx)
 
     assert not result.passed
-    assert "matching_chapter_receipt_unavailable" in result.message
+    assert result.message == "candidate_first_required"
     assert ctx.chapter_saved is False
 
 

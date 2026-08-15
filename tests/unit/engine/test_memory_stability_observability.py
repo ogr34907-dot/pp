@@ -5,7 +5,6 @@ import hashlib
 import json
 import re
 import sqlite3
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,8 +15,10 @@ from application.analyst.services.chapter_indexing_service import ChapterIndexin
 from application.core.services.chapter_rewrite_coordinator import ChapterRewriteCoordinator
 from application.engine.services.chapter_aftermath_pipeline import ChapterAftermathPipeline
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
-from application.engine.services.memory_engine import MemoryEngine
+from application.engine.services.candidate_chapter_workflow import CandidateChapterWorkflowService
+from application.engine.services.memory_engine import CompletedBeatItem, MemoryEngine
 from application.engine.services.memory_engine_settings import MemoryEngineRuntimeSettings
+from application.engine.services.worldline_rebuild_service import WorldlineRebuildService
 from application.world.services.chapter_narrative_sync import (
     sync_chapter_narrative_after_save,
 )
@@ -25,10 +26,8 @@ from application.world.services.knowledge_service import KnowledgeService
 from domain.ai.services.llm_service import GenerationResult
 from domain.ai.value_objects.prompt import Prompt
 from domain.ai.value_objects.token_usage import TokenUsage
-from domain.novel.entities.chapter import Chapter, ChapterStatus
+from domain.novel.candidate_chapter import GenerationRunState, RunMode
 from domain.novel.value_objects.novel_id import NovelId
-from engine.pipeline.base import BaseStoryPipeline
-from engine.pipeline.context import PipelineContext
 from engine.pipeline.prose_composer import (
     ChapterProseInvocationComposer,
     ProseCompositionRequest,
@@ -38,8 +37,12 @@ from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_chapter_repository import (
     SqliteChapterRepository,
 )
+from infrastructure.persistence.database.sqlite_novel_repository import SqliteNovelRepository
 from infrastructure.persistence.database.sqlite_knowledge_repository import (
     SqliteKnowledgeRepository,
+)
+from infrastructure.persistence.database.chapter_candidate_repository import (
+    ChapterCandidateRepository,
 )
 
 
@@ -187,7 +190,11 @@ class _DeterministicLLM:
                                     + (f"；{durable_suffix}" if durable_suffix else "")
                                 ),
                                 "chapter": chapter_number,
-                                "characters_involved": ["沈青"],
+                                "characters_involved": [],
+                                "evidence_text": (
+                                    f"第{chapter_number}章完成的记忆节拍"
+                                    + (f"；{durable_suffix}" if durable_suffix else "")
+                                ),
                             }
                         ],
                         "revealed_clues": [
@@ -200,6 +207,10 @@ class _DeterministicLLM:
                                 "revealed_at_chapter": chapter_number,
                                 "category": "truth",
                                 "is_still_valid": True,
+                                "evidence_text": (
+                                    f"第{chapter_number}章揭露的记忆线索"
+                                    + (f"；{durable_suffix}" if durable_suffix else "")
+                                ),
                             }
                         ],
                         "fact_violations": [],
@@ -238,10 +249,10 @@ class _DeterministicLLM:
             "open_threads": "钟楼暗门伏笔" if "钟楼暗门伏笔" in markers else "",
             "relation_triples": [
                 {
-                    "subject": marker,
-                    "predicate": "已发生",
+                    "subject": "本章",
+                    "predicate": "出现",
                     "object": marker,
-                    "evidence_text": marker,
+                    "evidence_text": f"本章出现{marker}",
                 }
                 for marker in markers
             ],
@@ -301,120 +312,90 @@ class _DeterministicComposer:
             200: "钟楼暗门伏笔",
             350: "苍梧城毁灭",
         }.get(request.chapter_number, "常规推进")
+        durable_suffix = "；".join(
+            marker
+            for marker in (
+                "沈青得知内鬼秘密",
+                "林澈死亡",
+                "沈青与陆宁从敌对转为合作",
+                "钟楼暗门伏笔",
+                "苍梧城毁灭",
+            )
+            if marker in scenario
+        )
         return ProseCompositionResult(
             content=(
-                f"第{request.chapter_number}章正文：{scenario}；"
-                f"记忆节拍-{request.chapter_number}；"
-                f"记忆线索-{request.chapter_number}"
+                f"第{request.chapter_number}章正文：本章出现{scenario}；"
+                f"第{request.chapter_number}章完成的记忆节拍"
+                + (f"；{durable_suffix}" if durable_suffix else "")
+                + f"；第{request.chapter_number}章揭露的记忆线索"
+                + (f"；{durable_suffix}" if durable_suffix else "")
             )
         )
 
 
-class _ChapterRepository:
-    def __init__(self, db):
-        self.db = db
-        self._connection = db.get_connection()
-        self._repository = SqliteChapterRepository(db)
-        self.chapters: dict[int, Chapter] = {}
+class _CandidateOutlineService:
+    """Published five-level projection used by the real candidate workflow."""
 
-    def get_by_novel_and_number(self, novel_id, number):
-        number = int(number)
-        if number in self.chapters:
-            return self.chapters[number]
-        chapter = self._repository.get_by_novel_and_number(novel_id, number)
-        if chapter is None:
-            return None
-        self.chapters[number] = chapter
-        return chapter
-
-    def list_by_novel(self, novel_id):
-        chapters = self._repository.list_by_novel(novel_id)
-        for chapter in chapters:
-            self.chapters[chapter.number] = chapter
-        return sorted(self.chapters.values(), key=lambda chapter: chapter.number)
-
-    def save(self, chapter):
-        self._repository.save(chapter)
-        self.db.commit()
-        persisted = self._repository.get_by_novel_and_number(
-            chapter.novel_id,
-            chapter.number,
-        )
-        self.chapters[chapter.number] = persisted
-        self._connection.execute(
-            """
-            INSERT INTO chapter_snapshots (chapter_number, content, status)
-            VALUES (?, ?, ?)
-            ON CONFLICT(chapter_number) DO UPDATE SET content = excluded.content, status = excluded.status
-            """,
-            (persisted.number, persisted.content, persisted.status.value),
-        )
-        self._connection.commit()
-
-    def rewrite(self, chapter, content):
-        rewritten = ChapterRewriteCoordinator(
-            db=self.db,
-            chapter_repository=self._repository,
-        ).rewrite(chapter, content).chapter
-        self.chapters[rewritten.number] = rewritten
-        self._connection.execute(
-            "UPDATE chapter_snapshots SET content = ?, status = ? WHERE chapter_number = ?",
-            (rewritten.content, rewritten.status.value, rewritten.number),
-        )
-        self._connection.commit()
-        return rewritten
+    def next_published_chapter_context(self, novel_id: str, *, after_chapter: int):
+        chapter_number = after_chapter + 1
+        title = f"第{chapter_number}章"
+        return SimpleNamespace(number=chapter_number, title=title), {
+            "outline": {"contract_id": "outline", "digest": "outline-v1", "payload": {}},
+            "part": {"contract_id": "part", "digest": "part-v1", "payload": {}},
+            "volume": {"contract_id": "volume", "digest": "volume-v1", "payload": {}},
+            "act": {"contract_id": "act", "digest": "act-v1", "payload": {}},
+            "chapter": {
+                "contract_id": f"chapter-{chapter_number}",
+                "digest": f"chapter-{chapter_number}-v1",
+                "payload": {
+                    "title": title,
+                    "creative_goal": "推进钟楼危机并留下下一章钩子",
+                    "entry_state": "沈青仍在追查钟楼秘密",
+                    "exit_state": "沈青获得新的危机线索",
+                    "required_events": [],
+                    "forbidden_events": [],
+                    "handoff_conditions": ["危机仍未解除"],
+                },
+            },
+        }
 
 
-class _NovelRepository:
-    def __init__(self, target_chapters: int):
-        self.novel = SimpleNamespace(
-            target_chapters=target_chapters,
-            current_beat_index=0,
-            generation_prefs=SimpleNamespace(inline_prose_aggregation_enabled=False),
-        )
-
-    def get_by_id(self, novel_id):
-        return self.novel
-
-
-@dataclass
-class _CurrentStoryNodeRepository:
-    node: object | None = None
-
-    async def get_by_novel(self, novel_id):
-        return [self.node] if self.node is not None else []
-
-
-class _ChapterWorkflow:
-    def __init__(self, allocator: ContextBudgetAllocator | None = None, captured_contexts=None):
-        self.context_builder = (
-            SimpleNamespace(budget_allocator=allocator) if allocator is not None else None
-        )
+class _CandidateDraftGenerator:
+    def __init__(self, allocator: ContextBudgetAllocator, captured_contexts: dict[int, str]):
         self._allocator = allocator
         self._captured_contexts = captured_contexts
+        self._composer = _DeterministicComposer()
 
-    def prepare_chapter_generation(self, novel_id, chapter_number, outline, scene_director=None):
-        if self._allocator is not None:
-            allocation = self._allocator.allocate(
+    async def generate_candidate_draft(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        chapter_title: str,
+        outline_text: str,
+        **_kwargs,
+    ) -> dict[str, str]:
+        allocation = self._allocator.allocate(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            outline=outline_text,
+            total_budget=12000,
+        )
+        context = allocation.get_final_context()
+        self._captured_contexts[chapter_number] = context
+        composed = await self._composer.compose(
+            ProseCompositionRequest(
                 novel_id=novel_id,
                 chapter_number=chapter_number,
-                outline=outline,
-                total_budget=12000,
+                chapter_title=chapter_title,
+                outline=outline_text,
+                context_text=context,
+                metadata={"continuity_context": context},
+                auto_approve_mode=False,
             )
-            context = allocation.get_final_context()
-            if self._captured_contexts is not None:
-                self._captured_contexts[chapter_number] = context
-            return {
-                "context": context,
-                "context_tokens": self._allocator.estimate_tokens(context),
-                "context_budget_tokens": 12000,
-                "voice_anchors": "",
-            }
-        return {
-            "context": f"T0 locked fact / T1 summary / T2 bridge / T3 evidence for {chapter_number}",
-            "context_tokens": 16,
-            "voice_anchors": "",
-        }
+        )
+        return {"content": composed.content, "script": f"第{chapter_number}章剧本"}
 
 
 class _MemoryBibleRepository:
@@ -560,11 +541,9 @@ async def _run_memory_stability_regression(
     database = DatabaseConnection(str(database_path))
     connection = database.get_connection()
     database.execute(
-        "INSERT INTO novels (id, title, slug) "
-        "VALUES ('memory-stability', 'Memory Stability', 'memory-stability')"
-    )
-    connection.execute(
-        "CREATE TABLE chapter_snapshots (chapter_number INTEGER PRIMARY KEY, content TEXT NOT NULL, status TEXT NOT NULL)"
+        "INSERT INTO novels (id, title, slug, target_chapters) "
+        "VALUES ('memory-stability', 'Memory Stability', 'memory-stability', ?)",
+        (chapter_count,),
     )
     connection.executescript(
         """
@@ -598,6 +577,7 @@ async def _run_memory_stability_regression(
             chapter_repository=active_chapter_repository,
             bible_repository=bible_repository,
             memory_engine=memory_engine,
+            novel_repository=SqliteNovelRepository(active_database),
         )
         knowledge = KnowledgeService(SqliteKnowledgeRepository(active_database))
         aftermath = ChapterAftermathPipeline(
@@ -624,99 +604,124 @@ async def _run_memory_stability_regression(
     monkeypatch.setattr(ChapterAftermathPipeline, "_extract_chapter_bridge", _observed_bridge)
     monkeypatch.setattr(ChapterAftermathPipeline, "_run_auxiliary_stages", _observed_auxiliary)
 
-    chapter_repository = _ChapterRepository(database)
+    chapter_repository = SqliteChapterRepository(database)
+    candidate_repository = ChapterCandidateRepository(database)
+    candidate_repository.start_run(
+        "memory-stability", run_mode=RunMode.CHAPTER_REVIEW
+    )
     vector_store, llm, memory_engine, allocator, aftermath, knowledge = _build_runtime(
         database,
         connection,
         chapter_repository,
     )
-    story_node_repository = _CurrentStoryNodeRepository()
-    novel_repository = _NovelRepository(chapter_count)
-    pipeline = BaseStoryPipeline()
+    draft_generator = _CandidateDraftGenerator(allocator, captured_contexts)
+    workflow = CandidateChapterWorkflowService(
+        candidate_repository,
+        _CandidateOutlineService(),
+        draft_generator,
+        aftermath,
+    )
     for chapter_number in range(1, chapter_count + 1):
         if chapter_number == 10:
+            await aftermath.drain_auxiliary_stages()
             database.close()
             database = DatabaseConnection(str(database_path))
             connection = database.get_connection()
-            chapter_repository = _ChapterRepository(database)
-            story_node_repository = _CurrentStoryNodeRepository()
-            novel_repository = _NovelRepository(chapter_count)
+            chapter_repository = SqliteChapterRepository(database)
+            candidate_repository = ChapterCandidateRepository(database)
             vector_store, llm, memory_engine, allocator, aftermath, knowledge = _build_runtime(
                 database,
                 connection,
                 chapter_repository,
             )
-            pipeline = BaseStoryPipeline()
-        story_node_repository.node = SimpleNamespace(
-            node_type=SimpleNamespace(value="chapter"),
-            number=chapter_number,
-            title=f"第{chapter_number}章",
-            outline=_execution_plan(chapter_number),
-            description="",
-            metadata={},
+            draft_generator = _CandidateDraftGenerator(allocator, captured_contexts)
+            workflow = CandidateChapterWorkflowService(
+                candidate_repository,
+                _CandidateOutlineService(),
+                draft_generator,
+                aftermath,
+            )
+        candidate = await workflow.generate_next("memory-stability")
+        assert candidate is not None
+        committed = await workflow.accept_candidate(
+            candidate.id, continue_after_commit=True
         )
-        context = PipelineContext(novel_id="memory-stability", auto_approve_mode=True)
-        context.inject(
-            novel_repository=novel_repository,
-            chapter_repository=chapter_repository,
-            story_node_repo=story_node_repository,
-            chapter_workflow=_ChapterWorkflow(allocator, captured_contexts),
-            prose_composer=_DeterministicComposer(),
-            llm_service=llm,
-            aftermath_pipeline=aftermath,
-        )
-        result = await pipeline.run_chapter(context)
-        if chapter_number == 17:
-            assert result.success is False
-            recovered_content = f"{context.chapter_content}\n人工修复后的补充。"
-            chapter = chapter_repository.chapters[chapter_number]
-            chapter_repository.rewrite(chapter, recovered_content)
-            persisted_recovery_chapter = chapter_repository.chapters[chapter_number]
-            assert persisted_recovery_chapter.content_sha256 == hashlib.sha256(
-                recovered_content.encode("utf-8")
-            ).hexdigest()
-            assert persisted_recovery_chapter.content_revision == 2
-            recovered = await aftermath.run_after_chapter_saved(
-                "memory-stability",
-                chapter_number,
-                recovered_content,
-                expected_content_sha256=persisted_recovery_chapter.content_sha256,
-                expected_content_revision=persisted_recovery_chapter.content_revision,
-            )
-            assert recovered["narrative_sync_ok"] is True
-            assert recovered["content_revision"] == 2
-            assert recovered["attempt_count"] == 1
-            assert recovered["auxiliary_deferred"] is True
-        else:
-            assert result.success
-        assert chapter_repository.chapters[chapter_number].status == ChapterStatus.COMPLETED
-        if chapter_number == 17:
-            assert llm.extraction_failures == 3
-
-        if chapter_number == 20:
-            chapter_repository.rewrite(
-                chapter_repository.chapters[10], "第10章重写后的正文"
-            )
-            rewrite_result = await aftermath.run_after_chapter_saved(
-                "memory-stability", 10, "第10章重写后的正文"
-            )
-            assert rewrite_result["vector_stored"] is True
-
         if chapter_number == 12:
-            vector_recovery = await sync_chapter_narrative_after_save(
+            assert committed.status.value == "committed"
+            recovered = await sync_chapter_narrative_after_save(
                 "memory-stability",
                 chapter_number,
-                context.chapter_content,
+                candidate.final_content,
                 knowledge,
                 aftermath._indexing,
                 llm,
                 chapter_repository=chapter_repository,
             )
-            assert vector_recovery["vector_stored"] is True
+            assert recovered["narrative_sync_ok"] is True
+            assert recovered["vector_stored"] is True
+        if chapter_number == 17:
+            assert committed.status.value == "failed"
+            failed_bridge_count = connection.execute(
+                "SELECT COUNT(*) FROM aftermath_calls "
+                "WHERE stage = 'bridge' AND chapter_number = 17"
+            ).fetchone()[0]
+            assert failed_bridge_count == 0
+            chapter = chapter_repository.get_by_novel_and_number(
+                NovelId("memory-stability"), chapter_number
+            )
+            recovered_content = f"{chapter.content}\n人工修复后的补充。"
+            persisted_recovery_chapter = ChapterRewriteCoordinator(
+                db=database,
+                chapter_repository=chapter_repository,
+            ).rewrite(chapter, recovered_content).chapter
+            assert persisted_recovery_chapter.content_sha256 == hashlib.sha256(
+                recovered_content.encode("utf-8")
+            ).hexdigest()
+            assert persisted_recovery_chapter.content_revision == 2
+            rebuilt = await WorldlineRebuildService(database, aftermath).rebuild(
+                "memory-stability"
+            )
+            assert rebuilt["status"] == "completed"
+            recovered_bridge_count = connection.execute(
+                "SELECT COUNT(*) FROM aftermath_calls "
+                "WHERE stage = 'bridge' AND chapter_number = 17"
+            ).fetchone()[0]
+            assert recovered_bridge_count == 1
+            candidate_repository.start_run(
+                "memory-stability", run_mode=RunMode.CHAPTER_REVIEW
+            )
+        else:
+            assert committed.status.value == "committed"
+        formal_chapter = chapter_repository.get_by_novel_and_number(
+            NovelId("memory-stability"), chapter_number
+        )
+        assert formal_chapter is not None and formal_chapter.status.value == "completed"
+        if chapter_number == 17:
+            assert llm.extraction_failures == 3
+
+        if chapter_number == 20:
+            chapter_ten = chapter_repository.get_by_novel_and_number(
+                NovelId("memory-stability"), 10
+            )
+            ChapterRewriteCoordinator(
+                db=database,
+                chapter_repository=chapter_repository,
+            ).rewrite(chapter_ten, "第10章重写后的正文")
+            rebuilt = await WorldlineRebuildService(database, aftermath).rebuild(
+                "memory-stability"
+            )
+            assert rebuilt["status"] == "completed"
+            candidate_repository.start_run(
+                "memory-stability", run_mode=RunMode.CHAPTER_REVIEW
+            )
 
     await aftermath.drain_auxiliary_stages()
     triple_payloads = [row[0] for row in connection.execute("SELECT payload_json FROM extracted_triples")]
-    persisted_chapters = connection.execute("SELECT chapter_number, content FROM chapter_snapshots").fetchall()
+    persisted_chapters = connection.execute(
+        "SELECT number, content FROM chapters "
+        "WHERE novel_id = ? AND status = 'completed' ORDER BY number",
+        ("memory-stability",),
+    ).fetchall()
     foreshadows = {row[0] for row in connection.execute("SELECT description FROM extracted_foreshadows")}
     aftermath_calls = connection.execute("SELECT stage, chapter_number FROM aftermath_calls").fetchall()
     memory_state = connection.execute(
@@ -737,8 +742,6 @@ async def _run_memory_stability_regression(
     assert f"ch{chapter_count}-durable-clue" in {
         clue["clue_id"] for clue in memory_payload["revealed_clues"]
     }
-    if chapter_count >= 17:
-        assert not any('"chapter_number": 17' in payload for payload in triple_payloads)
     persisted_text = "\n".join(triple_payloads)
     expected_markers = {
         3: "林澈死亡",
@@ -761,20 +764,26 @@ async def _run_memory_stability_regression(
         assert "钟楼暗门伏笔" in foreshadows
     bridge_calls = [item for item in aftermath_calls if item[0] == "bridge"]
     auxiliary_calls = [item for item in aftermath_calls if item[0] == "auxiliary"]
-    # Chapter 20 rewrites chapter 10.  The next chapter first replays the
-    # invalidated canonical history (10..20), then continues with 21..N.
-    expected_bridge_numbers = list(range(1, min(chapter_count, 20) + 1))
+    expected_bridge_numbers = list(range(1, chapter_count + 1))
     if chapter_count >= 17:
-        expected_bridge_numbers.insert(17, 17)
-    if chapter_count >= 20:
-        expected_bridge_numbers.extend(range(10, chapter_count + 1))
+        expected_bridge_numbers = list(range(1, 17))
+        expected_bridge_numbers.extend(range(1, 18))
+        if chapter_count >= 20:
+            expected_bridge_numbers.extend(range(18, 21))
+            expected_bridge_numbers.extend(range(1, 21))
+            expected_bridge_numbers.extend(range(21, chapter_count + 1))
+        else:
+            expected_bridge_numbers.extend(range(18, chapter_count + 1))
     assert [row[1] for row in bridge_calls] == expected_bridge_numbers
-    expected_auxiliary_numbers = list(range(1, min(chapter_count, 20) + 1))
+    expected_auxiliary_numbers = list(expected_bridge_numbers)
     if chapter_count >= 20:
-        expected_auxiliary_numbers.extend(range(10, chapter_count + 1))
+        # The chapter-17 rebuild queues a now-obsolete chapter-10 auxiliary
+        # job.  The chapter-20 rewrite changes that formal version before the
+        # queue reaches it, so the version guard must discard it.
+        expected_auxiliary_numbers.pop(16 + 9)
     assert [row[1] for row in auxiliary_calls] == expected_auxiliary_numbers
     if chapter_count >= 17:
-        assert len([item for item in bridge_calls if item[1] == 17]) == 3
+        assert len([item for item in bridge_calls if item[1] == 17]) == 2
         assert len([item for item in auxiliary_calls if item[1] == 17]) == 2
     if chapter_count >= 20:
         assert dict(persisted_chapters)[10] == "第10章重写后的正文"
@@ -857,3 +866,58 @@ async def test_long_run_memory_stability_preserves_durable_story_facts(
     if chapter_count >= 500:
         assert "钟楼暗门伏笔" in durable_memory
         assert "苍梧城毁灭" in durable_memory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_chapters", [300, 500, 800])
+async def test_completed_beats_window_does_not_control_novel_completion_target(
+    tmp_path: Path, target_chapters: int
+):
+    """The fixed working-memory window must not decide when a run completes."""
+    db = DatabaseConnection(str(tmp_path / f"target-{target_chapters}.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-1", "Novel", "novel-1", target_chapters),
+    )
+    db.commit()
+
+    repository = ChapterCandidateRepository(db)
+    run = repository.start_run(
+        "novel-1",
+        run_mode=RunMode.CHAPTER_REVIEW,
+        target_chapters=target_chapters + 1,
+    )
+    assert run.target_chapters == target_chapters
+    db.execute(
+        "UPDATE novel_generation_runs SET current_formal_chapter = ? WHERE novel_id = ?",
+        (target_chapters, "novel-1"),
+    )
+    db.commit()
+
+    memory = MemoryEngine(
+        llm_service=object(),
+        bible_repository=SimpleNamespace(
+            get_by_novel_id=lambda _novel_id: SimpleNamespace(
+                characters=[], locations=[], timeline_notes=[], world_settings=[], style_notes=[]
+            )
+        ),
+        db_connection=db,
+    )
+    state = memory._get_or_load_state("novel-1")
+    memory._merge_beats(
+        state,
+        [
+            CompletedBeatItem(
+                beat_id=f"beat-{chapter}",
+                summary=f"无关工作记忆{chapter}",
+                chapter=chapter,
+            )
+            for chapter in range(1, 506)
+        ],
+        chapter=505,
+    )
+    assert len(state.completed_beats) == 500
+
+    workflow = CandidateChapterWorkflowService(repository, None, None, None)
+    assert await workflow.generate_next("novel-1") is None
+    assert repository.get_run("novel-1").state == GenerationRunState.COMPLETED

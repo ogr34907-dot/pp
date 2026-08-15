@@ -37,6 +37,24 @@ from domain.structure.story_node import StoryNode
 logger = logging.getLogger(__name__)
 
 
+def _candidate_first_authority_blocks_completed_write(database: Any, novel_id: str) -> bool:
+    """Legacy writers never own a completed-chapter transition."""
+    return True
+
+
+def _pause_for_candidate_first_authority(host: Any, novel: Any, novel_id: str) -> None:
+    novel.autopilot_status = AutopilotStatus.STOPPED
+    novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+    host._update_shared_state(
+        novel_id,
+        current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+        writing_substep="candidate_first_required",
+        writing_substep_label="候选稿流程正在管理正式章节",
+        autopilot_pause_reason="candidate_first_required",
+    )
+    host._flush_novel(novel)
+
+
 def _coerce_word_count_to_int(wc: Any) -> int:
     """章节 word_count 可能为 int 或 WordCount 值对象。"""
     if wc is None:
@@ -2207,6 +2225,15 @@ class DaemonHostMixin:
             content_str = stripped
         novel_id = novel.novel_id.value
         chapter_number = chapter_node.number
+
+        if (
+            status == ChapterStatus.COMPLETED.value
+            and _candidate_first_authority_blocks_completed_write(
+                getattr(self.chapter_repository, "db", None), novel_id
+            )
+        ):
+            _pause_for_candidate_first_authority(self, novel, novel_id)
+            return False
 
         # 🔥 关键修复：completed 状态必须直接写 DB
         # 之前全部走持久化队列，如果队列消费延迟，_find_next_unwritten_chapter_async

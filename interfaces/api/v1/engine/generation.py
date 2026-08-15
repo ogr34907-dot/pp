@@ -41,6 +41,7 @@ from domain.novel.entities.plot_arc import PlotArc
 from domain.novel.repositories.plot_arc_repository import PlotArcRepository
 from domain.novel.services.storyline_manager import StorylineManager
 from domain.novel.value_objects.novel_id import NovelId
+from domain.novel.target_chapters import positive_integer_or_none
 from domain.novel.value_objects.plot_point import PlotPoint, PlotPointType
 from domain.novel.value_objects.storyline_type import StorylineType
 from domain.novel.value_objects.tension_level import TensionLevel
@@ -738,12 +739,19 @@ def save_plot_outline(
     novel = novel_service.get_novel(novel_id)
     if novel is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Novel not found")
+    target_chapters = positive_integer_or_none(
+        getattr(novel, "target_chapters", None)
+    )
+    if target_chapters is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="novels.target_chapters must be a positive integer",
+        )
     try:
         from application.ai_invocation.variable_hub import VariableWrite
         from infrastructure.persistence.database.sqlite_ai_invocation_repository import SqliteVariableHubRepository
 
         _ensure_plot_outline_invocation_contract()
-        target_chapters = int(getattr(novel, "target_chapters", 0) or 100)
         outline = normalize_setup_plot_outline_payload(
             request.plot_outline.model_dump(),
             target_chapters=target_chapters,

@@ -12,6 +12,7 @@ import inspect
 import json
 from typing import Any, Callable, Protocol
 
+from application.audit.services.chapter_ai_review_service import normalize_evidence_text
 from domain.novel.candidate_chapter import CandidateStatus, ChapterCandidate, GenerationRunState, RunMode
 from infrastructure.persistence.database.chapter_candidate_repository import (
     CandidateGateError,
@@ -220,6 +221,9 @@ class CandidateChapterWorkflowService:
         """Run a bounded candidate revision loop through DAG V2 when available."""
 
         if self.dag_engine is None or self.dag_factory is None:
+            candidate = self.repository.revalidate_candidate_generation_authority(
+                candidate.id
+            )
             from application.engine.dag.plan.schema import (
                 chapter_rhythm_from_outline_payload,
                 serialize_chapter_rhythm,
@@ -242,6 +246,9 @@ class CandidateChapterWorkflowService:
 
         result: dict[str, Any] = {}
         for revision in range(self.max_candidate_revisions + 1):
+            candidate = self.repository.revalidate_candidate_generation_authority(
+                candidate.id
+            )
             trace = self.repository.start_dag_run(
                 candidate.id, content_revision=candidate.content_revision + 1
             )
@@ -391,13 +398,18 @@ class CandidateChapterWorkflowService:
 
         chapter = dict(outline_chain.get("chapter", {}).get("payload") or {})
         content = candidate.final_content
+        normalized_content = normalize_evidence_text(content)
         required_events = [str(value) for value in chapter.get("required_events") or [] if str(value).strip()]
         forbidden_events = [str(value) for value in chapter.get("forbidden_events") or [] if str(value).strip()]
         required = [
             {
                 "event": event,
-                "status": "completed" if event in content else "unverified",
-                "evidence": event if event in content else "",
+                "status": "completed"
+                if normalize_evidence_text(event) and normalize_evidence_text(event) in normalized_content
+                else "unverified",
+                "evidence": event
+                if normalize_evidence_text(event) and normalize_evidence_text(event) in normalized_content
+                else "",
             }
             for event in required_events
         ]
@@ -426,7 +438,12 @@ class CandidateChapterWorkflowService:
             if not reviewed:
                 continue
             evidence = str(reviewed.get("evidence") or "").strip()
-            if reviewed.get("status") == "completed" and evidence and evidence in content:
+            normalized_evidence = normalize_evidence_text(evidence)
+            if (
+                reviewed.get("status") == "completed"
+                and normalized_evidence
+                and normalized_evidence in normalized_content
+            ):
                 item.update(status="completed", evidence=evidence)
             else:
                 item.update(status="unverified", evidence="")
@@ -444,7 +461,12 @@ class CandidateChapterWorkflowService:
                 for issue in semantic_issues
             )
         )
-        forbidden_hits = [event for event in forbidden_events if event in content]
+        forbidden_hits = [
+            event
+            for event in forbidden_events
+            if normalize_evidence_text(event)
+            and normalize_evidence_text(event) in normalized_content
+        ]
         hard_blocks = [
             {
                 "type": "forbidden_event",

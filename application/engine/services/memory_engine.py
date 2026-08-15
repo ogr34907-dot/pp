@@ -44,6 +44,7 @@ from domain.bible.repositories.bible_repository import BibleRepository
 from domain.novel.value_objects.novel_id import NovelId
 
 from application.ai.llm_json_extract import parse_llm_json_to_dict
+from domain.shared.final_text_evidence import is_affirmative_final_text_evidence
 from application.engine.services.memory_engine_settings import (
     MemoryEngineRuntimeSettings,
     get_memory_engine_runtime_settings,
@@ -65,14 +66,15 @@ _MAX_STORED_BEATS = 500
 _MAX_STORED_CLUES = 800
 _COMPLETED_BEATS_RENDER_TOKEN_BUDGET = 1000
 _REVEALED_CLUES_RENDER_TOKEN_BUDGET = 800
-
-
 class CompletedBeatItem(BaseModel):
     """已完成的一条剧情节拍"""
     beat_id: str = Field(description="节拍唯一标识，如 'ch3-meeting-first-time'")
     summary: str = Field(description="一句话概括这个已发生的事件")
     chapter: int = Field(description="该事件发生在第几章")
     characters_involved: List[str] = Field(default_factory=list, description="涉及的角色名")
+    evidence_text: str = Field(
+        default="", description="正文中连续、正向出现的原句"
+    )
 
 
 class RevealedClueItem(BaseModel):
@@ -87,6 +89,9 @@ class RevealedClueItem(BaseModel):
     is_still_valid: bool = Field(
         default=True,
         description="该线索是否仍然有效（未被后续章节推翻/证伪）"
+    )
+    evidence_text: str = Field(
+        default="", description="正文中连续、正向出现的原句"
     )
 
 
@@ -155,13 +160,14 @@ class FactLockBuilder:
             canonical = self._build_canonical_hard_facts(
                 novel_id, current_chapter, outline, bible
             )
-            return "\n".join(part for part in (text, canonical) if part)
+            # The allocator keeps complete FACT_LOCK lines from the start.  Put
+            # current-world Canonical facts ahead of the broad Bible catalogue.
+            return "\n".join(part for part in (canonical, text) if part)
         except Exception as e:
             raise RuntimeError(f"fact_lock_unavailable: {e}") from e
 
-    @staticmethod
-    def _canonical_entities(outline: str, bible: Any) -> list[str]:
-        """Return only Bible names/aliases explicitly mentioned in this outline.
+    def _canonical_entities(self, novel_id: str, outline: str, bible: Any) -> list[str]:
+        """Return relevant Bible entities and author-marked key props in this outline.
 
         The Bible is a catalogue, not a chapter-scene entity list.  Keeping the
         intersection here prevents a long-run fact scan from treating every
@@ -188,6 +194,34 @@ class FactLockBuilder:
             if any(phrase in text for phrase in phrases):
                 entities.extend(phrases)
 
+        if self.db_connection is not None:
+            try:
+                props = self.db_connection.fetch_all(
+                    "SELECT name, aliases_json, attributes_json FROM unified_props WHERE novel_id = ?",
+                    (novel_id,),
+                )
+                for prop in props:
+                    try:
+                        attributes = json.loads(prop["attributes_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        attributes = {}
+                    if not isinstance(attributes, dict) or not (
+                        attributes.get("key_context") or attributes.get("is_key")
+                    ):
+                        continue
+                    try:
+                        aliases = json.loads(prop["aliases_json"] or "[]")
+                    except (TypeError, json.JSONDecodeError):
+                        aliases = []
+                    if isinstance(aliases, str):
+                        aliases = [aliases]
+                    phrases = [str(prop["name"] or "").strip()]
+                    phrases.extend(str(alias or "").strip() for alias in aliases)
+                    if any(phrase and phrase in text for phrase in phrases):
+                        entities.extend(phrase for phrase in phrases if phrase)
+            except Exception as exc:
+                logger.debug("关键道具实体加载失败: %s", exc)
+
         return sorted(set(entities), key=len, reverse=True)
 
     def _build_canonical_hard_facts(
@@ -206,7 +240,7 @@ class FactLockBuilder:
         # whole committed-chapter set for every fact-lock build.
         active_generation_epoch(novel_id, db)
 
-        entities = self._canonical_entities(outline, bible)
+        entities = self._canonical_entities(novel_id, outline, bible)
         if not entities:
             return ""
 
@@ -832,7 +866,14 @@ class MemoryEngine:
                 "errors": list[str],
             }
         """
-        result = {"new_beats": 0, "new_clues": 0, "violations": 0, "errors": []}
+        result = {
+            "new_beats": 0,
+            "new_clues": 0,
+            "violations": 0,
+            "errors": [],
+            "unverified_beats": 0,
+            "unverified_clues": 0,
+        }
 
         try:
             # 1. 准备上下文
@@ -894,9 +935,15 @@ class MemoryEngine:
                 logger.warning(f"MemoryEngine contract validation failed: {err_msg}")
                 return result
 
-            # 5. 合并增量到状态
-            new_beats = self._merge_beats(state, payload.completed_beats, chapter_number)
-            new_clues = self._merge_clues(state, payload.revealed_clues, chapter_number)
+            # 5. 仅将最终正文中可逐字核对的正向引文写入长期记忆。
+            verified_beats, result["unverified_beats"] = self._verified_memory_items(
+                payload.completed_beats, content
+            )
+            verified_clues, result["unverified_clues"] = self._verified_memory_items(
+                payload.revealed_clues, content
+            )
+            new_beats = self._merge_beats(state, verified_beats, chapter_number)
+            new_clues = self._merge_clues(state, verified_clues, chapter_number)
 
             result["new_beats"] = new_beats
             result["new_clues"] = new_clues
@@ -1023,8 +1070,8 @@ class MemoryEngine:
                 state = MemoryState(
                     novel_id=novel_id,
                     last_updated_chapter=row[1] or 0,
-                    completed_beats=data.get("completed_beats", []),
-                    revealed_clues=data.get("revealed_clues", []),
+                    completed_beats=data.get("completed_beats", [])[-_MAX_STORED_BEATS:],
+                    revealed_clues=data.get("revealed_clues", [])[-_MAX_STORED_CLUES:],
                     fact_violations_history=data.get("fact_violations_history", []),
                     applied_aftermath_versions=data.get("applied_aftermath_versions", []),
                 )
@@ -1224,6 +1271,23 @@ class MemoryEngine:
             del state.completed_beats[:-_MAX_STORED_BEATS]
 
         return count
+
+    @staticmethod
+    def _verified_memory_items(items: List[Any], content: str) -> tuple[List[Any], int]:
+        """Keep only entries backed by an affirmative verbatim final-text quote."""
+        verified: List[Any] = []
+        for item in items:
+            evidence = str(getattr(item, "evidence_text", "") or "").strip()
+            claim = str(
+                getattr(item, "summary", "") or getattr(item, "content", "") or ""
+            ).strip()
+            characters = list(getattr(item, "characters_involved", []) or [])
+            if is_affirmative_final_text_evidence(content, evidence, [claim, *characters]):
+                item.evidence_text = evidence
+                verified.append(item)
+                continue
+            logger.info("MemoryEngine 未验证记忆项已跳过")
+        return verified, len(items) - len(verified)
 
     def _merge_clues(
         self, state: MemoryState, new_clues: List[RevealedClueItem], chapter: int

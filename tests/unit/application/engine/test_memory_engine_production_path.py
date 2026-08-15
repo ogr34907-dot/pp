@@ -306,17 +306,19 @@ class _DivergentMemoryExtraction:
             content=json.dumps(
                 {
                     "completed_beats": [
-                        {
-                            "beat_id": f"beat-{suffix}",
-                            "summary": f"beat {suffix}",
+                            {
+                                "beat_id": f"beat-{suffix}",
+                                "summary": "final prose",
                             "chapter": 1,
+                            "evidence_text": "final prose",
                         }
                     ],
                     "revealed_clues": [
-                        {
-                            "clue_id": f"clue-{suffix}",
-                            "content": f"clue {suffix}",
+                            {
+                                "clue_id": f"clue-{suffix}",
+                                "content": "final prose",
                             "revealed_at_chapter": 1,
+                            "evidence_text": "final prose",
                         }
                     ],
                     "fact_violations": [],

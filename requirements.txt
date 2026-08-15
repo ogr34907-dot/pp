@@ -23,6 +23,8 @@ pydantic>=2.0.0
 
 # ── HTTP 客户端 ──
 httpx==0.27.0
+# Starlette TestClient only; production HTTP clients continue using httpx above.
+httpx2==2.9.0
 
 # ── AI / LLM SDK ──
 openai>=1.65.0,<2.0.0

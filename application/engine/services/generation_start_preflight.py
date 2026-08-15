@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from domain.novel.target_chapters import positive_integer_or_none
+
 
 class GenerationStartPreflightError(RuntimeError):
     """A user-actionable condition prevents a new generation run."""
@@ -25,10 +27,13 @@ class GenerationStartPreflight:
     def ensure_startable(self, novel_id: str) -> None:
         conn = self.db.get_connection()
         novel = conn.execute(
-            "SELECT autopilot_recovery_reason FROM novels WHERE id = ?", (novel_id,)
+            "SELECT autopilot_recovery_reason, target_chapters FROM novels WHERE id = ?",
+            (novel_id,),
         ).fetchone()
         if novel is None:
             raise KeyError(f"novel not found: {novel_id}")
+        if positive_integer_or_none(novel["target_chapters"]) is None:
+            raise GenerationStartPreflightError("target_chapters_required")
         if self._full_resync_is_active(str(novel["autopilot_recovery_reason"] or "")):
             raise GenerationStartPreflightError("canonical_resync_active")
 
@@ -57,12 +62,16 @@ class GenerationStartPreflight:
             if rebuilding is not None:
                 raise GenerationStartPreflightError("worldline_rebuild_active")
 
+        try:
+            self.candidate_repository.assert_formal_history_is_proven(novel_id)
+        except Exception as exc:
+            raise GenerationStartPreflightError("unproven_formal_history") from exc
+
         formal_head = self.candidate_repository.formal_chapter_head(novel_id)
         next_chapter = formal_head + 1
-        conflicting_chapter = conn.execute(
-            "SELECT 1 FROM chapters WHERE novel_id = ? AND number = ?", (novel_id, next_chapter)
-        ).fetchone()
-        if conflicting_chapter is not None:
+        if not self.candidate_repository.formal_slot_is_available(
+            novel_id, next_chapter
+        ):
             raise GenerationStartPreflightError("next_chapter_number_conflict")
         try:
             node, _ = self.outline_service.next_published_chapter_context(

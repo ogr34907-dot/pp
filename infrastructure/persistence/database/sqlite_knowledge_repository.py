@@ -1,6 +1,8 @@
 """SQLite Knowledge Repository — 三元组扩展字段用子表，库内不存 JSON 文本列。"""
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -15,6 +17,7 @@ from domain.knowledge.chapter_summary import (
 from domain.knowledge.knowledge_triple import KnowledgeTriple
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_write_settings import get_sqlite_write_settings
+from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
 
 logger = logging.getLogger(__name__)
 
@@ -744,6 +747,122 @@ class SqliteKnowledgeRepository:
         now = datetime.now(timezone.utc).isoformat()
         summary_id = f"{knowledge_id}-ch{chapter_number}"
         self.db.execute(sql, (summary_id, knowledge_id, chapter_number, summary, now, now))
+
+    def save_canonical_chapter_summary(
+        self,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        summary: str,
+        key_events: str,
+        open_threads: str,
+        consistency_note: str,
+        beat_sections: List[str],
+        micro_beats: List[Dict[str, Any]],
+        content_sha256: str,
+        content_revision: int,
+        pipeline_version: str,
+        attempt_count: int,
+        canonical_payload_sha256: str,
+    ) -> bool:
+        """Write one canonical summary only while its source claim is current."""
+        now = datetime.now(timezone.utc).isoformat()
+        knowledge_id = f"{novel_id}-knowledge"
+        summary_id = f"{knowledge_id}-ch{chapter_number}"
+        beat_sections_json = json.dumps(list(beat_sections or []), ensure_ascii=False)
+        micro_beats_json = json.dumps(list(micro_beats or []), ensure_ascii=False)
+
+        with sqlite_writes_bypass_queue():
+            with self.db.transaction() as conn:
+                # Lock before reading the source so a rewrite cannot land before this write.
+                conn.execute("BEGIN IMMEDIATE")
+                source = conn.execute(
+                    "SELECT content, content_sha256, content_revision FROM chapters "
+                    "WHERE novel_id = ? AND number = ?",
+                    (novel_id, chapter_number),
+                ).fetchone()
+                actual_sha256 = hashlib.sha256(
+                    (source[0] or "").encode("utf-8")
+                ).hexdigest() if source is not None else ""
+                if (
+                    source is None
+                    or actual_sha256 != content_sha256
+                    or (source[1] or "") != content_sha256
+                    or int(source[2] or 0) != int(content_revision)
+                ):
+                    return False
+
+                claim = conn.execute(
+                    """
+                    SELECT 1 FROM chapter_narrative_commits
+                    WHERE novel_id = ? AND chapter_number = ?
+                      AND content_sha256 = ? AND pipeline_version = ?
+                      AND content_revision = ? AND status = 'in_progress'
+                    """,
+                    (
+                        novel_id,
+                        chapter_number,
+                        content_sha256,
+                        pipeline_version,
+                        int(content_revision),
+                    ),
+                ).fetchone()
+                if claim is None:
+                    return False
+
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO knowledge
+                    (id, novel_id, version, premise_lock, created_at, updated_at)
+                    VALUES (?, ?, 1, '', ?, ?)
+                    """,
+                    (knowledge_id, novel_id, now, now),
+                )
+                cursor = conn.execute(
+                    """
+                    INSERT INTO chapter_summaries
+                    (id, knowledge_id, chapter_number, summary, key_events, open_threads,
+                     consistency_note, beat_sections, micro_beats,
+                     source_content_sha256, source_content_revision, pipeline_version,
+                     sync_status, sync_error, sync_attempts, canonical_payload_sha256,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', '', ?, ?, ?, ?)
+                    ON CONFLICT(knowledge_id, chapter_number) DO UPDATE SET
+                        summary = excluded.summary,
+                        key_events = excluded.key_events,
+                        open_threads = excluded.open_threads,
+                        consistency_note = excluded.consistency_note,
+                        beat_sections = excluded.beat_sections,
+                        micro_beats = excluded.micro_beats,
+                        source_content_sha256 = excluded.source_content_sha256,
+                        source_content_revision = excluded.source_content_revision,
+                        pipeline_version = excluded.pipeline_version,
+                        sync_status = excluded.sync_status,
+                        sync_error = excluded.sync_error,
+                        sync_attempts = excluded.sync_attempts,
+                        canonical_payload_sha256 = excluded.canonical_payload_sha256,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        summary_id,
+                        knowledge_id,
+                        chapter_number,
+                        summary,
+                        key_events,
+                        open_threads,
+                        consistency_note,
+                        beat_sections_json,
+                        micro_beats_json,
+                        content_sha256,
+                        int(content_revision),
+                        pipeline_version,
+                        int(attempt_count),
+                        canonical_payload_sha256,
+                        now,
+                        now,
+                    ),
+                )
+        return cursor.rowcount == 1
 
     def save(self, knowledge: StoryKnowledge) -> None:
         novel_id = knowledge.novel_id

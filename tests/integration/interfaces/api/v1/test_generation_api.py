@@ -164,6 +164,28 @@ class TestDeprecatedDirectProseEndpoints:
 
 class TestSetupGenerationEndpoints:
 
+    @pytest.mark.parametrize("target_chapters", [0, True, 1.5, "invalid"])
+    def test_save_plot_outline_rejects_invalid_persisted_target_before_variable_write(
+        self,
+        client,
+        monkeypatch,
+        target_chapters,
+    ):
+        from interfaces.api.v1.engine import generation
+
+        novel_service = Mock()
+        novel_service.get_novel.return_value = SimpleNamespace(target_chapters=target_chapters)
+        client.app.dependency_overrides[generation.get_novel_service] = lambda: novel_service
+        monkeypatch.setattr(generation, "_ensure_plot_outline_invocation_contract", lambda: None)
+
+        response = client.put(
+            "/api/v1/novels/novel-1/setup/plot-outline",
+            json={"plot_outline": {}},
+        )
+
+        assert response.status_code == 400
+        assert "target_chapters" in response.json()["detail"]
+
     def test_setup_main_plot_stream_emits_approval_required(self, client, monkeypatch, test_novel_id):
         """新书引导 Step 4 也应先进入 AI 审阅，再输出候选。"""
         from interfaces.api.v1.engine import generation

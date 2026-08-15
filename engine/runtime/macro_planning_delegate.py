@@ -5,6 +5,7 @@ import logging
 from typing import Any, Mapping
 
 from domain.novel.entities.novel import AutopilotStatus, Novel, NovelStage
+from domain.novel.target_chapters import positive_integer_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -160,14 +161,26 @@ async def run_macro_planning(host: Any, novel: Novel) -> None:
     if not host._is_still_running(novel):
         return
 
+    target_chapters = positive_integer_or_none(
+        getattr(novel, "target_chapters", None)
+    )
+    if target_chapters is None:
+        novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+        novel.autopilot_status = AutopilotStatus.STOPPED
+        host._update_shared_state(
+            novel.novel_id.value,
+            current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+            autopilot_pause_reason="target_chapters_required",
+        )
+        host._flush_novel(novel)
+        return
+
     host._update_shared_state(
         novel.novel_id.value,
         writing_substep="macro_planning",
         writing_substep_label="宏观规划",
         macro_structure_ready=False,
     )
-
-    target_chapters = novel.target_chapters or 30
 
     logger.info(
         "[%s] macro_planning start target_chapters=%s",

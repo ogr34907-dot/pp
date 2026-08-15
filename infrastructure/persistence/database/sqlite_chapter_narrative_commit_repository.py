@@ -349,7 +349,7 @@ class SqliteChapterNarrativeCommitRepository:
                         SET content_revision = ?, status = 'in_progress',
                             failure_reason = '', attempt_count = 1,
                             vector_status = 'not_started', advance_status = 'pending',
-                            memory_status = ?, memory_failure_reason = '',
+                            memory_status = ?, memory_failure_reason = '', memory_attempt_count = 0,
                             advance_applied_at = NULL, committed_at = NULL,
                             updated_at = ?
                         WHERE novel_id = ? AND chapter_number = ?
@@ -389,7 +389,7 @@ class SqliteChapterNarrativeCommitRepository:
                         UPDATE chapter_narrative_commits
                         SET status = 'in_progress', failure_reason = '', attempt_count = 1,
                             vector_status = 'not_started', advance_status = 'pending',
-                            memory_status = ?, memory_failure_reason = '',
+                            memory_status = ?, memory_failure_reason = '', memory_attempt_count = 0,
                             advance_applied_at = NULL, committed_at = NULL, updated_at = ?
                         WHERE novel_id = ? AND chapter_number = ?
                           AND content_sha256 = ? AND pipeline_version = ?

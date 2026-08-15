@@ -586,12 +586,16 @@ class AutopilotDaemonManager:
         self._logger.info("状态发布器已绑定到持久化消费者队列")
 
         self.stop_event = self._event_factory()
+        api_log_path = Path(self._log_file)
+        daemon_log_file = str(
+            api_log_path.with_name(f"{api_log_path.stem}-daemon{api_log_path.suffix}")
+        )
         self.process = self._process_factory(
             target=run_autopilot_daemon_process,
             args=(
                 self.stop_event,
                 self._log_level,
-                self._log_file,
+                daemon_log_file,
                 stream_queue,
                 shared_state,
                 persistence_queue,

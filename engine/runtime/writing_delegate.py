@@ -18,6 +18,10 @@ from infrastructure.engine.story_pipeline_environment import (
     STORY_PIPELINE_MODE_ENV,
     StoryPipelineEnvironmentSettings,
 )
+from engine.runtime.daemon_host import (
+    _candidate_first_authority_blocks_completed_write,
+    _pause_for_candidate_first_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +205,17 @@ def _pause_for_story_pipeline_advance_failure(
     daemon._flush_novel(novel)
 
 
+def _candidate_first_authority_exists(host: Any, novel_id: str) -> bool:
+    database = getattr(getattr(host, "chapter_repository", None), "db", None)
+    return _candidate_first_authority_blocks_completed_write(database, novel_id)
+
+
 async def run_writing(host: Any, novel: Any) -> None:
     """写作阶段统一入口 — 按 host 配置或环境变量选择新/旧管线"""
+    novel_id = str(getattr(getattr(novel, "novel_id", ""), "value", novel.novel_id))
+    if _candidate_first_authority_exists(host, novel_id):
+        _pause_for_candidate_first_authority(host, novel, novel_id)
+        return
     if getattr(host, "use_story_pipeline_for_writing", False):
         await run_story_pipeline_writing(host, novel)
         return
@@ -351,6 +364,11 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
 
     pipeline = get_pipeline_registry().create_pipeline(genre)
     result = await pipeline.run_chapter(ctx)
+
+    if not result.success and result.error == "candidate_first_required":
+        _pause_for_candidate_first_authority(daemon, novel, novel_id)
+        logger.info("[%s] StoryPipeline formal write blocked by Candidate-first", novel_id)
+        return
 
     if not result.success and result.error == "awaiting_ai_review":
         novel.current_stage = NovelStage.PAUSED_FOR_REVIEW

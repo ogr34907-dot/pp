@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Set, Type
@@ -185,7 +186,7 @@ class BaseNode(ABC):
     def get_timeout(self) -> float:
         """获取超时时间（秒），支持配置覆盖"""
         base = self.meta.default_timeout_seconds if self.meta else 60
-        if self._config and self._config.timeout_seconds:
+        if self._config and self._config.timeout_seconds is not None:
             return self._config.timeout_seconds
         return base
 
@@ -319,8 +320,24 @@ class NodeRegistry:
             }
             context.update(dict(state.get("_runtime_context") or {}))
 
-            # 执行
-            result = await instance.execute(resolved_inputs, context)
+            # 执行：统一在节点 executor 边界应用现有 timeout 配置。
+            timeout_seconds = instance.get_timeout()
+            execution_task = asyncio.create_task(
+                instance.execute(resolved_inputs, context)
+            )
+            try:
+                result = await asyncio.wait_for(
+                    execution_task,
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                # asyncio.TimeoutError 与内层主动抛出的 TimeoutError 使用同一
+                # 标准异常类型；task.cancelled() 可区分 deadline 取消和内层异常。
+                if not execution_task.cancelled():
+                    raise
+                raise TimeoutError(
+                    f"DAG node {node_id} timed out after {timeout_seconds}s"
+                ) from None
 
             # A NodeResult is the node boundary contract.  Do not flatten an
             # explicit failure into outputs: the DAG runtime must stop before

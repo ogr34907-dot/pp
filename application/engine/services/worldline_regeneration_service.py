@@ -543,12 +543,9 @@ class WorldlineRegenerationService:
                 by_table.setdefault(str(entry["source_table"]), []).append(payload)
 
         # Read models are safely reconstructed from formal chapters and source
-        # facts.  Candidate rows are historic review artifacts, not an active
-        # candidate after a worldline switch.
+        # facts.  Only candidates with immutable formal-commit evidence belong
+        # to the restored authority chain; unfinished review artifacts stay archived.
         excluded = {
-            "chapter_candidates",
-            "chapter_candidate_versions",
-            "chapter_candidate_formal_commits",
             "memory_projections",
             "memory_engine_state",
             "novel_foreshadow_registry",
@@ -556,8 +553,27 @@ class WorldlineRegenerationService:
             "novel_checkpoints",
             "checkpoints",
         }
+        formal_candidate_ids = {
+            str(payload.get("candidate_id") or "")
+            for payload in by_table.get("chapter_candidate_formal_commits", [])
+            if payload.get("candidate_id")
+        }
+        by_table["chapter_candidates"] = [
+            payload
+            for payload in by_table.get("chapter_candidates", [])
+            if str(payload.get("id") or "") in formal_candidate_ids
+        ]
+        by_table["chapter_candidate_versions"] = [
+            payload
+            for payload in by_table.get("chapter_candidate_versions", [])
+            if str(payload.get("candidate_id") or "") in formal_candidate_ids
+        ]
         order = (
             "chapters",
+            "pre_candidate_formal_history",
+            "chapter_candidates",
+            "chapter_candidate_versions",
+            "chapter_candidate_formal_commits",
             "story_nodes",
             "outline_contracts",
             "outline_contract_versions",
@@ -644,12 +660,17 @@ class WorldlineRegenerationService:
         node_ids = [str(row["id"]) for row in tail_node_rows]
 
         # Candidate aggregate and its immutable content revisions.
-        candidate_rows = self._archive_rows_by_chapter(
-            conn, archive_id, "chapter_candidates", novel_id, start
+        candidate_rows = self._archive_rows_query(
+            conn,
+            archive_id,
+            "chapter_candidates",
+            "SELECT * FROM chapter_candidates WHERE novel_id = ? AND chapter_number >= ?",
+            (novel_id, start),
         )
         candidate_ids = [str(row["id"]) for row in candidate_rows]
         self._archive_rows_by_ids(conn, archive_id, "chapter_candidate_versions", "candidate_id", candidate_ids)
         self._archive_rows_by_ids(conn, archive_id, "chapter_candidate_formal_commits", "candidate_id", candidate_ids)
+        self._delete_rows_by_ids(conn, "chapter_candidates", "id", candidate_ids)
 
         # Chapter row children that refer to a chapter DB id rather than a number.
         self._archive_rows_by_ids(conn, archive_id, "beat_sheets", "chapter_id", chapter_ids)
@@ -677,6 +698,11 @@ class WorldlineRegenerationService:
             "character_voice_samples",
         ):
             self._archive_rows_by_chapter(conn, archive_id, table, novel_id, start)
+        # Explicit legacy provenance has RESTRICT foreign keys to chapters;
+        # archive it with the tail before deleting those chapter rows.
+        self._archive_rows_by_chapter(
+            conn, archive_id, "pre_candidate_formal_history", novel_id, start
+        )
         self._archive_rows_by_chapter(
             conn, archive_id, "causal_edges", novel_id, start, chapter_column="source_chapter"
         )

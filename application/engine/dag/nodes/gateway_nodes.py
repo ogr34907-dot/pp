@@ -355,9 +355,7 @@ class RetryNode(BaseNode):
         start = time.time()
 
         try:
-            max_attempts = inputs.get("max_attempts", 2)
-            if self._config and self._config.max_retries:
-                max_attempts = self._config.max_retries
+            max_attempts = self.get_max_retries()
 
             # 检查当前重试次数
             retry_count = context.get("shared_state", {}).get("candidate_revision", 0) if isinstance(context, dict) else 0

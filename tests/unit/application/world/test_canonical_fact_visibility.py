@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from application.world.services.chapter_narrative_sync import (
+    _has_final_text_evidence,
     _sync_chapter_narrative_after_save_once,
     sync_chapter_narrative_after_save,
 )
@@ -31,7 +32,12 @@ from infrastructure.persistence.database.sqlite_knowledge_repository import (
 )
 from infrastructure.persistence.database.triple_repository import TripleRepository
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
-from application.engine.services.memory_engine import MemoryEngine
+from application.engine.services.context_budget_models import ContextSlot, PriorityTier
+from application.engine.services.memory_engine import (
+    CompletedBeatItem,
+    FactLockBuilder,
+    MemoryEngine,
+)
 from application.engine.services.worldline_generation_guard import (
     GenerationEpochUnavailableError,
 )
@@ -164,9 +170,16 @@ def test_repository_allows_new_empty_and_uncommitted_draft_updates(tmp_path):
 async def test_formal_aftermath_persists_authority_rows_after_commit(
     tmp_path, monkeypatch
 ):
+    import infrastructure.ai.prompt_gateway as prompt_gateway_module
+    import infrastructure.ai.prompt_manager as prompt_manager_module
+    import infrastructure.ai.prompt_registry as prompt_registry_module
+
+    monkeypatch.setattr(prompt_gateway_module, "_prompt_gateway", None)
+    monkeypatch.setattr(prompt_manager_module, "_manager_instance", None)
+    monkeypatch.setattr(prompt_registry_module, "_registry_instance", None)
     content = (
-        "林澈在苍梧城亲眼看见城门坍塌。玉佩裂纹会引来追兵，"
-        "苍梧城毁灭迫使林澈复仇，林澈决定追查真相。"
+        "林澈亲眼见证苍梧城毁灭。玉佩裂纹会引来追兵。"
+        "苍梧城毁灭迫使林澈复仇。苍梧城毁灭后，林澈决定追查真相并复仇。"
     )
     db, chapter_repo, chapter, knowledge = _chapter_services(tmp_path, content)
     monkeypatch.setattr(
@@ -182,7 +195,7 @@ async def test_formal_aftermath_persists_authority_rows_after_commit(
                 "subject": "林澈",
                 "predicate": "见证",
                 "object": "苍梧城毁灭",
-                "evidence_text": "林澈在苍梧城亲眼看见城门坍塌",
+                "evidence_text": "林澈亲眼见证苍梧城毁灭",
             }
         ],
         "foreshadow_hints": [
@@ -200,17 +213,17 @@ async def test_formal_aftermath_persists_authority_rows_after_commit(
                 "event": "苍梧城毁灭",
                 "time_point": "第1章",
                 "description": "苍梧城毁灭迫使林澈复仇",
-                "evidence_text": "苍梧城毁灭",
+                "evidence_text": "苍梧城毁灭迫使林澈复仇",
             }
         ],
         "causal_edges": [
             {
-                "source_event": "苍梧城毁灭",
-                "target_event": "林澈复仇",
-                "causal_type": "causes",
-                "state_change": "林澈决定复仇",
-                "involved_characters": ["林澈"],
-                "evidence_text": "苍梧城毁灭迫使林澈复仇",
+                    "source_event": "苍梧城毁灭",
+                    "target_event": "林澈复仇",
+                    "causal_type": "causes",
+                    "state_change": "追查真相并复仇",
+                    "involved_characters": ["林澈"],
+                    "evidence_text": "苍梧城毁灭迫使林澈复仇。苍梧城毁灭后，林澈决定追查真相并复仇",
             }
         ],
         "character_mutations": [
@@ -220,7 +233,7 @@ async def test_formal_aftermath_persists_authority_rows_after_commit(
                 "source_event": "苍梧城毁灭",
                 "impact_or_description": "追查真相并复仇",
                 "sensitivity_tags_or_priority": 9,
-                "evidence_text": "林澈决定追查真相",
+                "evidence_text": "苍梧城毁灭后，林澈决定追查真相并复仇",
             }
         ],
         "character_states": [],
@@ -253,7 +266,7 @@ async def test_formal_aftermath_persists_authority_rows_after_commit(
             (triple["id"],),
         )
     }
-    assert triple_attrs["evidence_text"] == "林澈在苍梧城亲眼看见城门坍塌"
+    assert triple_attrs["evidence_text"] == "林澈亲眼见证苍梧城毁灭"
     commit = db.fetch_one(
         "SELECT status FROM chapter_narrative_commits "
         "WHERE novel_id = 'novel-1' AND chapter_number = 1"
@@ -329,7 +342,7 @@ async def test_rewrite_removes_only_chapter_aftermath_timeline_rows(tmp_path, mo
     ]
 
 
-def test_allocator_fact_lock_recalls_relevant_canonical_facts_only(tmp_path):
+def test_allocator_fact_lock_recalls_relevant_canonical_facts_only(tmp_path, monkeypatch):
     db = DatabaseConnection(str(tmp_path / "canonical-recall.db"))
     db.execute(
         "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
@@ -399,6 +412,7 @@ def test_allocator_fact_lock_recalls_relevant_canonical_facts_only(tmp_path):
         bible_repository=bible_repository,
         memory_engine=memory,
     )
+    monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 100)
 
     slots = allocator._collect_all_slots(
         "novel-1",
@@ -493,8 +507,9 @@ def test_fact_lock_uses_outline_entity_intersection_for_long_run_recall(tmp_path
     assert "已死亡" in canonical
     assert "真正身份" in canonical
     assert "地点A" in canonical
-    for unrelated in ("乙", "丙", "地点B", "地点C"):
-        assert unrelated not in canonical
+    canonical_facts = canonical.split("【可用实体】", 1)[0]
+    for unrelated in ("乙 —前往→ 地点B", "丙 —前往→ 地点C"):
+        assert unrelated not in canonical_facts
     assert canonical.count("[第") <= 40
     assert len(canonical) <= 6000
 
@@ -524,6 +539,54 @@ def _fact_lock_bible():
         world_settings=[],
         style_notes=[],
     )
+
+
+@pytest.mark.parametrize("total_budget", [35000, 16000, 8000])
+def test_canonical_facts_precede_large_bible_block_under_fact_lock_budget(
+    monkeypatch, total_budget
+):
+    """A broad Bible must not consume the FACT_LOCK prefix before current facts."""
+    bible = _fact_lock_bible()
+    builder = FactLockBuilder(
+        SimpleNamespace(get_by_novel_id=lambda _novel_id: bible)
+    )
+    broad_bible = "\n".join(
+        f"Bible 背景设定 {index}: 世界观历史和人物档案。" * 8
+        for index in range(120)
+    )
+    canonical = "\n".join(
+        (
+            "核心 Canonical 硬事实（正式正文证据，当前世界线）：",
+            "[第20章] 甲 —持有→ 赤铜钥匙",
+            "[第21章] 甲 —身份→ 守门人",
+            "[第22章] 反派甲 —状态→ 已死亡",
+            "[第23章] 伏笔(resolved)：钟楼暗门已回收",
+        )
+    )
+    monkeypatch.setattr(builder, "_build_from_bible", lambda *_args: broad_bible)
+    monkeypatch.setattr(
+        builder, "_build_canonical_hard_facts", lambda *_args: canonical
+    )
+
+    allocator = ContextBudgetAllocator()
+    slots = {
+        "fact_lock": ContextSlot(
+            name="绝对事实边界(FACT_LOCK)",
+            tier=PriorityTier.T0_CRITICAL,
+            content=builder.build("novel-1", 24, "甲前往钟楼。"),
+            max_tokens=1500,
+            priority=120,
+        )
+    }
+    monkeypatch.setattr(allocator, "_collect_all_slots", lambda *_args, **_kwargs: slots)
+    monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 800)
+
+    allocation = allocator.allocate("novel-1", 24, "甲前往钟楼。", total_budget)
+
+    fact_lock = allocation.slots["fact_lock"].content
+    for marker in ("赤铜钥匙", "守门人", "已死亡", "钟楼暗门已回收"):
+        assert marker in fact_lock
+    assert "..." not in fact_lock
 
 
 def test_fact_lock_relevance_precedes_limit_for_800_chapter_density(tmp_path):
@@ -572,6 +635,145 @@ def test_fact_lock_relevance_precedes_limit_for_800_chapter_density(tmp_path):
     assert "甲 —状态→ 已死亡" in canonical
     assert "无关人物" not in canonical
     assert canonical.count("[第") <= 40
+
+
+def test_early_canonical_hard_facts_survive_small_budget_after_memory_eviction(
+    tmp_path, monkeypatch
+):
+    """A compact canonical fact block must not be cut into partial fact rows."""
+    db = DatabaseConnection(str(tmp_path / "canonical-small-budget.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    )
+    db.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, title, content, content_sha256, content_revision) "
+        "VALUES ('chapter-1', 'novel-1', 1, 'Chapter', '正文', 'hash-1', 1)"
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status) "
+        "VALUES ('novel-1', 1, 'hash-1', 'chapter-narrative-sync:v1', 1, 'committed')"
+    )
+    required_facts = [
+        ("fact-death", "状态", "已死亡：不可复活"),
+        ("fact-identity", "身份", "真正身份：守门人"),
+        ("fact-prop", "持有", "关键道具：赤铜钥匙"),
+    ]
+    for fact_id, predicate, value in required_facts:
+        db.execute(
+            "INSERT INTO triples "
+            "(id, novel_id, subject, predicate, object, chapter_number, confidence, source_type) "
+            "VALUES (?, 'novel-1', '甲', ?, ?, 1, 0.99, 'chapter_inferred')",
+            (fact_id, predicate, value),
+        )
+    for index in range(1, 9):
+        db.execute(
+            "INSERT INTO triples "
+            "(id, novel_id, subject, predicate, object, chapter_number, confidence, source_type) "
+            "VALUES (?, 'novel-1', '甲', '关系', ?, 1, 0.5, 'chapter_inferred')",
+            (f"filler-{index}", f"无关长事实占位内容{index}，仅用于制造预算压力"),
+        )
+    db.commit()
+
+    memory = MemoryEngine(
+        llm_service=object(),
+        bible_repository=SimpleNamespace(
+            get_by_novel_id=lambda _novel_id: _fact_lock_bible()
+        ),
+        db_connection=db,
+    )
+    state = memory._get_or_load_state("novel-1")
+    memory._merge_beats(
+        state,
+        [
+            CompletedBeatItem(
+                beat_id=f"old-{chapter}",
+                summary=f"无关旧节拍{chapter}",
+                chapter=chapter,
+            )
+            for chapter in range(1, 506)
+        ],
+        chapter=505,
+    )
+    assert len(state.completed_beats) == 500
+
+    compact_fact_lock = memory.build_fact_lock_section(
+        "novel-1",
+        800,
+        "第800章，甲必须面对死亡、身份和赤铜钥匙的后果。",
+    )
+    allocator = ContextBudgetAllocator(memory_engine=memory)
+    slots = {
+        "lifecycle": ContextSlot(
+            name="生命周期",
+            tier=PriorityTier.T0_CRITICAL,
+            content="节奏引导" * 100,
+            tokens=600,
+            max_tokens=600,
+            priority=130,
+        ),
+        "anchor": ContextSlot(
+            name="主线锚点",
+            tier=PriorityTier.T0_CRITICAL,
+            content="主线" * 50,
+            tokens=300,
+            max_tokens=300,
+            priority=125,
+        ),
+        "promise": ContextSlot(
+            name="叙事承诺",
+            tier=PriorityTier.T0_CRITICAL,
+            content="承诺" * 70,
+            tokens=420,
+            max_tokens=420,
+            priority=123,
+        ),
+        "contract": ContextSlot(
+            name="创作契约",
+            tier=PriorityTier.T0_CRITICAL,
+            content="作者硬约束" * 200,
+            tokens=1400,
+            max_tokens=1400,
+            priority=122,
+        ),
+        "fact_lock": ContextSlot(
+            name="绝对事实边界(FACT_LOCK)",
+            tier=PriorityTier.T0_CRITICAL,
+            content=compact_fact_lock,
+            tokens=1500,
+            max_tokens=1500,
+            priority=120,
+        ),
+        "chapter_task": ContextSlot(
+            name="本章章纲",
+            tier=PriorityTier.T2_DYNAMIC,
+            content="本章章纲：甲必须完成选择并留下代价与钩子。",
+            tokens=40,
+            max_tokens=40,
+            priority=50,
+        ),
+    }
+    monkeypatch.setattr(
+        allocator,
+        "_collect_all_slots",
+        lambda *_args, **_kwargs: slots,
+    )
+    monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 800)
+
+    allocation = allocator.allocate(
+        "novel-1",
+        800,
+        "甲面对死亡、身份和赤铜钥匙。",
+        total_budget=8000,
+    )
+
+    final_context = allocation.get_final_context()
+    for marker in ("已死亡：不可复活", "真正身份：守门人", "关键道具：赤铜钥匙"):
+        assert marker in final_context
+    assert "..." not in allocation.slots["fact_lock"].content
+    assert "本章章纲：甲必须完成选择并留下代价与钩子。" in allocation.get_final_context()
+    assert allocator.estimate_tokens(allocation.get_final_context()) <= 8000
 
 
 def test_fact_lock_visibility_precedes_limit_for_invisible_dense_rows(tmp_path):
@@ -853,7 +1055,11 @@ def test_foreshadow_recall_fails_closed_when_generation_barrier_is_unavailable()
 async def test_failed_canonical_aftermath_does_not_expose_partial_facts(
     tmp_path, monkeypatch
 ):
-    content = "林澈在苍梧城看见城门坍塌。"
+    content = (
+        "林澈在苍梧城见证苍梧城城门坍塌。"
+        "城门坍塌后的追查伏笔已经浮现。"
+        "城门坍塌促使林澈追查原因，林澈开始追查。"
+    )
     db, chapter_repo, _chapter, knowledge = _chapter_services(tmp_path, content)
     bundle = {
         "summary": "城门坍塌",
@@ -864,14 +1070,14 @@ async def test_failed_canonical_aftermath_does_not_expose_partial_facts(
                 "subject": "林澈",
                 "predicate": "见证",
                 "object": "苍梧城城门坍塌",
-                "evidence_text": "林澈在苍梧城看见城门坍塌",
+                "evidence_text": "林澈在苍梧城见证苍梧城城门坍塌",
             }
         ],
         "foreshadow_hints": [
             {
                 "description": "城门坍塌后的追查伏笔",
                 "importance": "critical",
-                "evidence_text": "林澈在苍梧城看见城门坍塌",
+                "evidence_text": "城门坍塌后的追查伏笔已经浮现",
             }
         ],
         "consumed_foreshadows": [],
@@ -883,7 +1089,7 @@ async def test_failed_canonical_aftermath_does_not_expose_partial_facts(
                 "source_event": "城门坍塌",
                 "target_event": "追查原因",
                 "state_change": "林澈开始追查",
-                "evidence_text": "林澈在苍梧城看见城门坍塌",
+                "evidence_text": "城门坍塌促使林澈追查原因，林澈开始追查",
             }
         ],
         "character_mutations": [],
@@ -972,8 +1178,11 @@ async def test_changed_chapter_hides_old_and_failed_revision_facts_until_new_com
     chapter saving moves the source to revision 2, revision 1 must therefore
     be hidden as well as the revision-2 partial rows until revision 2 commits.
     """
-    old_content = "甲在旧修订正文中失去身份。"
-    new_content = "甲在新修订半成品正文中改写了选择。"
+    old_content = "甲的修订状态是旧修订事实。"
+    new_content = (
+        "甲的修订状态是成功修订事实。"
+        "成功修订事实导致甲继续行动，甲的选择发生变化。"
+    )
     db, chapter_repo, _chapter, knowledge = _chapter_services(tmp_path, old_content)
     monkeypatch.setattr(
         "infrastructure.persistence.database.connection.get_database",
@@ -990,7 +1199,7 @@ async def test_changed_chapter_hides_old_and_failed_revision_facts_until_new_com
                     "subject": "甲",
                     "predicate": "修订状态",
                     "object": fact,
-                    "evidence_text": fact,
+                    "evidence_text": f"甲的修订状态是{fact}",
                 }
             ],
             "foreshadow_hints": [],
@@ -1006,7 +1215,7 @@ async def test_changed_chapter_hides_old_and_failed_revision_facts_until_new_com
                         "causal_type": "causes",
                         "state_change": "甲的选择发生变化",
                         "involved_characters": ["甲"],
-                        "evidence_text": fact,
+                        "evidence_text": f"{fact}导致甲继续行动，甲的选择发生变化",
                     }
                 ]
                 if causal
@@ -1046,7 +1255,7 @@ async def test_changed_chapter_hides_old_and_failed_revision_facts_until_new_com
 
     monkeypatch.setattr(
         "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
-        AsyncMock(return_value=bundle(new_content.rstrip("。"), causal=True)),
+        AsyncMock(return_value=bundle("成功修订事实", causal=True)),
     )
 
     class FailingCausalRepository:
@@ -1082,7 +1291,7 @@ async def test_changed_chapter_hides_old_and_failed_revision_facts_until_new_com
         for fact in knowledge_view.facts
     )
     assert "旧修订事实" not in knowledge_text
-    assert "新修订半成品" not in knowledge_text
+    assert "成功修订事实" not in knowledge_text
 
     bible = _fact_lock_bible()
     memory = MemoryEngine(
@@ -1094,7 +1303,7 @@ async def test_changed_chapter_hides_old_and_failed_revision_facts_until_new_com
         "novel-1", 2, "第2章，甲处理新修订后的身份后果。"
     )
     assert "旧修订事实" not in fact_lock
-    assert "新修订半成品" not in fact_lock
+    assert "成功修订事实" not in fact_lock
 
     monkeypatch.setattr(
         "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
@@ -1167,14 +1376,14 @@ async def test_formal_canonical_facts_survive_working_memory_eviction_and_restar
 
     facts = {
         25: (
-            "林澈在第25章死亡",
+            "林澈的状态是已死亡",
             {
                 "relation_triples": [
                     {
                         "subject": "林澈",
                         "predicate": "状态",
                         "object": "已死亡",
-                        "evidence_text": "林澈在第25章死亡",
+                        "evidence_text": "林澈的状态是已死亡",
                     }
                 ],
             },
@@ -1192,7 +1401,7 @@ async def test_formal_canonical_facts_survive_working_memory_eviction_and_restar
             },
         ),
         120: (
-            "沈青与陆宁在第120章从敌对转为合作",
+            "沈青与陆宁敌对，随后沈青与陆宁合作，沈青与陆宁从敌对转为合作",
             {
                 "causal_edges": [
                     {
@@ -1201,26 +1410,26 @@ async def test_formal_canonical_facts_survive_working_memory_eviction_and_restar
                         "causal_type": "causes",
                         "state_change": "沈青与陆宁从敌对转为合作",
                         "involved_characters": ["沈青", "陆宁"],
-                        "evidence_text": "沈青与陆宁在第120章从敌对转为合作",
+                        "evidence_text": "沈青与陆宁敌对，随后沈青与陆宁合作，沈青与陆宁从敌对转为合作",
                     }
                 ],
             },
         ),
         200: (
-            "苍梧城在第200章毁灭",
+            "苍梧城毁灭。苍梧城在第200章毁灭",
             {
                 "timeline_events": [
                     {
                         "event": "苍梧城毁灭",
                         "time_point": "第200章",
                         "description": "苍梧城在第200章毁灭",
-                        "evidence_text": "苍梧城在第200章毁灭",
+                        "evidence_text": "苍梧城毁灭。苍梧城在第200章毁灭",
                     }
                 ],
             },
         ),
         350: (
-            "沈青在第350章带着失去故乡的余波继续追查",
+            "苍梧城毁灭后，沈青带着失去故乡的余波继续追查",
             {
                 "character_mutations": [
                     {
@@ -1229,7 +1438,7 @@ async def test_formal_canonical_facts_survive_working_memory_eviction_and_restar
                         "source_event": "苍梧城毁灭",
                         "impact_or_description": "带着失去故乡的余波继续追查",
                         "sensitivity_tags_or_priority": 8,
-                        "evidence_text": "沈青在第350章带着失去故乡的余波继续追查",
+                        "evidence_text": "苍梧城毁灭后，沈青带着失去故乡的余波继续追查",
                     }
                 ],
             },
@@ -1318,6 +1527,7 @@ async def test_formal_canonical_facts_survive_working_memory_eviction_and_restar
         bible_repository=bible_repository,
         memory_engine=restarted_memory,
     )
+    monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 800)
     outline = (
         "林澈已经死亡；沈青的真实身份；沈青与陆宁合作；"
         "苍梧城毁灭；沈青继续追查。"
@@ -1338,3 +1548,278 @@ async def test_formal_canonical_facts_survive_working_memory_eviction_and_restar
     )._get_pending_foreshadowings("novel-1", 800)
     assert "沈青的真实身份在第70章揭露" in restarted_foreshadows
     restarted_db.close()
+
+
+@pytest.mark.parametrize("total_budget", [35000, 16000, 8000])
+def test_fact_lock_keeps_key_prop_and_canonical_story_facts_at_supported_budgets(
+    tmp_path, monkeypatch, total_budget
+):
+    """A prop named by the chapter outline must select its formal history too."""
+    db = DatabaseConnection(str(tmp_path / f"fact-lock-{total_budget}.db"))
+    db.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    )
+    db.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, title, content, content_sha256, content_revision) "
+        "VALUES ('chapter-1', 'novel-1', 1, 'Chapter', '正文', 'hash-1', 1)"
+    )
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status) "
+        "VALUES ('novel-1', 1, 'hash-1', 'chapter-narrative-sync:v1', 1, 'committed')"
+    )
+    db.execute(
+        "INSERT INTO unified_props "
+        "(id, novel_id, name, description, aliases_json, prop_category, lifecycle_state, "
+        "attributes_json, created_at, updated_at) "
+        "VALUES ('prop-token', 'novel-1', '玄铁令', '', '[]', 'OTHER', 'ACTIVE', "
+        "'{\"key_context\": true}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+    )
+    for fact_id, subject, predicate, obj in (
+        ("fact-prop", "主角", "获得", "玄铁令"),
+        ("fact-identity", "顾明夷", "知晓", "主角真实身份"),
+        ("fact-death", "反派甲", "状态", "已死亡"),
+    ):
+        db.execute(
+            "INSERT INTO triples "
+            "(id, novel_id, subject, predicate, object, chapter_number, confidence, source_type) "
+            "VALUES (?, 'novel-1', ?, ?, ?, 1, 0.99, 'chapter_inferred')",
+            (fact_id, subject, predicate, obj),
+        )
+    db.execute(
+        "INSERT INTO foreshadows "
+        "(id, novel_id, description, planted_chapter, status) "
+        "VALUES ('fact-clue', 'novel-1', '伏笔B：玄铁令的来历已经回收', 1, 'resolved')"
+    )
+    db.commit()
+
+    bible = SimpleNamespace(
+        characters=[
+            SimpleNamespace(
+                name=name,
+                aliases=[],
+                relationships=[],
+                description="",
+                public_profile="",
+                hidden_profile="",
+                reveal_chapter=None,
+                mental_state="NORMAL",
+                is_dead=False,
+                status="alive",
+            )
+            for name in ("顾明夷", "反派甲")
+        ],
+        locations=[],
+        timeline_notes=[],
+        world_settings=[],
+        style_notes=[],
+    )
+    memory = MemoryEngine(
+        llm_service=object(),
+        bible_repository=SimpleNamespace(get_by_novel_id=lambda _novel_id: bible),
+        db_connection=db,
+    )
+    outline = "玄铁令牵出顾明夷知晓的身份，反派甲死亡，伏笔B已经回收。"
+    fact_lock = memory.build_fact_lock_section("novel-1", 2, outline)
+
+    required_lines = (
+        "主角 —获得→ 玄铁令",
+        "顾明夷 —知晓→ 主角真实身份",
+        "反派甲 —状态→ 已死亡",
+        "伏笔(resolved)：伏笔B：玄铁令的来历已经回收",
+    )
+    for line in required_lines:
+        assert line in fact_lock
+    assert "..." not in fact_lock
+
+    allocator = ContextBudgetAllocator(memory_engine=memory)
+    slots = {
+        "fact_lock": ContextSlot(
+            name="FACT_LOCK",
+            tier=PriorityTier.T0_CRITICAL,
+            content=fact_lock,
+            tokens=allocator.estimate_tokens(fact_lock),
+            max_tokens=1500,
+            priority=120,
+        ),
+        "chapter_task": ContextSlot(
+            name="CURRENT_CHAPTER_TASK",
+            tier=PriorityTier.T2_DYNAMIC,
+            content="本章必须承接玄铁令、身份、死亡与已回收线索。",
+            tokens=30,
+            max_tokens=30,
+            priority=50,
+        ),
+    }
+    monkeypatch.setattr(allocator, "_collect_all_slots", lambda *_args, **_kwargs: slots)
+    monkeypatch.setattr(allocator, "_estimate_total_chapters", lambda _novel_id: 800)
+
+    allocation = allocator.allocate("novel-1", 2, outline, total_budget=total_budget)
+    final_context = allocation.get_final_context()
+    for line in required_lines:
+        assert line in final_context
+    assert "..." not in allocation.slots["fact_lock"].content
+    assert allocator.estimate_tokens(final_context) <= total_budget
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {},
+        {"evidence_text": "正文中不存在的引文"},
+    ],
+)
+def test_final_authority_evidence_rejects_missing_or_forged_quotes(item):
+    assert not _has_final_text_evidence(
+        "林澈没有杀死反派甲。", item, "林澈", "杀死", "反派甲"
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "evidence"),
+    [
+        ("林澈站在城门前。", "林澈站在城门前。"),
+        ("林澈没能杀死反派甲。", "林澈没能杀死反派甲。"),
+        ("林澈没有亲手杀死反派甲。", "林澈没有亲手杀死反派甲。"),
+    ],
+)
+def test_final_authority_evidence_requires_an_affirmative_supported_claim(
+    content, evidence
+):
+    assert not _has_final_text_evidence(
+        content,
+        {"evidence_text": evidence},
+        "林澈",
+        "杀死",
+        "反派甲",
+    )
+
+
+def test_final_authority_evidence_rejects_similar_but_opposite_plot_event():
+    assert not _has_final_text_evidence(
+        "林澈救下赵无极。",
+        {"evidence_text": "林澈救下赵无极。"},
+        "林澈杀死赵无极",
+    )
+
+
+def test_final_authority_evidence_accepts_an_affirmative_supported_claim():
+    assert _has_final_text_evidence(
+        "林澈亲手杀死了反派甲。",
+        {"evidence_text": "林澈亲手杀死了反派甲。"},
+        "林澈",
+        "杀死",
+        "反派甲",
+    )
+
+
+@pytest.mark.asyncio
+async def test_negated_evidence_cannot_promote_any_authority_row(tmp_path, monkeypatch):
+    from domain.novel.value_objects.foreshadowing import (
+        Foreshadowing,
+        ForeshadowingStatus,
+        ImportanceLevel,
+    )
+
+    content = "林澈没有杀死反派甲，仍把刀收回鞘中。"
+    db, chapter_repo, _chapter, knowledge = _chapter_services(tmp_path, content)
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_database",
+        lambda *args, **kwargs: db,
+    )
+    foreshadowing_repo = SqliteForeshadowingRepository(db)
+    registry = foreshadowing_repo.get_by_novel_id(NovelId("novel-1"))
+    registry.register(
+        Foreshadowing(
+            id="pending-kill",
+            planted_in_chapter=1,
+            description="杀死反派甲的真相",
+            importance=ImportanceLevel.HIGH,
+            status=ForeshadowingStatus.PLANTED,
+        )
+    )
+    foreshadowing_repo.save(registry)
+
+    bundle = {
+        "summary": "林澈收刀。",
+        "key_events": "未杀反派甲。",
+        "open_threads": "反派甲仍在。",
+        "relation_triples": [
+            {
+                "subject": "林澈",
+                "predicate": "杀死",
+                "object": "反派甲",
+                "evidence_text": "林澈没有杀死反派甲",
+            }
+        ],
+        "foreshadow_hints": [
+            {
+                "description": "杀死反派甲的真相",
+                "importance": "high",
+                "evidence_text": "林澈没有杀死反派甲",
+            }
+        ],
+        "consumed_foreshadows": ["杀死反派甲的真相"],
+        "storyline_progress": [],
+        "dialogues": [],
+        "timeline_events": [
+            {
+                "event": "杀死反派甲",
+                "description": "林澈杀死反派甲",
+                "evidence_text": "林澈没有杀死反派甲",
+            }
+        ],
+        "causal_edges": [
+            {
+                "source_event": "杀死反派甲",
+                "target_event": "林澈复仇完成",
+                "state_change": "杀死反派甲后的轻松",
+                "evidence_text": "林澈没有杀死反派甲",
+            }
+        ],
+        "character_mutations": [
+            {
+                "character_name": "林澈",
+                "mutation_type": "motivation",
+                "source_event": "杀死反派甲",
+                "impact_or_description": "杀死反派甲后的轻松",
+                "evidence_text": "林澈没有杀死反派甲",
+            }
+        ],
+        "character_states": [
+            {
+                "character_name": "林澈",
+                "mental_state": "杀死反派甲后的轻松",
+                "evidence_text": "林澈没有杀死反派甲",
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        AsyncMock(return_value=bundle),
+    )
+
+    result = await sync_chapter_narrative_after_save(
+        "novel-1",
+        1,
+        content,
+        knowledge,
+        None,
+        SimpleNamespace(),
+        triple_repository=TripleRepository(db),
+        foreshadowing_repo=foreshadowing_repo,
+        chapter_repository=chapter_repo,
+        causal_edge_repository=SqliteCausalEdgeRepository(db),
+        character_state_repository=SqliteCharacterStateRepository(db),
+    )
+
+    assert result.commit_status == "committed", result.failure_reason
+    for table in ("triples", "causal_edges", "character_states"):
+        assert db.fetch_one(f"SELECT 1 FROM {table} LIMIT 1") is None
+    assert db.fetch_one(
+        "SELECT 1 FROM bible_timeline_notes WHERE source_type = 'chapter_aftermath'"
+    ) is None
+    assert db.fetch_one("SELECT 1 FROM memory_atoms LIMIT 1") is None
+    persisted = foreshadowing_repo.get_by_novel_id(NovelId("novel-1"))
+    assert [item.status for item in persisted.foreshadowings] == [ForeshadowingStatus.PLANTED]

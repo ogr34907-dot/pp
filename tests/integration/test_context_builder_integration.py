@@ -108,6 +108,7 @@ class TestContextBuilderIntegration:
         novel = Mock()
         novel.title = "The Quest for Vengeance"
         novel.author = "Test Author"
+        novel.target_chapters = 20
         novel_repo.get_by_id.return_value = novel
 
         prev_chapter = Mock()
@@ -215,6 +216,7 @@ class TestContextBuilderIntegration:
         novel = Mock()
         novel.title = "Epic Tale"
         novel.author = "Author"
+        novel.target_chapters = 20
         novel_repo.get_by_id.return_value = novel
 
         chapter_repo = Mock()

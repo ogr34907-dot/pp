@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from domain.novel.target_chapters import positive_integer_or_none
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,6 +43,14 @@ def resolve_story_phase_payload(
     try:
         novel_svc = novel_service or _default_novel_service()
         novel = novel_svc.get_novel(novel_id)
+        target = positive_integer_or_none(getattr(novel, "target_chapters", None))
+        if target is None:
+            return {
+                "phase": "setup",
+                "progress": 0.0,
+                "description": "目标章节数未设置",
+                "can_advance": False,
+            }
         if novel and hasattr(novel, "story_phase"):
             phase = novel.story_phase
             phase_value = phase.value if hasattr(phase, "value") else str(phase)
@@ -60,15 +70,16 @@ def resolve_story_phase_payload(
         novel_svc = novel_service or _default_novel_service()
         chapter_repo = chapter_repository or _default_chapter_repository()
         novel = novel or novel_svc.get_novel(novel_id)
+        target = positive_integer_or_none(getattr(novel, "target_chapters", None))
+        if target is None:
+            return {
+                "phase": "setup",
+                "progress": 0.0,
+                "description": "目标章节数未设置",
+                "can_advance": False,
+            }
         chapters = chapter_repo.list_by_novel(NovelId(novel_id))
         total = len(chapters) if chapters else 0
-        target_raw = getattr(novel, "target_chapters", 30) if novel else 30
-        try:
-            target = int(target_raw or 30)
-        except (TypeError, ValueError):
-            target = 30
-        if target <= 0:
-            target = 30
         progress = min(1.0, total / target) if target > 0 else 0.0
         sp = StoryPhaseEnum.from_progress(progress)
         return {

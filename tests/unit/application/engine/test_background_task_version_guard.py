@@ -100,45 +100,23 @@ def test_daemon_ephemeral_content_save_updates_version_columns():
 
 
 @pytest.mark.asyncio
-async def test_daemon_completed_overwrite_uses_shared_rewrite_coordinator(monkeypatch):
-    existing = Chapter(
-        id="chapter-1",
-        novel_id=NovelId("novel-1"),
-        number=1,
-        title="第1章",
-        content="旧正文",
-        status=ChapterStatus.COMPLETED,
-    )
-    calls = []
-
-    class _Coordinator:
-        def rewrite(self, chapter, content, *, rewrite_mode):
-            calls.append((chapter, content, rewrite_mode))
-            return ChapterRewriteResult(
-                chapter=chapter,
-                rewrite_mode=rewrite_mode,
-                requires_rebuild=True,
-                replay_completed=False,
-            )
-
-    monkeypatch.setattr(
-        "application.core.services.chapter_rewrite_coordinator.ChapterRewriteCoordinator.for_chapter_repository",
-        lambda *_args, **_kwargs: _Coordinator(),
-    )
+async def test_daemon_completed_overwrite_pauses_for_candidate_first_authority():
+    updates = []
+    flushed = []
     host = SimpleNamespace(
-        chapter_repository=SimpleNamespace(
-            get_by_novel_and_number=lambda *_args: existing
-        ),
+        chapter_repository=SimpleNamespace(db=SimpleNamespace()),
         _push_persistence_command=lambda *_args, **_kwargs: True,
         _queue_sql=lambda *_args, **_kwargs: True,
         _save_chapter_ephemeral=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("completed overwrite must not bypass rewrite coordinator")
+            AssertionError("completed overwrite must not bypass candidate authority")
         ),
+        _update_shared_state=lambda *args, **kwargs: updates.append((args, kwargs)),
+        _flush_novel=lambda novel: flushed.append(novel),
     )
     novel = SimpleNamespace(novel_id=NovelId("novel-1"), generation_prefs=None)
     chapter_node = SimpleNamespace(number=1, id="chapter-1", title="第1章", outline="")
 
-    await DaemonHostMixin._upsert_chapter_content(
+    result = await DaemonHostMixin._upsert_chapter_content(
         host,
         novel,
         chapter_node,
@@ -146,7 +124,21 @@ async def test_daemon_completed_overwrite_uses_shared_rewrite_coordinator(monkey
         status="completed",
     )
 
-    assert calls == [(existing, "新正文", "safe_snapshot")]
+    assert result is False
+    assert novel.autopilot_status.value == "stopped"
+    assert novel.current_stage.value == "paused_for_review"
+    assert updates == [
+        (
+            ("novel-1",),
+            {
+                "current_stage": "paused_for_review",
+                "writing_substep": "candidate_first_required",
+                "writing_substep_label": "候选稿流程正在管理正式章节",
+                "autopilot_pause_reason": "candidate_first_required",
+            },
+        )
+    ]
+    assert flushed == [novel]
 
 
 @pytest.mark.asyncio

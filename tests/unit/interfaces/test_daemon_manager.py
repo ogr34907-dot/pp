@@ -4,6 +4,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 from interfaces.api.settings import BackendSettings
 from interfaces.daemon_manager import (
     AutopilotDaemonManager,
@@ -83,6 +85,76 @@ def test_daemon_manager_start_respects_disable_auto_daemon():
 
     assert calls == []
     assert manager.process is None
+
+
+@pytest.mark.parametrize(
+    ("api_log_file", "expected_daemon_log_file"),
+    (
+        ("logs/plotpilot.log", str(Path("logs/plotpilot-daemon.log"))),
+        ("x/custom.log", str(Path("x/custom-daemon.log"))),
+    ),
+)
+def test_daemon_manager_start_uses_isolated_log_file(
+    monkeypatch, api_log_file, expected_daemon_log_file
+):
+    queue = type(
+        "PersistenceQueue",
+        (),
+        {"is_consumer_running": lambda self: True, "start_consumer": lambda self: None},
+    )()
+    process = FakeProcess(alive=True)
+    process_kwargs = {}
+
+    def process_factory(**kwargs):
+        process_kwargs.update(kwargs)
+        return process
+
+    manager = AutopilotDaemonManager(
+        log_level=20,
+        log_file=api_log_file,
+        shared_state_provider=lambda: {},
+        settings_provider=lambda: BackendSettings(disable_auto_daemon=False),
+        process_factory=process_factory,
+        event_factory=FakeEvent,
+    )
+
+    monkeypatch.setenv("DISABLE_ORPHAN_CLEANUP", "1")
+    monkeypatch.setattr(
+        "interfaces.daemon_manager.multiprocessing.set_executable", lambda _path: None
+    )
+    monkeypatch.setattr(
+        "application.engine.services.streaming_bus.init_streaming_bus", lambda: object()
+    )
+    monkeypatch.setattr(
+        "application.engine.services.shared_state_repository.init_shared_state_repository",
+        lambda _shared: object(),
+    )
+    monkeypatch.setattr(
+        "application.engine.services.state_bootstrap.bootstrap_state", lambda: {}
+    )
+    monkeypatch.setattr(
+        "application.engine.services.query_service.init_query_service", lambda _repo: None
+    )
+    monkeypatch.setattr(
+        "application.engine.services.persistence_queue.initialize_persistence_queue",
+        lambda: queue,
+    )
+    monkeypatch.setattr(
+        "application.engine.services.persistence_queue.register_persistence_handlers",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "application.engine.services.persistence_queue.get_persistence_queue", lambda: queue
+    )
+    monkeypatch.setattr(
+        "application.engine.services.state_publisher.init_state_publisher",
+        lambda _shared, _persistence: None,
+    )
+
+    manager.start()
+
+    assert manager._log_file == api_log_file
+    assert process_kwargs["args"][2] == expected_daemon_log_file
 
 
 def test_daemon_manager_binds_the_api_state_publisher_to_the_v1_consumer(

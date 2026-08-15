@@ -108,11 +108,37 @@ class ChapterCandidateRepository:
         return self._run_from_row(row)
 
     def formal_chapter_head(self, novel_id: str) -> int:
-        """Return the continuous Candidate-first Canonical chapter head."""
+        """Return the continuous baseline plus Candidate-first Canonical head."""
 
-        rows = self._connection().execute(
+        conn = self._connection()
+        return self._persisted_formal_chapter_head(conn, novel_id)
+
+    def assert_formal_history_is_proven(self, novel_id: str) -> None:
+        """Reject a run before it can observe unproven completed prose."""
+
+        conn = self._connection()
+        baseline = self._validated_pre_candidate_baseline(conn, novel_id)
+        self._ensure_no_unproven_completed_chapters(conn, novel_id, len(baseline))
+
+    def _persisted_formal_chapter_head(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: str,
+        *,
+        baseline: Optional[list[sqlite3.Row]] = None,
+    ) -> int:
+        baseline = (
+            self._validated_pre_candidate_baseline(conn, novel_id)
+            if baseline is None
+            else baseline
+        )
+        head = len(baseline)
+        rows = conn.execute(
             """
-            SELECT c.number
+            SELECT c.number, c.content, c.content_sha256 AS chapter_content_sha256,
+                   c.content_revision AS chapter_content_revision,
+                   commit_record.content_sha256 AS authority_content_sha256,
+                   commit_record.content_revision AS authority_content_revision
             FROM chapter_candidate_formal_commits AS commit_record
             JOIN chapter_candidates AS candidate ON candidate.id = commit_record.candidate_id
             JOIN chapters AS c ON c.id = commit_record.chapter_id
@@ -125,19 +151,358 @@ class ChapterCandidateRepository:
             """,
             (novel_id,),
         ).fetchall()
-        head = 0
         for row in rows:
-            if int(row["number"]) != head + 1:
+            if (
+                int(row["number"]) != head + 1
+                or not self._formal_version_matches(row)
+            ):
                 break
             head += 1
         return head
+
+    @staticmethod
+    def _content_sha256(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _formal_version_matches(cls, row: sqlite3.Row) -> bool:
+        content = str(row["content"] or "")
+        actual_sha256 = cls._content_sha256(content)
+        return (
+            bool(content.strip())
+            and str(row["chapter_content_sha256"] or "") == actual_sha256
+            and str(row["authority_content_sha256"] or "") == actual_sha256
+            and int(row["chapter_content_revision"] or 0)
+            == int(row["authority_content_revision"] or 0)
+        )
+
+    def _validated_pre_candidate_baseline(
+        self, conn: sqlite3.Connection, novel_id: str
+    ) -> list[sqlite3.Row]:
+        rows = conn.execute(
+            """
+            SELECT baseline.chapter_number, baseline.chapter_id, baseline.content_sha256,
+                   baseline.content_revision, chapter.number, chapter.content,
+                   chapter.content_sha256 AS legacy_content_sha256,
+                   chapter.content_revision AS legacy_content_revision, chapter.status,
+                   chapter.novel_id AS chapter_novel_id
+            FROM pre_candidate_formal_history AS baseline
+            LEFT JOIN chapters AS chapter ON chapter.id = baseline.chapter_id
+            WHERE baseline.novel_id = ?
+            ORDER BY baseline.chapter_number
+            """,
+            (novel_id,),
+        ).fetchall()
+        for expected_number, row in enumerate(rows, start=1):
+            content = str(row["content"] or "")
+            actual_sha256 = self._content_sha256(content)
+            if (
+                int(row["chapter_number"]) != expected_number
+                or row["number"] is None
+                or str(row["chapter_novel_id"] or "") != novel_id
+                or int(row["number"]) != expected_number
+                or str(row["status"] or "") != "completed"
+                or not content.strip()
+                or str(row["content_sha256"] or "") != actual_sha256
+                or int(row["content_revision"] or 0) != int(row["legacy_content_revision"] or 0)
+                or (
+                    str(row["legacy_content_sha256"] or "")
+                    and str(row["legacy_content_sha256"]) != actual_sha256
+                )
+            ):
+                raise CandidateGateError("legacy formal history integrity mismatch")
+        return rows
+
+    def _ensure_no_unproven_completed_chapters(
+        self, conn: sqlite3.Connection, novel_id: str, baseline_head: int
+    ) -> None:
+        """Reject later completed prose that was not formally committed by Candidate-first."""
+
+        rows = conn.execute(
+            """
+            SELECT chapter.id, chapter.number,
+                   chapter.content,
+                   chapter.content_sha256 AS chapter_content_sha256,
+                   chapter.content_revision AS chapter_content_revision,
+                   commit_record.candidate_id,
+                   commit_record.novel_id AS commit_novel_id,
+                   commit_record.chapter_number AS commit_chapter_number,
+                   commit_record.content_sha256 AS authority_content_sha256,
+                   commit_record.content_revision AS authority_content_revision,
+                   candidate.novel_id AS candidate_novel_id,
+                   candidate.chapter_number AS candidate_chapter_number
+            FROM chapters AS chapter
+            LEFT JOIN chapter_candidate_formal_commits AS commit_record
+              ON commit_record.chapter_id = chapter.id
+            LEFT JOIN chapter_candidates AS candidate
+              ON candidate.id = commit_record.candidate_id
+            WHERE chapter.novel_id = ?
+              AND chapter.number > ?
+              AND chapter.status = 'completed'
+              AND TRIM(COALESCE(chapter.content, '')) <> ''
+            ORDER BY chapter.number
+            """,
+            (novel_id, baseline_head),
+        ).fetchall()
+        for row in rows:
+            if (
+                row["candidate_id"] is None
+                or str(row["commit_novel_id"] or "") != novel_id
+                or int(row["commit_chapter_number"] or 0) != int(row["number"])
+                or str(row["candidate_novel_id"] or "") != novel_id
+                or int(row["candidate_chapter_number"] or 0) != int(row["number"])
+            ):
+                raise CandidateGateError(
+                    "legacy formal history has an unproven completed chapter"
+                )
+            if not self._formal_version_matches(row):
+                raise CandidateGateError("formal chapter authority mismatch")
+
+    def _formal_slot_placeholder_id(
+        self, conn: sqlite3.Connection, novel_id: str, chapter_number: int
+    ) -> Optional[str]:
+        """Return an empty draft placeholder, rejecting any real conflicting prose."""
+
+        row = conn.execute(
+            """
+            SELECT id, status, content FROM chapters
+            WHERE novel_id = ? AND number = ?
+            """,
+            (novel_id, chapter_number),
+        ).fetchone()
+        if row is None:
+            return None
+        if str(row["status"] or "") == "draft" and not str(row["content"] or "").strip():
+            return str(row["id"])
+        if str(row["status"] or "") == "draft":
+            raise CandidateGateError("formal slot contains nonempty draft prose")
+        raise CandidateGateError("formal chapter already exists for this chapter number")
+
+    def formal_slot_is_available(self, novel_id: str, chapter_number: int) -> bool:
+        """Whether the next formal slot is empty or an empty draft placeholder."""
+
+        try:
+            self._formal_slot_placeholder_id(
+                self._connection(), novel_id, chapter_number
+            )
+        except CandidateGateError:
+            return False
+        return True
+
+    def _assert_candidate_authority(
+        self,
+        conn: sqlite3.Connection,
+        candidate_id: str,
+        *,
+        allowed_statuses: tuple[CandidateStatus, ...],
+    ) -> tuple[ChapterCandidate, GenerationRun]:
+        """Recheck the durable cursor immediately before generation or formal write."""
+
+        row = conn.execute(
+            "SELECT * FROM chapter_candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"candidate not found: {candidate_id}")
+        candidate = self._candidate_from_row(row)
+        if candidate.status not in allowed_statuses:
+            raise CandidateGateError("candidate is no longer in an authority-bearing state")
+
+        run_row = conn.execute(
+            "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (candidate.novel_id,)
+        ).fetchone()
+        if run_row is None:
+            raise CandidateGateError("generation run is missing")
+        run = self._run_from_row(run_row)
+        if (
+            run.state != GenerationRunState.RUNNING
+            or candidate.generation_epoch != run.generation_epoch
+            or run.current_candidate_id != candidate.id
+            or int(run.current_candidate_chapter or 0) != candidate.chapter_number
+            or str(run.canonical_sync_status or "ready") != "ready"
+        ):
+            raise CandidateGateError("candidate no longer belongs to the active generation authority")
+
+        baseline = self._validated_pre_candidate_baseline(conn, candidate.novel_id)
+        self._ensure_no_unproven_completed_chapters(
+            conn, candidate.novel_id, len(baseline)
+        )
+        formal_head = self._persisted_formal_chapter_head(
+            conn, candidate.novel_id, baseline=baseline
+        )
+        if (
+            run.current_formal_chapter != formal_head
+            or candidate.chapter_number != formal_head + 1
+        ):
+            raise CandidateGateError(
+                "generation run formal cursor does not match the persisted formal head"
+            )
+        return candidate, run
+
+    def revalidate_candidate_generation_authority(
+        self, candidate_id: str
+    ) -> ChapterCandidate:
+        """Fail before an LLM/DAG call when legacy or formal authority has changed."""
+
+        conn = self._connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate, _ = self._assert_candidate_authority(
+                conn,
+                candidate_id,
+                allowed_statuses=(CandidateStatus.STREAMING, CandidateStatus.REGENERATING),
+            )
+            conn.commit()
+            return candidate
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _legacy_import_result_if_exact(
+        self, conn: sqlite3.Connection, novel_id: str
+    ) -> Optional[dict[str, Any]]:
+        baseline = self._validated_pre_candidate_baseline(conn, novel_id)
+        if not baseline:
+            return None
+        self._ensure_no_unproven_completed_chapters(conn, novel_id, len(baseline))
+        return {"head": len(baseline), "imported": 0, "idempotent": True}
+
+    def _ensure_legacy_import_is_not_blocked(
+        self, conn: sqlite3.Connection, novel_id: str
+    ) -> None:
+        run = conn.execute(
+            """
+            SELECT state, current_candidate_id, canonical_sync_status
+            FROM novel_generation_runs WHERE novel_id = ?
+            """,
+            (novel_id,),
+        ).fetchone()
+        if run is not None and (
+            str(run["state"] or "") in {"running", "waiting_review"}
+            or run["current_candidate_id"]
+            or str(run["canonical_sync_status"] or "ready") != "ready"
+        ):
+            raise CandidateGateError("active or pending generation work blocks legacy import")
+        if conn.execute(
+            """
+            SELECT 1 FROM chapter_candidates
+            WHERE novel_id = ?
+              AND status NOT IN ('committed', 'rejected', 'cancelled')
+            LIMIT 1
+            """,
+            (novel_id,),
+        ).fetchone():
+            raise CandidateGateError("active or pending generation work blocks legacy import")
+
+    def import_legacy_formal_history(self, novel_id: str) -> dict[str, Any]:
+        """Record an author-invoked, hash-checked baseline for old completed prose."""
+
+        conn = self._connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_legacy_import_is_not_blocked(conn, novel_id)
+            existing = self._legacy_import_result_if_exact(conn, novel_id)
+            if existing is not None:
+                conn.commit()
+                return existing
+
+            novel = conn.execute(
+                "SELECT target_chapters FROM novels WHERE id = ?", (novel_id,)
+            ).fetchone()
+            if novel is None:
+                raise KeyError(f"novel not found: {novel_id}")
+            if conn.execute(
+                "SELECT 1 FROM chapter_candidates WHERE novel_id = ? LIMIT 1", (novel_id,)
+            ).fetchone():
+                raise CandidateGateError("Candidate-first formal history cannot be imported as legacy")
+            if conn.execute(
+                "SELECT 1 FROM chapter_candidate_formal_commits WHERE novel_id = ? LIMIT 1",
+                (novel_id,),
+            ).fetchone():
+                raise CandidateGateError("Candidate-first formal history cannot be imported as legacy")
+
+            chapters = conn.execute(
+                """
+                SELECT id, number, content, content_sha256, content_revision, status
+                FROM chapters WHERE novel_id = ? ORDER BY number
+                """,
+                (novel_id,),
+            ).fetchall()
+            if not chapters:
+                raise CandidateGateError("no completed legacy chapters are available for import")
+            prefix: list[sqlite3.Row] = []
+            for expected_number, chapter in enumerate(chapters, start=1):
+                content = str(chapter["content"] or "")
+                actual_sha256 = self._content_sha256(content)
+                is_completed_prefix_row = (
+                    int(chapter["number"]) != expected_number
+                    or str(chapter["status"] or "") != "completed"
+                    or not content.strip()
+                    or (
+                        str(chapter["content_sha256"] or "")
+                        and str(chapter["content_sha256"]) != actual_sha256
+                    )
+                )
+                if not is_completed_prefix_row:
+                    if len(prefix) + 1 != expected_number:
+                        raise CandidateGateError(
+                            "legacy chapters must be a contiguous completed nonempty prefix"
+                        )
+                    prefix.append(chapter)
+                    continue
+                if str(chapter["status"] or "") == "completed" and content.strip():
+                    raise CandidateGateError(
+                        "legacy chapters must be a contiguous completed nonempty prefix"
+                    )
+            if not prefix:
+                raise CandidateGateError("no completed legacy chapters are available for import")
+            if len(prefix) > int(novel["target_chapters"] or 0):
+                raise CandidateGateError("legacy history exceeds novel target_chapters")
+
+            now = self._now()
+            for chapter in prefix:
+                content = str(chapter["content"] or "")
+                conn.execute(
+                    """
+                    INSERT INTO pre_candidate_formal_history
+                        (novel_id, chapter_number, chapter_id, content_sha256, content_revision, imported_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        novel_id,
+                        int(chapter["number"]),
+                        str(chapter["id"]),
+                        self._content_sha256(content),
+                        int(chapter["content_revision"] or 0),
+                        now,
+                    ),
+                )
+            conn.commit()
+            return {"head": len(prefix), "imported": len(prefix), "idempotent": False}
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._ensure_legacy_import_is_not_blocked(conn, novel_id)
+                existing = self._legacy_import_result_if_exact(conn, novel_id)
+                if existing is None:
+                    raise CandidateGateError(
+                        "legacy formal history import collision without an exact baseline"
+                    ) from exc
+                conn.commit()
+                return existing
+            except Exception:
+                conn.rollback()
+                raise
+        except Exception:
+            conn.rollback()
+            raise
 
     def start_run(
         self,
         novel_id: str,
         *,
         run_mode: RunMode,
-        target_chapters: int,
+        target_chapters: int | None = None,
     ) -> GenerationRun:
         conn = self._connection()
         novel = conn.execute(
@@ -148,6 +513,7 @@ class ChapterCandidateRepository:
         target_chapters = int(novel["target_chapters"] or 0)
         if target_chapters < 1:
             raise CandidateGateError("novel target_chapters must be at least 1")
+        self.assert_formal_history_is_proven(novel_id)
         existing = conn.execute(
             "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
         ).fetchone()
@@ -425,32 +791,50 @@ class ChapterCandidateRepository:
         outline_chain: dict[str, Any],
         llm_content: str = "",
     ) -> ChapterCandidate:
-        run = self.get_run(novel_id)
-        if run.state != GenerationRunState.RUNNING:
-            raise CandidateGateError(f"generation run is {run.state.value}; cannot generate next candidate")
-        if run.current_candidate_id:
-            raise CandidateGateError("pending candidate blocks next chapter generation")
-        if chapter_number != run.current_formal_chapter + 1:
-            raise CandidateGateError("candidate chapter must be the immediate next chapter after the formal cursor")
         conn = self._connection()
-        open_row = conn.execute(
-            """
-            SELECT id FROM chapter_candidates
-            WHERE novel_id = ?
-              AND status IN ('streaming', 'auditing', 'awaiting_review', 'committing', 'syncing', 'regenerating')
-            LIMIT 1
-            """,
-            (novel_id,),
-        ).fetchone()
-        if open_row is not None:
-            raise CandidateGateError("pending candidate blocks next chapter generation")
         candidate_id = f"candidate-{uuid4()}"
         outline_json = json.dumps(outline_chain, ensure_ascii=False, sort_keys=True)
         outline_digest = hashlib.sha256(outline_json.encode("utf-8")).hexdigest()
         content_revision = 1 if llm_content else 0
         now = self._now()
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
+            run_row = conn.execute(
+                "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"generation run not found: {novel_id}")
+            run = self._run_from_row(run_row)
+            if run.state != GenerationRunState.RUNNING:
+                raise CandidateGateError(
+                    f"generation run is {run.state.value}; cannot generate next candidate"
+                )
+            if run.current_candidate_id:
+                raise CandidateGateError("pending candidate blocks next chapter generation")
+            if chapter_number != run.current_formal_chapter + 1:
+                raise CandidateGateError(
+                    "candidate chapter must be the immediate next chapter after the formal cursor"
+                )
+            baseline = self._validated_pre_candidate_baseline(conn, novel_id)
+            self._ensure_no_unproven_completed_chapters(conn, novel_id, len(baseline))
+            if run.current_formal_chapter != self._persisted_formal_chapter_head(
+                conn, novel_id, baseline=baseline
+            ):
+                raise CandidateGateError(
+                    "generation run formal cursor does not match the persisted formal head"
+                )
+            self._formal_slot_placeholder_id(conn, novel_id, chapter_number)
+            open_row = conn.execute(
+                """
+                SELECT id FROM chapter_candidates
+                WHERE novel_id = ?
+                  AND status IN ('streaming', 'auditing', 'awaiting_review', 'committing', 'syncing', 'regenerating')
+                LIMIT 1
+                """,
+                (novel_id,),
+            ).fetchone()
+            if open_row is not None:
+                raise CandidateGateError("pending candidate blocks next chapter generation")
             conn.execute(
                 """
                 INSERT INTO chapter_candidates
@@ -1090,55 +1474,83 @@ class ChapterCandidateRepository:
     def commit_formal(self, candidate_id: str) -> ChapterCandidate:
         """Atomically write the final human-approved prose, then block on sync."""
 
-        candidate = self.get_candidate(candidate_id)
-        if candidate.status in {CandidateStatus.SYNCING, CandidateStatus.COMMITTED} and candidate.formal_chapter_id:
-            return candidate
-        if candidate.status != CandidateStatus.COMMITTING:
-            raise CandidateGateError("candidate must be approved before formal commit")
-        if not candidate.audit_is_current or not candidate.commit_plan_is_current:
-            raise CandidateGateError("candidate audit or commit plan is stale")
-        self._ensure_current_generation(candidate)
-        content = candidate.final_content
-        if not content.strip():
-            raise CandidateGateError("cannot commit empty candidate prose")
         conn = self._connection()
-        existing = conn.execute(
-            "SELECT id FROM chapters WHERE novel_id = ? AND number = ?",
-            (candidate.novel_id, candidate.chapter_number),
-        ).fetchone()
-        if existing is not None:
-            raise CandidateGateError("formal chapter already exists for this chapter number")
-        formal_chapter_id = f"chapter-{uuid4()}"
-        content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        now = self._now()
         try:
-            conn.execute("BEGIN")
-            conn.execute(
-                """
-                INSERT INTO chapters
-                    (id, novel_id, number, title, content, content_sha256, content_revision, outline, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
-                """,
-                (
-                    formal_chapter_id,
-                    candidate.novel_id,
-                    candidate.chapter_number,
-                    candidate.title,
-                    content,
-                    content_sha256,
-                    candidate.content_revision,
-                    json.dumps(candidate.commit_plan, ensure_ascii=False, sort_keys=True),
-                    now,
-                    now,
-                ),
+            conn.execute("BEGIN IMMEDIATE")
+            candidate, _ = self._assert_candidate_authority(
+                conn,
+                candidate_id,
+                allowed_statuses=(CandidateStatus.COMMITTING,),
             )
+            if not candidate.audit_is_current or not candidate.commit_plan_is_current:
+                raise CandidateGateError("candidate audit or commit plan is stale")
+            content = candidate.final_content
+            if not content.strip():
+                raise CandidateGateError("cannot commit empty candidate prose")
+            placeholder_id = self._formal_slot_placeholder_id(
+                conn, candidate.novel_id, candidate.chapter_number
+            )
+            formal_chapter_id = placeholder_id or f"chapter-{uuid4()}"
+            content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            now = self._now()
+            chapter_values = (
+                candidate.novel_id,
+                candidate.chapter_number,
+                candidate.title,
+                content,
+                content_sha256,
+                candidate.content_revision,
+                json.dumps(candidate.commit_plan, ensure_ascii=False, sort_keys=True),
+                now,
+            )
+            if placeholder_id is None:
+                update = conn.execute(
+                    """
+                    INSERT INTO chapters
+                        (id, novel_id, number, title, content, content_sha256, content_revision, outline, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
+                    """,
+                    (formal_chapter_id, *chapter_values, now),
+                )
+            else:
+                update = conn.execute(
+                    """
+                    UPDATE chapters
+                    SET title = ?, content = ?, content_sha256 = ?, content_revision = ?,
+                        outline = ?, status = 'completed', updated_at = ?
+                    WHERE id = ? AND novel_id = ? AND number = ? AND status = 'draft'
+                      AND TRIM(COALESCE(content, '')) = ''
+                    """,
+                    (
+                        candidate.title,
+                        content,
+                        content_sha256,
+                        candidate.content_revision,
+                        json.dumps(candidate.commit_plan, ensure_ascii=False, sort_keys=True),
+                        now,
+                        formal_chapter_id,
+                        candidate.novel_id,
+                        candidate.chapter_number,
+                    ),
+                )
+                if update.rowcount != 1:
+                    raise CandidateGateError("formal slot changed before formal commit")
             conn.execute(
                 """
                 INSERT INTO chapter_candidate_formal_commits
-                    (candidate_id, novel_id, chapter_number, chapter_id, sync_status, committed_at)
-                VALUES (?, ?, ?, ?, 'syncing', ?)
+                    (candidate_id, novel_id, chapter_number, chapter_id,
+                     content_sha256, content_revision, provenance, sync_status, committed_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'candidate_commit', 'syncing', ?)
                 """,
-                (candidate_id, candidate.novel_id, candidate.chapter_number, formal_chapter_id, now),
+                (
+                    candidate_id,
+                    candidate.novel_id,
+                    candidate.chapter_number,
+                    formal_chapter_id,
+                    content_sha256,
+                    candidate.content_revision,
+                    now,
+                ),
             )
             conn.execute(
                 """

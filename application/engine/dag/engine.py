@@ -1,9 +1,9 @@
-"""DAG 执行引擎 — LangGraph 编排 + 拓扑并行执行
+"""DAG 执行引擎 — 原生拓扑并行执行。
 
 核心职责：
-1. 将 DAGDefinition 编译为 LangGraph StateGraph
-2. 支持断点续写（通过 LangGraph Checkpoint）
-3. 拓扑排序后无依赖节点并行执行
+1. 依据 DAGDefinition 执行源端口合同、分支与 fan-in。
+2. 用源本地语义在本机与安装 LangGraph 的环境保持一致。
+3. 对无依赖节点进行并行执行。
 """
 from __future__ import annotations
 
@@ -41,9 +41,9 @@ class DAGEngine:
     """DAG 执行引擎
 
     设计决策：
-    - 优先使用 LangGraph 进行编排（支持循环重写、断点续写）
-    - LangGraph 不可用时降级为自研拓扑排序执行器
-    - 两种路径共享相同的节点注册表和输入收集逻辑
+    - 原生拓扑执行器是生产语义权威，不因 LangGraph 是否安装而改变。
+    - 兼容性 LangGraph 编译代码保留供隔离实验，不承诺 checkpoint 恢复语义。
+    - 节点注册表和输入收集逻辑为两条路径共用。
     """
 
     def __init__(self, checkpointer=None, observer=None):
@@ -53,9 +53,9 @@ class DAGEngine:
         self._use_langgraph = _is_langgraph_available()
 
         if self._use_langgraph:
-            logger.info("DAG 引擎: LangGraph 可用，使用 LangGraph 编排")
+            logger.info("DAG 引擎: 原生拓扑执行器（LangGraph 兼容代码可用）")
         else:
-            logger.info("DAG 引擎: LangGraph 不可用，使用自研拓扑执行器")
+            logger.info("DAG 引擎: 原生拓扑执行器（LangGraph 未安装）")
 
     # ─── 主入口 ───
 
@@ -73,7 +73,7 @@ class DAGEngine:
         Args:
             dag: DAG 定义
             initial_state: 初始状态
-            thread_id: 线程 ID（用于 LangGraph Checkpoint）
+            thread_id: 调用方的运行关联标识；原生运行时不读取 checkpoint。
 
         Returns:
             DAGRunResult
@@ -161,7 +161,7 @@ class DAGEngine:
 
         return await self.run(pruned_dag, state, thread_id)
 
-    # ─── LangGraph 路径 ───
+    # ─── LangGraph 兼容路径（不由生产 run() 调用） ───
 
     async def _run_with_langgraph(
         self,
@@ -169,7 +169,7 @@ class DAGEngine:
         initial_state: Dict[str, Any],
         thread_id: str,
     ) -> Dict[str, Any]:
-        """使用 LangGraph StateGraph 执行 DAG"""
+        """编译并执行 LangGraph StateGraph，仅供隔离兼容实验。"""
         from langgraph.graph import StateGraph, END
 
         # 构建状态 Schema（使用 dict 模式，更灵活）
@@ -318,8 +318,13 @@ class DAGEngine:
                         observer=observer, node_started_at=node_started_at,
                     )
 
+                source_succeeded = not isinstance(result, Exception)
                 for edge in outgoing[node.id]:
-                    active_edges[edge.id] = self._edge_matches(edge.condition, state)
+                    active_edges[edge.id] = self._edge_matches(
+                        edge.condition,
+                        state,
+                        source_succeeded=source_succeeded,
+                    )
 
         for node_id in nodes:
             if node_id not in completed and node_id not in skipped:
@@ -398,7 +403,19 @@ class DAGEngine:
             logger.exception("DAG observer callback failed: %s", method)
 
     @staticmethod
-    def _edge_matches(condition: EdgeCondition, state: Dict[str, Any]) -> bool:
+    def _edge_matches(
+        condition: EdgeCondition,
+        state: Dict[str, Any],
+        *,
+        source_succeeded: Optional[bool] = None,
+    ) -> bool:
+        if source_succeeded is not None:
+            if condition == EdgeCondition.ON_ERROR:
+                return not source_succeeded
+            if condition in {EdgeCondition.ALWAYS, EdgeCondition.ON_SUCCESS}:
+                return source_succeeded
+            if not source_succeeded:
+                return False
         return _make_condition_function(condition, "")(state)
 
     @staticmethod

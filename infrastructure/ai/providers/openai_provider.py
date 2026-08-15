@@ -94,8 +94,7 @@ class OpenAIProvider(BaseProvider):
 
         🔥 自适应容错策略：
         1. 如果指定了 json_schema response_format 但网关返回 400，自动降级到 json_object
-        2. 如果内容为空，降级到流式聚合（部分网关非流式返回空但流式正常）
-        3. 如果非流式与流式聚合都为空，按统一 LLM 重试预算进行有限重试
+        2. 空完成响应按统一 LLM 重试预算有限重试；单次尝试不得重放为流式请求
         """
         messages = self._build_messages(prompt)
         last_error: Exception | None = None
@@ -125,14 +124,7 @@ class OpenAIProvider(BaseProvider):
                 content = self._extract_text_from_response(response)
 
                 if not content:
-                    logger.warning(
-                        "OpenAI-compatible response returned empty non-stream content; "
-                        "falling back to streaming aggregation (attempt=%d/%d)",
-                        attempt + 1,
-                        LLM_MAX_TOTAL_ATTEMPTS,
-                    )
-                    content, token_usage = await self._generate_via_stream(request_kwargs)
-                    return GenerationResult(content=content, token_usage=token_usage)
+                    raise RuntimeError("API returned empty content")
 
                 return GenerationResult(
                     content=content,
@@ -230,11 +222,44 @@ class OpenAIProvider(BaseProvider):
     @staticmethod
     def _responses_endpoint_is_unsupported(exc: Exception) -> bool:
         response = getattr(exc, "response", None)
-        if getattr(response, "status_code", None) != 404:
+        status_code = getattr(response, "status_code", None)
+        if status_code in (405, 501):
+            return True
+        if status_code != 404:
             return False
-        message = str(exc).lower()
-        return "responses" in message and any(
-            marker in message for marker in ("not found", "unsupported", "does not support")
+        body = getattr(exc, "body", None)
+        response_text = getattr(response, "text", None)
+        message = " ".join(
+            str(part).lower()
+            for part in (str(exc), body, response_text)
+            if part not in (None, "")
+        )
+        resource_markers = ("model", "deployment", "resource")
+        missing_markers = (
+            "not found",
+            "does not exist",
+            "doesn't exist",
+            "not available",
+        )
+        if any(marker in message for marker in resource_markers) and any(
+            marker in message for marker in missing_markers
+        ):
+            return False
+        endpoint_markers = (
+            "responses endpoint",
+            "responses api endpoint",
+            "/v1/responses",
+            "responses path",
+        )
+        unsupported_markers = (
+            "not found",
+            "not supported",
+            "unsupported",
+            "does not support",
+            "doesn't support",
+        )
+        return any(marker in message for marker in endpoint_markers) and any(
+            marker in message for marker in unsupported_markers
         )
 
     @staticmethod
@@ -554,31 +579,3 @@ class OpenAIProvider(BaseProvider):
         if isinstance(content, list):
             return OpenAIProvider._normalize_chat_completion_content(content)
         return ""
-
-    async def _generate_via_stream(self, request_kwargs: dict[str, Any]) -> tuple[str, TokenUsage]:
-        stream = await self.async_client.chat.completions.create(
-            **{**request_kwargs, "stream": True}
-        )
-
-        parts: list[str] = []
-        input_tokens = 0
-        output_tokens = 0
-
-        async for chunk in stream:
-            content = self._extract_text_from_stream_chunk(chunk)
-            if content:
-                parts.append(content)
-
-            usage = getattr(chunk, "usage", None)
-            if usage is not None:
-                input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-                output_tokens = getattr(usage, "completion_tokens", 0) or 0
-
-        content = "".join(parts).strip()
-        if not content:
-            raise RuntimeError("API returned empty content")
-
-        return content, TokenUsage(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )

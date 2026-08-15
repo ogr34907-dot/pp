@@ -12,13 +12,9 @@
       </div>
       <div class="menu-divider" />
 
-      <!-- ★ 精简操作项：只保留"查看详情"和"启禁用" -->
+      <!-- 只读检查入口 -->
       <div class="menu-item" @click="$emit('detail', nodeId)">
         📋 查看详情
-      </div>
-      <div class="menu-divider" />
-      <div class="menu-item" :class="{ 'menu-item-warning': nodeEnabled }" @click="$emit('toggle', nodeId)">
-        {{ nodeEnabled ? '⛔ 禁用此节点' : '✅ 启用此节点' }}
       </div>
     </div>
   </Teleport>
@@ -33,14 +29,12 @@ const props = defineProps<{
   x: number
   y: number
   nodeId: string
-  nodeEnabled: boolean
   nodeType: string
 }>()
 
 defineEmits<{
   close: []
   detail: [nodeId: string]
-  toggle: [nodeId: string]
 }>()
 
 const dagStore = useDAGStore()
@@ -97,11 +91,6 @@ const menuStyle = computed(() => {
 .menu-item:hover {
   background: var(--dag-menu-hover);
   color: var(--color-brand);
-}
-
-.menu-item-warning:hover {
-  background: var(--color-warning-dim);
-  color: var(--color-warning);
 }
 
 .menu-divider {

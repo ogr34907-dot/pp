@@ -1,5 +1,6 @@
 import hashlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -48,6 +49,106 @@ class _DirectCompletedChapterRepository:
             content_revision=1,
             status=ChapterStatus.COMPLETED,
         )
+
+
+class _ReadyCanonicalDb:
+    def fetch_one(self, sql, _params=()):
+        if "novel_generation_runs" in sql:
+            return {"novel_id": "novel-1"}
+        if "chapter_candidate_formal_commits" in sql:
+            return {
+                "chapter_id": "formal-chapter-2",
+                "content_sha256": hashlib.sha256("正式正文".encode("utf-8")).hexdigest(),
+                "content_revision": 2,
+            }
+        raise AssertionError(f"unexpected authority query: {sql}")
+
+
+class _ReadyCanonicalChapterRepository:
+    def __init__(self):
+        self.db = _ReadyCanonicalDb()
+        self.chapter = SimpleNamespace(
+            id="formal-chapter-2",
+            content="正式正文",
+            content_sha256=hashlib.sha256("正式正文".encode("utf-8")).hexdigest(),
+            content_revision=2,
+            status=ChapterStatus.COMPLETED,
+        )
+
+    def get_by_novel_and_number(self, novel_id, chapter_number):
+        return self.chapter
+
+
+class _StaleFormalAuthorityDb:
+    def fetch_one(self, sql, _params=()):
+        if "novel_generation_runs" in sql:
+            return {"novel_id": "novel-1"}
+        if "chapter_candidate_formal_commits" in sql:
+            return {
+                "chapter_id": "formal-chapter-2",
+                "content_sha256": hashlib.sha256("候选正式正文".encode("utf-8")).hexdigest(),
+                "content_revision": 1,
+            }
+        raise AssertionError(f"unexpected authority query: {sql}")
+
+
+class _RewrittenCanonicalChapterRepository:
+    db = _StaleFormalAuthorityDb()
+
+    def get_by_novel_and_number(self, novel_id, chapter_number):
+        return SimpleNamespace(
+            id="formal-chapter-2",
+            content="人工改写正文",
+            content_sha256=hashlib.sha256("人工改写正文".encode("utf-8")).hexdigest(),
+            content_revision=2,
+            status=ChapterStatus.COMPLETED,
+        )
+
+
+class _MemoryCommitRepository:
+    def __init__(self, _db):
+        pass
+
+    def claim_memory_sync(self, **_kwargs):
+        return "claimed"
+
+    def fail_memory_sync(self, **_kwargs):
+        return False
+
+
+class _FailingMemoryEngine:
+    llm_service = None
+
+    async def update_canonical_version_from_chapter(self, *args, **kwargs):
+        raise RuntimeError("memory extraction failed")
+
+
+def _side_effect_probes():
+    return {
+        "bridge": AsyncMock(),
+        "reconcile": MagicMock(return_value={"checked": True}),
+        "auxiliary": AsyncMock(),
+    }
+
+
+def _canonical_pipeline(probes, *, memory_engine=None):
+    repository = _ReadyCanonicalChapterRepository()
+    pipeline = ChapterAftermathPipeline(
+        knowledge_service=object(),
+        chapter_indexing_service=None,
+        llm_service=object(),
+        chapter_repository=repository,
+        character_narrative_kernel=SimpleNamespace(
+            reconcile_after_chapter=probes["reconcile"]
+        ),
+        evolution_snapshot_service=MagicMock(),
+        unified_checkpoint_service=MagicMock(),
+        prop_lifecycle_syncer=probes["auxiliary"],
+        memory_engine=memory_engine,
+    )
+    pipeline._extract_chapter_bridge = probes["bridge"]
+    pipeline._run_auxiliary_stages = probes["auxiliary"]
+    return pipeline
 
 
 @pytest.mark.asyncio
@@ -135,3 +236,83 @@ async def test_aftermath_discards_direct_completed_chapter_when_candidate_run_ex
     assert result["discarded_uncommitted"] is True
     assert result["failure_reason"] == "candidate_first_required"
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_aftermath_discards_chapter_that_no_longer_matches_formal_authority(monkeypatch):
+    called = False
+
+    async def should_not_run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    pipeline = ChapterAftermathPipeline(
+        knowledge_service=object(),
+        chapter_indexing_service=None,
+        llm_service=object(),
+        chapter_repository=_RewrittenCanonicalChapterRepository(),
+    )
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.sync_chapter_narrative_after_save",
+        should_not_run,
+    )
+
+    result = await pipeline.run_after_chapter_saved("novel-1", 2, "人工改写正文")
+
+    assert result["discarded_uncommitted"] is True
+    assert result["failure_reason"] == "candidate_first_required"
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_aftermath_primary_sync_failure_does_not_publish_downstream_derivations(monkeypatch):
+    probes = _side_effect_probes()
+    pipeline = _canonical_pipeline(probes)
+
+    async def failed_sync(*args, **kwargs):
+        return {"narrative_sync_ok": False, "failure_reason": "primary_sync_failed"}
+
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.sync_chapter_narrative_after_save",
+        failed_sync,
+    )
+
+    result = await pipeline.run_after_chapter_saved("novel-1", 2, "正式正文")
+    await pipeline.drain_auxiliary_stages()
+
+    assert result["narrative_sync_ok"] is False
+    assert result["failure_reason"] == "primary_sync_failed"
+    probes["bridge"].assert_not_awaited()
+    probes["reconcile"].assert_not_called()
+    probes["auxiliary"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_aftermath_durable_memory_failure_does_not_publish_downstream_derivations(
+    monkeypatch,
+):
+    probes = _side_effect_probes()
+    pipeline = _canonical_pipeline(probes, memory_engine=_FailingMemoryEngine())
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository.SqliteChapterNarrativeCommitRepository",
+        _MemoryCommitRepository,
+    )
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.sync_chapter_narrative_after_save",
+        AsyncMock(
+            return_value={
+                "narrative_sync_ok": True,
+                "content_sha256": hashlib.sha256("正式正文".encode("utf-8")).hexdigest(),
+                "content_revision": 2,
+            }
+        ),
+    )
+
+    result = await pipeline.run_after_chapter_saved("novel-1", 2, "正式正文")
+    await pipeline.drain_auxiliary_stages()
+
+    assert result["narrative_sync_ok"] is False
+    assert result["failure_reason"] == "memory_engine_update_failed"
+    probes["bridge"].assert_not_awaited()
+    probes["reconcile"].assert_not_called()
+    probes["auxiliary"].assert_not_awaited()

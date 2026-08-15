@@ -1,10 +1,9 @@
 """DAG 管理 REST API — 纯展示层路由
 
 设计原则：
-- DAG 是纯展示层，不提供保存/校验/编辑接口
+- DAG 路由只投影受保护的默认定义
 - 节点注册是代码行为，写一个节点就注册一个
 - 执行权在全托管模式，DAG 只展示状态流转
-- 暂时不走数据库
 
 路由分组：
 - 健康检查: GET /dag/health/dag
@@ -13,7 +12,6 @@
 - SSE 事件流: GET /dag/events?novel_id=xxx
 - DAG 定义（只读）: GET /dag/{novel_id}
 - 节点详情（只读）: GET /dag/{novel_id}/nodes/{node_id}
-- 节点启禁用: POST /dag/{novel_id}/nodes/{node_id}/toggle
 - 运行状态: GET /dag/{novel_id}/status
 - 提示词来源: GET /dag/{novel_id}/nodes/{node_id}/prompt-live
 
@@ -32,15 +30,10 @@ from typing import Any, Deque, Dict, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from application.engine.dag.models import (
     DAGDefinition,
-    NodeConfig,
-    NodeDefinition,
-    NodeMeta,
-    NodeRunState,
-    NodeStatus,
     get_default_dag,
 )
 from application.engine.dag.registry import NodeRegistry
@@ -67,7 +60,7 @@ _sse_event_history: Dict[str, Deque[Dict[str, Any]]] = {}
 _sse_event_sequences: Dict[str, int] = {}
 _sse_projection_snapshots: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
-# ★ DAG 定义内存缓存（暂时不走数据库）
+# DAG definitions are cached only after loading them from the version store.
 _dag_cache: "OrderedDict[str, DAGDefinition]" = OrderedDict()
 
 
@@ -78,7 +71,7 @@ def _evict_dag_cache_overflow() -> None:
 
 
 def _get_dag_for_novel(novel_id: str) -> DAGDefinition:
-    """获取或初始化小说的 DAG 定义（内存缓存，不走数据库）"""
+    """Return the protected Candidate DAG definition for display."""
     dag = _dag_cache.get(novel_id)
     if dag is not None:
         _dag_cache.move_to_end(novel_id)
@@ -359,27 +352,13 @@ async def get_node(novel_id: str, node_id: str):
     return result
 
 
-# ─── 节点启禁用（唯一写操作） ───
+# ─── 已退役的节点编辑控制 ───
 
 
 @router.post("/{novel_id}/nodes/{node_id}/toggle")
 async def toggle_node(novel_id: str, node_id: str):
-    """切换启用/禁用"""
-    dag = _get_dag_for_novel(novel_id)
-    node = dag.get_node(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail=f"节点 '{node_id}' 不存在")
-
-    # 检查是否允许禁用
-    try:
-        meta = NodeRegistry.get_meta(node.type)
-        if not meta.can_disable and node.enabled:
-            raise HTTPException(status_code=400, detail=f"节点 '{node_id}' 不允许禁用")
-    except KeyError:
-        pass
-
-    node.enabled = not node.enabled
-    return dag.model_dump(mode="json")
+    """Candidate DAG barriers cannot be modified from the display surface."""
+    raise HTTPException(status_code=410, detail="candidate_generation_control_required")
 
 
 # ─── 运行状态（只读） ───
@@ -482,61 +461,22 @@ async def get_rendered_prompt(novel_id: str, node_id: str):
     }
 
 
-# ─── 节点配置更新（nodeEditorStore 使用） ───
-
-
-class UpdateNodeConfigRequest(BaseModel):
-    """更新节点配置请求"""
-    prompt_template: Optional[str] = None
-    prompt_variables: Optional[Dict[str, str]] = None
-    thresholds: Optional[Dict[str, float]] = None
-    model_override: Optional[str] = None
-    max_retries: Optional[int] = Field(default=None, ge=0, le=5)
-    timeout_seconds: Optional[int] = Field(default=None, ge=10, le=600)
-    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
-    max_tokens: Optional[int] = Field(default=None, ge=100)
-
-
 @router.put("/{novel_id}/nodes/{node_id}")
-async def update_node_config(novel_id: str, node_id: str, request: UpdateNodeConfigRequest):
-    """更新节点配置（运行参数）"""
-    dag = _get_dag_for_novel(novel_id)
-    node = dag.get_node(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail=f"节点 '{node_id}' 不存在")
-
-    # 应用配置更新
-    updates = request.model_dump(exclude_none=True)
-    if "prompt_template" in updates:
-        node.config.prompt_template = updates["prompt_template"]
-    if "prompt_variables" in updates:
-        node.config.prompt_variables = updates["prompt_variables"]
-    if "thresholds" in updates:
-        node.config.thresholds.update(updates["thresholds"])
-    if "model_override" in updates:
-        node.config.model_override = updates["model_override"]
-    if "max_retries" in updates:
-        node.config.max_retries = updates["max_retries"]
-    if "timeout_seconds" in updates:
-        node.config.timeout_seconds = updates["timeout_seconds"]
-    if "temperature" in updates:
-        node.config.temperature = updates["temperature"]
-    if "max_tokens" in updates:
-        node.config.max_tokens = updates["max_tokens"]
-
-    return dag.model_dump(mode="json")
+async def update_node_config(novel_id: str, node_id: str):
+    """Candidate DAG barriers cannot be modified from the display surface."""
+    raise HTTPException(status_code=410, detail="candidate_generation_control_required")
 
 
-# ─── DAG 运行控制（dagRunStore 使用） ───
+# ─── 已退役的 DAG 运行控制 ───
 
 
 @router.post("/{novel_id}/run")
 async def run_dag(novel_id: str):
-    """启动 DAG 运行"""
-    return {"status": "started", "novel_id": novel_id}
+    """DAG 只投影 Candidate 运行状态，不能独立启动。"""
+    raise HTTPException(status_code=410, detail="candidate_generation_control_required")
 
 
 @router.post("/{novel_id}/stop")
 async def stop_dag(novel_id: str):
-    """停止 DAG 运行"""
-    return {"status": "stopped", "novel_id": novel_id}
+    """DAG 只投影 Candidate 运行状态，不能独立停止。"""
+    raise HTTPException(status_code=410, detail="candidate_generation_control_required")

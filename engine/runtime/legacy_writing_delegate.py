@@ -15,6 +15,7 @@ from application.ai_invocation.autopilot.policy import AutopilotInvocationPolicy
 from application.ai_invocation.autopilot.publisher import AutopilotSessionPublisher
 from domain.ai.services.llm_service import GenerationConfig
 from domain.novel.entities.novel import Novel, NovelStage, AutopilotStatus
+from domain.novel.target_chapters import positive_integer_or_none
 from domain.novel.entities.chapter import ChapterStatus
 from domain.novel.value_objects.novel_id import NovelId
 from domain.structure.story_node import StoryNode
@@ -147,6 +148,20 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
     if not host._is_still_running(novel):
         return
 
+    target_chapters = positive_integer_or_none(
+        getattr(novel, "target_chapters", None)
+    )
+    if target_chapters is None:
+        novel.autopilot_status = AutopilotStatus.STOPPED
+        novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+        host._update_shared_state(
+            novel.novel_id.value,
+            current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+            autopilot_pause_reason="target_chapters_required",
+        )
+        host._flush_novel(novel)
+        return
+
     # 0. 叙事结构被清空（无任何卷）：DB 阶段往往仍为 writing，否则会先显示「写作」
     #    再白等一轮幕级规划才发现无卷。此处立即回到宏观规划并刷新共享内存。
     novel_id_v = novel.novel_id.value
@@ -176,7 +191,6 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
         logger.debug("[%s] 写作前结构探测失败（忽略）: %s", novel_id_v, e)
 
     # 1. 目标控制：达到目标章节数则自动停止
-    target_chapters = novel.target_chapters or 50
     max_chapters = novel.max_auto_chapters or 9999
     current_chapters = novel.current_auto_chapters or 0
 
@@ -209,6 +223,38 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
             getattr(host, "_canonical_history_block_reason", "") or ""
         )
 
+        if history_block_reason:
+            novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+            novel.last_audit_narrative_ok = False
+            host._update_shared_state(
+                novel.novel_id.value,
+                current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+                last_audit_narrative_ok=False,
+                autopilot_pause_reason=history_block_reason,
+            )
+            host._flush_novel(novel)
+            logger.warning(
+                "[%s] legacy 写作因规范历史未确认而暂停: %s",
+                novel.novel_id,
+                history_block_reason,
+            )
+            return
+
+        if await host._current_act_fully_written(novel):
+            novel.current_act += 1
+            novel.current_chapter_in_act = 0
+            novel.current_stage = NovelStage.ACT_PLANNING
+            logger.info(f"[{novel.novel_id}] 当前幕已完成，进入第 {novel.current_act + 1} 幕规划")
+        else:
+            novel.current_stage = NovelStage.ACT_PLANNING
+            logger.info(f"[{novel.novel_id}] 找不到下一章节点，进入幕级规划创建章节")
+        return
+
+    chapter_num = next_chapter_node.number
+    host._sync_novel_current_act_from_chapter_story_node(novel, next_chapter_node)
+    host._cache_stats_to_shared_memory(novel)
+    outline = next_chapter_node.outline or next_chapter_node.description or next_chapter_node.title
+
     # Legacy beat/full prose paths do not pass through AutoNovelGenerationWorkflow;
     # enforce the same hierarchy contract before any context/LLM call.
     gate = getattr(host, "hierarchy_gate", None) or getattr(getattr(host, "chapter_workflow", None), "hierarchy_gate", None)
@@ -234,41 +280,6 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
             novel.autopilot_status = AutopilotStatus.STOPPED
             host._flush_novel(novel)
             return
-        if history_block_reason:
-            novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
-            novel.last_audit_narrative_ok = False
-            host._update_shared_state(
-                novel.novel_id.value,
-                current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
-                last_audit_narrative_ok=False,
-                autopilot_pause_reason=history_block_reason,
-            )
-            host._flush_novel(novel)
-            logger.warning(
-                "[%s] legacy 写作因规范历史未确认而暂停: %s",
-                novel.novel_id,
-                history_block_reason,
-            )
-            return
-        # 🔥 修复：找不到下一章时，检查当前幕是否全部写完
-        if await host._current_act_fully_written(novel):
-            # 当前幕已完成，进入下一幕规划
-            novel.current_act += 1
-            novel.current_chapter_in_act = 0
-            novel.current_stage = NovelStage.ACT_PLANNING
-            logger.info(f"[{novel.novel_id}] 当前幕已完成，进入第 {novel.current_act + 1} 幕规划")
-        else:
-            # 🔥 修复：当前幕还有章节但找不到未写章节，说明章节节点可能未创建
-            # 进入幕级规划创建章节节点，而不是跳到审计
-            novel.current_stage = NovelStage.ACT_PLANNING
-            logger.info(f"[{novel.novel_id}] 找不到下一章节点，进入幕级规划创建章节")
-        return
-
-    chapter_num = next_chapter_node.number
-    host._sync_novel_current_act_from_chapter_story_node(novel, next_chapter_node)
-    host._cache_stats_to_shared_memory(novel)
-    outline = next_chapter_node.outline or next_chapter_node.description or next_chapter_node.title
-
     # 合并分章叙事节拍
     if host.knowledge_service:
         try:
@@ -690,9 +701,10 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
                 f"[{novel.novel_id}] 章节 {chapter_num} 已有 {len(existing_content)} 字 "
                 f"(达标 {int(len(existing_content) / target_word_count * 100)}%)，直接标记完成"
             )
-            await host._upsert_chapter_content(
+            if await host._upsert_chapter_content(
                 novel, next_chapter_node, existing_content, status="completed"
-            )
+            ) is False:
+                return
             novel.current_auto_chapters = (novel.current_auto_chapters or 0) + 1
             novel.current_chapter_in_act += 1
             novel.current_beat_index = 0
@@ -1250,11 +1262,36 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
         host._flush_novel(novel)
         return
 
-    # 8. 更新计数器，重置节拍状态
+    # 🔗 衔接引擎：章节完成后自检衔接度（非第 1 章）
+    # 如果衔接度 < 0.6，自动修整首段（最多 2 轮）
+    if chapter_num > 1:
+        # ★ 子步骤状态：衔接自检
+        host._update_shared_state(
+            novel.novel_id.value,
+            writing_substep="continuity_check",
+            writing_substep_label="衔接度自检",
+        )
+        chapter_content = await host._continuity_self_check(
+            novel.novel_id.value, chapter_num, chapter_content
+        )
+
+    # 标记章节完成（DB 写入，可能阻塞）
+    # ★ 子步骤状态：章节落盘
+    host._update_shared_state(
+        novel.novel_id.value,
+        writing_substep="chapter_persist",
+        writing_substep_label="章节落盘",
+    )
+    if await host._upsert_chapter_content(
+        novel, next_chapter_node, chapter_content, status="completed"
+    ) is False:
+        return
+
+    # 8. 正式落盘后才推进旧流程计数，避免 Candidate-first 阻断时产生虚假完成章。
     novel.current_auto_chapters = (novel.current_auto_chapters or 0) + 1
     novel.current_chapter_in_act += 1
     novel.current_beat_index = 0
-    novel.beats_completed = False  # 重置节拍完成标志
+    novel.beats_completed = False
     nid = novel.novel_id.value
     if beats:
         host._pending_chapter_micro_beats[(nid, chapter_num)] = [
@@ -1269,23 +1306,7 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
     else:
         host._pending_chapter_micro_beats.pop((nid, chapter_num), None)
     novel.current_stage = NovelStage.AUDITING
-    # 章节正常完成，清理对应的重写计数
     host._beat_exhausted_rewrite_count.pop((novel.novel_id.value, chapter_num), None)
-
-    # 🔗 衔接引擎：章节完成后自检衔接度（非第 1 章）
-    # 如果衔接度 < 0.6，自动修整首段（最多 2 轮）
-    if chapter_num > 1:
-        # ★ 子步骤状态：衔接自检
-        host._update_shared_state(
-            novel.novel_id.value,
-            writing_substep="continuity_check",
-            writing_substep_label="衔接度自检",
-        )
-        chapter_content = await host._continuity_self_check(
-            novel.novel_id.value, chapter_num, chapter_content
-        )
-
-    # 🔥 先更新阶段到共享内存（不写章节聚合，避免占位 0 覆盖真实数据）
     host._update_shared_state(
         novel.novel_id.value,
         current_stage="auditing",
@@ -1296,15 +1317,6 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
         target_words_per_chapter=novel.target_words_per_chapter,
         autopilot_status=novel.autopilot_status.value,
     )
-
-    # 标记章节完成（DB 写入，可能阻塞）
-    # ★ 子步骤状态：章节落盘
-    host._update_shared_state(
-        novel.novel_id.value,
-        writing_substep="chapter_persist",
-        writing_substep_label="章节落盘",
-    )
-    await host._upsert_chapter_content(novel, next_chapter_node, chapter_content, status="completed")
 
     # 🔥 落库后用短连接读真实聚合，刷新 /status 缓存（与接口 SQL 一致）
     st = host._read_chapter_stats_ephemeral(novel.novel_id.value)

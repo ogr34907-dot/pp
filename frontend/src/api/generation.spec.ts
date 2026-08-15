@@ -47,6 +47,21 @@ describe('getGenerationRunOrNull', () => {
     )
   })
 
+  it('starts a generation run without sending a client-side target chapter count', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      data: { novel_id: 'novel-1', run_mode: 'chapter_review', state: 'running' },
+    }), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await generationApi.start('novel-1', 'chapter_review')
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringMatching(/\/api\/v1\/generation\/novels\/novel-1\/start$/),
+      expect.objectContaining({ body: JSON.stringify({ run_mode: 'chapter_review' }) }),
+    )
+  })
+
   it('recovers and cancels an outline stream attempt through its durable endpoints', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({

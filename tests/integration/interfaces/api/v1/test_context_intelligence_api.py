@@ -99,11 +99,11 @@ def test_scene_director_analyze_service_error_returns_generic_message():
         assert "connection" not in data["detail"].lower()
 
 
-def test_context_retrieve_returns_layers():
+def test_context_retrieve_returns_layers(test_novel_id):
     """Test that context/retrieve endpoint returns correct layered structure"""
     client = TestClient(app)
     r = client.post(
-        "/api/v1/novels/test-novel/context/retrieve",
+        f"/api/v1/novels/{test_novel_id}/context/retrieve",
         json={"chapter_number": 1, "outline": "开场。", "max_tokens": 8000},
     )
     assert r.status_code == 200, r.text
@@ -125,11 +125,11 @@ def test_context_retrieve_returns_layers():
     assert body["token_usage"]["total"] >= 0
 
 
-def test_context_retrieve_with_scene_director_hint():
+def test_context_retrieve_with_scene_director_hint(test_novel_id):
     """Test context/retrieve with optional scene_director_result"""
     client = TestClient(app)
     r = client.post(
-        "/api/v1/novels/test-novel/context/retrieve",
+        f"/api/v1/novels/{test_novel_id}/context/retrieve",
         json={
             "chapter_number": 1,
             "outline": "主角进入房间。",

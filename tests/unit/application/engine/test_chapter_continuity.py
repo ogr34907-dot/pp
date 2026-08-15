@@ -86,6 +86,7 @@ async def test_aftermath_defers_auxiliary_stages(monkeypatch):
 
     async def fake_sync(*args, **kwargs):
         return {
+            "narrative_sync_ok": True,
             "vector_stored": True,
             "foreshadow_stored": True,
             "triples_extracted": True,
@@ -162,7 +163,7 @@ async def test_aftermath_reuses_precomputed_voice_result(monkeypatch):
         return None
 
     async def fake_sync(*args, **kwargs):
-        return {"tension_composite": 68.0}
+        return {"narrative_sync_ok": True, "tension_composite": 68.0}
 
     async def fake_auxiliary(self, novel_id, chapter_number, content, evidence):
         return None

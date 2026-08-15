@@ -97,6 +97,7 @@ def _make_builder(
         novel = Mock()
         novel.title = "Test Novel"
         novel.author = "Test Author"
+        novel.target_chapters = 20
         novel_repo.get_by_id.return_value = novel
 
     if chapter_repo is None:

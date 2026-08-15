@@ -119,16 +119,7 @@
 
     <template #footer>
       <div class="detail-footer">
-        <!-- 启用/禁用 Switch — 统一放在弹窗底部 -->
-        <div class="footer-left" v-if="nodeId && meta?.can_disable">
-          <n-text depth="3" style="font-size: 12px; margin-right: 8px">启用节点</n-text>
-          <n-switch
-            :value="nodeEnabled"
-            @update:value="handleToggleNode"
-            size="small"
-          />
-        </div>
-        <div v-else />
+        <div />
         <n-button size="small" @click="$emit('update:show', false)">关闭</n-button>
       </div>
     </template>
@@ -137,7 +128,6 @@
 
 <script setup lang="ts">
 import { computed, watch, ref } from 'vue'
-import { useMessage } from 'naive-ui'
 import type { NodeMeta, NodePromptLive, NodeStatus } from '@/types/dag'
 import { CATEGORY_LABELS } from '@/types/dag'
 import { useDAGStore } from '@/stores/dagStore'
@@ -156,7 +146,6 @@ defineEmits<{
 }>()
 
 const dagStore = useDAGStore()
-const message = useMessage()
 
 const promptLive = ref<NodePromptLive | null>(null)
 const promptLoading = ref(false)
@@ -335,13 +324,6 @@ function getNodeLabel(type: string): string {
   return m?.display_name || type
 }
 
-// ─── 节点启禁用 ───
-
-async function handleToggleNode(enabled: boolean) {
-  if (!props.nodeId) return
-  await dagStore.toggleNode(props.novelId, props.nodeId)
-  message.success(enabled ? '节点已启用' : '节点已禁用')
-}
 </script>
 
 <style scoped>

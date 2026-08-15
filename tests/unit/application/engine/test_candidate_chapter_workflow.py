@@ -4,11 +4,17 @@ from dataclasses import dataclass
 
 import pytest
 
-from application.engine.services.candidate_chapter_workflow import CandidateChapterWorkflowService
+from application.engine.services.candidate_chapter_workflow import (
+    CandidateChapterWorkflowService,
+    CandidateWorkflowError,
+)
 from application.engine.dag.engine import DAGEngine
 from application.engine.dag.models import DAGRunResult, NodeResult, get_default_dag
 from domain.novel.candidate_chapter import CandidateStatus, GenerationRunState, RunMode
-from infrastructure.persistence.database.chapter_candidate_repository import ChapterCandidateRepository
+from infrastructure.persistence.database.chapter_candidate_repository import (
+    CandidateGateError,
+    ChapterCandidateRepository,
+)
 from infrastructure.persistence.database.connection import DatabaseConnection
 
 
@@ -164,6 +170,106 @@ async def test_review_mode_has_exactly_one_candidate_and_no_next_llm_call_until_
     candidate_two = await service.generate_next("novel-1")
     assert candidate_two.chapter_number == 2
     assert drafts.calls == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_legacy_baseline_integrity_blocks_the_draft_generator_before_it_is_called(workflow):
+    db, repo, drafts, aftermath = workflow
+    conn = db.get_connection()
+    for number in range(1, 3):
+        conn.execute(
+            """
+            INSERT INTO chapters (id, novel_id, number, title, content, status)
+            VALUES (?, 'novel-1', ?, ?, ?, 'completed')
+            """,
+            (f"legacy-workflow-{number}", number, f"第{number}章", f"旧正文 {number}"),
+        )
+    conn.commit()
+    repo.import_legacy_formal_history("novel-1")
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    conn.execute(
+        "UPDATE chapters SET content_revision = content_revision + 1 WHERE novel_id = 'novel-1' AND number = 2"
+    )
+    conn.commit()
+    service = CandidateChapterWorkflowService(repo, _Outlines(), drafts, aftermath)
+
+    with pytest.raises(CandidateGateError, match="legacy formal history integrity mismatch"):
+        await service.generate_next("novel-1")
+
+    assert drafts.calls == []
+
+
+@pytest.mark.asyncio
+async def test_direct_generation_rechecks_legacy_authority_after_candidate_creation(workflow, monkeypatch):
+    db, repo, drafts, aftermath = workflow
+    conn = db.get_connection()
+    for number in range(1, 3):
+        conn.execute(
+            """
+            INSERT INTO chapters (id, novel_id, number, title, content, status)
+            VALUES (?, 'novel-1', ?, ?, ?, 'completed')
+            """,
+            (f"legacy-direct-{number}", number, f"第{number}章", f"旧正文 {number}"),
+        )
+    conn.commit()
+    repo.import_legacy_formal_history("novel-1")
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    create_candidate = repo.create_streaming_candidate
+
+    def create_then_tamper(**kwargs):
+        candidate = create_candidate(**kwargs)
+        conn.execute(
+            "UPDATE chapters SET content_revision = content_revision + 1 "
+            "WHERE novel_id = 'novel-1' AND number = 2"
+        )
+        conn.commit()
+        return candidate
+
+    monkeypatch.setattr(repo, "create_streaming_candidate", create_then_tamper)
+    service = CandidateChapterWorkflowService(repo, _Outlines(), drafts, aftermath)
+
+    with pytest.raises(CandidateWorkflowError, match="legacy formal history integrity mismatch"):
+        await service.generate_next("novel-1")
+
+    assert drafts.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dag_generation_rechecks_legacy_authority_after_candidate_creation(workflow, monkeypatch):
+    db, repo, drafts, aftermath = workflow
+    conn = db.get_connection()
+    for number in range(1, 3):
+        conn.execute(
+            """
+            INSERT INTO chapters (id, novel_id, number, title, content, status)
+            VALUES (?, 'novel-1', ?, ?, ?, 'completed')
+            """,
+            (f"legacy-dag-{number}", number, f"第{number}章", f"旧正文 {number}"),
+        )
+    conn.commit()
+    repo.import_legacy_formal_history("novel-1")
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    create_candidate = repo.create_streaming_candidate
+
+    def create_then_tamper(**kwargs):
+        candidate = create_candidate(**kwargs)
+        conn.execute(
+            "UPDATE chapters SET content_revision = content_revision + 1 "
+            "WHERE novel_id = 'novel-1' AND number = 2"
+        )
+        conn.commit()
+        return candidate
+
+    monkeypatch.setattr(repo, "create_streaming_candidate", create_then_tamper)
+    dag = _DAG([{"content": "不应执行的 DAG 正文", "approved": True}])
+    service = CandidateChapterWorkflowService(
+        repo, _Outlines(), drafts, aftermath, dag_engine=dag, dag_factory=lambda: object()
+    )
+
+    with pytest.raises(CandidateWorkflowError, match="legacy formal history integrity mismatch"):
+        await service.generate_next("novel-1")
+
+    assert dag.calls == []
 
 
 @pytest.mark.asyncio
@@ -343,6 +449,106 @@ async def test_negative_required_event_cannot_pass_from_literal_text_when_semant
     assert candidate.status == CandidateStatus.AWAITING_REVIEW
     assert candidate.commit_plan["timeline_events"] == []
     assert aftermath.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("required_events", "forbidden_events", "content", "coverage", "expected_status"),
+    [
+        pytest.param(
+            ["沈岚１２３交出证据"],
+            [],
+            "沈岚123交出证据。",
+            [{"event": "沈岚１２３交出证据", "status": "completed", "evidence": "沈岚１２３交出证据"}],
+            CandidateStatus.COMMITTED,
+            id="required-layout-and-nfkc-differences",
+        ),
+        pytest.param(
+            [],
+            ["沈岚１２３交出证据"],
+            "沈岚123交出证据。",
+            [],
+            CandidateStatus.AWAITING_REVIEW,
+            id="forbidden-layout-and-nfkc-differences",
+        ),
+        pytest.param(
+            ["沈岚１２３交出证据！"],
+            [],
+            "沈岚123交出证据。",
+            [{"event": "沈岚１２３交出证据！", "status": "completed", "evidence": "沈岚１２３交出证据！"}],
+            CandidateStatus.AWAITING_REVIEW,
+            id="punctuation-difference-is-not-equivalent",
+        ),
+        pytest.param(
+            ["沈岚１２３交出证据"],
+            [],
+            "沈岚123没有交出证据。",
+            [{"event": "沈岚１２３交出证据", "status": "completed", "evidence": "沈岚１２３交出证据"}],
+            CandidateStatus.AWAITING_REVIEW,
+            id="negation-and-content-order-remain-significant",
+        ),
+    ],
+)
+async def test_candidate_final_audit_applies_only_safe_evidence_normalization(
+    workflow,
+    required_events,
+    forbidden_events,
+    content,
+    coverage,
+    expected_status,
+):
+    db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=3)
+    drafts.text = content
+
+    class _EvidenceOutlines(_Outlines):
+        def next_published_chapter_context(self, novel_id, *, after_chapter):
+            node, chain = super().next_published_chapter_context(
+                novel_id, after_chapter=after_chapter
+            )
+            chain["chapter"]["payload"]["required_events"] = list(required_events)
+            chain["chapter"]["payload"]["forbidden_events"] = list(forbidden_events)
+            return node, chain
+
+    dag = _DAG(
+        [
+            {
+                "content": drafts.text,
+                "approved": True,
+                "review_required": False,
+                "semantic_review": {
+                    "status": "approved",
+                    "issues": [],
+                    "event_coverage": coverage,
+                },
+            }
+        ]
+    )
+    service = CandidateChapterWorkflowService(
+        repo,
+        _EvidenceOutlines(),
+        drafts,
+        aftermath,
+        dag_engine=dag,
+        dag_factory=lambda: object(),
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+
+    assert candidate.status == expected_status
+    chapter_count = db.fetch_one(
+        "SELECT COUNT(*) AS total FROM chapters WHERE novel_id = 'novel-1'"
+    )["total"]
+    assert chapter_count == (1 if expected_status == CandidateStatus.COMMITTED else 0)
+    assert aftermath.calls == ([1] if expected_status == CandidateStatus.COMMITTED else [])
+    if required_events:
+        required = candidate.audit["plan_actual_comparison"]["required_events"]
+        assert required[0]["status"] == (
+            "completed" if expected_status == CandidateStatus.COMMITTED else "unverified"
+        )
+    if forbidden_events:
+        assert candidate.audit["hard_blocks"]
 
 
 @pytest.mark.asyncio
@@ -570,6 +776,34 @@ async def test_real_dag_v2_persists_candidate_trace_without_serializing_runtime_
         "val_narrative",
         "gw_review",
     }
+
+
+@pytest.mark.asyncio
+async def test_candidate_dag_does_not_persist_outline_as_fact_or_world_context(workflow):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    service = CandidateChapterWorkflowService(
+        repo,
+        _Outlines(),
+        drafts,
+        aftermath,
+        dag_engine=DAGEngine(),
+        dag_factory=get_default_dag,
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+    trace = repo.get_latest_dag_run(candidate.id)
+    node_events = {
+        event["node_id"]: event
+        for event in trace["events"]
+        if event.get("type") == "node_completed"
+        and event.get("node_id") in {"ctx_blueprint", "ctx_memory"}
+    }
+
+    assert trace["final_state"]["outline_chain"] == candidate.outline_chain
+    assert "world_rules" not in node_events["ctx_blueprint"]["outputs"]
+    assert "fact_lock" not in node_events["ctx_memory"]["outputs"]
 
 
 @pytest.mark.asyncio
