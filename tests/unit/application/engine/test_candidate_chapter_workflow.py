@@ -779,6 +779,55 @@ async def test_real_dag_v2_persists_candidate_trace_without_serializing_runtime_
 
 
 @pytest.mark.asyncio
+async def test_candidate_dag_skips_redundant_outline_partition(workflow, monkeypatch):
+    _db, repo, drafts, aftermath = workflow
+    repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
+    planning_calls = 0
+
+    async def redundant_planning(*_args, **_kwargs):
+        nonlocal planning_calls
+        planning_calls += 1
+        raise AssertionError("candidate DAG must not run a second planning pass")
+
+    monkeypatch.setattr(
+        "application.engine.dag.nodes.planning_chapter_outline_node.build_chapter_execution_plan_async",
+        redundant_planning,
+    )
+
+    class _RhythmicOutlines(_Outlines):
+        def next_published_chapter_context(self, novel_id: str, *, after_chapter: int):
+            node, chain = super().next_published_chapter_context(
+                novel_id, after_chapter=after_chapter
+            )
+            chain["chapter"]["payload"]["rhythm"] = {
+                "chapter_function": "transition",
+                "chapter_goal": "完成选择并承担代价",
+                "chapter_delta": "主角带着证物离开",
+                "ending_hook": "追兵逼近",
+            }
+            return node, chain
+
+    service = CandidateChapterWorkflowService(
+        repo,
+        _RhythmicOutlines(),
+        drafts,
+        aftermath,
+        dag_engine=DAGEngine(),
+        dag_factory=get_default_dag,
+        max_candidate_revisions=0,
+    )
+
+    candidate = await service.generate_next("novel-1")
+    trace = repo.get_latest_dag_run(candidate.id)
+
+    assert planning_calls == 0
+    assert [beat["description"] for beat in trace["final_state"]["beats"]] == [
+        "主角作出选择"
+    ]
+    assert trace["final_state"]["chapter_rhythm"]["ending_hook"] == "追兵逼近"
+
+
+@pytest.mark.asyncio
 async def test_candidate_dag_does_not_persist_outline_as_fact_or_world_context(workflow):
     _db, repo, drafts, aftermath = workflow
     repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)

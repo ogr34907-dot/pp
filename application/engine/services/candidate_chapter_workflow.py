@@ -264,7 +264,7 @@ class CandidateChapterWorkflowService:
                 "outline": self._outline_text(candidate.outline_chain),
                 "outline_chain": candidate.outline_chain,
                 "retry_feedback": candidate.feedback,
-                "disabled_nodes": [],
+                "disabled_nodes": ["plan_outline"],
                 "node_configs": {},
             }
             runtime_context = {
