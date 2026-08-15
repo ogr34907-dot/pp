@@ -987,6 +987,8 @@ class ChapterCandidateRepository:
     def edit_content(self, candidate_id: str, content: str, *, feedback: str = "") -> ChapterCandidate:
         candidate = self.get_candidate(candidate_id)
         self._ensure_current_generation(candidate)
+        if candidate.formal_chapter_id:
+            raise CandidateGateError("formal candidate content can only retry canonical sync")
         if candidate.status not in {CandidateStatus.AWAITING_REVIEW, CandidateStatus.FAILED, CandidateStatus.STALE}:
             raise CandidateGateError("candidate content can only be edited during review or recovery")
         if not content.strip():
@@ -1032,6 +1034,8 @@ class ChapterCandidateRepository:
 
         candidate = self.get_candidate(candidate_id)
         self._ensure_current_generation(candidate)
+        if candidate.formal_chapter_id:
+            raise CandidateGateError("formal candidate content can only retry canonical sync")
         if candidate.status not in {
             CandidateStatus.AWAITING_REVIEW,
             CandidateStatus.STALE,
@@ -1285,6 +1289,38 @@ class ChapterCandidateRepository:
                     (now, novel_id),
                 )
             elif status == CandidateStatus.SYNCING.value:
+                formal = conn.execute(
+                    "SELECT content_sha256, content_revision "
+                    "FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+                    (candidate_id,),
+                ).fetchone()
+                if formal is not None:
+                    exact_version = (
+                        str(candidate_row["novel_id"]),
+                        int(candidate_row["chapter_number"]),
+                        str(formal["content_sha256"] or ""),
+                        int(formal["content_revision"] or 0),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE chapter_narrative_commits
+                        SET status = 'stale', failure_reason = ?, updated_at = ?
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND content_revision = ?
+                          AND status = 'in_progress'
+                        """,
+                        (interruption, now, *exact_version),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE chapter_narrative_commits
+                        SET memory_status = 'failed', memory_failure_reason = ?, updated_at = ?
+                        WHERE novel_id = ? AND chapter_number = ?
+                          AND content_sha256 = ? AND content_revision = ?
+                          AND status = 'committed' AND memory_status = 'in_progress'
+                        """,
+                        (interruption, now, *exact_version),
+                    )
                 conn.execute(
                     """
                     UPDATE chapter_candidate_formal_commits
@@ -1578,40 +1614,119 @@ class ChapterCandidateRepository:
         candidate = self.get_candidate(candidate_id)
         if candidate.status != CandidateStatus.SYNCING or not candidate.formal_chapter_id:
             raise CandidateGateError("candidate has no formal chapter awaiting sync")
-        run = self._ensure_current_generation(candidate)
-        pause_after_sync = run.next_action == "finish_sync_then_pause"
-        next_state = (
-            GenerationRunState.PAUSED
-            if pause_after_sync or not candidate.continue_after_commit
-            else GenerationRunState.RUNNING
-        )
-        next_action = "resume_generation" if next_state == GenerationRunState.PAUSED else "generate_candidate"
+        self._ensure_current_generation(candidate)
         now = self._now()
         conn = self._connection()
         try:
-            conn.execute("BEGIN")
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            version = conn.execute(
+                """
+                SELECT chapter.content,
+                       chapter.content_sha256 AS chapter_content_sha256,
+                       chapter.content_revision AS chapter_content_revision,
+                       formal.content_sha256 AS authority_content_sha256,
+                       formal.content_revision AS authority_content_revision,
+                       formal.sync_status AS authority_sync_status,
+                       candidate.llm_content, candidate.author_content,
+                       candidate.content_revision AS candidate_content_revision,
+                       candidate.status AS candidate_status,
+                       candidate.continue_after_commit,
+                       candidate.generation_epoch AS candidate_generation_epoch,
+                       run.generation_epoch AS active_generation_epoch,
+                       run.current_formal_chapter, run.current_candidate_id,
+                       run.canonical_sync_status, run.next_action AS run_next_action
+                FROM chapter_candidates AS candidate
+                JOIN chapter_candidate_formal_commits AS formal
+                  ON formal.candidate_id = candidate.id
+                JOIN chapters AS chapter
+                  ON chapter.id = formal.chapter_id
+                 AND chapter.novel_id = candidate.novel_id
+                 AND chapter.number = candidate.chapter_number
+                JOIN novel_generation_runs AS run ON run.novel_id = candidate.novel_id
+                WHERE candidate.id = ?
+                """,
+                (candidate_id,),
+            ).fetchone()
+            final_content = (
+                str(version["author_content"])
+                if version is not None and version["author_content"] is not None
+                else str(version["llm_content"] or "") if version is not None else ""
+            )
+            if (
+                version is None
+                or str(version["candidate_status"] or "") != CandidateStatus.SYNCING.value
+                or str(version["authority_sync_status"] or "") != "syncing"
+                or str(version["canonical_sync_status"] or "") != "syncing"
+                or int(version["candidate_generation_epoch"] or 0)
+                != int(version["active_generation_epoch"] or 0)
+                or int(version["current_formal_chapter"] or 0)
+                != candidate.chapter_number - 1
+                or str(version["current_candidate_id"] or "") != candidate_id
+                or int(version["candidate_content_revision"] or 0)
+                != int(version["authority_content_revision"] or 0)
+                or self._content_sha256(final_content)
+                != str(version["authority_content_sha256"] or "")
+                or not self._formal_version_matches(version)
+            ):
+                raise CandidateGateError("candidate formal version changed before sync publication")
+
+            pause_after_sync = str(version["run_next_action"] or "") == "finish_sync_then_pause"
+            next_state = (
+                GenerationRunState.PAUSED
+                if pause_after_sync or not bool(version["continue_after_commit"])
+                else GenerationRunState.RUNNING
+            )
+            next_action = (
+                "resume_generation"
+                if next_state == GenerationRunState.PAUSED
+                else "generate_candidate"
+            )
+            updated = conn.execute(
                 """
                 UPDATE chapter_candidate_formal_commits
                 SET sync_status = 'ready', failure_reason = '', synced_at = ?
-                WHERE candidate_id = ?
+                WHERE candidate_id = ? AND sync_status = 'syncing'
+                  AND content_sha256 = ? AND content_revision = ?
                 """,
-                (now, candidate_id),
+                (
+                    now,
+                    candidate_id,
+                    version["authority_content_sha256"],
+                    int(version["authority_content_revision"]),
+                ),
             )
-            conn.execute(
-                "UPDATE chapter_candidates SET status = 'committed', updated_at = ? WHERE id = ?",
-                (now, candidate_id),
+            if updated.rowcount != 1:
+                raise CandidateGateError("candidate formal version changed before sync publication")
+            updated = conn.execute(
+                "UPDATE chapter_candidates SET status = 'committed', updated_at = ? "
+                "WHERE id = ? AND status = 'syncing' AND content_revision = ?",
+                (now, candidate_id, int(version["candidate_content_revision"])),
             )
-            conn.execute(
+            if updated.rowcount != 1:
+                raise CandidateGateError("candidate formal version changed before sync publication")
+            updated = conn.execute(
                 """
                 UPDATE novel_generation_runs
                 SET state = ?, current_formal_chapter = ?, current_candidate_id = NULL,
                     current_candidate_chapter = NULL, canonical_sync_status = 'ready',
                     next_action = ?, last_error = '', updated_at = ?
-                WHERE novel_id = ?
+                WHERE novel_id = ? AND generation_epoch = ?
+                  AND current_candidate_id = ? AND current_formal_chapter = ?
+                  AND canonical_sync_status = 'syncing'
                 """,
-                (next_state.value, candidate.chapter_number, next_action, now, candidate.novel_id),
+                (
+                    next_state.value,
+                    candidate.chapter_number,
+                    next_action,
+                    now,
+                    candidate.novel_id,
+                    int(version["active_generation_epoch"]),
+                    candidate_id,
+                    candidate.chapter_number - 1,
+                ),
             )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation cursor changed before sync publication")
             conn.commit()
         except Exception:
             conn.rollback()

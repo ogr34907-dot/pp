@@ -7,12 +7,18 @@ import threading
 
 import pytest
 
+from application.world.services.chapter_narrative_sync import (
+    CHAPTER_NARRATIVE_PIPELINE_VERSION,
+)
 from domain.novel.candidate_chapter import CandidateStatus, GenerationRunState, RunMode
 from infrastructure.persistence.database.chapter_candidate_repository import (
     CandidateGateError,
     ChapterCandidateRepository,
 )
 from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
+    SqliteChapterNarrativeCommitRepository,
+)
 
 
 @pytest.fixture
@@ -874,6 +880,75 @@ def test_formal_candidate_with_failed_sync_cannot_be_rejected(candidates):
     assert repo.get_run("novel-1").next_action == "retry_sync"
 
 
+def test_formal_candidate_with_failed_sync_cannot_be_edited_or_regenerated(candidates):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选",
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    repo.approve_for_commit(candidate.id, continue_after_commit=False)
+    repo.commit_formal(candidate.id)
+    failed = repo.mark_sync_failed(candidate.id, "canonical_aftermath_not_ready")
+
+    with pytest.raises(CandidateGateError, match="formal candidate"):
+        repo.edit_content(candidate.id, "错误改稿")
+    with pytest.raises(CandidateGateError, match="formal candidate"):
+        repo.request_regeneration(candidate.id)
+
+    preserved = repo.get_candidate(candidate.id)
+    assert preserved.status == CandidateStatus.FAILED
+    assert preserved.content_revision == failed.content_revision
+    assert preserved.final_content == "候选"
+    assert repo.get_run("novel-1").next_action == "retry_sync"
+    assert db.fetch_one(
+        "SELECT sync_status FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+        (candidate.id,),
+    )["sync_status"] == "failed"
+
+
+def test_sync_ready_publication_rejects_candidate_formal_version_mismatch(candidates):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选旧版本",
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    repo.approve_for_commit(candidate.id, continue_after_commit=True)
+    syncing = repo.commit_formal(candidate.id)
+    rewritten = "作者并发改写版本"
+    rewritten_sha = hashlib.sha256(rewritten.encode("utf-8")).hexdigest()
+    db.execute(
+        "UPDATE chapters SET content = ?, content_sha256 = ?, content_revision = ? WHERE id = ?",
+        (rewritten, rewritten_sha, syncing.content_revision + 1, syncing.formal_chapter_id),
+    )
+    db.execute(
+        "UPDATE chapter_candidate_formal_commits "
+        "SET content_sha256 = ?, content_revision = ?, provenance = 'author_rewrite' "
+        "WHERE candidate_id = ?",
+        (rewritten_sha, syncing.content_revision + 1, candidate.id),
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(CandidateGateError, match="formal version"):
+        repo.mark_sync_succeeded(candidate.id)
+
+    assert repo.get_run("novel-1").current_formal_chapter == 0
+    assert repo.get_candidate(candidate.id).status == CandidateStatus.SYNCING
+    assert db.fetch_one(
+        "SELECT sync_status FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+        (candidate.id,),
+    )["sync_status"] == "syncing"
+
+
 def test_stopping_during_canonical_sync_finishes_sync_then_pauses(candidates):
     repo, _db = candidates
     candidate = repo.create_streaming_candidate(
@@ -1021,14 +1096,29 @@ def test_service_restart_preserves_candidate_waiting_for_author_review(candidate
 
 
 def test_service_restart_marks_syncing_candidate_retryable_without_retiring_epoch(candidates):
-    repo, _db = candidates
+    repo, db = candidates
     candidate = repo.create_streaming_candidate(
         novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain(), llm_content="候选"
     )
     repo.mark_auditing(candidate.id)
     repo.finish_audit(candidate.id, audit={}, commit_plan={})
     repo.approve_for_commit(candidate.id, continue_after_commit=True)
-    repo.commit_formal(candidate.id)
+    syncing = repo.commit_formal(candidate.id)
+    content_sha256 = hashlib.sha256(syncing.final_content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status, memory_status) "
+        "VALUES (?, ?, ?, ?, ?, 'in_progress', 'pending')",
+        (
+            "novel-1",
+            1,
+            content_sha256,
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            syncing.content_revision,
+        ),
+    )
+    db.get_connection().commit()
     before = repo.get_run("novel-1")
 
     recovered = repo.recover_after_service_restart("novel-1")
@@ -1039,3 +1129,63 @@ def test_service_restart_marks_syncing_candidate_retryable_without_retiring_epoc
     assert recovered.generation_epoch == before.generation_epoch
     assert repo.get_candidate(candidate.id).status == CandidateStatus.FAILED
     assert repo.begin_sync_retry(candidate.id).status == CandidateStatus.SYNCING
+    claim = SqliteChapterNarrativeCommitRepository(db).claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        expected_content_revision=syncing.content_revision,
+        require_memory_sync=True,
+    )
+    assert claim.disposition == "claimed"
+
+
+def test_service_restart_releases_abandoned_memory_claim(candidates):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选",
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    repo.approve_for_commit(candidate.id, continue_after_commit=True)
+    syncing = repo.commit_formal(candidate.id)
+    content_sha256 = hashlib.sha256(syncing.final_content.encode("utf-8")).hexdigest()
+    db.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status, memory_status, memory_attempt_count) "
+        "VALUES (?, ?, ?, ?, ?, 'committed', 'in_progress', 1)",
+        (
+            "novel-1",
+            1,
+            content_sha256,
+            CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            syncing.content_revision,
+        ),
+    )
+    db.get_connection().commit()
+
+    repo.recover_after_service_restart("novel-1")
+    repo.begin_sync_retry(candidate.id)
+
+    commits = SqliteChapterNarrativeCommitRepository(db)
+    claim = commits.claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        expected_content_revision=syncing.content_revision,
+        require_memory_sync=True,
+    )
+    assert claim.disposition == "reused"
+    assert commits.claim_memory_sync(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+        content_revision=syncing.content_revision,
+    ) == "claimed"
