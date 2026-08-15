@@ -9,6 +9,9 @@ from infrastructure.persistence.database.sqlite_chapter_repository import (
     SqliteChapterRepository,
 )
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+from infrastructure.persistence.database.outline_contract_repository import OutlineContractRepository
+from domain.structure.outline_contract import OutlinePayload
+from domain.structure.outline_plan import OutlinePlanItem
 
 
 def _manifest_book_with_runtime_summary(tmp_path):
@@ -18,18 +21,45 @@ def _manifest_book_with_runtime_summary(tmp_path):
         "INSERT INTO novels (id, title, slug, target_chapters) VALUES "
         "('novel-1', 'Manifest Rewrite', 'manifest-rewrite', 4)"
     )
-    conn.execute(
-        "INSERT INTO outline_plan_revisions "
-        "(id, novel_id, revision, status, digest, canonical_prefix_digest, "
-        "reconciliation_status, sealed_at) "
-        "VALUES ('plan-1', 'novel-1', 1, 'ready_for_review', 'plan-digest', '', "
-        "'aligned', CURRENT_TIMESTAMP)"
+    conn.commit()
+    contracts = OutlineContractRepository(database)
+    root = contracts.ensure_root("novel-1")
+    draft = contracts.save_draft(
+        root.id,
+        OutlinePayload(
+            title="Root",
+            narrative_text="A complete premise",
+            creative_goal="Reach the ending",
+            entry_state="start",
+            exit_state="end",
+        ),
     )
+    synced = contracts.publish_and_sync(root.id, expected_revision=draft.draft.revision)
+    version = conn.execute(
+        "SELECT active_version_id FROM outline_contracts WHERE id = ?",
+        (synced.id,),
+    ).fetchone()[0]
+    version_digest = conn.execute(
+        "SELECT digest FROM outline_contract_versions WHERE id = ?", (version,)
+    ).fetchone()[0]
+    plan = contracts.create_plan_draft(
+        novel_id="novel-1",
+        items=(OutlinePlanItem(
+            logical_node_id=synced.id,
+            version_id=version,
+            version_digest=version_digest,
+            level=synced.level,
+            sibling_index=0,
+        ),),
+        canonical_prefix_digest="",
+        canonical_boundary={"formal_head": 0},
+    )
+    plan = contracts.seal_plan_revision(plan.id)
     conn.execute(
-        "INSERT INTO outline_planning_heads "
-        "(novel_id, authority_mode, authority_generation, active_plan_revision_id, "
-        "active_plan_digest, projection_generation) "
-        "VALUES ('novel-1', 'manifest', 1, 'plan-1', 'plan-digest', 1)"
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, active_plan_revision_id=?, active_plan_digest=?, "
+        "projection_generation=1 WHERE novel_id='novel-1'",
+        (plan.id, plan.digest),
     )
     metadata = {
         "planning.keep": "immutable projection payload",
