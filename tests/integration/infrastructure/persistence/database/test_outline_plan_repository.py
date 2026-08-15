@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from domain.structure.outline_contract import OutlinePayload, OutlineSource
+from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
 from domain.structure.outline_plan import (
     BackfillStatus,
     OutlinePlanItem,
@@ -474,6 +474,182 @@ def test_head_starts_legacy_and_working_draft_is_not_active(plan_repo):
     assert sealed.sealed_at
     assert sealed_head.working_plan_revision_id is None
     assert sealed_head.active_plan_revision_id is None
+
+
+def test_clone_active_manifest_plan_creates_an_independent_replan_draft(plan_repo):
+    database, repository = plan_repo
+    item = _published_root(database, repository)
+    active = repository.backfill_initial_plan("novel-1").plan
+    assert active is not None
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+
+    draft = repository.clone_active_plan_draft(
+        "novel-1",
+        replan_start_chapter=1,
+        author_intent="将未来剧情转向新的核心冲突",
+        created_by="author",
+    )
+
+    assert draft.id != active.id
+    assert draft.parent_plan_revision_id == active.id
+    assert draft.base_plan_digest == active.digest
+    assert draft.replan_start_chapter == 1
+    assert draft.status == PlanRevisionStatus.DRAFT
+    assert [item.logical_node_id for item in draft.items] == [
+        item.logical_node_id for item in active.items
+    ]
+    assert [item.version_id for item in draft.items] == [
+        item.version_id for item in active.items
+    ]
+    assert all(item.is_reused for item in draft.items)
+    assert {item.id for item in draft.items}.isdisjoint({item.id for item in active.items})
+    assert repository.get_planning_head("novel-1").active_plan_revision_id == active.id
+    assert repository.get_planning_head("novel-1").working_plan_revision_id == draft.id
+
+
+def test_replace_draft_cohort_replaces_all_direct_children_atomically(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    active = repository.backfill_initial_plan("novel-1").plan
+    assert active is not None
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+    draft = repository.clone_active_plan_draft("novel-1")
+
+    payloads = []
+    for index, title in enumerate(("第一部", "第二部")):
+        payloads.append(
+            OutlinePayload(
+                title=title,
+                narrative_text="人物在冲突中作出不可逆的选择。",
+                creative_goal="推动全书阶段目标",
+                entry_state="旧秩序仍然完整" if index == 0 else "中段状态",
+                exit_state="中段状态" if index == 0 else "新秩序建立但付出代价",
+                conflicts=["主要冲突升级"],
+                state_changes={"主角": [{"change": "承担代价"}]},
+                handoff_conditions=["后续阶段承接未完成任务"],
+                chapter_start=1 if index == 0 else 6,
+                chapter_end=5 if index == 0 else 10,
+            )
+        )
+
+    updated = repository.replace_draft_cohort_payloads(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        payloads=tuple(payloads),
+    )
+
+    assert updated.items[0].logical_node_id == root_item.logical_node_id
+    assert [item.level for item in updated.items] == [
+        OutlineLevel.OUTLINE,
+        OutlineLevel.PART,
+        OutlineLevel.PART,
+    ]
+    assert len({item.logical_node_id for item in updated.items}) == 3
+    assert all(item.is_reused for item in updated.items if item.level == OutlineLevel.OUTLINE)
+    assert not any(item.is_reused for item in updated.items if item.level == OutlineLevel.PART)
+    assert repository.get_planning_head("novel-1").working_plan_revision_id == draft.id
+    assert repository.get_planning_head("novel-1").active_plan_revision_id == active.id
+
+
+def test_replace_draft_cohort_rolls_back_when_child_parent_digest_is_invalid(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    repository.backfill_initial_plan("novel-1")
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+    draft = repository.clone_active_plan_draft("novel-1")
+    invalid = OutlinePayload(
+        title="错误部纲",
+        narrative_text="人物推进冲突。",
+        creative_goal="推进阶段目标",
+        entry_state="旧秩序仍然完整",
+        exit_state="新秩序建立但付出代价",
+        conflicts=["冲突"],
+        state_changes={"主角": [{"change": "付出代价"}]},
+        handoff_conditions=["承接"],
+        chapter_start=1,
+        chapter_end=10,
+    )
+    before = repository.get_plan_revision(draft.id)
+
+    with pytest.raises(OutlineGateError, match="parent digest"):
+        repository.replace_draft_cohort_payloads(
+            plan_revision_id=draft.id,
+            parent_logical_node_id=root_item.logical_node_id,
+            payloads=(invalid,),
+            expected_parent_digest="wrong-parent-digest",
+        )
+
+    after = repository.get_plan_revision(draft.id)
+    assert after.digest == before.digest
+    assert after.items == before.items
+
+
+def test_replace_draft_cohort_rejects_replacing_an_already_expanded_parent(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    repository.backfill_initial_plan("novel-1")
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+    draft = repository.clone_active_plan_draft("novel-1")
+    first = repository.replace_draft_cohort_payloads(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        payloads=(
+            OutlinePayload(
+                title="第一部",
+                narrative_text="推进冲突。",
+                creative_goal="推进",
+                entry_state="旧秩序仍然完整",
+                exit_state="新秩序建立但付出代价",
+                conflicts=["冲突"],
+                state_changes={"主角": [{"change": "代价"}]},
+                handoff_conditions=["承接"],
+                chapter_start=1,
+                chapter_end=10,
+            ),
+        ),
+    )
+
+    with pytest.raises(OutlineGateError, match="impact-closure workflow"):
+        repository.replace_draft_cohort_payloads(
+            plan_revision_id=draft.id,
+            parent_logical_node_id=root_item.logical_node_id,
+            payloads=(
+                OutlinePayload(
+                    title="替换部纲",
+                    narrative_text="不应覆盖。",
+                    creative_goal="替换",
+                    entry_state="旧秩序仍然完整",
+                    exit_state="新秩序建立但付出代价",
+                    conflicts=["冲突"],
+                    state_changes={"主角": [{"change": "代价"}]},
+                    handoff_conditions=["承接"],
+                    chapter_start=1,
+                    chapter_end=10,
+                ),
+            ),
+        )
+
+    assert repository.get_plan_revision(draft.id).items == first.items
 
 
 def test_identical_sealed_digest_reuses_existing_revision_and_content_version(plan_repo):

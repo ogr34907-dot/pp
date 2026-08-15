@@ -593,6 +593,251 @@ class OutlineContractRepository:
             raise
         return self.get_plan_revision(plan_id)
 
+    def clone_active_plan_draft(
+        self,
+        novel_id: str,
+        *,
+        replan_start_chapter: Optional[int] = None,
+        author_intent: str = "",
+        created_by: str = "system",
+    ) -> OutlinePlanRevision:
+        """Clone the immutable active manifest into the book's only open draft.
+
+        This is the shared starting point for future replanning and rolling
+        cohort expansion. It deliberately does not mutate the active Head or
+        physical StoryNode projection.
+        """
+
+        conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("outline plan cloning requires a clean connection")
+        now = self._now()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            head = self.get_planning_head(novel_id)
+            if head.authority_mode != PlanningAuthorityMode.MANIFEST:
+                raise OutlineGateError("active manifest planning authority is required")
+            if head.working_plan_revision_id:
+                raise OutlineGateError("an outline plan draft is already open")
+            active = self._require_active_manifest_plan(novel_id, conn=conn)
+            revision = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(revision), 0) + 1 AS revision "
+                    "FROM outline_plan_revisions WHERE novel_id = ?",
+                    (novel_id,),
+                ).fetchone()["revision"]
+            )
+            plan_id = f"outline-plan-{uuid4()}"
+            conn.execute(
+                """
+                INSERT INTO outline_plan_revisions
+                    (id, novel_id, revision, parent_plan_revision_id, status,
+                     digest, base_plan_digest, replan_start_chapter,
+                     canonical_prefix_digest, canonical_boundary_json,
+                     reconciliation_status, reconciliation_report_json,
+                     author_intent, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan_id,
+                    novel_id,
+                    revision,
+                    active.id,
+                    active.digest,
+                    active.digest,
+                    replan_start_chapter,
+                    active.canonical_prefix_digest,
+                    json.dumps(dict(active.canonical_boundary or {}), ensure_ascii=False, sort_keys=True),
+                    active.reconciliation_status.value,
+                    json.dumps(dict(active.reconciliation_report or {}), ensure_ascii=False, sort_keys=True),
+                    author_intent,
+                    created_by,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_plan_items(
+                conn,
+                plan_id,
+                tuple(
+                    OutlinePlanItem(
+                        logical_node_id=item.logical_node_id,
+                        version_id=item.version_id,
+                        version_digest=item.version_digest,
+                        level=item.level,
+                        sibling_index=item.sibling_index,
+                        parent_logical_node_id=item.parent_logical_node_id,
+                        expansion_state=item.expansion_state,
+                        validated_parent_digest=item.validated_parent_digest,
+                        validated_previous_sibling_digest=(
+                            item.validated_previous_sibling_digest
+                        ),
+                        is_reused=True,
+                    )
+                    for item in active.items
+                ),
+                now,
+            )
+            updated = conn.execute(
+                """
+                UPDATE outline_planning_heads
+                SET working_plan_revision_id = ?, updated_at = ?
+                WHERE novel_id = ? AND authority_mode = 'manifest'
+                  AND active_plan_revision_id = ? AND active_plan_digest = ?
+                  AND authority_generation = ? AND projection_generation = ?
+                  AND working_plan_revision_id IS NULL
+                """,
+                (
+                    plan_id,
+                    now,
+                    novel_id,
+                    active.id,
+                    active.digest,
+                    head.authority_generation,
+                    head.projection_generation,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise OutlineGateError("active outline planning Head changed during cloning")
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        return self.get_plan_revision(plan_id)
+
+    def replace_draft_cohort_payloads(
+        self,
+        *,
+        plan_revision_id: str,
+        parent_logical_node_id: str,
+        payloads: Sequence[OutlinePayload],
+        expected_parent_digest: Optional[str] = None,
+        source: OutlineSource = OutlineSource.AI,
+    ) -> OutlinePlanRevision:
+        """Atomically create and replace one complete direct-child cohort."""
+
+        if not payloads:
+            raise OutlineGateError("manifest cohort must contain every direct child")
+        conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("manifest cohort replacement requires a clean connection")
+        now = self._now()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            plan = self.get_plan_revision(plan_revision_id, _connection=conn)
+            head = self.get_planning_head(plan.novel_id)
+            if head.authority_mode != PlanningAuthorityMode.MANIFEST:
+                raise OutlineGateError("manifest planning authority is required")
+            if head.working_plan_revision_id != plan.id:
+                raise OutlineGateError("manifest cohort must target the open plan draft")
+            if plan.sealed_at or plan.status not in {
+                PlanRevisionStatus.DRAFT,
+                PlanRevisionStatus.GENERATING,
+                PlanRevisionStatus.VALIDATING,
+            }:
+                raise OutlineGateError("manifest cohort requires an editable draft")
+            parent = next(
+                (item for item in plan.items if item.logical_node_id == parent_logical_node_id),
+                None,
+            )
+            if parent is None:
+                raise OutlineGateError("manifest cohort parent is not in the draft")
+            expected_level = parent.level.child_level
+            if expected_level is None:
+                raise OutlineGateError("manifest cohort parent cannot own children")
+            if expected_parent_digest and expected_parent_digest != parent.version_digest:
+                raise OutlineGateError("manifest cohort parent digest changed")
+            if any(
+                item.parent_logical_node_id == parent_logical_node_id
+                for item in plan.items
+            ):
+                raise OutlineGateError(
+                    "manifest cohort replacement requires a new expansion; "
+                    "future replanning must use the impact-closure workflow"
+                )
+            children: list[OutlinePlanItem] = []
+            previous_digest = ""
+            for sibling_index, payload in enumerate(payloads):
+                contract_id = f"outline-{uuid4()}"
+                version_id = f"outline-version-{uuid4()}"
+                payload_json = json.dumps(
+                    payload.canonical_dict(), ensure_ascii=False, sort_keys=True
+                )
+                conn.execute(
+                    """
+                    INSERT INTO outline_contracts
+                        (id, novel_id, level, parent_contract_id, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'draft', ?, ?)
+                    """,
+                    (
+                        contract_id,
+                        plan.novel_id,
+                        expected_level.value,
+                        parent_logical_node_id,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO outline_contract_versions
+                        (id, contract_id, revision, payload_json, digest,
+                         parent_revision_digest, previous_sibling_digest, source,
+                         status, created_at, updated_at)
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                    """,
+                    (
+                        version_id,
+                        contract_id,
+                        payload_json,
+                        payload.digest,
+                        parent.version_digest,
+                        previous_digest,
+                        source.value,
+                        now,
+                        now,
+                    ),
+                )
+                children.append(
+                    OutlinePlanItem(
+                        logical_node_id=contract_id,
+                        version_id=version_id,
+                        version_digest=payload.digest,
+                        level=expected_level,
+                        sibling_index=sibling_index,
+                        parent_logical_node_id=parent_logical_node_id,
+                        validated_parent_digest=parent.version_digest,
+                        validated_previous_sibling_digest=previous_digest,
+                    )
+                )
+                previous_digest = payload.digest
+            retained = list(plan.items)
+            normalized = self._validate_plan_items(
+                plan.novel_id, (*retained, *children), conn=conn
+            )
+            digest = canonical_plan_digest(
+                canonical_prefix_digest=plan.canonical_prefix_digest,
+                items=normalized,
+            )
+            self._insert_plan_items(conn, plan.id, children, now)
+            updated = conn.execute(
+                """
+                UPDATE outline_plan_revisions
+                SET digest = ?, updated_at = ?
+                WHERE id = ? AND sealed_at IS NULL AND status = ?
+                """,
+                (digest, now, plan.id, plan.status.value),
+            )
+            if updated.rowcount != 1:
+                raise OutlineGateError("manifest draft changed during cohort replacement")
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        return self.get_plan_revision(plan_revision_id)
+
     def seal_plan_revision(self, plan_revision_id: str) -> OutlinePlanRevision:
         conn = self._connection()
         if conn.in_transaction:
