@@ -247,9 +247,9 @@ def test_atomic_writer_exposes_no_capability_or_transaction_callback(manifest_bo
     writer = PlanProjectionWriter(repository)
 
     assert callable(writer.apply_atomic)
-    assert callable(writer.projection_transaction)
+    assert not hasattr(writer, "projection_transaction")
     assert not hasattr(writer, "capability_for")
-    assert callable(writer.activate_head)
+    assert not hasattr(writer, "activate_head")
     assert not hasattr(writer, "save_sync")
     assert not hasattr(writer, "repository")
 
@@ -272,7 +272,7 @@ def test_projection_capability_is_transaction_bound_and_private(manifest_book):
     database, repository, _, plan_id = manifest_book
     head = _head_snapshot(database)
     writer = PlanProjectionWriter(repository)
-    with writer.projection_transaction(
+    with writer._projection_transaction(
         novel_id="novel-1",
         plan_revision_id=plan_id,
         operation="restore",
@@ -294,7 +294,7 @@ def test_projection_capability_is_transaction_bound_and_private(manifest_book):
                 )
         finally:
             other_connection.close()
-        writer.activate_head(capability)
+        writer._activate_head(capability)
 
     with pytest.raises(PlanningAuthorityError, match="expired"):
         repository.save_sync(_node("post-commit-node"), _capability=capability)
@@ -306,7 +306,7 @@ def test_projection_capability_rejects_commit_rebegin_reuse(manifest_book):
     writer = PlanProjectionWriter(repository)
     conn = database.get_connection()
     with pytest.raises(PlanningAuthorityError, match="transaction has ended"):
-        with writer.projection_transaction(
+        with writer._projection_transaction(
             novel_id="novel-1",
             plan_revision_id=plan_id,
             operation="restore",
@@ -321,6 +321,45 @@ def test_projection_capability_rejects_commit_rebegin_reuse(manifest_book):
             repository.save_sync(
                 _node("reused-after-commit"), _capability=capability
             )
+
+
+def test_projection_transaction_rolls_back_without_designated_head_cas(manifest_book):
+    database, repository, _, plan_id = manifest_book
+    head = _head_snapshot(database)
+    writer = PlanProjectionWriter(repository)
+
+    with pytest.raises(PlanningAuthorityError, match="must activate"):
+        with writer._projection_transaction(
+            novel_id="novel-1",
+            plan_revision_id=plan_id,
+            operation="restore",
+            expected_active_plan_revision_id=head["plan_id"],
+            expected_active_plan_digest=head["digest"],
+            expected_authority_generation=head["authority_generation"],
+            expected_projection_generation=head["projection_generation"],
+        ) as capability:
+            repository.save_sync(_node("rollback-without-head"), _capability=capability)
+
+    assert _head_snapshot(database) == head
+    assert asyncio.run(repository.get_by_id("rollback-without-head")) is None
+
+
+def test_atomic_projection_requires_a_declared_physical_change(manifest_book):
+    database, repository, _, plan_id = manifest_book
+    writer = PlanProjectionWriter(repository)
+    head = _head_snapshot(database)
+
+    with pytest.raises(PlanningAuthorityError, match="declared physical projection change"):
+        _apply_atomic(
+            writer,
+            database,
+            plan_id,
+            operation="restore",
+            creates=(),
+            updates=(),
+            deletes=(),
+        )
+    assert _head_snapshot(database) == head
 
 
 def test_atomic_projection_rejects_a_sealed_non_active_plan_before_projection_dml(

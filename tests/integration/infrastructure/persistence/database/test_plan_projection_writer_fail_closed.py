@@ -116,7 +116,7 @@ def test_projection_writer_rejects_caller_batch_before_repository_dml(tmp_path):
     writer = PlanProjectionWriter(repository)
     before = _head(database)
 
-    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+    with pytest.raises(PlanningAuthorityError, match="designated Head operation"):
         asyncio.run(
             writer.apply_atomic(
                 novel_id="novel-1",
@@ -142,7 +142,7 @@ def test_projection_writer_rejects_empty_cutover_without_switching_head(tmp_path
     writer = PlanProjectionWriter(repository)
     before = _head(database)
 
-    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+    with pytest.raises(PlanningAuthorityError, match="declared physical projection change"):
         asyncio.run(
             writer.apply_atomic(
                 novel_id="novel-1",
@@ -158,7 +158,7 @@ def test_projection_writer_rejects_empty_cutover_without_switching_head(tmp_path
     assert _head(database) == before
 
 
-def test_projection_permit_helpers_are_disabled_even_inside_a_live_transaction(
+def test_projection_permit_helpers_require_a_clean_connection(
     tmp_path,
 ):
     database, _, _ = _sealed_plan(tmp_path, manifest=True)
@@ -169,7 +169,7 @@ def test_projection_permit_helpers_are_disabled_even_inside_a_live_transaction(
 
     conn.execute("BEGIN IMMEDIATE")
     try:
-        with pytest.raises(PlanningAuthorityError, match="disabled"):
+        with pytest.raises(PlanningAuthorityError, match="clean connection"):
             _begin_projection_writer_session(conn)
     finally:
         if conn.in_transaction:

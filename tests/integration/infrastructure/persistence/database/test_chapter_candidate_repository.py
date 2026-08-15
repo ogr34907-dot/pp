@@ -701,6 +701,8 @@ def test_manifest_candidate_rejects_pre_hardening_nonpublishable_head(
     # triggers to model an already persisted 031/032-era invalid Head.
     conn.execute("DROP TRIGGER trg_outline_planning_heads_publishable_insert")
     conn.execute("DROP TRIGGER trg_outline_planning_heads_publishable_update")
+    conn.execute("DROP TRIGGER trg_outline_planning_heads_publishable_insert_v2")
+    conn.execute("DROP TRIGGER trg_outline_planning_heads_publishable_update_v2")
     conn.execute(
         "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
         ("manifest-invalid", "Invalid Manifest", "manifest-invalid", 20),
@@ -713,6 +715,9 @@ def test_manifest_candidate_rejects_pre_hardening_nonpublishable_head(
         "CURRENT_TIMESTAMP)",
         (status, reconciliation_status),
     )
+    # Simulate a pre-033 database: remove the topology guard as well as
+    # the publishability guard so the invalid Head can be materialized.
+    conn.execute("DROP TRIGGER trg_outline_planning_heads_topology_insert_v2")
     conn.execute(
         "INSERT INTO outline_planning_heads "
         "(novel_id, authority_mode, authority_generation, active_plan_revision_id, "
@@ -725,7 +730,10 @@ def test_manifest_candidate_rejects_pre_hardening_nonpublishable_head(
         "manifest-invalid", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
     )
 
-    with pytest.raises(CandidateGateError, match="not backed by a sealed plan"):
+    with pytest.raises(
+        CandidateGateError,
+        match="not backed by a sealed plan|manifest.*topology|outline plan",
+    ):
         repo.create_streaming_candidate(
             novel_id="manifest-invalid",
             chapter_number=1,

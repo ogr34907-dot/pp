@@ -29,7 +29,7 @@ class PlanProjectionWriter:
         self._repository = repository
 
     @contextmanager
-    def projection_transaction(
+    def _projection_transaction(
         self, *, novel_id: str, plan_revision_id: str, operation: str,
         expected_active_plan_revision_id: Optional[str], expected_active_plan_digest: str,
         expected_authority_generation: int, expected_projection_generation: int,
@@ -59,7 +59,7 @@ class PlanProjectionWriter:
                 capability._expire()
             _end_projection_writer_session(conn, session)
 
-    def activate_head(self, capability: ProjectionWriteCapability) -> None:
+    def _activate_head(self, capability: ProjectionWriteCapability) -> None:
         conn = self._repository._get_connection()
         _validate_projection_capability(conn, capability.novel_id, capability)
         if capability.activated:
@@ -105,7 +105,11 @@ class PlanProjectionWriter:
         creates: Sequence["StoryNode"] = (), updates: Sequence["StoryNode"] = (),
         deletes: Sequence[str] = (),
     ) -> None:
-        with self.projection_transaction(
+        if not creates and not updates and not deletes:
+            raise PlanningAuthorityError(
+                "projection transaction requires a declared physical projection change"
+            )
+        with self._projection_transaction(
             novel_id=novel_id, plan_revision_id=plan_revision_id, operation=operation,
             expected_active_plan_revision_id=expected_active_plan_revision_id,
             expected_active_plan_digest=expected_active_plan_digest,
@@ -117,4 +121,4 @@ class PlanProjectionWriter:
                 await self._repository.save_batch(nodes, _capability=capability)
             for node_id in deletes:
                 await self._repository.delete(node_id, _capability=capability)
-            self.activate_head(capability)
+            self._activate_head(capability)
