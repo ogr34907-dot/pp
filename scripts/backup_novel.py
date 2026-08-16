@@ -960,12 +960,13 @@ def copy_outline_planning(
         row["story_node_id"] = (
             story_node_id_map.get(old_story_node_id) if old_story_node_id else None
         )
+        parent_logical_node_id = source_item.get("parent_logical_node_id")
         row["parent_contract_id"] = (
-            contract_map.get(str(row["parent_contract_id"]))
-            if row.get("parent_contract_id")
+            contract_map[str(parent_logical_node_id)]
+            if parent_logical_node_id is not None
             else None
         )
-        row["active_version_id"] = version_map[str(row["active_version_id"])]
+        row["active_version_id"] = version_map[str(source_item["version_id"])]
         row["draft_version_id"] = None
         row["status"] = "synced"
         row["created_at"] = now

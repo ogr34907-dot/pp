@@ -425,6 +425,137 @@ def test_clone_remaps_manifest_projection_bindings_to_cloned_story_nodes(tmp_pat
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_clone_uses_frozen_manifest_topology_and_version_over_cache_drift(tmp_path):
+    db_path = Path(tmp_path / "clone-manifest-cache-drift.db")
+    database = DatabaseConnection(str(db_path))
+    source_id, source_physical_ids = _seed_manifest_source_with_physical_chain(
+        database
+    )
+    source_conn = database.get_connection()
+    source_items = source_conn.execute(
+        """
+        SELECT item.logical_node_id, item.parent_logical_node_id, item.version_id,
+               item.level
+        FROM outline_plan_revision_items AS item
+        JOIN outline_planning_heads AS head
+          ON head.active_plan_revision_id = item.plan_revision_id
+        WHERE head.novel_id = ?
+        """,
+        (source_id,),
+    ).fetchall()
+    source_by_level = {str(row["level"]): row for row in source_items}
+    chapter_item = source_by_level[OutlineLevel.CHAPTER.value]
+    root_item = source_by_level[OutlineLevel.OUTLINE.value]
+    assert chapter_item["parent_logical_node_id"] != root_item["logical_node_id"]
+
+    source_conn.execute(
+        "UPDATE outline_contracts SET parent_contract_id = ? WHERE id = ?",
+        (root_item["logical_node_id"], chapter_item["logical_node_id"]),
+    )
+    frozen_version = source_conn.execute(
+        "SELECT revision, payload_json FROM outline_contract_versions WHERE id = ?",
+        (chapter_item["version_id"],),
+    ).fetchone()
+    assert frozen_version is not None
+    drift_payload = OutlinePayload.from_dict(
+        json.loads(str(frozen_version["payload_json"]))
+    )
+    drift_payload.extra = {**drift_payload.extra, "cache_only_drift": True}
+    drift_version_id = "source-cache-only-version"
+    next_revision = source_conn.execute(
+        "SELECT COALESCE(MAX(revision), 0) + 1 FROM outline_contract_versions "
+        "WHERE contract_id = ?",
+        (chapter_item["logical_node_id"],),
+    ).fetchone()[0]
+    source_conn.execute(
+        """
+        INSERT INTO outline_contract_versions
+            (id, contract_id, revision, payload_json, digest,
+             parent_revision_digest, source, status)
+        VALUES (?, ?, ?, ?, ?, '', 'author', 'synced')
+        """,
+        (
+            drift_version_id,
+            chapter_item["logical_node_id"],
+            next_revision,
+            json.dumps(
+                drift_payload.canonical_dict(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            drift_payload.digest,
+        ),
+    )
+    source_conn.execute(
+        "UPDATE outline_contracts SET active_version_id = ? WHERE id = ?",
+        (drift_version_id, chapter_item["logical_node_id"]),
+    )
+    source_conn.commit()
+    assert source_conn.execute(
+        "SELECT COUNT(*) FROM outline_plan_projection_bindings AS binding "
+        "JOIN outline_plan_revision_items AS item "
+        "ON item.id = binding.plan_revision_item_id "
+        "JOIN outline_planning_heads AS head "
+        "ON head.active_plan_revision_id = item.plan_revision_id "
+        "WHERE head.novel_id = ?",
+        (source_id,),
+    ).fetchone()[0] == len(source_items)
+    database.close()
+
+    assert backup_novel(db_path, source_id, "novel-cache-drift-clone") is True
+
+    clone_conn = DatabaseConnection(str(db_path)).get_connection()
+    clone_plan_id = clone_conn.execute(
+        "SELECT active_plan_revision_id FROM outline_planning_heads WHERE novel_id = ?",
+        ("novel-cache-drift-clone",),
+    ).fetchone()[0]
+    cloned_rows = clone_conn.execute(
+        """
+        SELECT item.logical_node_id, item.parent_logical_node_id, item.version_id,
+               item.level, contract.parent_contract_id, contract.active_version_id,
+               binding.story_node_id, binding.parent_story_node_id
+        FROM outline_plan_revision_items AS item
+        JOIN outline_contracts AS contract ON contract.id = item.logical_node_id
+        JOIN outline_plan_projection_bindings AS binding
+          ON binding.plan_revision_item_id = item.id
+        WHERE item.plan_revision_id = ?
+        """,
+        (clone_plan_id,),
+    ).fetchall()
+    clone_by_level = {str(row["level"]): row for row in cloned_rows}
+    clone_id_by_source_logical_id = {
+        str(source_by_level[level]["logical_node_id"]): row["logical_node_id"]
+        for level, row in clone_by_level.items()
+    }
+    for level, cloned_row in clone_by_level.items():
+        source_item = source_by_level[level]
+        source_parent = source_item["parent_logical_node_id"]
+        expected_parent = (
+            clone_id_by_source_logical_id[str(source_parent)]
+            if source_parent is not None
+            else None
+        )
+        assert cloned_row["parent_contract_id"] == expected_parent
+        assert cloned_row["active_version_id"] == cloned_row["version_id"]
+
+    clone_physical_ids = {
+        row[0]
+        for row in clone_conn.execute(
+            "SELECT id FROM story_nodes WHERE novel_id = ?",
+            ("novel-cache-drift-clone",),
+        ).fetchall()
+    }
+    bound_rows = [row for row in cloned_rows if row["story_node_id"] is not None]
+    assert {row["story_node_id"] for row in bound_rows}.isdisjoint(source_physical_ids)
+    assert {row["story_node_id"] for row in bound_rows} <= clone_physical_ids
+    assert {
+        row["parent_story_node_id"]
+        for row in bound_rows
+        if row["parent_story_node_id"] is not None
+    } <= clone_physical_ids
+
+
 def test_clone_rejects_manifest_source_with_mismatched_active_projection(tmp_path):
     db_path = Path(tmp_path / "clone-invalid-manifest.db")
     database = DatabaseConnection(str(db_path))
