@@ -473,6 +473,11 @@ def test_manifest_hardening_migration_preserves_parent_novel_cascade(tmp_path):
         "VALUES ('item-1', 'plan-1', 'contract-1', 'version-1', 'outline', 0)"
     )
     conn.execute(
+        "INSERT INTO outline_plan_projection_bindings "
+        "(plan_revision_item_id, story_node_id, parent_story_node_id, number, order_index) "
+        "VALUES ('item-1', NULL, NULL, NULL, NULL)"
+    )
+    conn.execute(
         "UPDATE outline_plan_revisions SET status='ready_for_review', "
         "sealed_at=CURRENT_TIMESTAMP WHERE id='plan-1'"
     )
@@ -493,6 +498,7 @@ def test_manifest_hardening_migration_preserves_parent_novel_cascade(tmp_path):
 
     for table in (
         "outline_planning_heads",
+        "outline_plan_projection_bindings",
         "outline_plan_revision_items",
         "outline_plan_revisions",
         "outline_contract_versions",

@@ -297,6 +297,121 @@ def test_manifest_head_rejects_raw_switch_to_unbound_cloned_draft(manifest_book)
     assert _head_snapshot(database) == before
 
 
+def test_manifest_head_rejects_raw_insert_of_unbound_root_plan(legacy_plan_book):
+    database, _, _, _ = legacy_plan_book
+    conn = database.get_connection()
+    root = conn.execute(
+        """
+        SELECT contract.id, contract.active_version_id
+        FROM outline_contracts AS contract
+        JOIN outline_contract_versions AS version
+          ON version.id = contract.active_version_id
+        WHERE contract.novel_id = 'novel-1'
+          AND contract.level = 'outline'
+          AND version.sealed_at IS NOT NULL
+        """
+    ).fetchone()
+    assert root is not None
+    plan_id = "raw-unbound-root-plan"
+    item_id = "raw-unbound-root-item"
+    digest = "raw-unbound-root-digest"
+    conn.execute(
+        """
+        INSERT INTO outline_plan_revisions
+            (id, novel_id, revision, status, digest, canonical_prefix_digest,
+             reconciliation_status)
+        VALUES (?, 'novel-1', 2, 'draft', '', '', 'aligned')
+        """,
+        (plan_id,),
+    )
+    conn.execute(
+        """
+        INSERT INTO outline_plan_revision_items
+            (id, plan_revision_id, logical_node_id, version_id,
+             parent_logical_node_id, level, sibling_index, expansion_state,
+             validated_parent_digest, validated_previous_sibling_digest)
+        VALUES (?, ?, ?, ?, NULL, 'outline', 0, 'expanded', '', '')
+        """,
+        (item_id, plan_id, root["id"], root["active_version_id"]),
+    )
+    conn.execute(
+        """
+        UPDATE outline_plan_revisions
+        SET status = 'ready_for_review', digest = ?, sealed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (digest, plan_id),
+    )
+    conn.commit()
+
+    assert _head_snapshot(database)["mode"] == "legacy"
+    conn.execute("DELETE FROM outline_planning_heads WHERE novel_id = 'novel-1'")
+    conn.commit()
+    assert conn.execute(
+        "SELECT 1 FROM outline_planning_heads WHERE novel_id = 'novel-1'"
+    ).fetchone() is None
+
+    with pytest.raises(sqlite3.IntegrityError, match="complete projection bindings"):
+        conn.execute(
+            """
+            INSERT INTO outline_planning_heads
+                (novel_id, authority_mode, authority_generation,
+                 active_plan_revision_id, active_plan_digest, projection_generation)
+            VALUES ('novel-1', 'manifest', 1, ?, ?, 1)
+            """,
+            (plan_id, digest),
+        )
+
+    assert conn.execute(
+        "SELECT 1 FROM outline_planning_heads WHERE novel_id = 'novel-1'"
+    ).fetchone() is None
+
+
+def test_manifest_head_allows_raw_insert_of_bound_root_plan(legacy_plan_book):
+    database, _, _, plan_id = legacy_plan_book
+    conn = database.get_connection()
+    row = conn.execute(
+        "SELECT digest FROM outline_plan_revisions WHERE id = ?", (plan_id,)
+    ).fetchone()
+    assert row is not None
+    assert conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ?
+          AND item.level = 'outline'
+          AND binding.story_node_id IS NULL
+          AND binding.parent_story_node_id IS NULL
+          AND binding.number IS NULL
+          AND binding.order_index IS NULL
+        """,
+        (plan_id,),
+    ).fetchone()[0] == 1
+
+    conn.execute("DELETE FROM outline_planning_heads WHERE novel_id = 'novel-1'")
+    conn.commit()
+    conn.execute(
+        """
+        INSERT INTO outline_planning_heads
+            (novel_id, authority_mode, authority_generation,
+             active_plan_revision_id, active_plan_digest, projection_generation)
+        VALUES ('novel-1', 'manifest', 1, ?, ?, 1)
+        """,
+        (plan_id, row["digest"]),
+    )
+    conn.commit()
+
+    assert _head_snapshot(database) == {
+        "mode": "manifest",
+        "plan_id": plan_id,
+        "digest": str(row["digest"]),
+        "authority_generation": 1,
+        "projection_generation": 1,
+    }
+
+
 def test_manifest_head_allows_valid_binding_checked_generation_update(manifest_book):
     database, _, _, _ = manifest_book
     before = _head_snapshot(database)

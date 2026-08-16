@@ -108,16 +108,3 @@ class PlanProjectionWriter:
         raise PlanningAuthorityError(
             "caller-supplied StoryNode projection batches are disabled"
         )
-        with self._projection_transaction(
-            novel_id=novel_id, plan_revision_id=plan_revision_id, operation=operation,
-            expected_active_plan_revision_id=expected_active_plan_revision_id,
-            expected_active_plan_digest=expected_active_plan_digest,
-            expected_authority_generation=expected_authority_generation,
-            expected_projection_generation=expected_projection_generation,
-        ) as capability:
-            nodes = [*creates, *updates]
-            if nodes:
-                await self._repository.save_batch(nodes, _capability=capability)
-            for node_id in deletes:
-                await self._repository.delete(node_id, _capability=capability)
-            self._activate_head(capability)
