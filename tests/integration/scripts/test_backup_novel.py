@@ -644,6 +644,14 @@ def test_clone_rejects_manifest_source_with_version_payload_digest_mismatch(tmp_
     )
     conn.execute(
         """
+        INSERT INTO outline_plan_projection_bindings
+            (plan_revision_item_id, story_node_id, parent_story_node_id,
+             number, order_index)
+        VALUES ('source-malformed-item', NULL, NULL, NULL, NULL)
+        """
+    )
+    conn.execute(
+        """
         UPDATE outline_plan_revisions
         SET status = 'ready_for_review', sealed_at = ?, updated_at = ?
         WHERE id = ?

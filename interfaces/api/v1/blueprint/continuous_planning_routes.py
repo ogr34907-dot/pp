@@ -23,6 +23,9 @@ from application.blueprint.services.continuous_planning_service import (
     get_macro_plan_result,
     get_act_chapters_llm_stream,
 )
+from infrastructure.persistence.database.planning_authority_guard import (
+    PlanningAuthorityError,
+)
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 from infrastructure.persistence.database.chapter_element_repository import ChapterElementRepository
 from infrastructure.persistence.database.sqlite_chapter_repository import SqliteChapterRepository
@@ -35,6 +38,11 @@ from interfaces.api.v1.blueprint.planning_runtime_settings import (
 
 
 router = APIRouter(prefix="/planning", tags=["continuous-planning"])
+_MANIFEST_AUTHORITY_DETAIL = "manifest_planning_authority"
+
+
+def _raise_manifest_authority_gone(exc: PlanningAuthorityError) -> None:
+    raise HTTPException(status_code=410, detail=_MANIFEST_AUTHORITY_DETAIL) from exc
 
 
 def _macro_sse_flat_node_payloads(parts: List[Dict]) -> List[Dict]:
@@ -553,6 +561,8 @@ async def confirm_macro_plan(
                 "conflicts": e.conflicts
             }
         )
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"确认宏观规划失败: {str(e)}")
 
@@ -576,6 +586,11 @@ async def stream_act_chapters_sse(
       event: done     data: {success, act_id, chapters}
       event: error    data: {message}
     """
+
+    try:
+        await service.preflight_act_planning_mutation(act_id)
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
 
     def _sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
@@ -711,6 +726,8 @@ async def generate_act_chapters(
             custom_chapter_count=request.chapter_count
         )
         return result
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -733,6 +750,8 @@ async def confirm_act_chapters(
             chapters=request.chapters
         )
         return result
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -757,6 +776,8 @@ async def continue_planning(
             current_chapter_number=request.current_chapter
         )
         return result
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"续规划失败: {str(e)}")
 
@@ -780,6 +801,8 @@ async def create_next_act(
             current_act_id=act_id
         )
         return result
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

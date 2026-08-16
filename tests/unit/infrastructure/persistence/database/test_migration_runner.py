@@ -7,6 +7,7 @@ import pytest
 
 from application.blueprint.services.outline_contract_service import OutlineContractService
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
+from domain.structure.outline_plan import OutlinePlanItem
 from domain.structure.story_node import NodeType, StoryNode
 from infrastructure.persistence.database.migration_runner import apply_migration_files
 from infrastructure.persistence.database.connection import DatabaseConnection
@@ -326,6 +327,216 @@ def test_current_schema_installs_outline_manifest_storage_idempotently(tmp_path)
     assert conn.execute(
         "SELECT COUNT(*) FROM migrations_applied "
         "WHERE migration_file = '038_manifest_head_projection_binding_guard.sql'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migrations_applied "
+        "WHERE migration_file = '039_manifest_head_projection_binding_upgrade_guard.sql'"
+    ).fetchone()[0] == 1
+
+
+def _create_bound_root_plan(
+    repository: OutlineContractRepository,
+    conn: sqlite3.Connection,
+    novel_id: str,
+):
+    root = repository.ensure_root(novel_id)
+    draft = repository.save_draft(
+        root.id,
+        OutlinePayload(
+            title="Root",
+            narrative_text="A complete premise",
+            creative_goal="Reach the irreversible ending",
+            entry_state="start",
+            exit_state="end",
+        ),
+        source=OutlineSource.AUTHOR,
+    )
+    published = repository.publish_and_sync(
+        root.id,
+        expected_revision=draft.draft.revision,
+        idempotency_key=f"root-{novel_id}",
+    )
+    version = conn.execute(
+        "SELECT active_version_id, digest FROM outline_contracts "
+        "JOIN outline_contract_versions ON outline_contract_versions.id = active_version_id "
+        "WHERE outline_contracts.id = ?",
+        (published.id,),
+    ).fetchone()
+    assert version is not None
+    draft_plan = repository.create_plan_draft(
+        novel_id=novel_id,
+        items=(
+            OutlinePlanItem(
+                logical_node_id=published.id,
+                version_id=str(version[0]),
+                version_digest=str(version[1]),
+                level=published.level,
+                sibling_index=0,
+            ),
+        ),
+        canonical_prefix_digest="",
+        canonical_boundary={"formal_head": 0},
+    )
+    return published, repository.seal_plan_revision(draft_plan.id)
+
+
+def _stage_039_migration(tmp_path: Path) -> Path:
+    staged = tmp_path / "039-only"
+    staged.mkdir()
+    migrations = Path("infrastructure/persistence/database/migrations")
+    shutil.copy2(
+        migrations / "039_manifest_head_projection_binding_upgrade_guard.sql",
+        staged / "039_manifest_head_projection_binding_upgrade_guard.sql",
+    )
+    return staged
+
+
+def test_039_upgrade_repairs_old_038_insert_guard_and_locks_manifest_head_novel(tmp_path):
+    """A database that recorded the old 038 must receive the missing raw-SQL guard."""
+
+    database = DatabaseConnection(str(tmp_path / "old-038.db"))
+    conn = database.get_connection()
+    for novel_id in ("novel-1", "novel-2", "novel-3"):
+        conn.execute(
+            "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+            (novel_id, novel_id, novel_id, 20),
+        )
+    conn.commit()
+
+    repository = OutlineContractRepository(database)
+    _, bound_plan = _create_bound_root_plan(repository, conn, "novel-1")
+    root_two, _ = _create_bound_root_plan(repository, conn, "novel-2")
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode = 'manifest', "
+        "authority_generation = 1, projection_generation = 1, "
+        "active_plan_revision_id = ?, active_plan_digest = ? WHERE novel_id = 'novel-1'",
+        (bound_plan.id, bound_plan.digest),
+    )
+
+    # Model the published f3 038: it was recorded and had the UPDATE guard,
+    # but did not create this INSERT trigger.  A current checkout may already
+    # have applied 039 while constructing the fixture, so erase only its work.
+    conn.execute(
+        "DROP TRIGGER IF EXISTS "
+        "trg_outline_planning_heads_manifest_projection_binding_insert_guard"
+    )
+    conn.execute(
+        "DROP TRIGGER IF EXISTS trg_outline_planning_heads_manifest_novel_id_guard"
+    )
+    conn.execute(
+        "DELETE FROM migrations_applied "
+        "WHERE migration_file = '039_manifest_head_projection_binding_upgrade_guard.sql'"
+    )
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migrations_applied "
+        "WHERE migration_file = '038_manifest_head_projection_binding_guard.sql'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+        "AND name = 'trg_outline_planning_heads_manifest_projection_binding_insert_guard'"
+    ).fetchone()[0] == 0
+
+    apply_migration_files(conn, _stage_039_migration(tmp_path))
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migrations_applied "
+        "WHERE migration_file = '039_manifest_head_projection_binding_upgrade_guard.sql'"
+    ).fetchone()[0] == 1
+
+    version = conn.execute(
+        "SELECT active_version_id FROM outline_contracts WHERE id = ?",
+        (root_two.id,),
+    ).fetchone()
+    assert version is not None
+    conn.execute(
+        "INSERT INTO outline_plan_revisions "
+        "(id, novel_id, revision, status, digest, canonical_prefix_digest, "
+        "reconciliation_status, created_at, updated_at) "
+        "VALUES ('unbound-plan', 'novel-2', 99, 'draft', 'unbound-digest', '', "
+        "'aligned', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+    )
+    conn.execute(
+        "INSERT INTO outline_plan_revision_items "
+        "(id, plan_revision_id, logical_node_id, version_id, level, sibling_index) "
+        "VALUES ('unbound-item', 'unbound-plan', ?, ?, 'outline', 0)",
+        (root_two.id, version[0]),
+    )
+    conn.execute(
+        "UPDATE outline_plan_revisions SET status = 'ready_for_review', "
+        "sealed_at = CURRENT_TIMESTAMP WHERE id = 'unbound-plan'"
+    )
+    conn.execute("DELETE FROM outline_planning_heads WHERE novel_id = 'novel-2'")
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="complete projection bindings"):
+        conn.execute(
+            "INSERT INTO outline_planning_heads "
+            "(novel_id, authority_mode, authority_generation, "
+            "active_plan_revision_id, active_plan_digest, projection_generation) "
+            "VALUES ('novel-2', 'manifest', 1, 'unbound-plan', 'unbound-digest', 1)"
+        )
+    conn.rollback()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM outline_planning_heads WHERE novel_id = 'novel-2'"
+    ).fetchone()[0] == 0
+
+    with pytest.raises(sqlite3.IntegrityError, match="novel_id"):
+        conn.execute(
+            "UPDATE outline_planning_heads SET novel_id = 'novel-3' "
+            "WHERE novel_id = 'novel-1'"
+        )
+    conn.rollback()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM outline_planning_heads WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM outline_planning_heads WHERE novel_id = 'novel-3'"
+    ).fetchone()[0] == 0
+
+
+def test_039_upgrade_fails_closed_for_existing_manifest_head_without_binding(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "invalid-old-038.db"))
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) "
+        "VALUES ('novel-1', 'N', 'n', 20)"
+    )
+    conn.commit()
+    repository = OutlineContractRepository(database)
+    _, plan = _create_bound_root_plan(repository, conn, "novel-1")
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode = 'manifest', "
+        "authority_generation = 1, projection_generation = 1, "
+        "active_plan_revision_id = ?, active_plan_digest = ? WHERE novel_id = 'novel-1'",
+        (plan.id, plan.digest),
+    )
+    conn.execute("DROP TRIGGER trg_outline_plan_projection_bindings_sealed_delete")
+    conn.execute(
+        "DELETE FROM outline_plan_projection_bindings WHERE plan_revision_item_id IN "
+        "(SELECT id FROM outline_plan_revision_items WHERE plan_revision_id = ?)",
+        (plan.id,),
+    )
+    conn.execute(
+        "DROP TRIGGER IF EXISTS "
+        "trg_outline_planning_heads_manifest_projection_binding_insert_guard"
+    )
+    conn.execute(
+        "DROP TRIGGER IF EXISTS trg_outline_planning_heads_manifest_novel_id_guard"
+    )
+    conn.execute(
+        "DELETE FROM migrations_applied "
+        "WHERE migration_file = '039_manifest_head_projection_binding_upgrade_guard.sql'"
+    )
+    conn.commit()
+
+    apply_migration_files(conn, _stage_039_migration(tmp_path))
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migrations_applied "
+        "WHERE migration_file = '039_manifest_head_projection_binding_upgrade_guard.sql'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM outline_planning_heads WHERE novel_id = 'novel-1'"
     ).fetchone()[0] == 1
 
 

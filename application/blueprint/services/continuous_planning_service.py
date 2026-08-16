@@ -500,6 +500,30 @@ class ContinuousPlanningService:
         ) is None:
             self.alignment_gate.story_node_repository = story_node_repo
 
+    def _assert_legacy_planning_mutation_allowed(
+        self, novel_id: str, *, operation: str
+    ) -> None:
+        """Use the repository's Manifest authority guard before legacy planning work."""
+        self.story_node_repo._assert_write_allowed(novel_id, operation=operation)
+
+    async def _load_act_for_legacy_mutation(
+        self, act_id: str, *, operation: str
+    ) -> Optional[StoryNode]:
+        act_node = await self.story_node_repo.get_by_id(act_id)
+        if act_node is not None:
+            self._assert_legacy_planning_mutation_allowed(
+                act_node.novel_id,
+                operation=operation,
+            )
+        return act_node
+
+    async def preflight_act_planning_mutation(self, act_id: str) -> None:
+        """Reject a Manifest book before the SSE route has committed HTTP 200."""
+        await self._load_act_for_legacy_mutation(
+            act_id,
+            operation="continuous act chapters stream",
+        )
+
     # CPMS 提示词渲染
 
     @staticmethod
@@ -1280,6 +1304,10 @@ class ContinuousPlanningService:
             MergeConflictException: 当新结构试图删除包含正文的节点时
         """
         logger.info(f"[SafeMerge] Starting safe macro plan confirmation for novel {novel_id}")
+        self._assert_legacy_planning_mutation_allowed(
+            novel_id,
+            operation="continuous macro confirm",
+        )
 
         target_chapters = self._target_chapter_limit(novel_id) or 0
         if not self._validate_macro_structure_completeness(structure, target_chapters):
@@ -1642,7 +1670,10 @@ class ContinuousPlanningService:
         """为指定幕生成章节规划"""
         logger.info(f"Planning chapters for act {act_id}")
 
-        act_node = await self.story_node_repo.get_by_id(act_id)
+        act_node = await self._load_act_for_legacy_mutation(
+            act_id,
+            operation="continuous act chapters generate",
+        )
         if not act_node:
             raise ValueError(f"幕节点不存在: {act_id}")
 
@@ -1852,7 +1883,10 @@ class ContinuousPlanningService:
         """确认幕级规划：写入 story_nodes + chapters 表（供工作台侧栏列表），并关联 Bible 元素。"""
         logger.info(f"Confirming act planning for act {act_id}")
 
-        act_node = await self.story_node_repo.get_by_id(act_id)
+        act_node = await self._load_act_for_legacy_mutation(
+            act_id,
+            operation="continuous act chapters confirm",
+        )
         if not act_node:
             raise ValueError(f"幕节点不存在: {act_id}")
 
@@ -2039,6 +2073,10 @@ class ContinuousPlanningService:
     async def continue_planning(self, novel_id: str, current_chapter_number: int) -> Dict:
         """AI 续规划"""
         logger.info(f"Continue planning for novel {novel_id}, chapter {current_chapter_number}")
+        self._assert_legacy_planning_mutation_allowed(
+            novel_id,
+            operation="continuous planning continue",
+        )
 
         current_act = await self._find_act_for_chapter(novel_id, current_chapter_number)
         if not current_act:
@@ -2159,7 +2197,10 @@ class ContinuousPlanningService:
         """自动创建下一幕"""
         logger.info(f"Creating next act after {current_act_id}")
 
-        current_act = await self.story_node_repo.get_by_id(current_act_id)
+        current_act = await self._load_act_for_legacy_mutation(
+            current_act_id,
+            operation="continuous create next act",
+        )
         if not current_act:
             raise ValueError(f"当前幕不存在: {current_act_id}")
 

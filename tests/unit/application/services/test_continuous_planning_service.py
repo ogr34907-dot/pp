@@ -24,6 +24,9 @@ from domain.structure.story_node import NodeType, StoryNode
 from application.engine.services.hierarchical_narrative_alignment_gate import (
     HierarchicalNarrativeAlignmentGate,
 )
+from infrastructure.persistence.database.planning_authority_guard import (
+    PlanningAuthorityError,
+)
 
 
 def _make_service() -> ContinuousPlanningService:
@@ -161,6 +164,10 @@ class _NextActCreationRepo:
     def __init__(self, nodes: list[StoryNode]):
         self._nodes = {node.id: node for node in nodes}
         self.saved: list[StoryNode] = []
+        self.guard_calls: list[tuple[str, str]] = []
+
+    def _assert_write_allowed(self, novel_id: str, *, operation: str):
+        self.guard_calls.append((novel_id, operation))
 
     async def get_by_id(self, node_id: str):
         return self._nodes.get(node_id)
@@ -1010,6 +1017,7 @@ def test_macro_structure_rejects_volume_capacity_inconsistent_with_child_acts():
 async def test_safe_macro_confirmation_rejects_missing_capacity_before_merge():
     """PLANNING-CAPACITY-003c: UI confirmation cannot persist unbounded containers."""
     story_repo = SimpleNamespace(
+        _assert_write_allowed=Mock(),
         get_by_novel=AsyncMock(return_value=[]),
         apply_merge_plan=AsyncMock(),
     )
@@ -1217,6 +1225,7 @@ async def test_confirm_act_planning_rejects_chapters_beyond_novel_target_before_
     act = _story_node("act-1", NodeType.ACT, 1, parent_id="volume-1")
     existing = _story_node("chapter-3", NodeType.CHAPTER, 3, parent_id="act-other")
     story_repo = SimpleNamespace(
+        _assert_write_allowed=Mock(),
         get_by_id=AsyncMock(return_value=act),
         get_children_sync=Mock(return_value=[]),
         get_by_novel_sync=Mock(return_value=[act, existing]),
@@ -1277,6 +1286,7 @@ async def test_confirm_act_planning_rejects_parent_volume_over_capacity_before_r
         "chapter-sibling-1", NodeType.CHAPTER, 2, parent_id=child_backed_act.id
     )
     story_repo = SimpleNamespace(
+        _assert_write_allowed=Mock(),
         get_by_id=AsyncMock(return_value=target_act),
         get_by_novel=AsyncMock(
             return_value=[
@@ -1514,9 +1524,124 @@ async def test_create_next_act_creates_the_next_act_after_passing_preflight():
     assert len(story_repo.saved) == 1
     assert story_repo.saved[0].parent_id == volume.id
     assert story_repo.saved[0].number == 2
+    assert story_repo.guard_calls == [("novel-1", "continuous create next act")]
     service._generate_next_act_info.assert_awaited_once_with(
         "novel-1", current, {}, 30
     )
+
+
+@pytest.mark.asyncio
+async def test_manifest_authority_blocks_macro_confirmation_before_legacy_merge():
+    guard = Mock(
+        side_effect=PlanningAuthorityError("manifest planning authority requires PlanRevision transaction")
+    )
+    story_repo = SimpleNamespace(
+        _assert_write_allowed=guard,
+        get_by_novel=AsyncMock(return_value=[]),
+        apply_merge_plan=AsyncMock(),
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+        novel_repository=SimpleNamespace(
+            get_by_id=Mock(return_value=SimpleNamespace(target_chapters=10))
+        ),
+    )
+
+    with pytest.raises(PlanningAuthorityError, match="manifest planning authority"):
+        await service.confirm_macro_plan_safe("novel-1", [])
+
+    guard.assert_called_once_with("novel-1", operation="continuous macro confirm")
+    story_repo.get_by_novel.assert_not_awaited()
+    story_repo.apply_merge_plan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manifest_authority_blocks_act_generation_and_confirmation_before_llm_or_dml():
+    act = _story_node("act-1", NodeType.ACT, 1, parent_id="volume-1")
+    existing_chapter = _story_node(
+        "chapter-existing", NodeType.CHAPTER, 1, parent_id=act.id
+    )
+    guard = Mock(
+        side_effect=PlanningAuthorityError("manifest planning authority requires PlanRevision transaction")
+    )
+    story_repo = SimpleNamespace(
+        _assert_write_allowed=guard,
+        get_by_id=AsyncMock(return_value=act),
+        get_by_novel=AsyncMock(return_value=[act, existing_chapter]),
+        get_by_novel_sync=Mock(return_value=[act, existing_chapter]),
+        get_children_sync=Mock(return_value=[existing_chapter]),
+        delete=AsyncMock(),
+        save_batch=AsyncMock(),
+        update=AsyncMock(),
+    )
+    chapter_elements = SimpleNamespace(
+        delete_by_chapter=AsyncMock(),
+        save_batch=AsyncMock(),
+    )
+    chapter_repository = SimpleNamespace(
+        list_by_novel=Mock(return_value=[]),
+        delete=Mock(),
+        get_by_novel_and_number=Mock(return_value=None),
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=chapter_elements,
+        chapter_repository=chapter_repository,
+        llm_service=Mock(),
+    )
+    service._stream_act_plan_llm_text = AsyncMock(return_value='{"chapters": []}')
+
+    with pytest.raises(PlanningAuthorityError, match="manifest planning authority"):
+        await service.plan_act_chapters(act.id)
+    with pytest.raises(PlanningAuthorityError, match="manifest planning authority"):
+        await service.confirm_act_planning(act.id, [])
+
+    assert guard.call_args_list == [
+        (("novel-1",), {"operation": "continuous act chapters generate"}),
+        (("novel-1",), {"operation": "continuous act chapters confirm"}),
+    ]
+    service._stream_act_plan_llm_text.assert_not_awaited()
+    chapter_elements.delete_by_chapter.assert_not_awaited()
+    chapter_elements.save_batch.assert_not_awaited()
+    chapter_repository.delete.assert_not_called()
+    story_repo.delete.assert_not_awaited()
+    story_repo.save_batch.assert_not_awaited()
+    story_repo.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manifest_authority_blocks_continue_and_create_next_before_llm_or_dml():
+    act = _story_node("act-1", NodeType.ACT, 1, parent_id="volume-1")
+    guard = Mock(
+        side_effect=PlanningAuthorityError("manifest planning authority requires PlanRevision transaction")
+    )
+    story_repo = SimpleNamespace(
+        _assert_write_allowed=guard,
+        get_by_id=AsyncMock(return_value=act),
+        save=AsyncMock(),
+    )
+    service = ContinuousPlanningService(
+        story_node_repo=story_repo,
+        chapter_element_repo=Mock(),
+        llm_service=Mock(),
+    )
+    service._find_act_for_chapter = AsyncMock()
+    service._generate_next_act_info = AsyncMock()
+
+    with pytest.raises(PlanningAuthorityError, match="manifest planning authority"):
+        await service.continue_planning("novel-1", 1)
+    with pytest.raises(PlanningAuthorityError, match="manifest planning authority"):
+        await service.create_next_act_auto("novel-1", act.id)
+
+    assert guard.call_args_list == [
+        (("novel-1",), {"operation": "continuous planning continue"}),
+        (("novel-1",), {"operation": "continuous create next act"}),
+    ]
+    service._find_act_for_chapter.assert_not_awaited()
+    service._generate_next_act_info.assert_not_awaited()
+    story_repo.save.assert_not_awaited()
 
 
 def test_parse_llm_response_logs_safe_metadata_without_raw_planning_content(
@@ -1568,6 +1693,7 @@ async def test_confirm_act_planning_replaces_stale_chapter_digest_after_row_norm
         persisted_nodes.extend(nodes)
 
     story_repo = SimpleNamespace(
+        _assert_write_allowed=Mock(),
         get_by_id=AsyncMock(return_value=act),
         get_by_novel=AsyncMock(return_value=[part, volume, act]),
         get_by_novel_sync=Mock(return_value=[part, volume, act]),
