@@ -164,6 +164,240 @@ class OutlineContractRepository:
             for row in rows
         )
 
+    def _validate_plan_projection_bindings(
+        self,
+        conn: sqlite3.Connection,
+        plan: OutlinePlanRevision,
+    ) -> dict[str, sqlite3.Row]:
+        """Fail closed unless every active item has its frozen physical mapping."""
+
+        try:
+            rows = conn.execute(
+                """
+                SELECT item.id AS item_id, item.logical_node_id,
+                       item.parent_logical_node_id, item.level,
+                       item.expansion_state,
+                       binding.plan_revision_item_id AS binding_item_id,
+                       binding.story_node_id, binding.parent_story_node_id,
+                       binding.number, binding.order_index,
+                       node.id AS live_story_node_id,
+                       node.novel_id AS live_novel_id,
+                       node.parent_id AS live_parent_story_node_id,
+                       node.node_type AS live_node_type,
+                       node.number AS live_number,
+                       node.order_index AS live_order_index
+                FROM outline_plan_revision_items AS item
+                LEFT JOIN outline_plan_projection_bindings AS binding
+                  ON binding.plan_revision_item_id = item.id
+                LEFT JOIN story_nodes AS node ON node.id = binding.story_node_id
+                WHERE item.plan_revision_id = ?
+                ORDER BY CASE item.level
+                    WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
+                    WHEN 'act' THEN 3 ELSE 4 END,
+                    COALESCE(item.parent_logical_node_id, ''), item.sibling_index,
+                    item.logical_node_id
+                """,
+                (plan.id,),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            raise OutlineGateError(
+                "active manifest projection binding storage is unavailable"
+            ) from exc
+
+        expected_item_ids = {item.id for item in plan.items}
+        if not expected_item_ids or len(rows) != len(expected_item_ids):
+            raise OutlineGateError("active manifest projection binding set is incomplete")
+
+        by_logical_id: dict[str, sqlite3.Row] = {}
+        physical_by_logical_id: dict[str, Optional[str]] = {}
+        physical_ids: set[str] = set()
+        for row in rows:
+            item_id = str(row["item_id"] or "")
+            logical_node_id = str(row["logical_node_id"] or "")
+            level = str(row["level"] or "")
+            if (
+                item_id not in expected_item_ids
+                or not logical_node_id
+                or logical_node_id in by_logical_id
+                or row["binding_item_id"] is None
+            ):
+                raise OutlineGateError("active manifest projection binding set is incomplete")
+
+            binding_values = (
+                row["story_node_id"],
+                row["parent_story_node_id"],
+                row["number"],
+                row["order_index"],
+            )
+            if level == OutlineLevel.OUTLINE.value:
+                if any(value is not None for value in binding_values):
+                    raise OutlineGateError(
+                        "active manifest outline root projection binding must be unbound"
+                    )
+                physical_by_logical_id[logical_node_id] = None
+                by_logical_id[logical_node_id] = row
+                continue
+
+            story_node_id = row["story_node_id"]
+            if story_node_id is None:
+                if any(value is not None for value in binding_values):
+                    raise OutlineGateError(
+                        "active manifest unbound projection binding is malformed"
+                    )
+                if str(row["expansion_state"] or "") != "unexpanded":
+                    raise OutlineGateError(
+                        "active manifest expanded item has no physical projection binding"
+                    )
+                physical_by_logical_id[logical_node_id] = None
+                by_logical_id[logical_node_id] = row
+                continue
+
+            if row["number"] is None or row["order_index"] is None:
+                raise OutlineGateError(
+                    "active manifest physical projection binding is incomplete"
+                )
+            if row["live_story_node_id"] is None:
+                raise OutlineGateError(
+                    "active manifest physical projection binding StoryNode is missing"
+                )
+            try:
+                number_matches = int(row["live_number"]) == int(row["number"])
+                order_matches = int(row["live_order_index"]) == int(
+                    row["order_index"]
+                )
+            except (TypeError, ValueError) as exc:
+                raise OutlineGateError(
+                    "active manifest physical projection binding is malformed"
+                ) from exc
+            if (
+                str(row["live_novel_id"] or "") != plan.novel_id
+                or str(row["live_node_type"] or "") != level
+                or row["live_parent_story_node_id"]
+                != row["parent_story_node_id"]
+                or not number_matches
+                or not order_matches
+            ):
+                raise OutlineGateError(
+                    "active manifest physical projection binding does not match StoryNode"
+                )
+
+            parent_logical_node_id = row["parent_logical_node_id"]
+            if not parent_logical_node_id:
+                raise OutlineGateError(
+                    "active manifest physical projection binding has no logical parent"
+                )
+            parent_key = str(parent_logical_node_id)
+            if parent_key not in physical_by_logical_id:
+                raise OutlineGateError(
+                    "active manifest projection binding parent is missing"
+                )
+            expected_parent_story_node_id = physical_by_logical_id[parent_key]
+            if row["parent_story_node_id"] != expected_parent_story_node_id:
+                raise OutlineGateError(
+                    "active manifest physical projection binding parent does not match"
+                )
+            if (
+                level != OutlineLevel.PART.value
+                and expected_parent_story_node_id is None
+            ):
+                raise OutlineGateError(
+                    "active manifest physical projection binding has an unbound parent"
+                )
+            physical_id = str(story_node_id)
+            if physical_id in physical_ids:
+                raise OutlineGateError(
+                    "active manifest has duplicate physical projection bindings"
+                )
+            physical_ids.add(physical_id)
+            physical_by_logical_id[logical_node_id] = physical_id
+            by_logical_id[logical_node_id] = row
+
+        if set(by_logical_id) != {item.logical_node_id for item in plan.items}:
+            raise OutlineGateError("active manifest projection binding set is incomplete")
+        return by_logical_id
+
+    def _snapshot_plan_projection_bindings(
+        self,
+        conn: sqlite3.Connection,
+        plan: OutlinePlanRevision,
+    ) -> None:
+        """Freeze the locked plan's current real StoryNode projection once."""
+
+        existing = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM outline_plan_projection_bindings AS binding
+            JOIN outline_plan_revision_items AS item
+              ON item.id = binding.plan_revision_item_id
+            WHERE item.plan_revision_id = ?
+            """,
+            (plan.id,),
+        ).fetchone()
+        if existing is None or int(existing["count"] or 0) != 0:
+            raise OutlineGateError("outline plan projection binding snapshot already exists")
+
+        rows = conn.execute(
+            """
+            SELECT item.id AS item_id, item.level, item.expansion_state,
+                   contract.story_node_id AS source_story_node_id,
+                   node.id AS live_story_node_id,
+                   node.parent_id AS live_parent_story_node_id,
+                   node.number AS live_number,
+                   node.order_index AS live_order_index
+            FROM outline_plan_revision_items AS item
+            JOIN outline_contracts AS contract
+              ON contract.id = item.logical_node_id
+            LEFT JOIN story_nodes AS node ON node.id = contract.story_node_id
+            WHERE item.plan_revision_id = ?
+            """,
+            (plan.id,),
+        ).fetchall()
+        expected_item_ids = {item.id for item in plan.items}
+        if len(rows) != len(expected_item_ids):
+            raise OutlineGateError("outline plan item set changed during binding snapshot")
+
+        physical_ids: set[str] = set()
+        for row in rows:
+            item_id = str(row["item_id"] or "")
+            if item_id not in expected_item_ids:
+                raise OutlineGateError("outline plan item set changed during binding snapshot")
+            if str(row["level"] or "") == OutlineLevel.OUTLINE.value:
+                values = (None, None, None, None)
+            elif row["live_story_node_id"] is None:
+                if str(row["expansion_state"] or "") != "unexpanded":
+                    raise OutlineGateError(
+                        "expanded outline plan item has no physical StoryNode"
+                    )
+                values = (None, None, None, None)
+            else:
+                if row["live_number"] is None or row["live_order_index"] is None:
+                    raise OutlineGateError(
+                        "physical StoryNode has incomplete projection coordinates"
+                    )
+                story_node_id = str(row["live_story_node_id"])
+                if story_node_id in physical_ids:
+                    raise OutlineGateError(
+                        "outline plan has duplicate physical StoryNode bindings"
+                    )
+                physical_ids.add(story_node_id)
+                values = (
+                    story_node_id,
+                    row["live_parent_story_node_id"],
+                    int(row["live_number"]),
+                    int(row["live_order_index"]),
+                )
+            conn.execute(
+                """
+                INSERT INTO outline_plan_projection_bindings
+                    (plan_revision_item_id, story_node_id, parent_story_node_id,
+                     number, order_index)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (item_id, *values),
+            )
+
+        self._validate_plan_projection_bindings(conn, plan)
+
     def get_plan_revision(
         self,
         plan_revision_id: str,
@@ -272,6 +506,7 @@ class OutlineContractRepository:
         )
         if recomputed_digest != plan.digest:
             raise OutlineGateError("active manifest revision digest is invalid")
+        self._validate_plan_projection_bindings(conn, plan)
         return plan
 
     def get_active_plan(self, novel_id: str) -> Optional[OutlinePlanRevision]:
@@ -298,7 +533,10 @@ class OutlineContractRepository:
                    item.parent_logical_node_id, item.level, item.sibling_index,
                    item.expansion_state, item.validated_parent_digest,
                    item.validated_previous_sibling_digest, item.is_reused,
-                   contract.novel_id, contract.story_node_id,
+                   contract.novel_id, binding.story_node_id AS story_node_id,
+                   binding.parent_story_node_id,
+                   binding.number AS story_node_number,
+                   binding.order_index AS story_node_order_index,
                    contract.parent_contract_id, contract.author_locked,
                    version.id AS version_id, version.revision AS version_revision,
                    version.digest AS version_digest, version.payload_json,
@@ -310,6 +548,8 @@ class OutlineContractRepository:
              AND contract.novel_id = ?
             JOIN outline_contract_versions AS version
               ON version.id = item.version_id
+            JOIN outline_plan_projection_bindings AS binding
+              ON binding.plan_revision_item_id = item.id
             WHERE item.plan_revision_id = ?
             ORDER BY CASE item.level
                 WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
@@ -971,6 +1211,10 @@ class OutlineContractRepository:
                 (plan.novel_id, plan.digest, plan.id),
             ).fetchone()
             if existing is not None:
+                existing_plan = self.get_plan_revision(
+                    str(existing["id"]), _connection=conn
+                )
+                self._validate_plan_projection_bindings(conn, existing_plan)
                 conn.execute(
                     """
                     UPDATE outline_planning_heads
@@ -986,7 +1230,8 @@ class OutlineContractRepository:
                 if deleted.rowcount != 1:
                     raise OutlineGateError("outline plan changed during duplicate sealing")
                 conn.commit()
-                return self.get_plan_revision(str(existing["id"]))
+                return existing_plan
+            self._snapshot_plan_projection_bindings(conn, plan)
             conn.execute(
                 """
                 UPDATE outline_contract_versions
@@ -1244,6 +1489,7 @@ class OutlineContractRepository:
                 plan = self.get_plan_revision(
                     str(existing["id"]), _connection=conn
                 )
+                self._validate_plan_projection_bindings(conn, plan)
                 activated = conn.execute(
                     """
                     UPDATE outline_planning_heads
@@ -1294,6 +1540,10 @@ class OutlineContractRepository:
                 ),
             )
             self._insert_plan_items(conn, plan_id, items, now)
+            self._snapshot_plan_projection_bindings(
+                conn,
+                self.get_plan_revision(plan_id, _connection=conn),
+            )
             conn.execute(
                 """
                 UPDATE outline_contract_versions

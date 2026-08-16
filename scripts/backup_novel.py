@@ -252,6 +252,89 @@ def _clone_safe_story_node_metadata(raw_metadata: object) -> str:
     return json.dumps(cleaned, ensure_ascii=False, sort_keys=True)
 
 
+def _validate_manifest_projection_bindings(
+    rows: list[sqlite3.Row],
+    *,
+    novel_id: str,
+) -> None:
+    """Reject a Manifest source unless its frozen physical projection is intact."""
+
+    physical_by_logical_id: dict[str, str | None] = {}
+    physical_ids: set[str] = set()
+    for row in rows:
+        logical_node_id = str(row["logical_node_id"] or "")
+        level = str(row["level"] or "")
+        if (
+            not logical_node_id
+            or logical_node_id in physical_by_logical_id
+            or row["projection_binding_item_id"] is None
+        ):
+            raise ValueError("manifest projection binding set is incomplete")
+
+        binding_values = (
+            row["story_node_id"],
+            row["parent_story_node_id"],
+            row["number"],
+            row["order_index"],
+        )
+        if level == OutlineLevel.OUTLINE.value:
+            if any(value is not None for value in binding_values):
+                raise ValueError("manifest outline root projection binding is malformed")
+            physical_by_logical_id[logical_node_id] = None
+            continue
+
+        story_node_id = row["story_node_id"]
+        if story_node_id is None:
+            if any(value is not None for value in binding_values):
+                raise ValueError("manifest unbound projection binding is malformed")
+            if str(row["expansion_state"] or "") != "unexpanded":
+                raise ValueError("manifest expanded item has no physical projection")
+            physical_by_logical_id[logical_node_id] = None
+            continue
+
+        if (
+            row["number"] is None
+            or row["order_index"] is None
+            or row["live_story_node_id"] is None
+        ):
+            raise ValueError("manifest physical projection binding is incomplete")
+        try:
+            number_matches = int(row["live_number"]) == int(row["number"])
+            order_matches = int(row["live_order_index"]) == int(
+                row["order_index"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("manifest physical projection binding is malformed") from exc
+        if (
+            str(row["live_novel_id"] or "") != novel_id
+            or str(row["live_node_type"] or "") != level
+            or row["live_parent_story_node_id"]
+            != row["parent_story_node_id"]
+            or not number_matches
+            or not order_matches
+        ):
+            raise ValueError(
+                "manifest physical projection binding does not match StoryNode"
+            )
+
+        parent_logical_node_id = row["parent_logical_node_id"]
+        if not parent_logical_node_id:
+            raise ValueError("manifest physical projection binding has no logical parent")
+        parent_key = str(parent_logical_node_id)
+        if parent_key not in physical_by_logical_id:
+            raise ValueError("manifest projection binding parent is missing")
+        expected_parent_story_node_id = physical_by_logical_id[parent_key]
+        if row["parent_story_node_id"] != expected_parent_story_node_id:
+            raise ValueError("manifest physical projection binding parent does not match")
+        if level != OutlineLevel.PART.value and expected_parent_story_node_id is None:
+            raise ValueError("manifest physical projection binding has an unbound parent")
+        physical_id = str(story_node_id)
+        if physical_id in physical_ids:
+            raise ValueError("manifest has duplicate physical projection bindings")
+        physical_ids.add(physical_id)
+        physical_by_logical_id[logical_node_id] = physical_id
+
+
 def _validate_active_manifest_snapshot(
     conn: sqlite3.Connection,
     novel_id: str,
@@ -291,20 +374,40 @@ def _validate_active_manifest_snapshot(
     if str(plan["digest"] or "") != str(head["active_plan_digest"]):
         raise ValueError("manifest planning Head digest does not match its plan")
 
-    rows = conn.execute(
-        """
-        SELECT item.*, contract.novel_id AS contract_novel_id,
-               version.contract_id AS version_contract_id,
-               version.digest AS version_digest,
-               version.payload_json AS version_payload_json,
-               version.sealed_at AS version_sealed_at
-        FROM outline_plan_revision_items AS item
-        JOIN outline_contracts AS contract ON contract.id = item.logical_node_id
-        JOIN outline_contract_versions AS version ON version.id = item.version_id
-        WHERE item.plan_revision_id = ?
-        """,
-        (plan["id"],),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            SELECT item.*, contract.novel_id AS contract_novel_id,
+                   version.contract_id AS version_contract_id,
+                   version.digest AS version_digest,
+                   version.payload_json AS version_payload_json,
+                   version.sealed_at AS version_sealed_at,
+                   binding.plan_revision_item_id AS projection_binding_item_id,
+                   binding.story_node_id, binding.parent_story_node_id,
+                   binding.number, binding.order_index,
+                   node.id AS live_story_node_id,
+                   node.novel_id AS live_novel_id,
+                   node.parent_id AS live_parent_story_node_id,
+                   node.node_type AS live_node_type,
+                   node.number AS live_number,
+                   node.order_index AS live_order_index
+            FROM outline_plan_revision_items AS item
+            JOIN outline_contracts AS contract ON contract.id = item.logical_node_id
+            JOIN outline_contract_versions AS version ON version.id = item.version_id
+            LEFT JOIN outline_plan_projection_bindings AS binding
+              ON binding.plan_revision_item_id = item.id
+            LEFT JOIN story_nodes AS node ON node.id = binding.story_node_id
+            WHERE item.plan_revision_id = ?
+            ORDER BY CASE item.level
+                WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
+                WHEN 'act' THEN 3 ELSE 4 END,
+                COALESCE(item.parent_logical_node_id, ''), item.sibling_index,
+                item.logical_node_id
+            """,
+            (plan["id"],),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        raise ValueError("manifest projection binding storage is unavailable") from exc
     if not rows:
         raise ValueError("manifest plan has no items")
 
@@ -405,6 +508,8 @@ def _validate_active_manifest_snapshot(
         raise ValueError("manifest plan digest does not match its topology")
     if expected_digest != str(head["active_plan_digest"]):
         raise ValueError("manifest planning Head digest does not match topology")
+
+    _validate_manifest_projection_bindings(rows, novel_id=novel_id)
 
     projections = conn.execute(
         """
@@ -707,6 +812,8 @@ def _source_outline_snapshot(
         SELECT contract.id AS logical_node_id,
                contract.parent_contract_id AS parent_logical_node_id,
                contract.level,
+               contract.story_node_id,
+               node.parent_id AS parent_story_node_id,
                version.id AS version_id,
                version.digest AS version_digest,
                version.previous_sibling_digest,
@@ -789,6 +896,9 @@ def copy_outline_planning(
         return {"contracts": 0, "versions": 0, "items": 0}
     source_plan, source_items = snapshot
     logical_ids = {str(item["logical_node_id"]) for item in source_items}
+    source_items_by_logical_id = {
+        str(item["logical_node_id"]): item for item in source_items
+    }
     version_ids = {str(item["version_id"]) for item in source_items}
     placeholders = ", ".join("?" for _ in logical_ids)
     contract_rows = conn.execute(
@@ -802,6 +912,27 @@ def copy_outline_planning(
     ).fetchall()
     if len(contract_rows) != len(logical_ids) or len(version_rows) != len(version_ids):
         raise ValueError("active outline snapshot references missing content")
+
+    contracts_by_id = {str(row["id"]): row for row in contract_rows}
+    ordered_contract_ids: list[str] = []
+    pending_contract_ids = set(contracts_by_id)
+    while pending_contract_ids:
+        ready = [
+            contract_id
+            for contract_id in sorted(pending_contract_ids)
+            if not source_items_by_logical_id[contract_id].get(
+                "parent_logical_node_id"
+            )
+            or str(
+                source_items_by_logical_id[contract_id]["parent_logical_node_id"]
+            )
+            in ordered_contract_ids
+        ]
+        if not ready:
+            raise ValueError("active outline snapshot has a logical parent cycle")
+        ordered_contract_ids.extend(ready)
+        pending_contract_ids.difference_update(ready)
+    contract_rows = [contracts_by_id[contract_id] for contract_id in ordered_contract_ids]
 
     contract_map = {
         old_id: _uid("outline", next(id_counter)) for old_id in sorted(logical_ids)
@@ -818,7 +949,10 @@ def copy_outline_planning(
     for source_row in contract_rows:
         row = dict(source_row)
         old_contract_id = str(row["id"])
-        old_story_node_id = row.get("story_node_id")
+        source_item = source_items_by_logical_id.get(old_contract_id)
+        if source_item is None:
+            raise ValueError("active outline snapshot has an unmapped contract")
+        old_story_node_id = source_item.get("story_node_id")
         if old_story_node_id and old_story_node_id not in story_node_id_map:
             raise ValueError("outline contract references an unmapped StoryNode")
         row["id"] = contract_map[old_contract_id]
@@ -911,7 +1045,15 @@ def copy_outline_planning(
             now,
         ),
     )
+    source_logical_id_by_cloned_logical_id = {
+        new_id: old_id for old_id, new_id in contract_map.items()
+    }
     for item in cloned_items:
+        source_logical_node_id = source_logical_id_by_cloned_logical_id[
+            item.logical_node_id
+        ]
+        source_item = source_items_by_logical_id[source_logical_node_id]
+        cloned_item_id = _uid("outlineitem", next(id_counter))
         conn.execute(
             """
             INSERT INTO outline_plan_revision_items
@@ -922,7 +1064,7 @@ def copy_outline_planning(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
             """,
             (
-                _uid("outlineitem", next(id_counter)),
+                cloned_item_id,
                 plan_id,
                 item.logical_node_id,
                 item.version_id,
@@ -953,6 +1095,53 @@ def copy_outline_planning(
                 now,
                 now,
             ),
+        )
+        source_story_node_id = source_item.get("story_node_id")
+        source_parent_story_node_id = source_item.get("parent_story_node_id")
+        source_number = source_item.get("number")
+        source_order_index = source_item.get("order_index")
+        if source_story_node_id is None:
+            if any(
+                value is not None
+                for value in (
+                    source_parent_story_node_id,
+                    source_number,
+                    source_order_index,
+                )
+            ):
+                raise ValueError("outline projection binding is malformed")
+            binding_values = (None, None, None, None)
+        else:
+            if source_number is None or source_order_index is None:
+                raise ValueError("outline projection binding is incomplete")
+            old_story_node_id = str(source_story_node_id)
+            if old_story_node_id not in story_node_id_map:
+                raise ValueError("outline projection binding references an unmapped StoryNode")
+            if (
+                source_parent_story_node_id is not None
+                and str(source_parent_story_node_id) not in story_node_id_map
+            ):
+                raise ValueError(
+                    "outline projection binding parent references an unmapped StoryNode"
+                )
+            binding_values = (
+                story_node_id_map[old_story_node_id],
+                (
+                    story_node_id_map[str(source_parent_story_node_id)]
+                    if source_parent_story_node_id is not None
+                    else None
+                ),
+                int(source_number),
+                int(source_order_index),
+            )
+        conn.execute(
+            """
+            INSERT INTO outline_plan_projection_bindings
+                (plan_revision_item_id, story_node_id, parent_story_node_id,
+                 number, order_index)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (cloned_item_id, *binding_values),
         )
     conn.execute(
         """

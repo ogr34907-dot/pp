@@ -1163,12 +1163,129 @@ def test_delete_manifest_book_removes_sealed_plan_history_without_orphans(plan_r
     for table in (
         "outline_planning_heads",
         "outline_plan_revision_items",
+        "outline_plan_projection_bindings",
         "outline_plan_revisions",
         "outline_plan_projections",
         "outline_contract_versions",
         "outline_contracts",
     ):
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_sealed_plan_projection_binding_is_immutable(plan_repo):
+    database, repository = plan_repo
+    _published_root(database, repository)
+    plan = repository.backfill_initial_plan("novel-1").plan
+    assert plan is not None
+    conn = database.get_connection()
+    binding = conn.execute(
+        """
+        SELECT binding.plan_revision_item_id
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ?
+        """,
+        (plan.id,),
+    ).fetchone()
+    assert binding is not None
+
+    for sql in (
+        "UPDATE outline_plan_projection_bindings SET order_index = 1 "
+        "WHERE plan_revision_item_id = ?",
+        "DELETE FROM outline_plan_projection_bindings WHERE plan_revision_item_id = ?",
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute(sql, (binding["plan_revision_item_id"],))
+        conn.rollback()
+
+
+def test_projection_binding_rejects_duplicate_physical_node_before_seal(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    root = repository.ensure_root("novel-1")
+    items = [root_item]
+    previous_sibling_digest = ""
+    for sibling_index in range(2):
+        part = repository.create_contract(
+            novel_id="novel-1",
+            level=OutlineLevel.PART,
+            parent_contract_id=root.id,
+        )
+        draft = repository.save_draft(
+            part.id,
+            OutlinePayload(
+                title=f"第{sibling_index + 1}部",
+                narrative_text="阶段冲突推动人物作出不可逆选择。",
+                creative_goal="推进主线冲突",
+                entry_state="承接上一步状态",
+                exit_state="留下后续必须回应的变化",
+            ),
+            source=OutlineSource.AUTHOR,
+        )
+        published = repository.publish_and_sync(
+            part.id, expected_revision=draft.draft.revision
+        )
+        version = database.get_connection().execute(
+            """
+            SELECT id, digest FROM outline_contract_versions
+            WHERE id = (SELECT active_version_id FROM outline_contracts WHERE id = ?)
+            """,
+            (published.id,),
+        ).fetchone()
+        items.append(
+            OutlinePlanItem(
+                logical_node_id=published.id,
+                version_id=str(version["id"]),
+                version_digest=str(version["digest"]),
+                parent_logical_node_id=root_item.logical_node_id,
+                level=OutlineLevel.PART,
+                sibling_index=sibling_index,
+                expansion_state="unexpanded",
+                validated_parent_digest=root_item.version_digest,
+                validated_previous_sibling_digest=previous_sibling_digest,
+            )
+        )
+        previous_sibling_digest = str(version["digest"])
+
+    plan = repository.create_plan_draft(
+        novel_id="novel-1",
+        items=tuple(items),
+        canonical_prefix_digest="duplicate-binding",
+        canonical_boundary={"formal_head": 0},
+    )
+    conn = database.get_connection()
+    part_item_ids = [
+        row["id"]
+        for row in conn.execute(
+            """
+            SELECT id FROM outline_plan_revision_items
+            WHERE plan_revision_id = ? AND level = 'part'
+            ORDER BY sibling_index
+            """,
+            (plan.id,),
+        ).fetchall()
+    ]
+    conn.execute(
+        """
+        INSERT INTO outline_plan_projection_bindings
+            (plan_revision_item_id, story_node_id, parent_story_node_id,
+             number, order_index)
+        VALUES (?, 'shared-physical-node', NULL, 1, 0)
+        """,
+        (part_item_ids[0],),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="duplicates"):
+        conn.execute(
+            """
+            INSERT INTO outline_plan_projection_bindings
+                (plan_revision_item_id, story_node_id, parent_story_node_id,
+                 number, order_index)
+            VALUES (?, 'shared-physical-node', NULL, 2, 1)
+            """,
+            (part_item_ids[1],),
+        )
+    conn.rollback()
 
 
 def test_manifest_head_rejects_sealed_plan_requiring_author_decision(plan_repo):

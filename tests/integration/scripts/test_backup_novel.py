@@ -6,12 +6,15 @@ from pathlib import Path
 
 import pytest
 
+from application.blueprint.services.outline_contract_service import OutlineContractService
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
 from domain.structure.outline_plan import OutlinePlanItem, canonical_plan_digest
+from domain.structure.story_node import NodeType, StoryNode
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
 )
+from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 from scripts.backup_novel import backup_novel
 
 
@@ -115,6 +118,120 @@ def _seed_manifest_source(database: DatabaseConnection) -> tuple[str, str, str]:
     return source_id, plan.id, published.id
 
 
+def _seed_manifest_source_with_physical_chain(
+    database: DatabaseConnection,
+) -> tuple[str, set[str]]:
+    source_id = "novel-physical-source"
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        (source_id, "Physical Source", source_id, 20),
+    )
+    conn.commit()
+    contracts = OutlineContractRepository(database)
+    nodes = StoryNodeRepository(database)
+    service = OutlineContractService(
+        contract_repository=contracts,
+        story_node_repository=nodes,
+    )
+    payload = OutlinePayload(
+        title="完整大纲",
+        narrative_text="主角以代价推进冲突，并把后果留给下一阶段。",
+        creative_goal="推进主线",
+        entry_state="承接前态",
+        exit_state="留下后态",
+        required_events=["发生不可逆选择"],
+        state_changes={"characters": [{"name": "主角", "change": "承担代价"}]},
+        handoff_conditions=["后续阶段回应本阶段结局"],
+        chapter_start=1,
+        chapter_end=1,
+    )
+    root = contracts.ensure_root(source_id)
+    root = contracts.save_draft(root.id, payload, source=OutlineSource.AUTHOR)
+    published_root = contracts.publish_and_sync(
+        root.id, expected_revision=root.draft.revision
+    )
+    root_version = conn.execute(
+        """
+        SELECT id, digest FROM outline_contract_versions
+        WHERE id = (SELECT active_version_id FROM outline_contracts WHERE id = ?)
+        """,
+        (published_root.id,),
+    ).fetchone()
+    parent_item = OutlinePlanItem(
+        logical_node_id=published_root.id,
+        version_id=str(root_version["id"]),
+        version_digest=str(root_version["digest"]),
+        level=OutlineLevel.OUTLINE,
+        sibling_index=0,
+        expansion_state="expanded",
+    )
+    items = [parent_item]
+    parent_node_id = None
+    physical_ids: set[str] = set()
+    for index, node_type in enumerate(
+        (NodeType.PART, NodeType.VOLUME, NodeType.ACT, NodeType.CHAPTER), start=1
+    ):
+        node = StoryNode(
+            id=f"{source_id}-{node_type.value}",
+            novel_id=source_id,
+            node_type=node_type,
+            number=1,
+            title=node_type.value,
+            order_index=index,
+            parent_id=parent_node_id,
+        )
+        nodes.save_sync(node)
+        physical_ids.add(node.id)
+        slot = service.ensure_contract_for_story_node(source_id, node.id)
+        slot = contracts.save_draft(slot.id, payload, source=OutlineSource.AUTHOR)
+        published = contracts.publish_and_sync(
+            slot.id, expected_revision=slot.draft.revision
+        )
+        version = conn.execute(
+            """
+            SELECT id, digest FROM outline_contract_versions
+            WHERE id = (SELECT active_version_id FROM outline_contracts WHERE id = ?)
+            """,
+            (published.id,),
+        ).fetchone()
+        item = OutlinePlanItem(
+            logical_node_id=published.id,
+            version_id=str(version["id"]),
+            version_digest=str(version["digest"]),
+            parent_logical_node_id=parent_item.logical_node_id,
+            level=published.level,
+            sibling_index=0,
+            expansion_state=(
+                "unexpanded" if node_type == NodeType.CHAPTER else "expanded"
+            ),
+            validated_parent_digest=parent_item.version_digest,
+        )
+        items.append(item)
+        parent_item = item
+        parent_node_id = node.id
+
+    plan_draft = contracts.create_plan_draft(
+        novel_id=source_id,
+        items=tuple(items),
+        canonical_prefix_digest="physical-source-history",
+        canonical_boundary={"formal_head": 0},
+    )
+    plan = contracts.seal_plan_revision(plan_draft.id)
+    conn.execute(
+        """
+        UPDATE outline_planning_heads
+        SET authority_mode = 'manifest', authority_generation = 1,
+            active_plan_revision_id = ?, active_plan_digest = ?,
+            projection_generation = 1
+        WHERE novel_id = ?
+        """,
+        (plan.id, plan.digest, source_id),
+    )
+    conn.commit()
+    return source_id, physical_ids
+
+
 def test_clone_remaps_active_manifest_and_excludes_runtime_history(tmp_path):
     db_path = Path(tmp_path / "clone-manifest.db")
     database = DatabaseConnection(str(db_path))
@@ -210,6 +327,18 @@ def test_clone_remaps_active_manifest_and_excludes_runtime_history(tmp_path):
         (row.logical_node_id, row.version_id, row.version_digest)
         for row in logical_items
     }
+    clone_binding = conn.execute(
+        """
+        SELECT binding.*
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ?
+        """,
+        (plan["id"],),
+    ).fetchone()
+    assert clone_binding is not None
+    assert tuple(clone_binding[1:]) == (None, None, None, None)
 
     for table in (
         "outline_generation_attempts",
@@ -230,6 +359,69 @@ def test_clone_remaps_active_manifest_and_excludes_runtime_history(tmp_path):
         ).fetchone()[0] == 0, table
 
     conn.execute("PRAGMA foreign_keys = ON")
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_clone_remaps_manifest_projection_bindings_to_cloned_story_nodes(tmp_path):
+    db_path = Path(tmp_path / "clone-physical-manifest.db")
+    database = DatabaseConnection(str(db_path))
+    source_id, source_physical_ids = _seed_manifest_source_with_physical_chain(
+        database
+    )
+    source_item_rows = database.get_connection().execute(
+        """
+        SELECT item.id FROM outline_plan_revision_items AS item
+        JOIN outline_planning_heads AS head
+          ON head.active_plan_revision_id = item.plan_revision_id
+        WHERE head.novel_id = ?
+        """,
+        (source_id,),
+    ).fetchall()
+    source_item_ids = {row[0] for row in source_item_rows}
+    database.close()
+
+    assert backup_novel(db_path, source_id, "novel-physical-clone") is True
+
+    conn = DatabaseConnection(str(db_path)).get_connection()
+    clone_plan_id = conn.execute(
+        "SELECT active_plan_revision_id FROM outline_planning_heads WHERE novel_id = ?",
+        ("novel-physical-clone",),
+    ).fetchone()[0]
+    rows = conn.execute(
+        """
+        SELECT item.level, binding.plan_revision_item_id, binding.story_node_id,
+               binding.parent_story_node_id, binding.number, binding.order_index,
+               contract.story_node_id AS contract_story_node_id
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        JOIN outline_contracts AS contract ON contract.id = item.logical_node_id
+        WHERE item.plan_revision_id = ?
+        ORDER BY CASE item.level
+            WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
+            WHEN 'act' THEN 3 ELSE 4 END
+        """,
+        (clone_plan_id,),
+    ).fetchall()
+    clone_story_node_ids = {
+        row[0]
+        for row in conn.execute(
+            "SELECT id FROM story_nodes WHERE novel_id = ?",
+            ("novel-physical-clone",),
+        ).fetchall()
+    }
+
+    assert len(rows) == 5
+    assert tuple(rows[0][2:6]) == (None, None, None, None)
+    assert rows[0][6] is None
+    assert all(row[1] not in source_item_ids for row in rows)
+    bound_rows = rows[1:]
+    assert {row[2] for row in bound_rows}.isdisjoint(source_physical_ids)
+    assert {row[2] for row in bound_rows} <= clone_story_node_ids
+    assert {
+        row[3] for row in bound_rows if row[3] is not None
+    } <= clone_story_node_ids
+    assert all(row[2] == row[6] for row in bound_rows)
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

@@ -1,15 +1,20 @@
 import sqlite3
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from application.blueprint.services.outline_contract_service import OutlineContractService
+from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
+from domain.structure.story_node import NodeType, StoryNode
 from infrastructure.persistence.database.migration_runner import apply_migration_files
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
     OutlineGateError,
 )
+from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 
 
 def test_apply_migration_files_is_idempotent(tmp_path):
@@ -285,6 +290,7 @@ def test_current_schema_installs_outline_manifest_storage_idempotently(tmp_path)
         "outline_planning_heads",
         "outline_plan_revisions",
         "outline_plan_revision_items",
+        "outline_plan_projection_bindings",
     } <= tables
     assert {
         "active_plan_revision_id",
@@ -313,6 +319,128 @@ def test_current_schema_installs_outline_manifest_storage_idempotently(tmp_path)
         "SELECT COUNT(*) FROM migrations_applied "
         "WHERE migration_file = '033_outline_manifest_immutability_hardening.sql'"
     ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migrations_applied "
+        "WHERE migration_file = '037_outline_plan_projection_bindings.sql'"
+    ).fetchone()[0] == 1
+
+
+def test_projection_binding_migration_backfills_only_the_current_head(tmp_path):
+    database = DatabaseConnection(str(tmp_path / "pre-037-active-head.db"))
+    conn = database.get_connection()
+    novel_id = "pre-037-active-head"
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        (novel_id, "Pre 037", novel_id, 20),
+    )
+    conn.commit()
+
+    contracts = OutlineContractRepository(database)
+    nodes = StoryNodeRepository(database)
+    service = OutlineContractService(
+        contract_repository=contracts,
+        story_node_repository=nodes,
+    )
+    payload = OutlinePayload(
+        title="封存大纲",
+        narrative_text="主角作出不可逆选择，推动下一阶段冲突。",
+        creative_goal="推进主线",
+        entry_state="承接前态",
+        exit_state="留下后态",
+        required_events=["发生不可逆选择"],
+        state_changes={"characters": [{"name": "主角", "change": "承担代价"}]},
+        handoff_conditions=["下一阶段回应本阶段结局"],
+        chapter_start=1,
+        chapter_end=1,
+    )
+    root = contracts.ensure_root(novel_id)
+    root = contracts.save_draft(root.id, payload, source=OutlineSource.AUTHOR)
+    parent_contract = contracts.publish_and_sync(
+        root.id, expected_revision=root.draft.revision
+    )
+    parent_node_id = None
+    physical_ids: list[str] = []
+    for index, node_type in enumerate(
+        (NodeType.PART, NodeType.VOLUME, NodeType.ACT, NodeType.CHAPTER), start=1
+    ):
+        node = StoryNode(
+            id=f"{novel_id}-{node_type.value}",
+            novel_id=novel_id,
+            node_type=node_type,
+            number=1,
+            title=node_type.value,
+            order_index=index,
+            parent_id=parent_node_id,
+        )
+        nodes.save_sync(node)
+        physical_ids.append(node.id)
+        slot = service.ensure_contract_for_story_node(novel_id, node.id)
+        slot = contracts.save_draft(slot.id, payload, source=OutlineSource.AUTHOR)
+        parent_contract = contracts.publish_and_sync(
+            slot.id, expected_revision=slot.draft.revision
+        )
+        parent_node_id = node.id
+
+    active = contracts.backfill_initial_plan(novel_id).plan
+    assert active is not None
+    historical_draft = contracts.create_plan_draft(
+        novel_id=novel_id,
+        items=tuple(replace(item, id="") for item in active.items),
+        canonical_prefix_digest="historical-plan-without-migration-binding",
+        canonical_boundary={"formal_head": 0},
+        parent_plan_revision_id=active.id,
+    )
+    historical = contracts.seal_plan_revision(historical_draft.id)
+
+    conn.execute("DROP TABLE outline_plan_projection_bindings")
+    conn.execute(
+        "DELETE FROM migrations_applied "
+        "WHERE migration_file = '037_outline_plan_projection_bindings.sql'"
+    )
+    conn.commit()
+    staged = tmp_path / "037-only"
+    staged.mkdir()
+    migrations = Path("infrastructure/persistence/database/migrations")
+    shutil.copy2(
+        migrations / "037_outline_plan_projection_bindings.sql",
+        staged / "037_outline_plan_projection_bindings.sql",
+    )
+
+    apply_migration_files(conn, staged)
+
+    rows = conn.execute(
+        """
+        SELECT item.level, binding.story_node_id, binding.parent_story_node_id,
+               binding.number, binding.order_index
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ?
+        ORDER BY CASE item.level
+            WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
+            WHEN 'act' THEN 3 ELSE 4 END
+        """,
+        (active.id,),
+    ).fetchall()
+    assert len(rows) == 5
+    assert tuple(rows[0]) == ("outline", None, None, None, None)
+    assert [row[1] for row in rows[1:]] == physical_ids
+    assert [row[2] for row in rows[1:]] == [None, *physical_ids[:-1]]
+    assert conn.execute(
+        """
+        SELECT COUNT(*) FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ?
+        """,
+        (historical.id,),
+    ).fetchone()[0] == 0
+    assert all(
+        row[2] != "story_nodes"
+        for row in conn.execute(
+            "PRAGMA foreign_key_list(outline_plan_projection_bindings)"
+        ).fetchall()
+    )
 
 
 def test_manifest_hardening_migration_preserves_parent_novel_cascade(tmp_path):

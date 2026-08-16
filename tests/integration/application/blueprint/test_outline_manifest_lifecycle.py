@@ -101,3 +101,32 @@ def test_complete_synced_five_level_chain_backfills_as_one_shadow_manifest(tmp_p
         assert by_level[parent_level].expansion_state == "expanded"
     assert by_level[OutlineLevel.CHAPTER].expansion_state == "unexpanded"
     assert result.head.authority_mode.value == "legacy"
+
+    bindings = conn.execute(
+        """
+        SELECT item.level, binding.story_node_id, binding.parent_story_node_id,
+               binding.number, binding.order_index
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ?
+        ORDER BY CASE item.level
+            WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
+            WHEN 'act' THEN 3 ELSE 4 END
+        """,
+        (plan.id,),
+    ).fetchall()
+    assert len(bindings) == 5
+    assert tuple(bindings[0]) == ("outline", None, None, None, None)
+    assert [row[1] for row in bindings[1:]] == [
+        "node-part",
+        "node-volume",
+        "node-act",
+        "node-chapter",
+    ]
+    assert [row[2] for row in bindings[1:]] == [
+        None,
+        "node-part",
+        "node-volume",
+        "node-act",
+    ]

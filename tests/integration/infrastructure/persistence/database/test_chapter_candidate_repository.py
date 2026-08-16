@@ -27,6 +27,7 @@ from infrastructure.persistence.database.chapter_candidate_repository import (
 )
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.outline_contract_repository import (
+    OutlineGateError,
     OutlineContractRepository,
 )
 from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
@@ -590,6 +591,235 @@ def test_manifest_candidate_persists_full_five_level_plan_pin_at_creation(tmp_pa
         "chapter",
     }
     assert all(candidate.outline_chain[level]["version_id"] for level in candidate.outline_chain)
+
+
+def test_manifest_context_and_candidate_ignore_mutable_contract_story_node_cache(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "manifest-binding-cache.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-binding-cache", "Manifest Binding", "manifest-binding-cache", 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-binding-cache"
+    )
+    expected_chain = service.published_context_for_chapter(
+        "manifest-binding-cache", chapter_node.id
+    )
+    conn.execute(
+        """
+        UPDATE outline_contracts
+        SET story_node_id = 'mutable-cache-does-not-control-manifest'
+        WHERE id = ?
+        """,
+        (expected_chain["chapter"]["logical_node_id"],),
+    )
+    conn.commit()
+
+    assert service.published_context_for_chapter(
+        "manifest-binding-cache", chapter_node.id
+    ) == expected_chain
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-binding-cache", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+    candidate = repo.create_streaming_candidate(
+        novel_id="manifest-binding-cache",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=expected_chain,
+    )
+    assert candidate.plan_revision_id
+
+
+def test_manifest_binding_rejects_live_story_node_parent_tampering(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "manifest-binding-live-node.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-binding-live", "Manifest Binding", "manifest-binding-live", 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id="manifest-binding-live"
+    )
+    original_chain = service.published_context_for_chapter(
+        "manifest-binding-live", chapter_node.id
+    )
+    conn.execute("UPDATE story_nodes SET parent_id = NULL WHERE id = ?", (chapter_node.id,))
+    conn.commit()
+
+    with pytest.raises(OutlineGateError, match="projection binding"):
+        service.published_context_for_chapter("manifest-binding-live", chapter_node.id)
+
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-binding-live", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+    with pytest.raises(CandidateGateError, match="physical"):
+        repo.create_streaming_candidate(
+            novel_id="manifest-binding-live",
+            chapter_number=1,
+            title="第一章",
+            outline_chain=original_chain,
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (("node_type", "act"), ("number", 2), ("order_index", 99)),
+)
+def test_manifest_binding_rejects_live_story_node_type_or_coordinate_tampering(
+    tmp_path, column, value
+):
+    db = DatabaseConnection(str(tmp_path / f"manifest-binding-{column}.db"))
+    conn = db.get_connection()
+    novel_id = f"manifest-binding-{column}"
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        (novel_id, "Manifest Binding", novel_id, 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id=novel_id
+    )
+    original_chain = service.published_context_for_chapter(novel_id, chapter_node.id)
+    conn.execute(
+        f"UPDATE story_nodes SET {column} = ? WHERE id = ?",
+        (value, chapter_node.id),
+    )
+    conn.commit()
+
+    with pytest.raises(OutlineGateError, match="projection binding"):
+        service.published_context_for_chapter(novel_id, chapter_node.id)
+
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(novel_id, run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
+    with pytest.raises(CandidateGateError, match="physical"):
+        repo.create_streaming_candidate(
+            novel_id=novel_id,
+            chapter_number=1,
+            title="第一章",
+            outline_chain=original_chain,
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (
+        ("parent_id", None),
+        ("node_type", "act"),
+        ("number", 2),
+        ("order_index", 99),
+    ),
+)
+def test_manifest_candidate_transition_rejects_tampered_frozen_physical_mapping(
+    tmp_path, column, value
+):
+    db = DatabaseConnection(
+        str(tmp_path / f"manifest-binding-transition-{column}.db")
+    )
+    conn = db.get_connection()
+    novel_id = f"manifest-binding-transition-{column}"
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        (novel_id, "Manifest Binding", novel_id, 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db, novel_id=novel_id
+    )
+    outline_chain = service.published_context_for_chapter(novel_id, chapter_node.id)
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(novel_id, run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
+    candidate = repo.create_streaming_candidate(
+        novel_id=novel_id,
+        chapter_number=1,
+        title="第一章",
+        outline_chain=outline_chain,
+    )
+    conn.execute(
+        f"UPDATE story_nodes SET {column} = ? WHERE id = ?",
+        (value, chapter_node.id),
+    )
+    conn.commit()
+
+    with pytest.raises(CandidateGateError, match="physical"):
+        repo.set_generated_content(candidate.id, "候选正文")
+
+    assert repo.get_candidate(candidate.id).status == CandidateStatus.STREAMING
+
+
+def test_manifest_candidate_rejects_unbound_chapter_projection(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "manifest-unbound-chapter.db"))
+    conn = db.get_connection()
+    novel_id = "manifest-unbound-chapter"
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        (novel_id, "Manifest Binding", novel_id, 20),
+    )
+    conn.commit()
+    service, chapter_node, active_plan = _activate_manifest_five_level_chain(
+        db, novel_id=novel_id
+    )
+    contracts = service.contract_repository
+    unbound_draft = contracts.create_plan_draft(
+        novel_id=novel_id,
+        items=tuple(replace(item, id="") for item in active_plan.items),
+        canonical_prefix_digest="unbound-chapter-projection",
+        canonical_boundary={"formal_head": 0},
+        parent_plan_revision_id=active_plan.id,
+    )
+    chapter_item = next(
+        item for item in active_plan.items if item.level == OutlineLevel.CHAPTER
+    )
+    conn.execute(
+        "UPDATE outline_contracts SET story_node_id = NULL WHERE id = ?",
+        (chapter_item.logical_node_id,),
+    )
+    conn.commit()
+    unbound_plan = contracts.seal_plan_revision(unbound_draft.id)
+    conn.execute(
+        "UPDATE outline_contracts SET story_node_id = ? WHERE id = ?",
+        (chapter_node.id, chapter_item.logical_node_id),
+    )
+    conn.execute(
+        """
+        UPDATE outline_planning_heads
+        SET active_plan_revision_id = ?, active_plan_digest = ?,
+            authority_generation = 2, projection_generation = 2
+        WHERE novel_id = ?
+        """,
+        (unbound_plan.id, unbound_plan.digest, novel_id),
+    )
+    conn.commit()
+
+    outline_chain = {}
+    for row in contracts.active_plan_items_with_payload(novel_id):
+        payload = OutlinePayload.from_dict(json.loads(str(row["payload_json"])))
+        outline_chain[str(row["level"])] = {
+            "contract_id": str(row["logical_node_id"]),
+            "logical_node_id": str(row["logical_node_id"]),
+            "version_id": str(row["version_id"]),
+            "revision": int(row["version_revision"]),
+            "digest": str(row["version_digest"]),
+            "level": str(row["level"]),
+            "parent_logical_node_id": row["parent_logical_node_id"],
+            "sibling_index": int(row["sibling_index"]),
+            "story_node_id": row["story_node_id"],
+            "payload": payload.canonical_dict(),
+        }
+
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(novel_id, run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
+    with pytest.raises(CandidateGateError, match="no physical projection"):
+        repo.create_streaming_candidate(
+            novel_id=novel_id,
+            chapter_number=1,
+            title="第一章",
+            outline_chain=outline_chain,
+        )
 
 
 @pytest.mark.parametrize(

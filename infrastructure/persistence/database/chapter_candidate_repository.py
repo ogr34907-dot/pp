@@ -575,6 +575,161 @@ class ChapterCandidateRepository:
         )
         return "|".join(f"{len(value)}:{value}" for value in values)
 
+    def _require_manifest_projection_bindings(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: str,
+        plan_revision_id: str,
+    ) -> list[sqlite3.Row]:
+        """Load every frozen physical mapping before a Candidate can use it."""
+
+        try:
+            rows = conn.execute(
+                """
+                SELECT item.logical_node_id, item.version_id,
+                       item.parent_logical_node_id, item.level, item.sibling_index,
+                       item.expansion_state,
+                       binding.plan_revision_item_id AS binding_item_id,
+                       binding.story_node_id, binding.parent_story_node_id,
+                       binding.number AS binding_number,
+                       binding.order_index AS binding_order_index,
+                       contract.novel_id AS contract_novel_id,
+                       version.revision AS version_revision,
+                       version.digest AS version_digest, version.payload_json,
+                       version.sealed_at,
+                       node.id AS live_story_node_id,
+                       node.novel_id AS live_novel_id,
+                       node.parent_id AS live_parent_story_node_id,
+                       node.node_type AS live_node_type,
+                       node.number AS live_number,
+                       node.order_index AS live_order_index
+                FROM outline_plan_revision_items AS item
+                LEFT JOIN outline_plan_projection_bindings AS binding
+                  ON binding.plan_revision_item_id = item.id
+                JOIN outline_contracts AS contract
+                  ON contract.id = item.logical_node_id
+                JOIN outline_contract_versions AS version
+                  ON version.id = item.version_id
+                LEFT JOIN story_nodes AS node ON node.id = binding.story_node_id
+                WHERE item.plan_revision_id = ?
+                ORDER BY CASE item.level
+                    WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
+                    WHEN 'act' THEN 3 ELSE 4 END,
+                    COALESCE(item.parent_logical_node_id, ''), item.sibling_index,
+                    item.logical_node_id
+                """,
+                (plan_revision_id,),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            raise CandidateGateError(
+                "active manifest projection binding storage is unavailable"
+            ) from exc
+        if not rows:
+            raise CandidateGateError("active manifest projection binding set is empty")
+
+        physical_by_logical_id: dict[str, Optional[str]] = {}
+        physical_ids: set[str] = set()
+        for row in rows:
+            logical_node_id = str(row["logical_node_id"] or "")
+            level = str(row["level"] or "")
+            if not logical_node_id or logical_node_id in physical_by_logical_id:
+                raise CandidateGateError(
+                    "active manifest projection binding set is incomplete"
+                )
+            if row["binding_item_id"] is None:
+                raise CandidateGateError(
+                    "active manifest projection binding is missing"
+                )
+
+            binding_values = (
+                row["story_node_id"],
+                row["parent_story_node_id"],
+                row["binding_number"],
+                row["binding_order_index"],
+            )
+            if level == "outline":
+                if any(value is not None for value in binding_values):
+                    raise CandidateGateError(
+                        "active manifest outline root projection binding is malformed"
+                    )
+                physical_by_logical_id[logical_node_id] = None
+                continue
+
+            story_node_id = row["story_node_id"]
+            if story_node_id is None:
+                if any(value is not None for value in binding_values):
+                    raise CandidateGateError(
+                        "active manifest unbound projection binding is malformed"
+                    )
+                if str(row["expansion_state"] or "") != "unexpanded":
+                    raise CandidateGateError(
+                        "active manifest expanded item has no physical projection"
+                    )
+                physical_by_logical_id[logical_node_id] = None
+                continue
+
+            if (
+                row["binding_number"] is None
+                or row["binding_order_index"] is None
+                or row["live_story_node_id"] is None
+            ):
+                raise CandidateGateError(
+                    "active manifest physical projection binding is incomplete"
+                )
+            try:
+                number_matches = int(row["live_number"]) == int(
+                    row["binding_number"]
+                )
+                order_matches = int(row["live_order_index"]) == int(
+                    row["binding_order_index"]
+                )
+            except (TypeError, ValueError) as exc:
+                raise CandidateGateError(
+                    "active manifest physical projection binding is malformed"
+                ) from exc
+            if (
+                str(row["contract_novel_id"] or "") != novel_id
+                or str(row["live_novel_id"] or "") != novel_id
+                or str(row["live_node_type"] or "") != level
+                or row["live_parent_story_node_id"]
+                != row["parent_story_node_id"]
+                or not number_matches
+                or not order_matches
+            ):
+                raise CandidateGateError(
+                    "active manifest physical projection binding does not match StoryNode"
+                )
+
+            parent_logical_node_id = row["parent_logical_node_id"]
+            if not parent_logical_node_id:
+                raise CandidateGateError(
+                    "active manifest physical projection binding has no logical parent"
+                )
+            parent_key = str(parent_logical_node_id)
+            if parent_key not in physical_by_logical_id:
+                raise CandidateGateError(
+                    "active manifest projection binding parent is missing"
+                )
+            expected_parent_story_node_id = physical_by_logical_id[parent_key]
+            if row["parent_story_node_id"] != expected_parent_story_node_id:
+                raise CandidateGateError(
+                    "active manifest physical projection binding parent does not match"
+                )
+            if level != "part" and expected_parent_story_node_id is None:
+                raise CandidateGateError(
+                    "active manifest physical projection binding has an unbound parent"
+                )
+            physical_id = str(story_node_id)
+            if physical_id in physical_ids:
+                raise CandidateGateError(
+                    "active manifest has duplicate physical projection bindings"
+                )
+            physical_ids.add(physical_id)
+            physical_by_logical_id[logical_node_id] = physical_id
+
+        return rows
+
     def _validate_manifest_outline_chain(
         self,
         conn: sqlite3.Connection,
@@ -604,23 +759,11 @@ class ChapterCandidateRepository:
         ):
             raise CandidateGateError("candidate outline chain digest is corrupted")
 
-        rows = conn.execute(
-            """
-            SELECT item.logical_node_id, item.version_id,
-                   item.parent_logical_node_id, item.level, item.sibling_index,
-                   contract.story_node_id, contract.novel_id AS contract_novel_id,
-                   version.revision AS version_revision,
-                   version.digest AS version_digest, version.payload_json,
-                   version.sealed_at
-            FROM outline_plan_revision_items AS item
-            JOIN outline_contracts AS contract
-              ON contract.id = item.logical_node_id
-            JOIN outline_contract_versions AS version
-              ON version.id = item.version_id
-            WHERE item.plan_revision_id = ?
-            """,
-            (plan_id,),
-        ).fetchall()
+        rows = self._require_manifest_projection_bindings(
+            conn,
+            novel_id=novel_id,
+            plan_revision_id=plan_id,
+        )
         required_levels = ("outline", "part", "volume", "act", "chapter")
         if any(level not in outline_chain for level in required_levels):
             raise CandidateGateError("candidate outline chain is missing a required level")
