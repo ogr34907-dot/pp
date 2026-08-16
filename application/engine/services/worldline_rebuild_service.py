@@ -8,6 +8,9 @@ import json
 from typing import Any, Protocol, Union
 
 from application.world.services.chapter_narrative_sync import CHAPTER_NARRATIVE_PIPELINE_VERSION
+from infrastructure.persistence.database.canonical_aftermath_barrier import (
+    exact_candidate_aftermath_is_ready,
+)
 from infrastructure.persistence.database.sqlite_chapter_narrative_commit_repository import (
     SqliteChapterNarrativeCommitRepository,
 )
@@ -142,18 +145,17 @@ class WorldlineRebuildService:
         novel_id: str,
         epoch: int,
         rows,
-        pipeline_version: str,
-        require_memory_sync: bool,
     ) -> None:
         """Require the real current-version barriers and archived state recovery."""
-        repo = SqliteChapterNarrativeCommitRepository(self._database)
         for chapter in rows:
-            if not repo.is_current_version_ready(
+            ready, _reason = exact_candidate_aftermath_is_ready(
+                conn,
                 novel_id=novel_id,
                 chapter_number=int(chapter["number"]),
-                pipeline_version=pipeline_version,
-                require_memory_sync=require_memory_sync,
-            ):
+                content_sha256=str(chapter["content_sha256"] or ""),
+                content_revision=int(chapter["content_revision"] or 0),
+            )
+            if not ready:
                 raise WorldlineRebuildError(
                     f"rebuild_output_not_ready:chapter={int(chapter['number'])}"
                 )
@@ -304,6 +306,278 @@ class WorldlineRebuildService:
                         f"character_state_not_recovered:{character_id}"
                     )
 
+    @staticmethod
+    def _run_matches(
+        row,
+        *,
+        generation_epoch: int,
+        state: str,
+        canonical_sync_status: str,
+        next_action: str,
+        last_error: str,
+    ) -> bool:
+        return (
+            row is not None
+            and int(row["generation_epoch"] or 0) == int(generation_epoch)
+            and str(row["state"] or "") == state
+            and str(row["canonical_sync_status"] or "ready") == canonical_sync_status
+            and str(row["next_action"] or "") == next_action
+            and str(row["last_error"] or "") == last_error
+        )
+
+    def _cancelled_result(self, conn, novel_id: str, fallback_epoch: int) -> dict[str, Any]:
+        try:
+            generation_epoch = self._current_epoch(conn, novel_id)
+        except WorldlineRebuildError:
+            generation_epoch = int(fallback_epoch)
+        return {
+            "status": "cancelled",
+            "generation_epoch": generation_epoch,
+            "rebuilt_chapters": 0,
+        }
+
+    @staticmethod
+    def _transition_all_jobs(
+        conn,
+        *,
+        novel_id: str,
+        generation_epoch: int,
+        expected_statuses: tuple[str, ...],
+        status: str,
+        failure_reason: str,
+        now: str,
+    ) -> None:
+        placeholders = ", ".join("?" for _ in expected_statuses)
+        total = conn.execute(
+            "SELECT COUNT(*) AS total FROM worldline_rebuild_jobs "
+            "WHERE novel_id = ? AND generation_epoch = ?",
+            (novel_id, int(generation_epoch)),
+        ).fetchone()
+        expected_count = int(total["total"] or 0) if total is not None else 0
+        if expected_count < 1:
+            raise WorldlineRebuildCancelled(int(generation_epoch))
+        cursor = conn.execute(
+            """
+            UPDATE worldline_rebuild_jobs
+            SET status = ?, failure_reason = ?, updated_at = ?
+            WHERE novel_id = ? AND generation_epoch = ?
+              AND status IN ({})
+            """.format(placeholders),
+            (
+                status,
+                failure_reason,
+                now,
+                novel_id,
+                int(generation_epoch),
+                *expected_statuses,
+            ),
+        )
+        if cursor.rowcount != expected_count:
+            raise WorldlineRebuildCancelled(int(generation_epoch))
+
+    def _claim_rebuild(
+        self,
+        conn,
+        *,
+        novel_id: str,
+        generation_epoch: int,
+        expected_state: str,
+        expected_sync_status: str,
+        expected_next_action: str,
+        expected_last_error: str,
+        now: str,
+    ) -> None:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            locked = conn.execute(
+                "SELECT * FROM novel_generation_runs WHERE novel_id = ?",
+                (novel_id,),
+            ).fetchone()
+            if not self._run_matches(
+                locked,
+                generation_epoch=generation_epoch,
+                state=expected_state,
+                canonical_sync_status=expected_sync_status,
+                next_action=expected_next_action,
+                last_error=expected_last_error,
+            ):
+                raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
+            self._transition_all_jobs(
+                conn,
+                novel_id=novel_id,
+                generation_epoch=generation_epoch,
+                expected_statuses=("pending", "failed"),
+                status="running",
+                failure_reason="",
+                now=now,
+            )
+            cursor = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET canonical_sync_status = 'rebuilding', next_action = 'rebuild_worldline',
+                    last_error = '', updated_at = ?
+                WHERE novel_id = ? AND generation_epoch = ? AND state = ?
+                  AND canonical_sync_status = ? AND next_action = ? AND last_error = ?
+                """,
+                (
+                    now,
+                    novel_id,
+                    int(generation_epoch),
+                    expected_state,
+                    expected_sync_status,
+                    expected_next_action,
+                    expected_last_error,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def _fail_rebuild(
+        self,
+        conn,
+        *,
+        novel_id: str,
+        generation_epoch: int,
+        expected_state: str,
+        failure_reason: str,
+        now: str,
+    ) -> bool:
+        """Publish a retry state only while this worker still owns the epoch."""
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            locked = conn.execute(
+                "SELECT * FROM novel_generation_runs WHERE novel_id = ?",
+                (novel_id,),
+            ).fetchone()
+            if not self._run_matches(
+                locked,
+                generation_epoch=generation_epoch,
+                state=expected_state,
+                canonical_sync_status="rebuilding",
+                next_action="rebuild_worldline",
+                last_error="",
+            ):
+                conn.rollback()
+                return False
+            self._transition_all_jobs(
+                conn,
+                novel_id=novel_id,
+                generation_epoch=generation_epoch,
+                expected_statuses=("running",),
+                status="failed",
+                failure_reason=failure_reason,
+                now=now,
+            )
+            cursor = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'paused', canonical_sync_status = 'failed',
+                    next_action = 'retry_worldline_rebuild', last_error = ?, updated_at = ?
+                WHERE novel_id = ? AND generation_epoch = ? AND state = ?
+                  AND canonical_sync_status = 'rebuilding'
+                  AND next_action = 'rebuild_worldline' AND last_error = ''
+                """,
+                (failure_reason, now, novel_id, int(generation_epoch), expected_state),
+            )
+            if cursor.rowcount != 1:
+                raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
+            conn.commit()
+            return True
+        except WorldlineRebuildCancelled:
+            conn.rollback()
+            return False
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def _complete_rebuild(
+        self,
+        conn,
+        *,
+        novel_id: str,
+        generation_epoch: int,
+        expected_state: str,
+        rows,
+        now: str,
+    ) -> bool:
+        """Make a rebuilt epoch visible only with current durable aftermath proof."""
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            locked = conn.execute(
+                "SELECT * FROM novel_generation_runs WHERE novel_id = ?",
+                (novel_id,),
+            ).fetchone()
+            if not self._run_matches(
+                locked,
+                generation_epoch=generation_epoch,
+                state=expected_state,
+                canonical_sync_status="rebuilding",
+                next_action="rebuild_worldline",
+                last_error="",
+            ):
+                conn.rollback()
+                return False
+            self._validate_rebuild_outputs(conn, novel_id, generation_epoch, rows)
+            for chapter in rows:
+                if "candidate_id" not in chapter.keys():
+                    continue
+                candidate_id = str(chapter["candidate_id"] or "")
+                if not candidate_id:
+                    continue
+                conn.execute(
+                    """
+                    UPDATE chapter_candidate_formal_commits
+                    SET sync_status = 'ready', failure_reason = '', synced_at = ?
+                    WHERE candidate_id = ? AND provenance = 'author_rewrite'
+                      AND sync_status = 'syncing'
+                    """,
+                    (now, candidate_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE chapter_candidates
+                    SET status = 'committed', failure_reason = '', updated_at = ?
+                    WHERE id = ? AND status = 'syncing'
+                    """,
+                    (now, candidate_id),
+                )
+            self._transition_all_jobs(
+                conn,
+                novel_id=novel_id,
+                generation_epoch=generation_epoch,
+                expected_statuses=("running",),
+                status="completed",
+                failure_reason="",
+                now=now,
+            )
+            cursor = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'paused', canonical_sync_status = 'ready',
+                    next_action = 'select_run_mode', last_error = '', updated_at = ?
+                WHERE novel_id = ? AND generation_epoch = ? AND state = ?
+                  AND canonical_sync_status = 'rebuilding'
+                  AND next_action = 'rebuild_worldline' AND last_error = ''
+                """,
+                (now, novel_id, int(generation_epoch), expected_state),
+            )
+            if cursor.rowcount != 1:
+                raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
+            conn.commit()
+            return True
+        except WorldlineRebuildCancelled:
+            conn.rollback()
+            return False
+        except BaseException:
+            conn.rollback()
+            raise
+
     async def rebuild(self, novel_id: str) -> dict[str, Any]:
         conn = self._connection()
         run = conn.execute(
@@ -312,35 +586,33 @@ class WorldlineRebuildService:
         if run is None:
             raise WorldlineRebuildError("generation run not found")
         epoch = int(run["generation_epoch"] or 0)
+        expected_state = str(run["state"] or "paused")
         sync_status = str(run["canonical_sync_status"] or "ready")
+        expected_next_action = str(run["next_action"] or "")
+        expected_last_error = str(run["last_error"] or "")
         if sync_status == "ready":
             return {"status": "already_ready", "generation_epoch": epoch, "rebuilt_chapters": 0}
         now = self._now()
-        conn.execute(
-            """
-            UPDATE worldline_rebuild_jobs
-            SET status = 'running', failure_reason = '', updated_at = ?
-            WHERE novel_id = ? AND generation_epoch = ? AND status IN ('pending', 'failed')
-            """,
-            (now, novel_id, epoch),
-        )
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET canonical_sync_status = 'rebuilding', next_action = 'rebuild_worldline', last_error = ?, updated_at = ?
-            WHERE novel_id = ?
-            """,
-            ("", now, novel_id),
-        )
-        conn.commit()
-        rows = self._retained_formal_chapters(conn, novel_id)
-        commit_repo = SqliteChapterNarrativeCommitRepository(self._database)
-        require_memory_sync = bool(getattr(self.aftermath_pipeline, "_memory_engine", None))
-        memory_engine = getattr(self.aftermath_pipeline, "_memory_engine", None)
-        if memory_engine is not None and hasattr(memory_engine, "invalidate_cached_state"):
-            memory_engine.invalidate_cached_state(novel_id)
-        replay_pipeline_version = CHAPTER_NARRATIVE_PIPELINE_VERSION
         try:
+            self._claim_rebuild(
+                conn,
+                novel_id=novel_id,
+                generation_epoch=epoch,
+                expected_state=expected_state,
+                expected_sync_status=sync_status,
+                expected_next_action=expected_next_action,
+                expected_last_error=expected_last_error,
+                now=now,
+            )
+        except WorldlineRebuildCancelled:
+            return self._cancelled_result(conn, novel_id, epoch)
+        try:
+            rows = self._retained_formal_chapters(conn, novel_id)
+            commit_repo = SqliteChapterNarrativeCommitRepository(self._database)
+            memory_engine = getattr(self.aftermath_pipeline, "_memory_engine", None)
+            if memory_engine is not None and hasattr(memory_engine, "invalidate_cached_state"):
+                memory_engine.invalidate_cached_state(novel_id)
+            replay_pipeline_version = CHAPTER_NARRATIVE_PIPELINE_VERSION
             for chapter in rows:
                 self._ensure_epoch(conn, novel_id, epoch)
                 prepared = commit_repo.prepare_worldline_replay(
@@ -374,12 +646,14 @@ class WorldlineRebuildService:
                 result_pipeline_version = str(result.get("pipeline_version") or "")
                 if result_pipeline_version != replay_pipeline_version:
                     raise WorldlineRebuildError("worldline_replay_missing_pipeline_version")
-                if not commit_repo.is_current_version_ready(
+                ready, _reason = exact_candidate_aftermath_is_ready(
+                    conn,
                     novel_id=novel_id,
                     chapter_number=int(chapter["number"]),
-                    pipeline_version=result_pipeline_version,
-                    require_memory_sync=require_memory_sync,
-                ):
+                    content_sha256=str(chapter["content_sha256"] or ""),
+                    content_revision=int(chapter["content_revision"] or 0),
+                )
+                if not ready:
                     raise WorldlineRebuildError(
                         f"rebuild_output_not_ready:chapter={int(chapter['number'])}"
                     )
@@ -388,8 +662,6 @@ class WorldlineRebuildService:
                 novel_id,
                 epoch,
                 rows,
-                replay_pipeline_version,
-                require_memory_sync,
             )
         except WorldlineRebuildCancelled as exc:
             return {
@@ -400,75 +672,40 @@ class WorldlineRebuildService:
         except Exception as exc:
             failure = str(exc)
             now = self._now()
-            conn.execute(
-                """
-                UPDATE worldline_rebuild_jobs
-                SET status = 'failed', failure_reason = ?, updated_at = ?
-                WHERE novel_id = ? AND generation_epoch = ?
-                """,
-                (failure, now, novel_id, epoch),
-            )
-            conn.execute(
-                """
-                UPDATE novel_generation_runs
-                SET state = 'paused', canonical_sync_status = 'failed',
-                    next_action = 'retry_worldline_rebuild', last_error = ?, updated_at = ?
-                WHERE novel_id = ? AND generation_epoch = ?
-                """,
-                (failure, now, novel_id, epoch),
-            )
-            conn.commit()
-            if self._current_epoch(conn, novel_id) != epoch:
-                current_epoch = self._current_epoch(conn, novel_id)
-                return {
-                    "status": "cancelled",
-                    "generation_epoch": current_epoch,
-                    "rebuilt_chapters": 0,
-                }
+            if not self._fail_rebuild(
+                conn,
+                novel_id=novel_id,
+                generation_epoch=epoch,
+                expected_state=expected_state,
+                failure_reason=failure,
+                now=now,
+            ):
+                return self._cancelled_result(conn, novel_id, epoch)
             raise WorldlineRebuildError(failure) from exc
         now = self._now()
-        self._ensure_epoch(conn, novel_id, epoch)
-        for chapter in rows:
-            if "candidate_id" not in chapter.keys():
-                continue
-            candidate_id = str(chapter["candidate_id"] or "")
-            if not candidate_id:
-                continue
-            conn.execute(
-                """
-                UPDATE chapter_candidate_formal_commits
-                SET sync_status = 'ready', failure_reason = '', synced_at = ?
-                WHERE candidate_id = ? AND provenance = 'author_rewrite'
-                  AND sync_status = 'syncing'
-                """,
-                (now, candidate_id),
+        try:
+            completed = self._complete_rebuild(
+                conn,
+                novel_id=novel_id,
+                generation_epoch=epoch,
+                expected_state=expected_state,
+                rows=rows,
+                now=now,
             )
-            conn.execute(
-                """
-                UPDATE chapter_candidates
-                SET status = 'committed', failure_reason = '', updated_at = ?
-                WHERE id = ? AND status = 'syncing'
-                """,
-                (now, candidate_id),
-            )
-        conn.execute(
-            """
-            UPDATE worldline_rebuild_jobs
-            SET status = 'completed', failure_reason = '', updated_at = ?
-            WHERE novel_id = ? AND generation_epoch = ?
-            """,
-            (now, novel_id, epoch),
-        )
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET state = 'paused', canonical_sync_status = 'ready',
-                next_action = 'select_run_mode', last_error = '', updated_at = ?
-            WHERE novel_id = ? AND generation_epoch = ?
-            """,
-            (now, novel_id, epoch),
-        )
-        conn.commit()
+        except Exception as exc:
+            failure = str(exc)
+            if not self._fail_rebuild(
+                conn,
+                novel_id=novel_id,
+                generation_epoch=epoch,
+                expected_state=expected_state,
+                failure_reason=failure,
+                now=self._now(),
+            ):
+                return self._cancelled_result(conn, novel_id, epoch)
+            raise WorldlineRebuildError(failure) from exc
+        if not completed:
+            return self._cancelled_result(conn, novel_id, epoch)
         return {"status": "completed", "generation_epoch": epoch, "rebuilt_chapters": len(rows)}
 
     def status(self, novel_id: str) -> dict[str, Any]:

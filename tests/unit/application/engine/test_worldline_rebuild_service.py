@@ -36,9 +36,10 @@ from domain.novel.value_objects.novel_id import NovelId
 
 
 class _Aftermath:
-    def __init__(self, db, ok: bool = True):
+    def __init__(self, db, ok: bool = True, memory_ready: bool = True):
         self.db = db
         self.ok = ok
+        self.memory_ready = memory_ready
         self.chapters: list[int] = []
 
     async def run_after_chapter_saved(self, novel_id, chapter_number, content, **kwargs):
@@ -100,6 +101,14 @@ class _Aftermath:
             content_revision=content_revision,
             canonical_payload_sha256=payload_sha256,
         )
+        if self.memory_ready:
+            assert repo.finish_memory_sync(
+                novel_id=novel_id,
+                chapter_number=chapter_number,
+                content_sha256=content_sha256,
+                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                content_revision=content_revision,
+            )
         return {
             "narrative_sync_ok": True,
             "commit_status": "committed",
@@ -262,6 +271,83 @@ async def test_cancelled_rebuild_cannot_resume_or_overwrite_the_new_epoch(tmp_pa
         "restart_worldline_rebuild",
     )
     assert run["generation_epoch"] == cancelled["generation_epoch"]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_start_epoch_race_cannot_mutate_new_epoch_run_or_jobs(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-rebuild-start-epoch-race.db"))
+    _seed(db)
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    service = WorldlineRebuildService(db, _Aftermath(db))
+    original_now = service._now
+    raced = False
+
+    def _race_after_worker_read():
+        nonlocal raced
+        if not raced:
+            raced = True
+            conn = db.get_connection()
+            conn.execute(
+                "UPDATE novel_generation_runs SET generation_epoch = 2, state = 'stopped', "
+                "canonical_sync_status = 'failed', next_action = 'restart_worldline_rebuild', "
+                "last_error = 'new epoch owner' WHERE novel_id = 'novel-1'"
+            )
+            conn.execute(
+                "UPDATE worldline_generation_filters SET active_generation_epoch = 2 "
+                "WHERE novel_id = 'novel-1'"
+            )
+            conn.commit()
+        return original_now()
+
+    service._now = _race_after_worker_read
+    result = await service.rebuild("novel-1")
+
+    assert result == {"status": "cancelled", "generation_epoch": 2, "rebuilt_chapters": 0}
+    run = db.fetch_one(
+        "SELECT generation_epoch, state, canonical_sync_status, next_action, last_error "
+        "FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+    )
+    assert tuple(
+        run[field]
+        for field in (
+            "generation_epoch",
+            "state",
+            "canonical_sync_status",
+            "next_action",
+            "last_error",
+        )
+    ) == (2, "stopped", "failed", "restart_worldline_rebuild", "new epoch owner")
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM worldline_rebuild_jobs "
+        "WHERE novel_id = 'novel-1' AND generation_epoch = 1 AND status = 'pending'"
+    )["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_rebuild_keeps_retry_state_when_exact_aftermath_memory_is_not_ready(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-rebuild-memory-barrier.db"))
+    _seed(db)
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    service = WorldlineRebuildService(db, _Aftermath(db, memory_ready=False))
+
+    with pytest.raises(WorldlineRebuildError):
+        await service.rebuild("novel-1")
+
+    run = db.fetch_one(
+        "SELECT state, canonical_sync_status, next_action FROM novel_generation_runs "
+        "WHERE novel_id = 'novel-1'"
+    )
+    assert tuple(
+        run[field] for field in ("state", "canonical_sync_status", "next_action")
+    ) == ("paused", "failed", "retry_worldline_rebuild")
+    assert db.fetch_one(
+        "SELECT memory_status FROM chapter_narrative_commits "
+        "WHERE novel_id = 'novel-1' AND chapter_number = 1"
+    )["memory_status"] == "not_required"
 
 
 @pytest.mark.asyncio

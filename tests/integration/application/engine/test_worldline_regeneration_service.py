@@ -620,3 +620,106 @@ def test_restore_strips_pre_fix_archived_runtime_summary_payload(tmp_path):
     # Legacy payload is retained only for compatibility and cannot be read
     # while the explicit runtime invalidation marker is present.
     assert metadata["checkpoint_summary"] == "pre-fix legacy fallback"
+
+
+def test_execute_rechecks_formal_identity_inside_write_transaction_before_archiving(tmp_path):
+    """A Formal change after preview validation must roll back the whole reset."""
+
+    db = DatabaseConnection(str(tmp_path / "worldline-execute-inner-formal-race.db"))
+    _seed(db)
+    preview = WorldlineRegenerationService(db).preview(
+        "novel-1", start_chapter=2, target_chapters=6
+    )
+
+    class _FormalRaceWorldlineService(WorldlineRegenerationService):
+        def _ensure_run(self, conn, novel_id, target_chapters):
+            super()._ensure_run(conn, novel_id, target_chapters)
+            conn.execute(
+                "UPDATE chapters SET content = 'raced formal prose', content_sha256 = 'raced-hash' "
+                "WHERE novel_id = ? AND number = 1",
+                (novel_id,),
+            )
+
+    service = _FormalRaceWorldlineService(db)
+    conn = db.get_connection()
+    original = conn.execute(
+        "SELECT content, content_sha256, content_revision FROM chapters "
+        "WHERE novel_id = 'novel-1' AND number = 1"
+    ).fetchone()
+
+    with pytest.raises(WorldlineRegenerationError, match="chapter prefix changed"):
+        service.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+
+    assert tuple(
+        conn.execute(
+            "SELECT content, content_sha256, content_revision FROM chapters "
+            "WHERE novel_id = 'novel-1' AND number = 1"
+        ).fetchone()
+    ) == tuple(original)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM chapters WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 3
+    assert conn.execute(
+        "SELECT consumed_at FROM worldline_regeneration_previews WHERE token = ?",
+        (preview.token,),
+    ).fetchone()[0] is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM worldline_archives WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT 1 FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT 1 FROM outline_planning_heads WHERE novel_id = 'novel-1'"
+    ).fetchone() is None
+
+
+def test_restore_rechecks_generation_epoch_inside_write_transaction_before_archiving(tmp_path):
+    """A newer epoch cannot be overwritten by a restore worker that read stale state."""
+
+    db = DatabaseConnection(str(tmp_path / "worldline-restore-inner-epoch-race.db"))
+    _seed(db)
+    initial = WorldlineRegenerationService(db)
+    preview = initial.preview("novel-1", start_chapter=2, target_chapters=6)
+    archived = initial.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+
+    class _EpochRaceWorldlineService(WorldlineRegenerationService):
+        def _ensure_run(self, conn, novel_id, target_chapters):
+            super()._ensure_run(conn, novel_id, target_chapters)
+            conn.execute(
+                "UPDATE novel_generation_runs SET generation_epoch = generation_epoch + 10 "
+                "WHERE novel_id = ?",
+                (novel_id,),
+            )
+
+    conn = db.get_connection()
+    before_run = tuple(
+        conn.execute(
+            "SELECT generation_epoch, state, canonical_sync_status, next_action "
+            "FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+        ).fetchone()
+    )
+
+    with pytest.raises(WorldlineRegenerationError, match="generation epoch changed"):
+        _EpochRaceWorldlineService(db).restore(
+            "novel-1", archive_id=archived.archive_id, run_mode="chapter_review"
+        )
+
+    assert tuple(
+        conn.execute(
+            "SELECT generation_epoch, state, canonical_sync_status, next_action "
+            "FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+        ).fetchone()
+    ) == before_run
+    assert conn.execute(
+        "SELECT COUNT(*) FROM worldline_archives WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT status FROM worldline_archives WHERE id = ?", (archived.archive_id,)
+    ).fetchone()[0] == "archived"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM chapters WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT 1 FROM outline_planning_heads WHERE novel_id = 'novel-1'"
+    ).fetchone() is None

@@ -111,6 +111,436 @@ class WorldlineRegenerationService:
         ).fetchone()
         return int(row["generation_epoch"] or 0) if row else 0
 
+    @staticmethod
+    def _stable_digest(value: Any) -> str:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _generation_filter_snapshot(
+        self, conn: sqlite3.Connection, novel_id: str
+    ) -> dict[str, Any]:
+        try:
+            row = conn.execute(
+                "SELECT active_generation_epoch FROM worldline_generation_filters WHERE novel_id = ?",
+                (novel_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise WorldlineRegenerationError(
+                "worldline generation filter is unavailable"
+            ) from exc
+        if row is None:
+            return {"exists": False, "active_generation_epoch": None}
+        return {
+            "exists": True,
+            "active_generation_epoch": int(row["active_generation_epoch"] or 0),
+        }
+
+    def _generation_run_snapshot(
+        self, conn: sqlite3.Connection, novel_id: str
+    ) -> Optional[dict[str, Any]]:
+        row = conn.execute(
+            """
+            SELECT run_mode, state, generation_epoch, target_chapters,
+                   current_formal_chapter, current_candidate_id,
+                   current_candidate_chapter, canonical_sync_status,
+                   next_action, last_error, max_pending_candidates, prefetch
+            FROM novel_generation_runs
+            WHERE novel_id = ?
+            """,
+            (novel_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "run_mode": str(row["run_mode"] or "continuous"),
+            "state": str(row["state"] or "stopped"),
+            "generation_epoch": int(row["generation_epoch"] or 0),
+            "target_chapters": int(row["target_chapters"] or 0),
+            "current_formal_chapter": int(row["current_formal_chapter"] or 0),
+            "current_candidate_id": (
+                str(row["current_candidate_id"])
+                if row["current_candidate_id"] is not None
+                else None
+            ),
+            "current_candidate_chapter": (
+                int(row["current_candidate_chapter"])
+                if row["current_candidate_chapter"] is not None
+                else None
+            ),
+            "canonical_sync_status": str(row["canonical_sync_status"] or "ready"),
+            "next_action": str(row["next_action"] or ""),
+            "last_error": str(row["last_error"] or ""),
+            "max_pending_candidates": int(row["max_pending_candidates"] or 1),
+            "prefetch": int(row["prefetch"] or 0),
+        }
+
+    def _formal_identity_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: str,
+        *,
+        allow_unproven_tail: bool = False,
+    ) -> dict[str, Any]:
+        """Capture the unique, continuous Formal prefix by exact identity."""
+
+        candidates = ChapterCandidateRepository(self._db or self.db_path)
+        try:
+            formal_head, blockers = candidates.formal_history_snapshot(novel_id)
+            if blockers and not allow_unproven_tail:
+                raise CandidateGateError("formal history has an unproven completed tail")
+            rows = conn.execute(
+                """
+                SELECT id, number, content, content_sha256, content_revision, status
+                FROM chapters
+                WHERE novel_id = ? AND number <= ?
+                ORDER BY number, id
+                """,
+                (novel_id, int(formal_head)),
+            ).fetchall()
+            identities: list[dict[str, Any]] = []
+            for expected_number, row in enumerate(rows, start=1):
+                content = str(row["content"] or "")
+                actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if (
+                    int(row["number"] or 0) != expected_number
+                    or str(row["status"] or "") != "completed"
+                    or not content.strip()
+                    or str(row["content_sha256"] or "") != actual_hash
+                    or int(row["content_revision"] or 0) < 1
+                ):
+                    raise CandidateGateError("formal chapter authority mismatch")
+                identities.append(
+                    {
+                        "chapter_number": expected_number,
+                        "chapter_id": str(row["id"]),
+                        "content_sha256": actual_hash,
+                        "content_revision": int(row["content_revision"] or 0),
+                    }
+                )
+            if len(identities) != int(formal_head):
+                raise CandidateGateError("formal history is not continuous")
+        except CandidateGateError as exc:
+            raise WorldlineRegenerationError(
+                "chapter prefix changed; request a new worldline preview"
+            ) from exc
+        return {
+            "formal_head": int(formal_head),
+            "formal_identity_digest": self._stable_digest(identities),
+        }
+
+    def _chapter_identity_digest(self, conn: sqlite3.Connection, novel_id: str) -> str:
+        rows = conn.execute(
+            """
+            SELECT id, number, content, content_sha256, content_revision, status
+            FROM chapters
+            WHERE novel_id = ?
+            ORDER BY number, id
+            """,
+            (novel_id,),
+        ).fetchall()
+        identities = [
+            {
+                "id": str(row["id"]),
+                "number": int(row["number"]),
+                "content_sha256": hashlib.sha256(
+                    str(row["content"] or "").encode("utf-8")
+                ).hexdigest(),
+                "stored_content_sha256": str(row["content_sha256"] or ""),
+                "content_revision": int(row["content_revision"] or 0),
+                "status": str(row["status"] or ""),
+            }
+            for row in rows
+        ]
+        return self._stable_digest(identities)
+
+    def _worldline_authority_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: str,
+        *,
+        retained_through: int,
+        allow_unproven_tail: bool = False,
+    ) -> dict[str, Any]:
+        formal = self._formal_identity_snapshot(
+            conn,
+            novel_id,
+            allow_unproven_tail=allow_unproven_tail,
+        )
+        epoch = self._generation_epoch(conn, novel_id)
+        generation_filter = self._generation_filter_snapshot(conn, novel_id)
+        return {
+            **formal,
+            "retained_through": int(retained_through),
+            "prefix_digest": self._prefix_digest(conn, novel_id, retained_through),
+            "chapter_identity_digest": self._chapter_identity_digest(conn, novel_id),
+            "generation_epoch": epoch,
+            "worldline_filter": generation_filter,
+            "run": self._generation_run_snapshot(conn, novel_id),
+        }
+
+    @staticmethod
+    def _assert_snapshot_filter_is_consistent(snapshot: dict[str, Any]) -> None:
+        generation_filter = snapshot["worldline_filter"]
+        epoch = int(snapshot["generation_epoch"])
+        if generation_filter["exists"]:
+            if int(generation_filter["active_generation_epoch"] or 0) != epoch:
+                raise WorldlineRegenerationError("worldline generation filter changed")
+        elif epoch != 0:
+            raise WorldlineRegenerationError("worldline generation filter is unavailable")
+
+    @staticmethod
+    def _is_default_created_run(
+        run: Optional[dict[str, Any]], *, expected_epoch: int, target_chapters: int
+    ) -> bool:
+        return run == {
+            "run_mode": "continuous",
+            "state": "stopped",
+            "generation_epoch": int(expected_epoch),
+            "target_chapters": int(target_chapters),
+            "current_formal_chapter": 0,
+            "current_candidate_id": None,
+            "current_candidate_chapter": None,
+            "canonical_sync_status": "ready",
+            "next_action": "",
+            "last_error": "",
+            "max_pending_candidates": 1,
+            "prefetch": 0,
+        }
+
+    def _assert_authority_snapshot_matches(
+        self,
+        expected: dict[str, Any],
+        actual: dict[str, Any],
+        *,
+        allow_created_run: bool = False,
+        target_chapters: int = 0,
+    ) -> None:
+        if int(actual["generation_epoch"]) != int(expected["generation_epoch"]):
+            raise WorldlineRegenerationError(
+                "generation epoch changed; request a new worldline preview"
+            )
+        if actual["worldline_filter"] != expected["worldline_filter"]:
+            raise WorldlineRegenerationError(
+                "worldline generation filter changed; request a new worldline preview"
+            )
+        if int(actual["retained_through"]) != int(expected["retained_through"]):
+            raise WorldlineRegenerationError("worldline preview is invalid")
+        if str(actual["prefix_digest"]) != str(expected["prefix_digest"]):
+            raise WorldlineRegenerationError(
+                "chapter prefix changed; request a new worldline preview"
+            )
+        if (
+            int(actual["formal_head"]) != int(expected["formal_head"])
+            or str(actual["formal_identity_digest"])
+            != str(expected["formal_identity_digest"])
+            or str(actual["chapter_identity_digest"])
+            != str(expected["chapter_identity_digest"])
+        ):
+            raise WorldlineRegenerationError(
+                "chapter tail changed; request a new worldline preview"
+            )
+        expected_run = expected.get("run")
+        actual_run = actual.get("run")
+        if expected_run == actual_run:
+            return
+        if (
+            expected_run is None
+            and allow_created_run
+            and self._is_default_created_run(
+                actual_run,
+                expected_epoch=int(expected["generation_epoch"]),
+                target_chapters=int(target_chapters),
+            )
+        ):
+            return
+        raise WorldlineRegenerationError(
+            "generation run changed; request a new worldline preview"
+        )
+
+    @staticmethod
+    def _validate_preview_row(preview_row: sqlite3.Row, preview: dict[str, Any]) -> None:
+        try:
+            matches = (
+                str(preview["novel_id"]) == str(preview_row["novel_id"])
+                and int(preview["start_chapter"]) == int(preview_row["start_chapter"])
+                and int(preview["target_chapters"]) == int(preview_row["target_chapters"])
+                and int(preview["current_generated_chapters"])
+                == int(preview_row["current_generated_chapters"])
+                and int(preview["retained_through"]) == int(preview_row["retained_through"])
+                and str(preview["operation"]) == str(preview_row["operation"])
+                and int(preview["generation_epoch"]) == int(preview_row["generation_epoch"])
+                and str(preview["prefix_digest"]) == str(preview_row["prefix_digest"])
+                and isinstance(preview.get("authority_snapshot"), dict)
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorldlineRegenerationError(
+                "worldline preview is incomplete; request a new preview"
+            ) from exc
+        if not matches:
+            raise WorldlineRegenerationError(
+                "worldline preview changed; request a new preview"
+            )
+
+    def _assert_preview_authority_current(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: str,
+        preview_row: sqlite3.Row,
+        preview: dict[str, Any],
+        *,
+        allow_created_run: bool = False,
+    ) -> dict[str, Any]:
+        self._validate_preview_row(preview_row, preview)
+        expected = preview["authority_snapshot"]
+        if (
+            int(expected.get("retained_through", -1))
+            != int(preview["retained_through"])
+            or int(expected.get("formal_head", -1))
+            != int(preview["current_generated_chapters"])
+            or int(expected.get("generation_epoch", -1))
+            != int(preview["generation_epoch"])
+            or str(expected.get("prefix_digest", "")) != str(preview["prefix_digest"])
+        ):
+            raise WorldlineRegenerationError("worldline preview is invalid")
+        self._assert_snapshot_filter_is_consistent(expected)
+        actual = self._worldline_authority_snapshot(
+            conn,
+            novel_id,
+            retained_through=int(preview["retained_through"]),
+        )
+        self._assert_authority_snapshot_matches(
+            expected,
+            actual,
+            allow_created_run=allow_created_run,
+            target_chapters=int(preview["target_chapters"]),
+        )
+        return actual
+
+    def _archive_source_snapshot(
+        self, conn: sqlite3.Connection, archive_id: str, novel_id: str
+    ) -> tuple[sqlite3.Row, str]:
+        source = conn.execute(
+            "SELECT * FROM worldline_archives WHERE id = ? AND novel_id = ?",
+            (archive_id, novel_id),
+        ).fetchone()
+        if source is None:
+            raise WorldlineRegenerationError("worldline archive was not found for this novel")
+        entries = conn.execute(
+            """
+            SELECT source_table, source_key, chapter_number, payload_json, created_at
+            FROM worldline_archive_entries
+            WHERE archive_id = ?
+            ORDER BY source_table, source_key, chapter_number, created_at
+            """,
+            (archive_id,),
+        ).fetchall()
+        snapshot = {
+            "archive": dict(source),
+            "entries": [dict(row) for row in entries],
+        }
+        return source, self._stable_digest(snapshot)
+
+    def _update_run_for_rebuild(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: str,
+        expected_run: dict[str, Any],
+        run_mode: str,
+        generation_epoch: int,
+        target_chapters: int,
+        current_formal_chapter: int,
+        now: str,
+    ) -> None:
+        cursor = conn.execute(
+            """
+            UPDATE novel_generation_runs
+            SET run_mode = ?, state = 'paused', generation_epoch = ?, target_chapters = ?,
+                current_formal_chapter = ?, current_candidate_id = NULL, current_candidate_chapter = NULL,
+                canonical_sync_status = 'rebuilding', next_action = 'rebuild_worldline', last_error = '',
+                max_pending_candidates = 1, prefetch = 0, updated_at = ?
+            WHERE novel_id = ? AND run_mode = ? AND state = ? AND generation_epoch = ?
+              AND target_chapters = ? AND current_formal_chapter = ?
+              AND current_candidate_id IS ? AND current_candidate_chapter IS ?
+              AND canonical_sync_status = ? AND next_action = ? AND last_error = ?
+              AND max_pending_candidates = ? AND prefetch = ?
+            """,
+            (
+                run_mode,
+                int(generation_epoch),
+                int(target_chapters),
+                int(current_formal_chapter),
+                now,
+                novel_id,
+                expected_run["run_mode"],
+                expected_run["state"],
+                int(expected_run["generation_epoch"]),
+                int(expected_run["target_chapters"]),
+                int(expected_run["current_formal_chapter"]),
+                expected_run["current_candidate_id"],
+                expected_run["current_candidate_chapter"],
+                expected_run["canonical_sync_status"],
+                expected_run["next_action"],
+                expected_run["last_error"],
+                int(expected_run["max_pending_candidates"]),
+                int(expected_run["prefetch"]),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise WorldlineRegenerationError("generation run changed during worldline reset")
+
+    def _advance_generation_filter(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: str,
+        expected_filter: dict[str, Any],
+        generation_epoch: int,
+        now: str,
+    ) -> None:
+        if expected_filter.get("exists"):
+            cursor = conn.execute(
+                """
+                UPDATE worldline_generation_filters
+                SET active_generation_epoch = ?, updated_at = ?
+                WHERE novel_id = ? AND active_generation_epoch = ?
+                """,
+                (
+                    int(generation_epoch),
+                    now,
+                    novel_id,
+                    int(expected_filter["active_generation_epoch"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise WorldlineRegenerationError(
+                    "worldline generation filter changed during worldline reset"
+                )
+            return
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO worldline_generation_filters
+                    (novel_id, active_generation_epoch, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (novel_id, int(generation_epoch), now),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise WorldlineRegenerationError(
+                "worldline generation filter changed during worldline reset"
+            ) from exc
+        if cursor.rowcount != 1:
+            raise WorldlineRegenerationError(
+                "worldline generation filter changed during worldline reset"
+            )
+
     def _formal_chapter_head(self, novel_id: str) -> int:
         candidates = ChapterCandidateRepository(self._db or self.db_path)
         candidates.assert_formal_history_is_proven(novel_id)
@@ -156,7 +586,8 @@ class WorldlineRegenerationService:
         exists = conn.execute("SELECT 1 FROM novels WHERE id = ?", (novel_id,)).fetchone()
         if exists is None:
             raise KeyError(f"novel not found: {novel_id}")
-        generated = self._formal_chapter_head(novel_id)
+        formal = self._formal_identity_snapshot(conn, novel_id)
+        generated = int(formal["formal_head"])
         operation = "continue" if start_chapter > generated else "regenerate"
         retained = generated if operation == "continue" else max(0, start_chapter - 1)
         archive_from = start_chapter if operation == "regenerate" else None
@@ -178,8 +609,18 @@ class WorldlineRegenerationService:
                         (novel_id, start_chapter),
                     ).fetchone()
                     counts[table] = int(item["total"] or 0)
-        prefix_digest = self._prefix_digest(conn, novel_id, retained)
-        epoch = self._generation_epoch(conn, novel_id)
+        authority_snapshot = self._worldline_authority_snapshot(
+            conn,
+            novel_id,
+            retained_through=retained,
+        )
+        self._assert_snapshot_filter_is_consistent(authority_snapshot)
+        if int(authority_snapshot["formal_head"]) != generated:
+            raise WorldlineRegenerationError(
+                "chapter tail changed; request a new worldline preview"
+            )
+        prefix_digest = str(authority_snapshot["prefix_digest"])
+        epoch = int(authority_snapshot["generation_epoch"])
         token = f"worldline-preview-{uuid4()}"
         preview = WorldlinePreview(
             token=token,
@@ -212,7 +653,11 @@ class WorldlineRegenerationService:
                 operation,
                 epoch,
                 prefix_digest,
-                json.dumps(asdict(preview), ensure_ascii=False, sort_keys=True),
+                json.dumps(
+                    {**asdict(preview), "authority_snapshot": authority_snapshot},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             ),
         )
         conn.commit()
@@ -252,19 +697,9 @@ class WorldlineRegenerationService:
 
         if preview_row["consumed_at"] is not None:
             raise WorldlineRegenerationError("preview token was already consumed")
-        try:
-            current_formal_head = self._formal_chapter_head(novel_id)
-        except CandidateGateError as exc:
-            raise WorldlineRegenerationError(
-                "chapter prefix changed; request a new worldline preview"
-            ) from exc
-        if current_formal_head != int(preview["current_generated_chapters"]):
-            raise WorldlineRegenerationError("chapter tail changed; request a new worldline preview")
-        if self._generation_epoch(conn, novel_id) != int(preview["generation_epoch"]):
-            raise WorldlineRegenerationError("generation epoch changed; request a new worldline preview")
+        self._assert_preview_authority_current(conn, novel_id, preview_row, preview)
+        preview_row_digest = self._stable_digest(dict(preview_row))
         retained = int(preview["retained_through"])
-        if self._prefix_digest(conn, novel_id, retained) != str(preview["prefix_digest"]):
-            raise WorldlineRegenerationError("chapter prefix changed; request a new worldline preview")
 
         if operation == "continue":
             run = ChapterCandidateRepository(self._db or self.db_path).start_run(
@@ -304,7 +739,37 @@ class WorldlineRegenerationService:
         now = self._now()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            self._assert_legacy_worldline_allowed(conn, novel_id)
+            locked_preview_row = conn.execute(
+                "SELECT * FROM worldline_regeneration_previews WHERE token = ? AND novel_id = ?",
+                (preview_token, novel_id),
+            ).fetchone()
+            if locked_preview_row is None:
+                raise WorldlineRegenerationError("preview token is invalid for this novel")
+            if self._stable_digest(dict(locked_preview_row)) != preview_row_digest:
+                raise WorldlineRegenerationError(
+                    "worldline preview changed; request a new preview"
+                )
+            if locked_preview_row["consumed_at"] is not None:
+                raise WorldlineRegenerationError("preview token was already consumed")
+            locked_preview = json.loads(locked_preview_row["payload_json"] or "{}")
+            self._assert_preview_authority_current(
+                conn,
+                novel_id,
+                locked_preview_row,
+                locked_preview,
+            )
             self._ensure_run(conn, novel_id, int(preview["target_chapters"]))
+            locked_authority = self._assert_preview_authority_current(
+                conn,
+                novel_id,
+                locked_preview_row,
+                locked_preview,
+                allow_created_run=True,
+            )
+            expected_run = locked_authority.get("run")
+            if expected_run is None:
+                raise WorldlineRegenerationError("generation run was not initialized")
             conn.execute(
                 """
                 INSERT INTO worldline_archives
@@ -326,26 +791,22 @@ class WorldlineRegenerationService:
                 ),
             )
             self._archive_tail(conn, archive_id, novel_id, start)
-            conn.execute(
-                """
-                UPDATE novel_generation_runs
-                SET run_mode = ?, state = 'paused', generation_epoch = ?, target_chapters = ?,
-                    current_formal_chapter = ?, current_candidate_id = NULL, current_candidate_chapter = NULL,
-                    canonical_sync_status = 'rebuilding', next_action = 'rebuild_worldline', last_error = '',
-                    max_pending_candidates = 1, prefetch = 0, updated_at = ?
-                WHERE novel_id = ?
-                """,
-                (run_mode, new_epoch, int(preview["target_chapters"]), retained, now, novel_id),
+            self._update_run_for_rebuild(
+                conn,
+                novel_id=novel_id,
+                expected_run=expected_run,
+                run_mode=run_mode,
+                generation_epoch=new_epoch,
+                target_chapters=int(preview["target_chapters"]),
+                current_formal_chapter=retained,
+                now=now,
             )
-            conn.execute(
-                """
-                INSERT INTO worldline_generation_filters (novel_id, active_generation_epoch, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(novel_id) DO UPDATE SET
-                    active_generation_epoch = excluded.active_generation_epoch,
-                    updated_at = excluded.updated_at
-                """,
-                (novel_id, new_epoch, now),
+            self._advance_generation_filter(
+                conn,
+                novel_id=novel_id,
+                expected_filter=locked_authority["worldline_filter"],
+                generation_epoch=new_epoch,
+                now=now,
             )
             for job_type in ("canonical_facts", "memory", "vectors", "foreshadowing", "macro_summaries"):
                 conn.execute(
@@ -358,12 +819,22 @@ class WorldlineRegenerationService:
                     (f"worldline-job-{uuid4()}", novel_id, new_epoch, archive_id, job_type, now, now),
                 )
             self._pause_legacy_autopilot(conn, novel_id)
-            conn.execute(
-                "UPDATE worldline_archives SET status = 'archived' WHERE id = ?", (archive_id,)
+            archived = conn.execute(
+                "UPDATE worldline_archives SET status = 'archived' WHERE id = ? AND status = 'archiving'",
+                (archive_id,),
             )
-            conn.execute(
-                "UPDATE worldline_regeneration_previews SET consumed_at = ? WHERE token = ?", (now, preview_token)
+            if archived.rowcount != 1:
+                raise WorldlineRegenerationError("worldline archive changed during reset")
+            consumed = conn.execute(
+                """
+                UPDATE worldline_regeneration_previews
+                SET consumed_at = ?
+                WHERE token = ? AND novel_id = ? AND consumed_at IS NULL
+                """,
+                (now, preview_token, novel_id),
             )
+            if consumed.rowcount != 1:
+                raise WorldlineRegenerationError("preview token was already consumed")
             result = WorldlineRegenerationResult(
                 operation="regenerate",
                 novel_id=novel_id,
@@ -382,7 +853,7 @@ class WorldlineRegenerationService:
                     (novel_id, idempotency_key, archive_id, json.dumps(asdict(result), ensure_ascii=False)),
                 )
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         return result
@@ -432,12 +903,11 @@ class WorldlineRegenerationService:
             raise WorldlineRegenerationError("run_mode must be continuous or chapter_review")
         conn = self._connection()
         self._assert_legacy_worldline_allowed(conn, novel_id)
-        source = conn.execute(
-            "SELECT * FROM worldline_archives WHERE id = ? AND novel_id = ?",
-            (archive_id, novel_id),
-        ).fetchone()
-        if source is None:
-            raise WorldlineRegenerationError("worldline archive was not found for this novel")
+        source, source_snapshot_digest = self._archive_source_snapshot(
+            conn,
+            archive_id,
+            novel_id,
+        )
         if str(source["status"]) not in {"archived", "restored"}:
             raise WorldlineRegenerationError("worldline archive is not ready to restore")
         if idempotency_key:
@@ -454,7 +924,14 @@ class WorldlineRegenerationService:
         start = int(source["start_chapter"])
         retained = int(source["retained_through"])
         source_prefix = str(source["prefix_digest"] or "")
-        if source_prefix and self._prefix_digest(conn, novel_id, retained) != source_prefix:
+        authority_snapshot = self._worldline_authority_snapshot(
+            conn,
+            novel_id,
+            retained_through=retained,
+            allow_unproven_tail=True,
+        )
+        self._assert_snapshot_filter_is_consistent(authority_snapshot)
+        if source_prefix and authority_snapshot["prefix_digest"] != source_prefix:
             raise WorldlineRegenerationError("the retained prefix changed; create a new regeneration plan instead")
 
         current_max_row = conn.execute(
@@ -468,7 +945,43 @@ class WorldlineRegenerationService:
         now = self._now()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            self._assert_legacy_worldline_allowed(conn, novel_id)
+            locked_source, locked_source_snapshot_digest = self._archive_source_snapshot(
+                conn,
+                archive_id,
+                novel_id,
+            )
+            if locked_source_snapshot_digest != source_snapshot_digest:
+                raise WorldlineRegenerationError(
+                    "worldline archive changed; create a new regeneration plan instead"
+                )
+            if str(locked_source["status"]) not in {"archived", "restored"}:
+                raise WorldlineRegenerationError("worldline archive is not ready to restore")
+            self._assert_authority_snapshot_matches(
+                authority_snapshot,
+                self._worldline_authority_snapshot(
+                    conn,
+                    novel_id,
+                    retained_through=retained,
+                    allow_unproven_tail=True,
+                ),
+            )
             self._ensure_run(conn, novel_id, int(source["target_chapters"]))
+            locked_authority = self._worldline_authority_snapshot(
+                conn,
+                novel_id,
+                retained_through=retained,
+                allow_unproven_tail=True,
+            )
+            self._assert_authority_snapshot_matches(
+                authority_snapshot,
+                locked_authority,
+                allow_created_run=True,
+                target_chapters=int(source["target_chapters"]),
+            )
+            expected_run = locked_authority.get("run")
+            if expected_run is None:
+                raise WorldlineRegenerationError("generation run was not initialized")
             conn.execute(
                 """
                 INSERT INTO worldline_archives
@@ -499,37 +1012,41 @@ class WorldlineRegenerationService:
                 (novel_id,),
             ).fetchone()
             restored_max = int(restored_max_row["max_number"] or 0)
-            conn.execute(
-                """
-                UPDATE novel_generation_runs
-                SET run_mode = ?, state = 'paused', generation_epoch = ?, target_chapters = ?,
-                    current_formal_chapter = ?, current_candidate_id = NULL, current_candidate_chapter = NULL,
-                    canonical_sync_status = 'rebuilding', next_action = 'rebuild_worldline', last_error = '',
-                    max_pending_candidates = 1, prefetch = 0, updated_at = ?
-                WHERE novel_id = ?
-                """,
-                (run_mode, new_epoch, int(source["target_chapters"]), restored_max, now, novel_id),
+            self._update_run_for_rebuild(
+                conn,
+                novel_id=novel_id,
+                expected_run=expected_run,
+                run_mode=run_mode,
+                generation_epoch=new_epoch,
+                target_chapters=int(source["target_chapters"]),
+                current_formal_chapter=restored_max,
+                now=now,
             )
-            conn.execute(
-                """
-                INSERT INTO worldline_generation_filters (novel_id, active_generation_epoch, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(novel_id) DO UPDATE SET
-                    active_generation_epoch = excluded.active_generation_epoch,
-                    updated_at = excluded.updated_at
-                """,
-                (novel_id, new_epoch, now),
+            self._advance_generation_filter(
+                conn,
+                novel_id=novel_id,
+                expected_filter=locked_authority["worldline_filter"],
+                generation_epoch=new_epoch,
+                now=now,
             )
             self._queue_rebuild_jobs(conn, novel_id, new_epoch, replacement_archive_id, now)
             self._pause_legacy_autopilot(conn, novel_id)
-            conn.execute(
-                "UPDATE worldline_archives SET status = 'archived' WHERE id = ?",
+            replacement_archived = conn.execute(
+                "UPDATE worldline_archives SET status = 'archived' WHERE id = ? AND status = 'archiving'",
                 (replacement_archive_id,),
             )
-            conn.execute(
-                "UPDATE worldline_archives SET status = 'restored', restored_at = ? WHERE id = ?",
-                (now, archive_id),
+            if replacement_archived.rowcount != 1:
+                raise WorldlineRegenerationError("worldline archive changed during restore")
+            source_restored = conn.execute(
+                """
+                UPDATE worldline_archives
+                SET status = 'restored', restored_at = ?
+                WHERE id = ? AND novel_id = ? AND status = ?
+                """,
+                (now, archive_id, novel_id, str(locked_source["status"])),
             )
+            if source_restored.rowcount != 1:
+                raise WorldlineRegenerationError("worldline archive changed during restore")
             result = WorldlineRegenerationResult(
                 operation="restore",
                 novel_id=novel_id,
@@ -548,7 +1065,7 @@ class WorldlineRegenerationService:
                     (novel_id, idempotency_key, replacement_archive_id, json.dumps(asdict(result), ensure_ascii=False)),
                 )
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         return result
