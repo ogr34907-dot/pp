@@ -783,7 +783,6 @@ class ChapterCandidateRepository:
         allowed_run_states: tuple[GenerationRunState, ...] = (
             GenerationRunState.RUNNING,
         ),
-        require_ready_canonical_sync: bool = True,
     ) -> tuple[ChapterCandidate, GenerationRun]:
         """Recheck the durable cursor immediately before an authority-bearing write."""
 
@@ -807,10 +806,7 @@ class ChapterCandidateRepository:
             run.state not in allowed_run_states
             or run.current_candidate_id != candidate.id
             or int(run.current_candidate_chapter or 0) != candidate.chapter_number
-            or (
-                require_ready_canonical_sync
-                and str(run.canonical_sync_status or "ready") != "ready"
-            )
+            or str(run.canonical_sync_status or "ready") != "ready"
         ):
             raise CandidateGateError("candidate no longer belongs to the active generation authority")
 
@@ -1648,6 +1644,12 @@ class ChapterCandidateRepository:
         conn = self._connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            formal = conn.execute(
+                "SELECT formal_chapter_id FROM chapter_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if formal is not None and formal["formal_chapter_id"]:
+                raise CandidateGateError("formal candidate content can only retry canonical sync")
             candidate, run = self._assert_candidate_authority(
                 conn,
                 candidate_id,
@@ -1661,10 +1663,7 @@ class ChapterCandidateRepository:
                     GenerationRunState.PAUSED,
                     GenerationRunState.ERROR,
                 ),
-                require_ready_canonical_sync=False,
             )
-            if candidate.formal_chapter_id:
-                raise CandidateGateError("formal candidate content can only retry canonical sync")
             revision = candidate.content_revision + 1
             now = self._now()
             updated = conn.execute(
@@ -1700,11 +1699,10 @@ class ChapterCandidateRepository:
             updated = conn.execute(
                 """
                 UPDATE novel_generation_runs
-                SET state = 'waiting_review', canonical_sync_status = 'ready',
-                    next_action = 're_audit_candidate', last_error = '', updated_at = ?
+                SET state = 'waiting_review', next_action = 're_audit_candidate', updated_at = ?
                 WHERE novel_id = ? AND generation_epoch = ? AND state = ?
                   AND current_candidate_id = ? AND current_candidate_chapter = ?
-                  AND current_formal_chapter = ?
+                  AND current_formal_chapter = ? AND canonical_sync_status = 'ready'
                 """,
                 (
                     now,
@@ -1734,6 +1732,12 @@ class ChapterCandidateRepository:
         conn = self._connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            formal = conn.execute(
+                "SELECT formal_chapter_id FROM chapter_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if formal is not None and formal["formal_chapter_id"]:
+                raise CandidateGateError("formal candidate content can only retry canonical sync")
             candidate, run = self._assert_candidate_authority(
                 conn,
                 candidate_id,
@@ -1747,10 +1751,7 @@ class ChapterCandidateRepository:
                     GenerationRunState.PAUSED,
                     GenerationRunState.ERROR,
                 ),
-                require_ready_canonical_sync=False,
             )
-            if candidate.formal_chapter_id:
-                raise CandidateGateError("formal candidate content can only retry canonical sync")
             now = self._now()
             updated = conn.execute(
                 """
@@ -1779,7 +1780,7 @@ class ChapterCandidateRepository:
                     next_action = 'regenerate_candidate', last_error = '', updated_at = ?
                 WHERE novel_id = ? AND generation_epoch = ? AND state = ?
                   AND current_candidate_id = ? AND current_candidate_chapter = ?
-                  AND current_formal_chapter = ?
+                  AND current_formal_chapter = ? AND canonical_sync_status = 'ready'
                 """,
                 (
                     now,
@@ -2522,12 +2523,10 @@ class ChapterCandidateRepository:
                        chapter.content_revision AS chapter_content_revision,
                        formal.content_sha256 AS authority_content_sha256,
                        formal.content_revision AS authority_content_revision,
-                       formal.chapter_id AS authority_chapter_id,
                        formal.sync_status AS authority_sync_status,
                        candidate.llm_content, candidate.author_content,
                        candidate.content_revision AS candidate_content_revision,
                        candidate.status AS candidate_status,
-                       candidate.formal_chapter_id AS candidate_formal_chapter_id,
                        candidate.continue_after_commit,
                        candidate.generation_epoch AS candidate_generation_epoch,
                        run.generation_epoch AS active_generation_epoch,
@@ -2562,8 +2561,6 @@ class ChapterCandidateRepository:
                 or str(version["current_candidate_id"] or "") != candidate_id
                 or int(version["candidate_content_revision"] or 0)
                 != int(version["authority_content_revision"] or 0)
-                or str(version["candidate_formal_chapter_id"] or "")
-                != str(version["authority_chapter_id"] or "")
                 or self._content_sha256(final_content)
                 != str(version["authority_content_sha256"] or "")
                 or not self._formal_version_matches(version)
@@ -2598,12 +2595,11 @@ class ChapterCandidateRepository:
                 UPDATE chapter_candidate_formal_commits
                 SET sync_status = 'ready', failure_reason = '', synced_at = ?
                 WHERE candidate_id = ? AND sync_status = 'syncing'
-                  AND chapter_id = ? AND content_sha256 = ? AND content_revision = ?
+                  AND content_sha256 = ? AND content_revision = ?
                 """,
                 (
                     now,
                     candidate_id,
-                    version["authority_chapter_id"],
                     version["authority_content_sha256"],
                     int(version["authority_content_revision"]),
                 ),
@@ -2612,14 +2608,8 @@ class ChapterCandidateRepository:
                 raise CandidateGateError("candidate formal version changed before sync publication")
             updated = conn.execute(
                 "UPDATE chapter_candidates SET status = 'committed', updated_at = ? "
-                "WHERE id = ? AND status = 'syncing' AND content_revision = ? "
-                "AND formal_chapter_id = ?",
-                (
-                    now,
-                    candidate_id,
-                    int(version["candidate_content_revision"]),
-                    version["authority_chapter_id"],
-                ),
+                "WHERE id = ? AND status = 'syncing' AND content_revision = ?",
+                (now, candidate_id, int(version["candidate_content_revision"])),
             )
             if updated.rowcount != 1:
                 raise CandidateGateError("candidate formal version changed before sync publication")

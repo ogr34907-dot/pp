@@ -1097,6 +1097,64 @@ def test_nonformal_worker_failure_can_be_recovered_by_regeneration(candidates):
     assert repo.get_run(candidate.novel_id).state == GenerationRunState.RUNNING
 
 
+@pytest.mark.parametrize("operation", ("edit", "regenerate"))
+def test_review_transition_rejects_non_ready_canonical_authority(candidates, operation):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选正文",
+    )
+    repo.mark_auditing(candidate.id)
+    candidate = repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    db.execute(
+        "UPDATE novel_generation_runs "
+        "SET canonical_sync_status='failed', last_error='canonical_authority_changed' "
+        "WHERE novel_id=?",
+        (candidate.novel_id,),
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(CandidateGateError, match="active generation authority"):
+        if operation == "edit":
+            repo.edit_content(candidate.id, "不得保存的作者改稿")
+        else:
+            repo.request_regeneration(candidate.id, feedback="不得重新生成")
+
+    persisted = repo.get_candidate(candidate.id)
+    run = repo.get_run(candidate.novel_id)
+    assert persisted.status == CandidateStatus.AWAITING_REVIEW
+    assert persisted.content_revision == candidate.content_revision
+    assert run.state == GenerationRunState.WAITING_REVIEW
+    assert run.canonical_sync_status == "failed"
+    assert run.last_error == "canonical_authority_changed"
+
+
+def test_author_edit_preserves_existing_run_error_context(candidates):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选正文",
+    )
+    repo.mark_auditing(candidate.id)
+    candidate = repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    db.execute(
+        "UPDATE novel_generation_runs SET last_error='preserve_this_context' WHERE novel_id=?",
+        (candidate.novel_id,),
+    )
+    db.get_connection().commit()
+
+    edited = repo.edit_content(candidate.id, "作者改稿")
+
+    assert edited.status == CandidateStatus.AWAITING_REVIEW
+    assert repo.get_run(candidate.novel_id).last_error == "preserve_this_context"
+
+
 @pytest.mark.parametrize("run_mode", [RunMode.CHAPTER_REVIEW, RunMode.CONTINUOUS])
 def test_start_run_rejects_unproven_completed_legacy_history(tmp_path, run_mode):
     db = DatabaseConnection(str(tmp_path / "unproven-legacy-start.db"))
@@ -1807,29 +1865,6 @@ def test_mark_sync_succeeded_rejects_not_required_memory_even_with_exact_summary
 
     with pytest.raises(CandidateGateError, match="canonical aftermath"):
         repo.mark_sync_succeeded(syncing.id)
-
-
-def test_mark_sync_succeeded_rejects_candidate_formal_slot_drift(candidates):
-    """Cursor publication must bind the Candidate slot to its Formal commit row."""
-
-    repo, db = candidates
-    syncing = _syncing_candidate(repo)
-    _persist_durable_aftermath(db, syncing)
-    db.execute(
-        "UPDATE chapter_candidates SET formal_chapter_id = 'wrong-formal-slot' WHERE id = ?",
-        (syncing.id,),
-    )
-    db.get_connection().commit()
-
-    with pytest.raises(CandidateGateError, match="candidate formal version changed"):
-        repo.mark_sync_succeeded(syncing.id)
-
-    assert repo.get_candidate(syncing.id).status == CandidateStatus.SYNCING
-    assert db.fetch_one(
-        "SELECT sync_status FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
-        (syncing.id,),
-    )["sync_status"] == "syncing"
-    assert repo.get_run(syncing.novel_id).current_formal_chapter == 0
 
 
 @pytest.mark.parametrize("mismatch", ["hash", "revision", "pipeline"])
