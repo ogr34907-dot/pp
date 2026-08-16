@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from application.blueprint.services.outline_contract_service import OutlineContractService
 from application.blueprint.services.outline_draft_generation_service import (
@@ -23,13 +23,20 @@ from infrastructure.persistence.database.chapter_candidate_repository import (
     ChapterCandidateRepository,
 )
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+from infrastructure.persistence.database.planning_authority_guard import (
+    PlanningAuthorityError,
+    assert_legacy_planning_mutation_allowed,
+)
 from interfaces.api import dependencies as api_dependencies
 
 
 router = APIRouter(prefix="/outline", tags=["outline-studio"])
+_MANIFEST_AUTHORITY_DETAIL = "manifest_planning_authority"
 
 
 class OutlinePayloadDTO(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     title: str = ""
     narrative_text: str = ""
     creative_goal: str = ""
@@ -105,6 +112,8 @@ def _slot_to_dict(slot: OutlineContractSlot) -> dict[str, Any]:
 
 
 def _raise_contract_error(exc: Exception) -> None:
+    if isinstance(exc, PlanningAuthorityError):
+        raise HTTPException(status_code=410, detail=_MANIFEST_AUTHORITY_DETAIL) from exc
     if isinstance(exc, KeyError):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if isinstance(exc, OutlineGateError):
@@ -112,6 +121,14 @@ def _raise_contract_error(exc: Exception) -> None:
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     raise exc
+
+
+def _assert_legacy_outline_mutation_allowed(
+    service: OutlineContractService, novel_id: str, operation: str
+) -> None:
+    assert_legacy_planning_mutation_allowed(
+        service.contract_repository._connection(), novel_id, operation=operation
+    )
 
 
 @router.get("/novels/{novel_id}/tree")
@@ -211,6 +228,7 @@ def bind_story_node_to_outline_contract(
     """Open the next logical level only after its parent plan is synced."""
 
     try:
+        _assert_legacy_outline_mutation_allowed(service, novel_id, "bind_story_node")
         slot = service.ensure_contract_for_story_node(novel_id, story_node_id)
         return {"success": True, "data": _slot_to_dict(slot)}
     except Exception as exc:

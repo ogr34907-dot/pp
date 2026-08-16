@@ -169,6 +169,7 @@ const message = useMessage()
 const dialog = useDialog()
 
 const loading = ref(false)
+const manifestAuthority = ref(false)
 /** 并发 loadTree 时用深度计数维护 loading，避免先结束的请求把 loading 关掉导致空态与 spin 来回闪 */
 let loadTreeDepth = 0
 /** 只采纳最近一次 loadTree 的响应，避免慢请求覆盖新数据造成树/空态来回切 */
@@ -496,6 +497,7 @@ const addChildPlaceholder = computed(() => {
 
 // 右键菜单选项（根据节点类型动态生成）
 const menuOptions = computed(() => {
+  if (manifestAuthority.value) return []
   const node = menuTargetNode.value
   if (!node) return []
   const items: any[] = [
@@ -656,6 +658,9 @@ const loadTree = async () => {
       return
     }
     const nodes = Array.isArray(res.tree) ? res.tree : (res.tree?.nodes ?? [])
+    manifestAuthority.value = Boolean(
+      (res as typeof res & { manifest_authority?: boolean }).manifest_authority
+    )
     treeData.value = nodes.length > 0 ? nodes.map(convertToTreeNode) : buildChapterFallbackTree()
 
     const hasData = treeData.value.length > 0
@@ -751,6 +756,7 @@ const handleSelect = (keys: string[]) => {
 
 // 右键菜单
 const handleContextMenu = (e: MouseEvent, node: StoryNode) => {
+  if (manifestAuthority.value) return
   e.preventDefault()
   e.stopPropagation()
   menuTargetNode.value = node
@@ -763,6 +769,7 @@ const closeMenu = () => { menuVisible.value = false }
 
 const handleMenuSelect = (key: string) => {
   closeMenu()
+  if (manifestAuthority.value) return
   const node = menuTargetNode.value
   if (!node) return
   if (key === 'rename') {
@@ -793,6 +800,7 @@ const handleMenuSelect = (key: string) => {
 }
 
 const doRename = async () => {
+  if (manifestAuthority.value) return
   const node = menuTargetNode.value
   if (!node || !renameValue.value.trim()) return
   showRename.value = false
@@ -812,6 +820,7 @@ const childTypeMap: Record<string, string> = {
 }
 
 const doAddChild = async () => {
+  if (manifestAuthority.value) return
   const node = menuTargetNode.value
   if (!node || !addChildValue.value.trim()) return
   showAddChild.value = false
@@ -996,7 +1005,7 @@ const nodeProps = ({ option }: { option: any }) => {
   const base = {
     class: `node-level-${lv}`,
   }
-  if (isMacroPreviewTree.value || node.metadata?.syntheticTreeFallback) {
+  if (isMacroPreviewTree.value || manifestAuthority.value || node.metadata?.syntheticTreeFallback) {
     return base
   }
   return {

@@ -265,8 +265,13 @@ async function approve(continueAfterCommit: boolean) {
     if (!continueAfterCommit) return
     // This remains deliberately one-at-a-time: review mode triggers only the
     // next candidate after the formal sync succeeds; continuous keeps running.
-    if (run.value?.run_mode === 'continuous') void generationApi.runContinuous(novelId.value)
-    else void generationApi.generateNext(novelId.value)
+    try {
+      if (run.value?.run_mode === 'continuous') await generationApi.runContinuous(novelId.value)
+      else await generationApi.generateNext(novelId.value)
+    } catch (cause) {
+      await refresh({ force: true })
+      throw cause
+    }
   }, continueAfterCommit ? '已正式提交；正在按所选模式推进。' : '已正式提交并暂停。')
 }
 async function reject() {

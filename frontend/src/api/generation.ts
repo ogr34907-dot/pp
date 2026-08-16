@@ -18,6 +18,7 @@ export interface OutlineRevision {
 }
 
 export interface OutlinePayload {
+  [key: string]: unknown
   title?: string
   narrative_text?: string
   creative_goal?: string
@@ -314,7 +315,7 @@ export interface OutlineDraftStreamEvent {
 /** Consume the durable outline attempt stream. */
 export async function consumeOutlineDraftStream(
   contractId: string,
-  onEvent: (event: OutlineDraftStreamEvent) => void,
+  onEvent: (event: OutlineDraftStreamEvent) => void | Promise<void>,
   signal?: AbortSignal,
   retryAttemptId?: string,
 ): Promise<void> {
@@ -327,13 +328,15 @@ export async function consumeOutlineDraftStream(
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
-  const dispatch = (frame: string) => {
+  const dispatch = async (frame: string) => {
     const raw = frame.split(/\r?\n/)
       .filter(line => line.startsWith('data:'))
       .map(line => line.slice(5).trimStart())
       .join('\n')
     if (!raw) return
-    try { onEvent(JSON.parse(raw) as OutlineDraftStreamEvent) } catch { /* ignore malformed keepalive */ }
+    let event: OutlineDraftStreamEvent
+    try { event = JSON.parse(raw) as OutlineDraftStreamEvent } catch { return }
+    await onEvent(event)
   }
   try {
     while (true) {
@@ -341,13 +344,13 @@ export async function consumeOutlineDraftStream(
       buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
       let boundary = buffer.search(/\r?\n\r?\n/)
       while (boundary >= 0) {
-        dispatch(buffer.slice(0, boundary))
+        await dispatch(buffer.slice(0, boundary))
         buffer = buffer.slice(boundary).replace(/^\r?\n\r?\n/, '')
         boundary = buffer.search(/\r?\n\r?\n/)
       }
       if (done) break
     }
-    if (buffer.trim()) dispatch(buffer)
+    if (buffer.trim()) await dispatch(buffer)
   } finally {
     reader.releaseLock()
   }

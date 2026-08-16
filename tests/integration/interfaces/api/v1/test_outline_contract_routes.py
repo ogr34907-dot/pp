@@ -60,3 +60,50 @@ def test_outline_generation_attempt_can_be_recovered_and_cancelled(client, db, t
     )
     assert cancelled.status_code == 200
     assert cancelled.json()["data"]["status"] == "cancelled"
+
+
+def test_outline_draft_preserves_unknown_payload_fields_in_extra(client, test_novel_id):
+    root = client.get(f"/api/v1/outline/novels/{test_novel_id}/tree").json()["data"]
+    payload = {
+        "title": "Forward-compatible outline",
+        "state_changes": {"characters": [{"id": "hero", "to": "resolved"}]},
+        "foreshadowing": {"setup": ["a sealed letter"], "payoff": ["the seal breaks"]},
+        "extra": {"schema_version": 3},
+        "field_provenance": {"title": "manifest-import"},
+        "field_locks": {"creative_goal": True},
+        "future_schema_field": {"retained": True},
+    }
+
+    response = client.post(
+        f"/api/v1/outline/contracts/{root['id']}/draft",
+        json={"source": "author", "payload": payload},
+    )
+
+    assert response.status_code == 200
+    saved = response.json()["data"]["draft"]["payload"]
+    assert saved["state_changes"] == payload["state_changes"]
+    assert saved["foreshadowing"] == payload["foreshadowing"]
+    assert saved["extra"] == {
+        "schema_version": 3,
+        "field_provenance": payload["field_provenance"],
+        "field_locks": payload["field_locks"],
+        "future_schema_field": payload["future_schema_field"],
+    }
+
+    round_trip = client.post(
+        f"/api/v1/outline/contracts/{root['id']}/draft",
+        json={"source": "author", "payload": saved},
+    )
+    assert round_trip.status_code == 200
+    assert round_trip.json()["data"]["draft"]["payload"] == saved
+
+
+def test_legacy_outline_publish_without_a_draft_remains_conflict(client, db, test_novel_id):
+    root = OutlineContractRepository(db).ensure_root(test_novel_id)
+
+    response = client.post(
+        f"/api/v1/outline/contracts/{root.id}/publish",
+        json={"expected_revision": 1, "idempotency_key": "missing-draft"},
+    )
+
+    assert response.status_code == 409

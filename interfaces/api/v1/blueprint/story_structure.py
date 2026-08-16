@@ -13,11 +13,17 @@ from infrastructure.persistence.database.story_node_repository import StoryNodeR
 from infrastructure.persistence.database.chapter_element_repository import ChapterElementRepository
 from infrastructure.persistence.database.sqlite_chapter_repository import SqliteChapterRepository
 from infrastructure.persistence.database.connection import get_database
+from infrastructure.persistence.database.planning_authority_guard import (
+    PlanningAuthorityError,
+    assert_story_node_write_allowed,
+    is_manifest_authority,
+)
 from application.paths import get_db_path
 import os
 
 
 router = APIRouter(tags=["story-structure"])
+_MANIFEST_AUTHORITY_DETAIL = "manifest_planning_authority"
 
 
 def get_planning_service() -> ContinuousPlanningService:
@@ -88,6 +94,26 @@ class ReorderRequest(BaseModel):
     node_ids: List[str]
 
 
+def _structure_repository_connection(service: StoryStructureService):
+    return service.repository._get_connection()
+
+
+def _manifest_authority(service: StoryStructureService, novel_id: str) -> bool:
+    return is_manifest_authority(_structure_repository_connection(service), novel_id)
+
+
+def _assert_legacy_structure_mutation_allowed(
+    service: StoryStructureService, novel_id: str, operation: str
+) -> None:
+    assert_story_node_write_allowed(
+        _structure_repository_connection(service), novel_id, operation=operation
+    )
+
+
+def _raise_manifest_authority_gone(exc: PlanningAuthorityError) -> None:
+    raise HTTPException(status_code=410, detail=_MANIFEST_AUTHORITY_DETAIL) from exc
+
+
 @router.get("/novels/{novel_id}/structure")
 async def get_structure_tree(
     novel_id: str,
@@ -95,7 +121,8 @@ async def get_structure_tree(
 ):
     """获取小说的完整结构树"""
     try:
-        return await service.get_tree(novel_id)
+        tree = await service.get_tree(novel_id)
+        return {**tree, "manifest_authority": _manifest_authority(service, novel_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -110,7 +137,8 @@ async def get_children(
     try:
         return {
             "parent_id": parent_id,
-            "children": await service.get_children(novel_id, parent_id)
+            "children": await service.get_children(novel_id, parent_id),
+            "manifest_authority": _manifest_authority(service, novel_id),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -124,6 +152,7 @@ async def create_node(
 ):
     """创建节点"""
     try:
+        _assert_legacy_structure_mutation_allowed(service, novel_id, "structure create")
         node = await service.create_node(
             novel_id=novel_id,
             node_type=request.node_type,
@@ -134,6 +163,8 @@ async def create_node(
             order_index=request.order_index
         )
         return {"success": True, "node": node}
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -149,6 +180,7 @@ async def update_node(
 ):
     """更新节点"""
     try:
+        _assert_legacy_structure_mutation_allowed(service, novel_id, "structure update")
         node = await service.update_node(
             node_id=node_id,
             title=request.title,
@@ -156,6 +188,8 @@ async def update_node(
             number=request.number
         )
         return {"success": True, "node": node}
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -170,12 +204,15 @@ async def delete_node(
 ):
     """删除节点"""
     try:
+        _assert_legacy_structure_mutation_allowed(service, novel_id, "structure delete")
         success = await service.delete_node(node_id)
         if not success:
             raise HTTPException(status_code=404, detail="Node not found")
         return {"success": True}
     except HTTPException:
         raise
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -188,8 +225,11 @@ async def reorder_nodes(
 ):
     """重新排序节点"""
     try:
+        _assert_legacy_structure_mutation_allowed(service, novel_id, "structure reorder")
         nodes = await service.reorder_nodes(request.node_ids)
         return {"success": True, "nodes": nodes}
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -201,8 +241,11 @@ async def update_chapter_ranges(
 ):
     """更新章节范围"""
     try:
+        _assert_legacy_structure_mutation_allowed(service, novel_id, "structure update ranges")
         await service.update_chapter_ranges(novel_id)
         return {"success": True}
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -226,12 +269,15 @@ async def create_default_structure(
     - 精密模式：structure_preference={"parts": 3, "volumes_per_part": 3, "acts_per_volume": 3}
     """
     try:
+        _assert_legacy_structure_mutation_allowed(service, novel_id, "structure create default")
         result = await service.create_default_structure(
             novel_id=novel_id,
             total_chapters=request.total_chapters,
             structure_preference=request.structure_preference
         )
         return {"success": True, "structure": result}
+    except PlanningAuthorityError as e:
+        _raise_manifest_authority_gone(e)
     except RuntimeError as e:
         # 配置错误（如 planning_service 未注入）
         raise HTTPException(status_code=503, detail=str(e))

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { generationApi, getGenerationRunOrNull, outlineApi } from './generation'
+import { consumeOutlineDraftStream, generationApi, getGenerationRunOrNull, outlineApi } from './generation'
 
 describe('getGenerationRunOrNull', () => {
   afterEach(() => {
@@ -78,5 +78,36 @@ describe('getGenerationRunOrNull', () => {
     await expect(outlineApi.cancelGenerationAttempt('outline-1', 'attempt-1')).resolves.toMatchObject({ status: 'cancelled' })
     expect(fetchMock.mock.calls[0][0]).toMatch(/outline\/contracts\/outline-1\/generation-attempts\/latest\?after_sequence=3$/)
     expect(fetchMock.mock.calls[1][0]).toMatch(/outline\/contracts\/outline-1\/generation-attempts\/attempt-1\/cancel$/)
+  })
+
+  it('waits for an asynchronous outline stream callback before completing', async () => {
+    const encoder = new TextEncoder()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"completed","contract_id":"outline-1"}\n\n'))
+        controller.close()
+      },
+    }), { status: 200 })))
+
+    let releaseCallback!: () => void
+    const callbackGate = new Promise<void>((resolve) => { releaseCallback = resolve })
+    let callbackStarted = false
+    let callbackFinished = false
+    let consumeFinished = false
+
+    const consuming = consumeOutlineDraftStream('outline-1', async () => {
+      callbackStarted = true
+      await callbackGate
+      callbackFinished = true
+    }).then(() => { consumeFinished = true })
+
+    for (let attempt = 0; attempt < 10 && !callbackStarted; attempt++) await Promise.resolve()
+    expect(callbackStarted).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(consumeFinished).toBe(false)
+
+    releaseCallback()
+    await consuming
+    expect(callbackFinished).toBe(true)
   })
 })

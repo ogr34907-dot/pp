@@ -217,6 +217,10 @@ const streamText = ref('')
 const streamAttempt = ref<OutlineGenerationAttempt | null>(null)
 const error = ref('')
 let streamController: AbortController | null = null
+let selectionEpoch = 0
+let streamEpoch = 0
+let payloadSnapshot: OutlinePayload | null = null
+let formSnapshot: FormState | null = null
 
 const form = reactive<FormState>({
   title: '', narrative_text: '', creative_goal: '', entry_state: '', exit_state: '',
@@ -254,7 +258,7 @@ function payloadToForm(payload?: OutlinePayload | null) {
   form.requiredEventsText = toLines(data.required_events)
   form.forbiddenEventsText = toLines(data.forbidden_events)
   form.handoffText = toLines(data.handoff_conditions)
-  form.foreshadowText = Object.values(outlineStringLists(data.foreshadowing)).flat().join('\n')
+  form.foreshadowText = toLines(outlineStringLists(data.foreshadowing).author_notes)
   form.chapter_start = data.chapter_start ?? null
   form.chapter_end = data.chapter_end ?? null
   form.word_budget = data.word_budget ?? null
@@ -263,17 +267,56 @@ function payloadToForm(payload?: OutlinePayload | null) {
   form.beatsText = toLines(data.beats)
   form.conflictsText = toLines(data.conflicts)
   form.ending_hook = outlineText(data.ending_hook)
+  payloadSnapshot = payload ? { ...payload } : null
+  formSnapshot = { ...form }
 }
+
+function formChanged(field: keyof FormState) {
+  return !formSnapshot || form[field] !== formSnapshot[field]
+}
+
 function formToPayload(): OutlinePayload {
-  return {
-    title: form.title.trim(), narrative_text: form.narrative_text.trim(), creative_goal: form.creative_goal.trim(),
-    entry_state: form.entry_state.trim(), exit_state: form.exit_state.trim(),
-    required_events: fromLines(form.requiredEventsText), forbidden_events: fromLines(form.forbiddenEventsText),
-    state_changes: {}, foreshadowing: { author_notes: fromLines(form.foreshadowText) },
-    chapter_start: form.chapter_start, chapter_end: form.chapter_end, word_budget: form.word_budget,
-    handoff_conditions: fromLines(form.handoffText), pov: form.pov.trim(), scenes: fromLines(form.scenesText),
-    beats: fromLines(form.beatsText), conflicts: fromLines(form.conflictsText), ending_hook: form.ending_hook.trim(), extra: {},
+  const changes: Partial<OutlinePayload> = {}
+  if (formChanged('title')) changes.title = form.title.trim()
+  if (formChanged('narrative_text')) changes.narrative_text = form.narrative_text.trim()
+  if (formChanged('creative_goal')) changes.creative_goal = form.creative_goal.trim()
+  if (formChanged('entry_state')) changes.entry_state = form.entry_state.trim()
+  if (formChanged('exit_state')) changes.exit_state = form.exit_state.trim()
+  if (formChanged('requiredEventsText')) changes.required_events = fromLines(form.requiredEventsText)
+  if (formChanged('forbiddenEventsText')) changes.forbidden_events = fromLines(form.forbiddenEventsText)
+  if (formChanged('handoffText')) changes.handoff_conditions = fromLines(form.handoffText)
+  if (formChanged('chapter_start')) changes.chapter_start = form.chapter_start
+  if (formChanged('chapter_end')) changes.chapter_end = form.chapter_end
+  if (formChanged('word_budget')) changes.word_budget = form.word_budget
+  if (formChanged('pov')) changes.pov = form.pov.trim()
+  if (formChanged('scenesText')) changes.scenes = fromLines(form.scenesText)
+  if (formChanged('beatsText')) changes.beats = fromLines(form.beatsText)
+  if (formChanged('conflictsText')) changes.conflicts = fromLines(form.conflictsText)
+  if (formChanged('ending_hook')) changes.ending_hook = form.ending_hook.trim()
+  if (formChanged('foreshadowText')) {
+    changes.foreshadowing = {
+      ...(payloadSnapshot?.foreshadowing || {}),
+      author_notes: fromLines(form.foreshadowText),
+    }
   }
+  return { ...(payloadSnapshot || {}), ...changes }
+}
+
+type ContractContext = { selection: number; nodeId: string; contractId: string }
+
+function isCurrentNode(selection: number, nodeId: string) {
+  return selection === selectionEpoch && selectedNode.value?.id === nodeId
+}
+
+function captureContractContext(contract: OutlineContract): ContractContext | null {
+  const nodeId = selectedNode.value?.id
+  if (!nodeId || selectedContract.value?.id !== contract.id) return null
+  return { selection: selectionEpoch, nodeId, contractId: contract.id }
+}
+
+function isCurrentContract(context: ContractContext) {
+  return isCurrentNode(context.selection, context.nodeId)
+    && selectedContract.value?.id === context.contractId
 }
 function idempotencyKey(prefix: string) { return `${prefix}-${crypto.randomUUID()}` }
 const streamStatus = computed(() => {
@@ -298,122 +341,194 @@ async function loadTree() {
 }
 
 async function selectNode(node: OutlineTreeNode) {
+  const requestEpoch = ++selectionEpoch
+  ++streamEpoch
+  streamController?.abort()
+  streamController = null
   selectedNode.value = node
   selectedParent.value = flattenedTree.value.find(item => item.node.id === node.id)?.parent
+  selectedContract.value = null
   streamText.value = ''
+  streamAttempt.value = null
+  streaming.value = false
+  saving.value = false
+  publishing.value = false
+  binding.value = false
+  error.value = ''
+  payloadToForm(null)
   const contractId = node.outline_contract?.contract_id
-  if (!contractId) { selectedContract.value = null; return }
+  if (!contractId) return
+  let contract: OutlineContract
   try {
-    selectedContract.value = await outlineApi.getContract(contractId)
-    await recoverDraftAttempt(contractId)
-    payloadToForm(selectedContract.value.draft?.payload || selectedContract.value.active?.payload)
+    contract = await outlineApi.getContract(contractId)
   } catch (cause) {
+    if (!isCurrentNode(requestEpoch, node.id)) return
     selectedContract.value = null
     error.value = cause instanceof Error ? cause.message : '读取大纲节点失败'
+    return
+  }
+  if (!isCurrentNode(requestEpoch, node.id) || contract.id !== contractId) return
+  selectedContract.value = contract
+  payloadToForm(contract.draft?.payload || contract.active?.payload)
+  const context = captureContractContext(contract)
+  if (!context) return
+  const recoveryStreamEpoch = streamEpoch
+  try {
+    await recoverDraftAttempt(contractId, context, recoveryStreamEpoch)
+  } catch (cause) {
+    if (isCurrentRecovery(context, recoveryStreamEpoch)) {
+      error.value = cause instanceof Error ? cause.message : '恢复草稿流失败'
+    }
   }
 }
 
 async function bindSelectedNode() {
-  if (!selectedNode.value || selectedNode.value.node_type === 'outline') return
+  const node = selectedNode.value
+  const requestEpoch = selectionEpoch
+  if (!node || node.node_type === 'outline') return
   binding.value = true
   error.value = ''
   try {
-    selectedContract.value = await outlineApi.bindNode(novelId.value, selectedNode.value.id)
-    payloadToForm(selectedContract.value.draft?.payload || selectedContract.value.active?.payload)
+    const contract = await outlineApi.bindNode(novelId.value, node.id)
+    if (!isCurrentNode(requestEpoch, node.id)) return
+    selectedContract.value = contract
+    payloadToForm(contract.draft?.payload || contract.active?.payload)
     await loadTree()
-    message.success('本层契约已建立；现在可以生成或编辑草稿。')
-  } catch (cause) { error.value = cause instanceof Error ? cause.message : '建立本层契约失败' } finally { binding.value = false }
+    if (isCurrentNode(requestEpoch, node.id)) message.success('本层契约已建立；现在可以生成或编辑草稿。')
+  } catch (cause) {
+    if (isCurrentNode(requestEpoch, node.id)) error.value = cause instanceof Error ? cause.message : '建立本层契约失败'
+  } finally {
+    if (isCurrentNode(requestEpoch, node.id)) binding.value = false
+  }
 }
 
 async function saveDraft() {
-  if (!selectedContract.value) return
+  const contract = selectedContract.value
+  if (!contract) return
+  const context = captureContractContext(contract)
+  if (!context) return
   saving.value = true
   error.value = ''
   try {
-    selectedContract.value = await outlineApi.saveDraft(selectedContract.value.id, formToPayload())
-    payloadToForm(selectedContract.value.draft?.payload)
+    const saved = await outlineApi.saveDraft(contract.id, formToPayload())
+    if (!isCurrentContract(context) || saved.id !== contract.id) return
+    selectedContract.value = saved
+    payloadToForm(saved.draft?.payload)
     await loadTree()
-    message.success('草稿已保存，尚未进入正文上下文。')
-  } catch (cause) { error.value = cause instanceof Error ? cause.message : '保存草稿失败' } finally { saving.value = false }
+    if (isCurrentContract(context)) message.success('草稿已保存，尚未进入正文上下文。')
+  } catch (cause) {
+    if (isCurrentContract(context)) error.value = cause instanceof Error ? cause.message : '保存草稿失败'
+  } finally {
+    if (isCurrentContract(context)) saving.value = false
+  }
 }
 
 async function publishAndSync() {
-  const draft = selectedContract.value?.draft
-  if (!selectedContract.value || !draft) return
+  const contract = selectedContract.value
+  const draft = contract?.draft
+  if (!contract || !draft) return
+  const context = captureContractContext(contract)
+  if (!context) return
   publishing.value = true
   error.value = ''
   try {
-    selectedContract.value = await outlineApi.publish(selectedContract.value.id, draft.revision, idempotencyKey('outline-publish'))
+    const published = await outlineApi.publish(contract.id, draft.revision, idempotencyKey('outline-publish'))
+    if (!isCurrentContract(context) || published.id !== contract.id) return
+    selectedContract.value = published
     await loadTree()
-    message.success('已发布并同步；下一级现在可按新的计划链生成。')
-  } catch (cause) { error.value = cause instanceof Error ? cause.message : '发布并同步失败' } finally { publishing.value = false }
+    if (isCurrentContract(context)) message.success('已发布并同步；下一级现在可按新的计划链生成。')
+  } catch (cause) {
+    if (isCurrentContract(context)) error.value = cause instanceof Error ? cause.message : '发布并同步失败'
+  } finally {
+    if (isCurrentContract(context)) publishing.value = false
+  }
 }
 
-async function generateDraftStream() {
-  if (!selectedContract.value || streaming.value) return
+async function runDraftStream(retryAttemptId?: string) {
+  const contract = selectedContract.value
+  if (!contract || streaming.value) return
+  const context = captureContractContext(contract)
+  if (!context) return
   streamController?.abort()
-  streamController = new AbortController()
+  const controller = new AbortController()
+  streamController = controller
+  const requestStreamEpoch = ++streamEpoch
   streaming.value = true
   streamText.value = ''
   streamAttempt.value = null
   error.value = ''
+  const isCurrent = () => requestStreamEpoch === streamEpoch && isCurrentContract(context)
   try {
-    await consumeOutlineDraftStream(selectedContract.value.id, async event => {
-      if (event.type === 'started') streamAttempt.value = { id: event.attempt_id || '', contract_id: selectedContract.value!.id, status: 'running', retry_of_attempt_id: event.retry_of_attempt_id, accumulated_text: '', error: '', events: [] }
+    await consumeOutlineDraftStream(contract.id, async event => {
+      if (!isCurrent() || (event.contract_id && event.contract_id !== contract.id)) return
+      if (event.type === 'started') streamAttempt.value = { id: event.attempt_id || '', contract_id: contract.id, status: 'running', retry_of_attempt_id: event.retry_of_attempt_id, accumulated_text: '', error: '', events: [] }
       if (event.type === 'delta') streamText.value += event.text || ''
       if (event.type === 'completed') {
         payloadToForm(event.payload)
-        selectedContract.value = await outlineApi.getContract(selectedContract.value!.id)
+        const refreshed = await outlineApi.getContract(contract.id)
+        if (!isCurrent() || refreshed.id !== contract.id) return
+        selectedContract.value = refreshed
+        payloadToForm(refreshed.draft?.payload || refreshed.active?.payload || event.payload)
         await loadTree()
       }
       if (event.type === 'error') error.value = event.message || 'AI 大纲生成失败'
-    }, streamController.signal)
-    await recoverDraftAttempt(selectedContract.value.id)
+    }, controller.signal, retryAttemptId)
+    if (isCurrent()) await recoverDraftAttempt(contract.id, context, requestStreamEpoch)
   } catch (cause) {
-    if (!(cause instanceof DOMException && cause.name === 'AbortError')) {
+    if (isCurrent() && !(cause instanceof DOMException && cause.name === 'AbortError')) {
       error.value = cause instanceof Error ? cause.message : 'AI 大纲生成失败'
     }
-  } finally { streaming.value = false }
+  } finally {
+    if (streamController === controller) streamController = null
+    if (isCurrent()) streaming.value = false
+  }
 }
 
-async function recoverDraftAttempt(contractId: string) {
+async function generateDraftStream() {
+  await runDraftStream()
+}
+
+function isCurrentRecovery(context: ContractContext, expectedStream?: number) {
+  return isCurrentContract(context)
+    && (expectedStream === undefined || expectedStream === streamEpoch)
+}
+
+async function recoverDraftAttempt(
+  contractId: string,
+  context: ContractContext,
+  expectedStream?: number,
+) {
   const attempt = await outlineApi.getLatestGenerationAttempt(contractId)
+  if (!isCurrentRecovery(context, expectedStream)) return null
   streamAttempt.value = attempt
   if (attempt) streamText.value = attempt.accumulated_text || streamText.value
+  return attempt
 }
 
 async function cancelDraftStream() {
+  const contract = selectedContract.value
   const attempt = streamAttempt.value
-  if (!selectedContract.value || !attempt) return
-  streamController?.abort()
+  if (!contract || !attempt || attempt.contract_id !== contract.id) return
+  const context = captureContractContext(contract)
+  if (!context) return
+  const requestStreamEpoch = ++streamEpoch
+  const controller = streamController
+  controller?.abort()
+  if (streamController === controller) streamController = null
+  streaming.value = false
   try {
-    streamAttempt.value = await outlineApi.cancelGenerationAttempt(selectedContract.value.id, attempt.id)
-  } catch (cause) { error.value = cause instanceof Error ? cause.message : '取消大纲生成失败' }
+    const cancelled = await outlineApi.cancelGenerationAttempt(contract.id, attempt.id)
+    if (requestStreamEpoch === streamEpoch && isCurrentContract(context)) streamAttempt.value = cancelled
+  } catch (cause) {
+    if (requestStreamEpoch === streamEpoch && isCurrentContract(context)) error.value = cause instanceof Error ? cause.message : '取消大纲生成失败'
+  }
 }
 
 async function retryDraftStream() {
+  const contract = selectedContract.value
   const previous = streamAttempt.value
-  if (!selectedContract.value || !previous || streaming.value) return
-  streamController?.abort()
-  streamController = new AbortController()
-  streaming.value = true
-  streamText.value = ''
-  error.value = ''
-  try {
-    await consumeOutlineDraftStream(selectedContract.value.id, async event => {
-      if (event.type === 'started') streamAttempt.value = { id: event.attempt_id || '', contract_id: selectedContract.value!.id, status: 'running', retry_of_attempt_id: event.retry_of_attempt_id, accumulated_text: '', error: '', events: [] }
-      if (event.type === 'delta') streamText.value += event.text || ''
-      if (event.type === 'completed') {
-        payloadToForm(event.payload)
-        selectedContract.value = await outlineApi.getContract(selectedContract.value!.id)
-        await loadTree()
-      }
-      if (event.type === 'error') error.value = event.message || 'AI 大纲生成失败'
-    }, streamController.signal, previous.id)
-    await recoverDraftAttempt(selectedContract.value.id)
-  } catch (cause) {
-    if (!(cause instanceof DOMException && cause.name === 'AbortError')) error.value = cause instanceof Error ? cause.message : 'AI 大纲生成失败'
-  } finally { streaming.value = false }
+  if (!contract || !previous || previous.contract_id !== contract.id || streaming.value) return
+  await runDraftStream(previous.id)
 }
 
 onMounted(loadTree)
