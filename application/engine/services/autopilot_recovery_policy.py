@@ -12,10 +12,6 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from domain.novel.entities.novel import NovelStage
-from infrastructure.persistence.database.planning_authority_guard import (
-    is_manifest_authority,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -682,8 +678,23 @@ class AutopilotRecoveryPolicy:
             connection = get_connection() if callable(get_connection) else getattr(db, "conn", None)
             if not isinstance(connection, sqlite3.Connection):
                 return False
-            connection.execute("SELECT 1").fetchone()
-            return not is_manifest_authority(connection, novel_id)
+            head_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+                ("outline_planning_heads",),
+            ).fetchone()
+            if head_table is None:
+                return True
+            head = connection.execute(
+                "SELECT authority_mode FROM outline_planning_heads WHERE novel_id = ?",
+                (novel_id,),
+            ).fetchone()
+            if head is None:
+                return False
+            try:
+                authority_mode = head["authority_mode"]
+            except (IndexError, KeyError, TypeError):
+                authority_mode = head[0]
+            return str(authority_mode or "").strip().lower() == "legacy"
         except Exception:
             return False
 

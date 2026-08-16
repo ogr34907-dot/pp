@@ -6,8 +6,8 @@ from application.engine.services.autopilot_recovery_policy import AutopilotRecov
 
 
 class _Db:
-    def __init__(self):
-        self.conn = sqlite3.connect(":memory:")
+    def __init__(self, *, connection_factory=sqlite3.Connection):
+        self.conn = sqlite3.connect(":memory:", factory=connection_factory)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(
             """
@@ -112,6 +112,13 @@ class _Db:
 
     def commit(self):
         self.conn.commit()
+
+
+class _AuthorityProbeOperationalErrorConnection(sqlite3.Connection):
+    def execute(self, sql, params=()):
+        if "from sqlite_master" in sql.lower():
+            raise sqlite3.OperationalError("authority probe unavailable")
+        return super().execute(sql, params)
 
 
 class _NoAuthorityConnectionDb:
@@ -476,6 +483,48 @@ def test_recovery_cleanup_without_authority_connection_never_writes_story_node_p
     assert "chapter_preplan" in json.loads(story_node["metadata"])
     assert chapter == {"outline": "", "content": "", "word_count": 0, "status": "draft"}
     assert preplan_flag["is_current"] == 0
+
+
+def test_recovery_cleanup_rejects_authority_probe_operational_error():
+    db = _Db(connection_factory=_AuthorityProbeOperationalErrorConnection)
+    db.execute(
+        """
+        CREATE TABLE outline_planning_heads (
+            novel_id TEXT PRIMARY KEY,
+            authority_mode TEXT NOT NULL
+        )
+        """
+    )
+    metadata = {"chapter_preplan": {"detail_outline": "临时七段细纲"}}
+    db.execute(
+        """
+        INSERT INTO story_nodes (id, novel_id, number, node_type, outline, metadata)
+        VALUES ('sn-1', 'novel-1', 1, 'chapter', '临时七段细纲', ?)
+        """,
+        (json.dumps(metadata, ensure_ascii=False),),
+    )
+    db.execute(
+        """
+        INSERT INTO chapters (id, novel_id, number, status, content)
+        VALUES ('c1', 'novel-1', 1, 'draft', '半章草稿')
+        """
+    )
+    statements: list[str] = []
+    db.conn.set_trace_callback(statements.append)
+
+    AutopilotRecoveryPolicy(db)._discard_transient_chapter_preplan("novel-1", 1)
+
+    story_node = db.fetch_one("SELECT outline, metadata FROM story_nodes WHERE id = 'sn-1'")
+    chapter = db.fetch_one("SELECT outline, content, word_count, status FROM chapters WHERE id = 'c1'")
+    story_node_dml = [
+        sql for sql in statements
+        if "story_nodes" in sql.lower() and sql.lstrip().lower().startswith(("update", "insert", "delete"))
+    ]
+
+    assert story_node_dml == []
+    assert story_node["outline"] == "临时七段细纲"
+    assert "chapter_preplan" in json.loads(story_node["metadata"])
+    assert chapter == {"outline": "", "content": "", "word_count": 0, "status": "draft"}
 
 
 def test_recovery_cleanup_cancels_only_retryable_pending_invocations():
