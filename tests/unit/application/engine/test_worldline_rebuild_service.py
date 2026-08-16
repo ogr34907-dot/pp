@@ -273,6 +273,93 @@ async def test_cancelled_rebuild_cannot_resume_or_overwrite_the_new_epoch(tmp_pa
     assert run["generation_epoch"] == cancelled["generation_epoch"]
 
 
+def test_cancel_prelock_epoch_race_does_not_overwrite_new_epoch_run_or_jobs(tmp_path):
+    db_path = tmp_path / "worldline-rebuild-cancel-epoch-race.db"
+    db = DatabaseConnection(str(db_path))
+    _seed(db)
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    service = WorldlineRebuildService(db, _Aftermath(db))
+    old_epoch = int(
+        db.fetch_one(
+            "SELECT generation_epoch FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+        )["generation_epoch"]
+    )
+    new_epoch = old_epoch + 1
+    racing_db = DatabaseConnection(str(db_path))
+    original_now = service._now
+    raced = False
+
+    def _switch_to_new_epoch_between_precheck_and_lock():
+        nonlocal raced
+        if not raced:
+            raced = True
+            conn = racing_db.get_connection()
+            conn.execute(
+                "UPDATE novel_generation_runs SET generation_epoch = ?, state = 'paused', "
+                "canonical_sync_status = 'rebuilding', next_action = 'rebuild_worldline', "
+                "last_error = 'new epoch owner' WHERE novel_id = 'novel-1'",
+                (new_epoch,),
+            )
+            conn.execute(
+                "UPDATE worldline_generation_filters SET active_generation_epoch = ?, "
+                "updated_at = 'new epoch owner' "
+                "WHERE novel_id = 'novel-1'",
+                (new_epoch,),
+            )
+            conn.execute(
+                "INSERT INTO worldline_rebuild_jobs "
+                "(id, novel_id, generation_epoch, job_type, status) "
+                "VALUES ('new-epoch-job', 'novel-1', ?, 'canonical_facts', 'running')",
+                (new_epoch,),
+            )
+            conn.commit()
+        return original_now()
+
+    service._now = _switch_to_new_epoch_between_precheck_and_lock
+    try:
+        result = service.cancel("novel-1")
+    finally:
+        racing_db.close()
+
+    assert result == {
+        "status": "cancelled",
+        "generation_epoch": new_epoch,
+        "rebuilt_chapters": 0,
+    }
+    run = db.fetch_one(
+        "SELECT generation_epoch, state, canonical_sync_status, next_action, last_error "
+        "FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+    )
+    assert tuple(
+        run[field]
+        for field in (
+            "generation_epoch",
+            "state",
+            "canonical_sync_status",
+            "next_action",
+            "last_error",
+        )
+    ) == (new_epoch, "paused", "rebuilding", "rebuild_worldline", "new epoch owner")
+    assert db.fetch_one(
+        "SELECT status FROM worldline_rebuild_jobs WHERE id = 'new-epoch-job'"
+    )["status"] == "running"
+    generation_filter = db.fetch_one(
+        "SELECT active_generation_epoch, updated_at FROM worldline_generation_filters "
+        "WHERE novel_id = 'novel-1'"
+    )
+    assert tuple(generation_filter[field] for field in ("active_generation_epoch", "updated_at")) == (
+        new_epoch,
+        "new epoch owner",
+    )
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM worldline_rebuild_jobs "
+        "WHERE novel_id = 'novel-1' AND generation_epoch = ? AND status = 'pending'",
+        (old_epoch,),
+    )["total"] == 5
+
+
 @pytest.mark.asyncio
 async def test_rebuild_start_epoch_race_cannot_mutate_new_epoch_run_or_jobs(tmp_path):
     db = DatabaseConnection(str(tmp_path / "worldline-rebuild-start-epoch-race.db"))

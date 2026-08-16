@@ -51,6 +51,51 @@ def active_generation_epoch(novel_id: str, db: Optional[Any] = None) -> int:
         ) from exc
 
 
+def _legacy_completed_head_without_candidate_authority(conn, novel_id: str) -> int:
+    """Validate the only legacy fallback allowed before any generation run exists."""
+
+    authority = conn.execute(
+        """
+        SELECT (
+            EXISTS(SELECT 1 FROM pre_candidate_formal_history WHERE novel_id = ?)
+            OR EXISTS(SELECT 1 FROM chapter_candidates WHERE novel_id = ?)
+            OR EXISTS(SELECT 1 FROM chapter_candidate_formal_commits WHERE novel_id = ?)
+        ) AS has_candidate_authority
+        """,
+        (novel_id, novel_id, novel_id),
+    ).fetchone()
+    if authority is None or bool(authority["has_candidate_authority"]):
+        return 0
+
+    rows = conn.execute(
+        """
+        SELECT number, content, content_sha256, content_revision, status
+        FROM chapters WHERE novel_id = ? ORDER BY number
+        """,
+        (novel_id,),
+    ).fetchall()
+    head = 0
+    prefix_ended = False
+    for expected_number, row in enumerate(rows, start=1):
+        content = str(row["content"] or "")
+        actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        exact_completed = (
+            not prefix_ended
+            and int(row["number"] or 0) == expected_number
+            and str(row["status"] or "") == "completed"
+            and bool(content.strip())
+            and str(row["content_sha256"] or "") == actual_hash
+            and int(row["content_revision"] or 0) >= 1
+        )
+        if exact_completed:
+            head += 1
+            continue
+        if str(row["status"] or "") == "completed":
+            return 0
+        prefix_ended = True
+    return head
+
+
 def visible_committed_chapters(
     novel_id: str,
     db: Optional[Any] = None,
@@ -95,6 +140,8 @@ def visible_committed_chapters(
             novel_id
         )
         formal_head = int(formal_head)
+        if formal_head < 1 and run is None and active_epoch == 0:
+            formal_head = _legacy_completed_head_without_candidate_authority(conn, novel_id)
         if formal_head < 1:
             return set()
         if run is not None and int(run["current_formal_chapter"] or 0) != formal_head:

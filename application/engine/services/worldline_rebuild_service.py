@@ -736,16 +736,63 @@ class WorldlineRebuildService:
 
         conn = self._connection()
         run = conn.execute(
-            "SELECT generation_epoch FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+            """
+            SELECT generation_epoch, state, canonical_sync_status, next_action, last_error
+            FROM novel_generation_runs WHERE novel_id = ?
+            """,
+            (novel_id,),
         ).fetchone()
         if run is None:
             raise WorldlineRebuildError("generation run not found")
         old_epoch = int(run["generation_epoch"] or 0)
+        expected_state = str(run["state"] or "")
+        expected_sync_status = str(run["canonical_sync_status"] or "ready")
+        expected_next_action = str(run["next_action"] or "")
+        expected_last_error = str(run["last_error"] or "")
+        expected_filter = conn.execute(
+            "SELECT active_generation_epoch FROM worldline_generation_filters WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        if (
+            expected_filter is None
+            or int(expected_filter["active_generation_epoch"] or 0) != old_epoch
+        ):
+            return self._cancelled_result(conn, novel_id, old_epoch)
         new_epoch = old_epoch + 1
         now = self._now()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
+            locked = conn.execute(
+                "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+            ).fetchone()
+            if not self._run_matches(
+                locked,
+                generation_epoch=old_epoch,
+                state=expected_state,
+                canonical_sync_status=expected_sync_status,
+                next_action=expected_next_action,
+                last_error=expected_last_error,
+            ):
+                raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
+            locked_filter = conn.execute(
+                "SELECT active_generation_epoch FROM worldline_generation_filters WHERE novel_id = ?",
+                (novel_id,),
+            ).fetchone()
+            if (
+                locked_filter is None
+                or int(locked_filter["active_generation_epoch"] or 0) != old_epoch
+            ):
+                raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
+
+            jobs = conn.execute(
+                """
+                SELECT COUNT(*) AS total FROM worldline_rebuild_jobs
+                WHERE novel_id = ? AND generation_epoch = ? AND status IN ('pending', 'running')
+                """,
+                (novel_id, old_epoch),
+            ).fetchone()
+            expected_jobs = int(jobs["total"] or 0) if jobs is not None else 0
+            jobs_cursor = conn.execute(
                 """
                 UPDATE worldline_rebuild_jobs
                 SET status = 'failed', failure_reason = 'cancelled_by_author', updated_at = ?
@@ -753,27 +800,47 @@ class WorldlineRebuildService:
                 """,
                 (now, novel_id, old_epoch),
             )
-            conn.execute(
+            if jobs_cursor.rowcount != expected_jobs:
+                raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
+
+            run_cursor = conn.execute(
                 """
                 UPDATE novel_generation_runs
                 SET generation_epoch = ?, state = 'stopped', canonical_sync_status = 'failed',
                     next_action = 'restart_worldline_rebuild', last_error = 'cancelled_by_author', updated_at = ?
-                WHERE novel_id = ?
+                WHERE novel_id = ? AND generation_epoch = ? AND state = ?
+                  AND COALESCE(canonical_sync_status, 'ready') = ?
+                  AND COALESCE(next_action, '') = ? AND COALESCE(last_error, '') = ?
                 """,
-                (new_epoch, now, novel_id),
+                (
+                    new_epoch,
+                    now,
+                    novel_id,
+                    old_epoch,
+                    expected_state,
+                    expected_sync_status,
+                    expected_next_action,
+                    expected_last_error,
+                ),
             )
-            conn.execute(
+            if run_cursor.rowcount != 1:
+                raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
+
+            filter_cursor = conn.execute(
                 """
-                INSERT INTO worldline_generation_filters (novel_id, active_generation_epoch, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(novel_id) DO UPDATE SET
-                    active_generation_epoch = excluded.active_generation_epoch,
-                    updated_at = excluded.updated_at
+                UPDATE worldline_generation_filters
+                SET active_generation_epoch = ?, updated_at = ?
+                WHERE novel_id = ? AND active_generation_epoch = ?
                 """,
-                (novel_id, new_epoch, now),
+                (new_epoch, now, novel_id, old_epoch),
             )
+            if filter_cursor.rowcount != 1:
+                raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
             conn.commit()
-        except Exception:
+        except WorldlineRebuildCancelled:
+            conn.rollback()
+            return self._cancelled_result(conn, novel_id, old_epoch)
+        except BaseException:
             conn.rollback()
             raise
         return {"status": "cancelled", "generation_epoch": new_epoch}

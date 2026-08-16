@@ -17,6 +17,36 @@ from infrastructure.persistence.database.chapter_candidate_repository import (
 from infrastructure.persistence.database.connection import DatabaseConnection
 
 
+def _seed_exact_legacy_history(conn, *, novel_id: str) -> None:
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) "
+        "VALUES (?, 'Legacy', 'legacy-visible', 3)",
+        (novel_id,),
+    )
+    for chapter_number, content in ((1, "legacy chapter one"), (2, "legacy chapter two")):
+        content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        conn.execute(
+            "INSERT INTO chapters "
+            "(id, novel_id, number, title, content, content_sha256, content_revision, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, 'completed')",
+            (
+                f"{novel_id}-chapter-{chapter_number}",
+                novel_id,
+                chapter_number,
+                f"Chapter {chapter_number}",
+                content,
+                content_sha256,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO chapter_narrative_commits "
+            "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status) "
+            "VALUES (?, ?, ?, ?, 1, 'committed')",
+            (novel_id, chapter_number, content_sha256, CHAPTER_NARRATIVE_PIPELINE_VERSION),
+        )
+    conn.commit()
+
+
 def test_new_generation_filters_retired_and_untagged_vectors_until_rebuild():
     assert is_payload_in_active_epoch({"generation_epoch": 3}, active_epoch=3)
     assert not is_payload_in_active_epoch({"generation_epoch": 2}, active_epoch=3)
@@ -35,6 +65,43 @@ def test_epoch_read_failure_does_not_fall_back_to_epoch_zero():
 
     with pytest.raises(GenerationEpochUnavailableError, match="generation_epoch_unavailable"):
         active_generation_epoch("novel-1", BrokenDatabase())
+
+
+def test_visible_committed_chapters_allows_exact_legacy_history_without_generation_run(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-visible-legacy-history.db"))
+    _seed_exact_legacy_history(db.get_connection(), novel_id="novel-1")
+
+    assert visible_committed_chapters("novel-1", db) == {1, 2}
+
+    db.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, title, content, content_sha256, content_revision, status) "
+        "VALUES ('novel-1-chapter-3', 'novel-1', 3, 'Chapter 3', '', ?, 1, 'completed')",
+        (hashlib.sha256(b"").hexdigest(),),
+    )
+    db.commit()
+    assert visible_committed_chapters("novel-1", db) == set()
+
+    db.execute(
+        "INSERT INTO worldline_generation_filters (novel_id, active_generation_epoch) "
+        "VALUES ('novel-1', 1)"
+    )
+    db.commit()
+    assert visible_committed_chapters("novel-1", db) == set()
+
+
+def test_visible_committed_chapters_does_not_fallback_past_candidate_authority(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "worldline-visible-candidate-authority.db"))
+    conn = db.get_connection()
+    _seed_exact_legacy_history(conn, novel_id="novel-1")
+    conn.execute(
+        "INSERT INTO chapter_candidates "
+        "(id, novel_id, chapter_number, generation_epoch, status, llm_content) "
+        "VALUES ('candidate-1', 'novel-1', 1, 0, 'awaiting_review', 'candidate prose')"
+    )
+    conn.commit()
+
+    assert visible_committed_chapters("novel-1", db) == set()
 
 
 def test_visible_committed_chapters_requires_current_formal_identity_and_ready_epoch(tmp_path):

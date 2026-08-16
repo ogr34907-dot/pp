@@ -1,3 +1,4 @@
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,6 +16,9 @@ from application.world.services.knowledge_service import KnowledgeService
 from domain.novel.entities.chapter import Chapter, ChapterStatus
 from domain.novel.value_objects.novel_id import NovelId
 from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.chapter_candidate_repository import (
+    ChapterCandidateRepository,
+)
 from infrastructure.persistence.database.sqlite_causal_edge_repository import (
     SqliteCausalEdgeRepository,
 )
@@ -41,6 +45,7 @@ from application.engine.services.memory_engine import (
 from application.engine.services.worldline_generation_guard import (
     GenerationEpochUnavailableError,
 )
+from application.world.services.chapter_narrative_sync import CHAPTER_NARRATIVE_PIPELINE_VERSION
 
 
 def _chapter_services(tmp_path, content: str):
@@ -961,41 +966,58 @@ def test_fact_lock_round_robins_authority_types_under_shared_cap(tmp_path):
 
 def test_graph_recall_excludes_canonical_triples_from_retired_generation(tmp_path):
     db = DatabaseConnection(str(tmp_path / "canonical-graph-epoch.db"))
-    db.execute(
-        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    conn = db.get_connection()
+    current_content = "current retained prose"
+    current_hash = hashlib.sha256(current_content.encode("utf-8")).hexdigest()
+    retired_content = "retired tail prose"
+    retired_hash = hashlib.sha256(retired_content.encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) "
+        "VALUES ('novel-1', 'Novel', 'novel-1', 3)"
     )
-    db.execute(
+    conn.execute(
         "INSERT INTO chapters "
-        "(id, novel_id, number, title, content, content_sha256, content_revision) "
-        "VALUES ('chapter-1', 'novel-1', 1, 'Chapter', '正文', 'hash-1', 1)"
+        "(id, novel_id, number, title, content, content_sha256, content_revision, status) "
+        "VALUES ('chapter-1', 'novel-1', 1, 'Chapter', ?, ?, 1, 'completed')",
+        (current_content, current_hash),
     )
-    db.execute(
+    conn.commit()
+    ChapterCandidateRepository(db).import_legacy_formal_history("novel-1")
+    conn.execute(
         "INSERT INTO chapters "
-        "(id, novel_id, number, title, content, content_sha256, content_revision) "
-        "VALUES ('chapter-2', 'novel-1', 2, 'Chapter', '正文', 'hash-2', 1)"
+        "(id, novel_id, number, title, content, content_sha256, content_revision, status) "
+        "VALUES ('chapter-2', 'novel-1', 2, 'Chapter', ?, ?, 1, 'completed')",
+        (retired_content, retired_hash),
     )
-    db.execute(
+    conn.execute(
+        "INSERT INTO novel_generation_runs "
+        "(novel_id, run_mode, state, generation_epoch, target_chapters, current_formal_chapter, "
+        "canonical_sync_status, next_action) "
+        "VALUES ('novel-1', 'continuous', 'paused', 2, 3, 1, 'ready', 'select_run_mode')"
+    )
+    conn.execute(
         "INSERT INTO worldline_generation_filters (novel_id, active_generation_epoch) "
         "VALUES ('novel-1', 2)"
     )
-    db.execute(
+    conn.execute(
         "INSERT INTO chapter_narrative_commits "
         "(novel_id, chapter_number, content_sha256, pipeline_version, content_revision, status) "
         "VALUES "
-        "('novel-1', 1, 'hash-1', 'chapter-narrative-sync:v1', 1, 'stale'), "
-        "('novel-1', 2, 'hash-2', 'chapter-narrative-sync:v1', 1, 'committed')"
+        "('novel-1', 1, ?, ?, 1, 'committed'), "
+        "('novel-1', 2, ?, ?, 1, 'committed')",
+        (current_hash, CHAPTER_NARRATIVE_PIPELINE_VERSION, retired_hash, CHAPTER_NARRATIVE_PIPELINE_VERSION),
     )
     for triple_id, chapter_number, object_name in (
-        ("triple-stale", 1, "旧世界线地点"),
-        ("triple-current", 2, "新世界线地点"),
+        ("triple-current", 1, "新世界线地点"),
+        ("triple-stale", 2, "旧世界线地点"),
     ):
-        db.execute(
+        conn.execute(
             "INSERT INTO triples "
             "(id, novel_id, subject, predicate, object, chapter_number, confidence, source_type) "
             "VALUES (?, 'novel-1', '林澈', '前往', ?, ?, 0.9, 'autopilot_extract')",
             (triple_id, object_name, chapter_number),
         )
-    db.commit()
+    conn.commit()
 
     bible = SimpleNamespace(
         characters=[
@@ -1473,6 +1495,24 @@ async def test_formal_canonical_facts_survive_working_memory_eviction_and_restar
         lambda *args, **kwargs: db,
     )
 
+    for chapter_number in range(1, 351):
+        if chapter_number in facts:
+            continue
+        content = f"legacy continuity {chapter_number}"
+        db.execute(
+            "INSERT INTO chapters "
+            "(id, novel_id, number, title, content, content_sha256, content_revision, status) "
+            "VALUES (?, 'novel-1', ?, ?, ?, ?, 1, 'completed')",
+            (
+                f"chapter-{chapter_number}",
+                chapter_number,
+                f"第{chapter_number}章",
+                content,
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            ),
+        )
+    db.commit()
+
     for chapter_number, (evidence, _extra) in facts.items():
         chapter = Chapter(
             id=f"chapter-{chapter_number}",
@@ -1480,6 +1520,7 @@ async def test_formal_canonical_facts_survive_working_memory_eviction_and_restar
             number=chapter_number,
             title=f"第{chapter_number}章",
             content=evidence + "。",
+            status=ChapterStatus.COMPLETED,
         )
         chapter_repo.save(chapter)
         result = await sync_chapter_narrative_after_save(
