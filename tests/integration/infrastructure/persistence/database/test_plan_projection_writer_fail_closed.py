@@ -110,18 +110,18 @@ class _HostileRepository(StoryNodeRepository):
         return await super().save_batch(nodes, _capability=_capability)
 
 
-def test_projection_writer_rejects_caller_batch_before_repository_dml(tmp_path):
+def test_projection_writer_rejects_publish_batch_before_repository_dml(tmp_path):
     database, _, plan_id = _sealed_plan(tmp_path, manifest=True)
     repository = _HostileRepository(database)
     writer = PlanProjectionWriter(repository)
     before = _head(database)
 
-    with pytest.raises(PlanningAuthorityError, match="designated Head operation"):
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
         asyncio.run(
             writer.apply_atomic(
                 novel_id="novel-1",
                 plan_revision_id=plan_id,
-                operation="projection",
+                operation="publish",
                 expected_active_plan_revision_id=plan_id,
                 expected_active_plan_digest=str(before[2]),
                 expected_authority_generation=int(before[3]),
@@ -142,7 +142,7 @@ def test_projection_writer_rejects_empty_cutover_without_switching_head(tmp_path
     writer = PlanProjectionWriter(repository)
     before = _head(database)
 
-    with pytest.raises(PlanningAuthorityError, match="declared physical projection change"):
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
         asyncio.run(
             writer.apply_atomic(
                 novel_id="novel-1",

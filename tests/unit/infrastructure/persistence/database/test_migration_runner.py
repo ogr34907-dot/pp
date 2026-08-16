@@ -323,6 +323,10 @@ def test_current_schema_installs_outline_manifest_storage_idempotently(tmp_path)
         "SELECT COUNT(*) FROM migrations_applied "
         "WHERE migration_file = '037_outline_plan_projection_bindings.sql'"
     ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM migrations_applied "
+        "WHERE migration_file = '038_manifest_head_projection_binding_guard.sql'"
+    ).fetchone()[0] == 1
 
 
 def test_projection_binding_migration_backfills_only_the_current_head(tmp_path):

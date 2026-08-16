@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from domain.structure.outline_contract import OutlinePayload
+from domain.structure.outline_plan import canonical_plan_digest
 from domain.structure.story_node import NodeType, StoryNode
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.outline_contract_repository import (
@@ -242,6 +243,81 @@ def _insert_sealed_plan(
     conn.commit()
 
 
+def test_manifest_head_rejects_raw_switch_to_unbound_cloned_draft(manifest_book):
+    database, _, contracts, _ = manifest_book
+    draft = contracts.clone_active_plan_draft("novel-1")
+    conn = database.get_connection()
+    before = _head_snapshot(database)
+    assert conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ?
+        """,
+        (draft.id,),
+    ).fetchone()[0] == 0
+    draft_digest = canonical_plan_digest(
+        canonical_prefix_digest=draft.canonical_prefix_digest,
+        items=draft.items,
+    )
+    assert draft_digest != before["digest"]
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """
+            UPDATE outline_plan_revisions
+            SET status = 'ready_for_review', digest = ?, sealed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (draft_digest, draft.id),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="complete projection bindings"):
+            conn.execute(
+                """
+                UPDATE outline_planning_heads
+                SET active_plan_revision_id = ?, active_plan_digest = ?,
+                    working_plan_revision_id = NULL,
+                    authority_generation = ?, projection_generation = ?
+                WHERE novel_id = 'novel-1'
+                """,
+                (
+                    draft.id,
+                    draft_digest,
+                    before["authority_generation"] + 1,
+                    before["projection_generation"] + 1,
+                ),
+            )
+    finally:
+        if conn.in_transaction:
+            conn.rollback()
+
+    assert _head_snapshot(database) == before
+
+
+def test_manifest_head_allows_valid_binding_checked_generation_update(manifest_book):
+    database, _, _, _ = manifest_book
+    before = _head_snapshot(database)
+    conn = database.get_connection()
+    conn.execute(
+        """
+        UPDATE outline_planning_heads
+        SET authority_generation = ?, projection_generation = ?
+        WHERE novel_id = 'novel-1'
+        """,
+        (before["authority_generation"] + 1, before["projection_generation"] + 1),
+    )
+    conn.commit()
+
+    assert _head_snapshot(database) == {
+        **before,
+        "authority_generation": before["authority_generation"] + 1,
+        "projection_generation": before["projection_generation"] + 1,
+    }
+
+
 def test_atomic_writer_exposes_no_capability_or_transaction_callback(manifest_book):
     database, repository, _, plan_id = manifest_book
     writer = PlanProjectionWriter(repository)
@@ -344,12 +420,12 @@ def test_projection_transaction_rolls_back_without_designated_head_cas(manifest_
     assert asyncio.run(repository.get_by_id("rollback-without-head")) is None
 
 
-def test_atomic_projection_requires_a_declared_physical_change(manifest_book):
+def test_atomic_projection_rejects_empty_caller_batch_before_head_cas(manifest_book):
     database, repository, _, plan_id = manifest_book
     writer = PlanProjectionWriter(repository)
     head = _head_snapshot(database)
 
-    with pytest.raises(PlanningAuthorityError, match="declared physical projection change"):
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
         _apply_atomic(
             writer,
             database,
@@ -410,22 +486,10 @@ def test_atomic_projection_rejects_every_caller_batch_before_node_writes(
 def test_atomic_publish_rejects_caller_batch_before_head_cas(manifest_book):
     database, repository, _, _ = manifest_book
     replacement = _head_snapshot(database)["plan_id"]
-    conn = database.get_connection()
-    conn.execute(
-        """
-        CREATE TRIGGER reject_test_head_switch
-        BEFORE UPDATE ON outline_planning_heads
-        WHEN NEW.active_plan_revision_id = ?
-        BEGIN
-            SELECT RAISE(ABORT, 'forced Head failure');
-        END
-        """.replace("?", repr(replacement))
-    )
-    conn.commit()
     before = _head_snapshot(database)
     writer = PlanProjectionWriter(repository)
 
-    with pytest.raises(PlanningAuthorityError, match="forced Head failure"):
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
         _apply_atomic(
             writer,
             database,
@@ -441,14 +505,14 @@ def test_atomic_publish_rejects_caller_batch_before_head_cas(manifest_book):
     assert _head_snapshot(database) == before
 
 
-def test_atomic_publish_rejects_manifest_without_plan_items(manifest_book):
+def test_atomic_publish_rejects_caller_batch_before_target_validation(manifest_book):
     database, repository, _, _ = manifest_book
     replacement = "publish-target"
     _insert_sealed_plan(database, replacement, digest="publish-target-digest")
     writer = PlanProjectionWriter(repository)
 
     before = _head_snapshot(database)
-    with pytest.raises(PlanningAuthorityError, match="no sealed plan items"):
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
         _apply_atomic(
             writer,
             database,
@@ -477,13 +541,13 @@ def test_atomic_publish_rejects_manifest_without_plan_items(manifest_book):
     ).fetchone()[0] == 0
 
 
-def test_atomic_writer_rejects_stale_head_and_non_publishable_target_before_dml(
+def test_atomic_writer_rejects_caller_batch_before_head_or_target_validation(
     manifest_book,
 ):
     database, repository, _, active_plan_id = manifest_book
     writer = PlanProjectionWriter(repository)
 
-    with pytest.raises(PlanningAuthorityError, match="planning Head generation changed"):
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
         _apply_atomic(
             writer,
             database,
@@ -501,7 +565,7 @@ def test_atomic_writer_rejects_stale_head_and_non_publishable_target_before_dml(
         status="ready_for_review",
         reconciliation_status="author_decision_required",
     )
-    with pytest.raises(PlanningAuthorityError, match="sealed aligned"):
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
         _apply_atomic(
             writer,
             database,
@@ -514,7 +578,7 @@ def test_atomic_writer_rejects_stale_head_and_non_publishable_target_before_dml(
     assert asyncio.run(repository.get_by_id("non-publishable-node")) is None
 
 
-def test_atomic_cutover_switches_head_atomically(legacy_plan_book):
+def test_atomic_cutover_rejects_caller_batch_without_head_switch(legacy_plan_book):
     database, repository, _, plan_id = legacy_plan_book
     writer = PlanProjectionWriter(repository)
     assert _head_snapshot(database) == {
@@ -525,13 +589,14 @@ def test_atomic_cutover_switches_head_atomically(legacy_plan_book):
         "projection_generation": 0,
     }
 
-    _apply_atomic(
-        writer,
-        database,
-        plan_id,
-        operation="cutover",
-        creates=(_node("cutover-part"),),
-    )
+    with pytest.raises(PlanningAuthorityError, match="caller-supplied"):
+        _apply_atomic(
+            writer,
+            database,
+            plan_id,
+            operation="cutover",
+            creates=(_node("cutover-part"),),
+        )
 
     fresh = DatabaseConnection(database.db_path).get_connection()
     head = fresh.execute(
@@ -541,10 +606,10 @@ def test_atomic_cutover_switches_head_atomically(legacy_plan_book):
         FROM outline_planning_heads WHERE novel_id = 'novel-1'
         """
     ).fetchone()
-    assert tuple(head) == ("manifest", plan_id, 1, 1)
+    assert tuple(head) == ("legacy", None, 0, 0)
     assert fresh.execute(
         "SELECT COUNT(*) FROM story_nodes WHERE id = 'cutover-part'"
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 0
 
 
 def test_manifest_runtime_whitelist_does_not_allow_planning_changes(manifest_book):
