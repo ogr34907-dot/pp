@@ -7,7 +7,10 @@ import hashlib
 import json
 from typing import Any, Protocol, Union
 
-from application.world.services.chapter_narrative_sync import CHAPTER_NARRATIVE_PIPELINE_VERSION
+from application.world.services.chapter_narrative_sync import (
+    CHAPTER_NARRATIVE_PIPELINE_VERSION,
+    worldline_rebuild_epoch_fence,
+)
 from infrastructure.persistence.database.canonical_aftermath_barrier import (
     exact_candidate_aftermath_is_ready,
 )
@@ -73,6 +76,16 @@ class WorldlineRebuildService:
     def _ensure_epoch(cls, conn, novel_id: str, expected_epoch: int) -> None:
         current_epoch = cls._current_epoch(conn, novel_id)
         if current_epoch != expected_epoch:
+            raise WorldlineRebuildCancelled(current_epoch)
+        filter_row = conn.execute(
+            "SELECT active_generation_epoch FROM worldline_generation_filters "
+            "WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        if (
+            filter_row is None
+            or int(filter_row["active_generation_epoch"] or 0) != int(expected_epoch)
+        ):
             raise WorldlineRebuildCancelled(current_epoch)
 
     @staticmethod
@@ -402,6 +415,7 @@ class WorldlineRebuildService:
                 last_error=expected_last_error,
             ):
                 raise WorldlineRebuildCancelled(self._current_epoch(conn, novel_id))
+            self._ensure_epoch(conn, novel_id, generation_epoch)
             self._transition_all_jobs(
                 conn,
                 novel_id=novel_id,
@@ -464,6 +478,7 @@ class WorldlineRebuildService:
             ):
                 conn.rollback()
                 return False
+            self._ensure_epoch(conn, novel_id, generation_epoch)
             self._transition_all_jobs(
                 conn,
                 novel_id=novel_id,
@@ -523,6 +538,7 @@ class WorldlineRebuildService:
             ):
                 conn.rollback()
                 return False
+            self._ensure_epoch(conn, novel_id, generation_epoch)
             self._validate_rebuild_outputs(conn, novel_id, generation_epoch, rows)
             for chapter in rows:
                 if "candidate_id" not in chapter.keys():
@@ -626,14 +642,15 @@ class WorldlineRebuildService:
                     raise WorldlineRebuildError(
                         f"worldline_replay_prepare_{prepared}:chapter={int(chapter['number'])}"
                     )
-                result = await self.aftermath_pipeline.run_after_chapter_saved(
-                    novel_id,
-                    int(chapter["number"]),
-                    str(chapter["content"] or ""),
-                    expected_content_sha256=str(chapter["content_sha256"] or ""),
-                    expected_content_revision=int(chapter["content_revision"] or 0),
-                    outline=str(chapter["outline"] or ""),
-                )
+                with worldline_rebuild_epoch_fence(novel_id, epoch):
+                    result = await self.aftermath_pipeline.run_after_chapter_saved(
+                        novel_id,
+                        int(chapter["number"]),
+                        str(chapter["content"] or ""),
+                        expected_content_sha256=str(chapter["content_sha256"] or ""),
+                        expected_content_revision=int(chapter["content_revision"] or 0),
+                        outline=str(chapter["outline"] or ""),
+                    )
                 self._ensure_epoch(conn, novel_id, epoch)
                 if not isinstance(result, dict) or not result.get("narrative_sync_ok"):
                     reason = str((result or {}).get("failure_reason") or "canonical_aftermath_not_ready")

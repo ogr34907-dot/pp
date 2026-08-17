@@ -136,4 +136,77 @@ describe('CandidateReviewDesk approval advancement', () => {
       await mounted.finish()
     }
   })
+
+  it('ignores an older refresh that resolves after the post-approval failure refresh', async () => {
+    const initial = candidateRun()
+    const authoritative = {
+      ...initial,
+      state: 'paused',
+      current_candidate_id: null,
+      current_candidate_chapter: null,
+      next_action: 'retry_advance',
+      last_error: 'advance failed',
+      candidate: null,
+    }
+    let resolveOlderRefresh!: (run: ReturnType<typeof candidateRun>) => void
+    const olderRefresh = new Promise<ReturnType<typeof candidateRun>>(
+      (resolve) => { resolveOlderRefresh = resolve }
+    )
+    mocks.getRun.mockReset()
+      .mockResolvedValueOnce(initial)
+      .mockReturnValueOnce(olderRefresh)
+      .mockResolvedValueOnce(authoritative)
+    mocks.listCandidateVersions.mockResolvedValue([])
+    mocks.approveAndCommit.mockResolvedValue(undefined)
+    mocks.generateNext.mockRejectedValue(new Error('advance failed'))
+
+    const mounted = await setupDesk()
+    try {
+      await mounted.state.refresh({ force: true })
+      const pendingOlderRefresh = mounted.state.refresh()
+      await Promise.resolve()
+
+      await mounted.state.approve(true)
+      resolveOlderRefresh(initial)
+      await pendingOlderRefresh
+
+      expect(mounted.state.run.state).toBe('paused')
+      expect(mounted.state.run.next_action).toBe('retry_advance')
+      expect(mounted.state.error).toBe('advance failed')
+      expect(mocks.messageSuccess).not.toHaveBeenCalled()
+    } finally {
+      await mounted.finish()
+    }
+  })
+
+  it('does not retain versions from the previous candidate when the new list fails', async () => {
+    const candidateA = candidateRun()
+    const candidateB = {
+      ...candidateA,
+      current_candidate_id: 'candidate-2',
+      candidate: {
+        ...candidateA.candidate,
+        id: 'candidate-2',
+        final_content: 'Candidate B',
+      },
+    }
+    mocks.getRun.mockReset().mockResolvedValueOnce(candidateA).mockResolvedValueOnce(candidateB)
+    mocks.listCandidateVersions.mockReset()
+      .mockResolvedValueOnce([{ id: 'version-a' }])
+      .mockRejectedValueOnce(new Error('version list failed'))
+
+    const mounted = await setupDesk()
+    try {
+      await mounted.state.refresh({ force: true })
+      expect(mounted.state.versions).toEqual([{ id: 'version-a' }])
+
+      await mounted.state.refresh({ force: true })
+
+      expect(mounted.state.run.candidate.id).toBe('candidate-1')
+      expect(mounted.state.versions).toEqual([])
+      expect(mounted.state.error).toBe('version list failed')
+    } finally {
+      await mounted.finish()
+    }
+  })
 })

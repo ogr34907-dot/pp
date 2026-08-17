@@ -6,9 +6,13 @@ import pytest
 
 from application.blueprint.services.outline_contract_service import OutlineContractService
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
+from domain.structure.outline_plan import OutlineExpansionRequired
 from domain.structure.story_node import NodeType, StoryNode
 from infrastructure.persistence.database.connection import DatabaseConnection
-from infrastructure.persistence.database.outline_contract_repository import OutlineContractRepository
+from infrastructure.persistence.database.outline_contract_repository import (
+    OutlineContractRepository,
+    OutlineGateError,
+)
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 
 
@@ -57,12 +61,23 @@ class _ManifestContracts:
         return list(self.rows)
 
 
-def _node(id: str, node_type: NodeType, parent_id: str | None = None) -> StoryNode:
+class _CorruptManifestContracts(_ManifestContracts):
+    def active_plan_items_with_payload(self, novel_id):
+        raise OutlineGateError("active manifest projection binding is malformed")
+
+
+def _node(
+    id: str,
+    node_type: NodeType,
+    parent_id: str | None = None,
+    *,
+    number: int = 1,
+) -> StoryNode:
     return StoryNode(
         id=id,
         novel_id="novel-1",
         node_type=node_type,
-        number=1,
+        number=number,
         title=id,
         order_index=1,
         parent_id=parent_id,
@@ -229,6 +244,89 @@ def test_manifest_chain_uses_logical_plan_parent_not_physical_story_parent():
         "story_node_id": "chapter-1",
         "payload": context["chapter"]["payload"],
     }
+
+
+def test_manifest_future_gap_requires_outline_expansion_before_later_projected_chapter():
+    nodes = [
+        _node("part-1", NodeType.PART),
+        _node("volume-1", NodeType.VOLUME, "part-1"),
+        _node("act-1", NodeType.ACT, "volume-1"),
+        _node("chapter-3", NodeType.CHAPTER, "act-1", number=3),
+    ]
+    rows = []
+    for logical_id, level, parent_id in (
+        ("root", "outline", None),
+        ("part-1", "part", "root"),
+        ("volume-1", "volume", "part-1"),
+        ("act-1", "act", "volume-1"),
+        ("chapter-3", "chapter", "act-1"),
+    ):
+        rows.append(
+            {
+                "logical_node_id": logical_id,
+                "parent_logical_node_id": parent_id,
+                "level": level,
+                "novel_id": "novel-1",
+                "story_node_id": None if logical_id == "root" else logical_id,
+                "version_id": f"version-{logical_id}",
+                "version_revision": 1,
+                "version_digest": f"digest-{logical_id}",
+                "version_source": "author",
+                "payload_json": __import__("json").dumps(
+                    {
+                        "title": logical_id,
+                        "narrative_text": logical_id,
+                        "creative_goal": "推进目标",
+                        "entry_state": "前态",
+                        "exit_state": "后态",
+                    }
+                ),
+            }
+        )
+    service = OutlineContractService(
+        contract_repository=_ManifestContracts(rows),
+        story_node_repository=_NodeRepo(nodes),
+    )
+
+    with pytest.raises(OutlineExpansionRequired, match="expand outline cohort"):
+        service.next_published_chapter_context("novel-1", after_chapter=1)
+
+
+def test_corrupt_manifest_is_not_misclassified_as_outline_expansion():
+    service = OutlineContractService(
+        contract_repository=_CorruptManifestContracts([]),
+        story_node_repository=_NodeRepo([]),
+    )
+
+    with pytest.raises(OutlineGateError, match="projection binding is malformed"):
+        service.next_published_chapter_context("novel-1", after_chapter=1)
+
+
+def test_manifest_gap_rejects_an_unbound_physical_chapter():
+    service = OutlineContractService(
+        contract_repository=_ManifestContracts(
+            [
+                {
+                    "logical_node_id": "root",
+                    "parent_logical_node_id": None,
+                    "level": "outline",
+                    "novel_id": "novel-1",
+                    "story_node_id": None,
+                    "version_id": "version-root",
+                    "version_revision": 1,
+                    "version_digest": "digest-root",
+                    "version_source": "author",
+                    "payload_json": '{"title":"root","creative_goal":"goal"}',
+                }
+            ]
+        ),
+        story_node_repository=_NodeRepo(
+            [_node("foreign-chapter-3", NodeType.CHAPTER, number=3)]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="not bound to the active manifest"):
+        service.next_published_chapter_context("novel-1", after_chapter=1)
 
 
 def test_manifest_logical_tree_is_rendered_from_the_active_manifest():

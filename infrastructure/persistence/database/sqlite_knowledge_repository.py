@@ -764,6 +764,7 @@ class SqliteKnowledgeRepository:
         pipeline_version: str,
         attempt_count: int,
         canonical_payload_sha256: str,
+        expected_generation_epoch: Optional[int] = None,
     ) -> bool:
         """Write one canonical summary only while its source claim is current."""
         now = datetime.now(timezone.utc).isoformat()
@@ -776,6 +777,15 @@ class SqliteKnowledgeRepository:
             with self.db.transaction() as conn:
                 # Lock before reading the source so a rewrite cannot land before this write.
                 conn.execute("BEGIN IMMEDIATE")
+                if expected_generation_epoch is not None:
+                    epoch = conn.execute(
+                        "SELECT active_generation_epoch "
+                        "FROM worldline_generation_filters WHERE novel_id = ?",
+                        (novel_id,),
+                    ).fetchone()
+                    current_epoch = int(epoch[0] or 0) if epoch is not None else 0
+                    if current_epoch != int(expected_generation_epoch):
+                        return False
                 source = conn.execute(
                     "SELECT content, content_sha256, content_revision FROM chapters "
                     "WHERE novel_id = ? AND number = ?",

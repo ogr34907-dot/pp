@@ -129,6 +129,49 @@ class _BlockingAftermath(_Aftermath):
         return await super().run_after_chapter_saved(novel_id, chapter_number, content, **kwargs)
 
 
+class _FilterRaceAftermath(_Aftermath):
+    """Retire the rebuild filter without changing the run row."""
+
+    def __init__(self, db):
+        super().__init__(db)
+        self.raced = False
+
+    async def run_after_chapter_saved(self, novel_id, chapter_number, content, **kwargs):
+        if not self.raced:
+            self.raced = True
+            conn = self.db.get_connection()
+            conn.execute(
+                "UPDATE worldline_generation_filters "
+                "SET active_generation_epoch = active_generation_epoch + 1 "
+                "WHERE novel_id = ?",
+                (novel_id,),
+            )
+            conn.commit()
+        return await super().run_after_chapter_saved(
+            novel_id, chapter_number, content, **kwargs
+        )
+
+
+class _BeforeRebuildBeginConnection:
+    """Apply one competing change at a chosen rebuild write-lock boundary."""
+
+    def __init__(self, connection, before_begin, *, begin_number):
+        self._connection = connection
+        self._before_begin = before_begin
+        self._begin_number = begin_number
+        self._begin_count = 0
+
+    def execute(self, sql, params=()):
+        if sql.strip().upper() == "BEGIN IMMEDIATE":
+            self._begin_count += 1
+            if self._begin_count == self._begin_number:
+                self._before_begin()
+        return self._connection.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 def _seed(db, *, import_legacy: bool = True):
     conn = db.get_connection()
     conn.execute("INSERT INTO novels (id, title, slug, target_chapters) VALUES ('novel-1', '重建小说', 'rebuild', 5)")
@@ -413,6 +456,182 @@ async def test_rebuild_start_epoch_race_cannot_mutate_new_epoch_run_or_jobs(tmp_
 
 
 @pytest.mark.asyncio
+async def test_rebuild_filter_epoch_race_cannot_publish_old_epoch(tmp_path):
+    """A generation filter retirement is an authority change even if the run row lags."""
+
+    db = DatabaseConnection(str(tmp_path / "worldline-rebuild-filter-race.db"))
+    _seed(db)
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    result = await WorldlineRebuildService(db, _FilterRaceAftermath(db)).rebuild(
+        "novel-1"
+    )
+
+    assert result == {
+        "status": "cancelled",
+        "generation_epoch": 1,
+        "rebuilt_chapters": 0,
+    }
+    run = db.fetch_one(
+        "SELECT state, canonical_sync_status, next_action "
+        "FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+    )
+    assert tuple(run[field] for field in ("state", "canonical_sync_status", "next_action")) == (
+        "paused",
+        "rebuilding",
+        "rebuild_worldline",
+    )
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM worldline_rebuild_jobs "
+        "WHERE novel_id = 'novel-1' AND generation_epoch = 1 AND status = 'completed'"
+    )["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rebuild_claim_rechecks_filter_epoch_under_its_write_lock(tmp_path):
+    """A retired filter cannot let claim mark the old epoch's jobs running."""
+
+    db_path = tmp_path / "worldline-rebuild-claim-filter-race.db"
+    db = DatabaseConnection(str(db_path))
+    _seed(db)
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    competing = DatabaseConnection(str(db_path))
+
+    def retire_filter() -> None:
+        conn = competing.get_connection()
+        conn.execute(
+            "UPDATE worldline_generation_filters "
+            "SET active_generation_epoch = active_generation_epoch + 1 "
+            "WHERE novel_id = ?",
+            ("novel-1",),
+        )
+        conn.commit()
+
+    service = WorldlineRebuildService(db, _Aftermath(db))
+    service._connection = lambda: _BeforeRebuildBeginConnection(
+        db.get_connection(), retire_filter, begin_number=1
+    )
+    try:
+        result = await service.rebuild("novel-1")
+    finally:
+        competing.close()
+
+    assert result == {
+        "status": "cancelled",
+        "generation_epoch": 1,
+        "rebuilt_chapters": 0,
+    }
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM worldline_rebuild_jobs "
+        "WHERE novel_id = 'novel-1' AND generation_epoch = 1 AND status = 'pending'"
+    )["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_rebuild_failure_rechecks_filter_epoch_under_its_write_lock(tmp_path):
+    """A retired filter cannot publish failure over an old rebuild epoch."""
+
+    db_path = tmp_path / "worldline-rebuild-failure-filter-race.db"
+    db = DatabaseConnection(str(db_path))
+    _seed(db)
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    competing = DatabaseConnection(str(db_path))
+
+    def retire_filter() -> None:
+        conn = competing.get_connection()
+        conn.execute(
+            "UPDATE worldline_generation_filters "
+            "SET active_generation_epoch = active_generation_epoch + 1 "
+            "WHERE novel_id = ?",
+            ("novel-1",),
+        )
+        conn.commit()
+
+    service = WorldlineRebuildService(db, _Aftermath(db, ok=False))
+    service._connection = lambda: _BeforeRebuildBeginConnection(
+        db.get_connection(), retire_filter, begin_number=2
+    )
+    try:
+        result = await service.rebuild("novel-1")
+    finally:
+        competing.close()
+
+    assert result == {
+        "status": "cancelled",
+        "generation_epoch": 1,
+        "rebuilt_chapters": 0,
+    }
+    run = db.fetch_one(
+        "SELECT state, canonical_sync_status, next_action, last_error "
+        "FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+    )
+    assert tuple(
+        run[field]
+        for field in ("state", "canonical_sync_status", "next_action", "last_error")
+    ) == ("paused", "rebuilding", "rebuild_worldline", "")
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM worldline_rebuild_jobs "
+        "WHERE novel_id = 'novel-1' AND generation_epoch = 1 AND status = 'running'"
+    )["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_rebuild_completion_rechecks_filter_epoch_under_final_write_lock(tmp_path):
+    """A filter retirement immediately before completion cannot publish old work."""
+
+    db_path = tmp_path / "worldline-rebuild-final-filter-race.db"
+    db = DatabaseConnection(str(db_path))
+    _seed(db)
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+    competing = DatabaseConnection(str(db_path))
+
+    def retire_filter() -> None:
+        conn = competing.get_connection()
+        conn.execute(
+            "UPDATE worldline_generation_filters "
+            "SET active_generation_epoch = active_generation_epoch + 1 "
+            "WHERE novel_id = ?",
+            ("novel-1",),
+        )
+        conn.commit()
+
+    service = WorldlineRebuildService(db, _Aftermath(db))
+    service._connection = lambda: _BeforeRebuildBeginConnection(
+        db.get_connection(), retire_filter, begin_number=2
+    )
+    try:
+        result = await service.rebuild("novel-1")
+    finally:
+        competing.close()
+
+    assert result == {
+        "status": "cancelled",
+        "generation_epoch": 1,
+        "rebuilt_chapters": 0,
+    }
+    run = db.fetch_one(
+        "SELECT state, canonical_sync_status, next_action "
+        "FROM novel_generation_runs WHERE novel_id = 'novel-1'"
+    )
+    assert tuple(run[field] for field in ("state", "canonical_sync_status", "next_action")) == (
+        "paused",
+        "rebuilding",
+        "rebuild_worldline",
+    )
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM worldline_rebuild_jobs "
+        "WHERE novel_id = 'novel-1' AND generation_epoch = 1 AND status = 'completed'"
+    )["total"] == 0
+
+
+@pytest.mark.asyncio
 async def test_rebuild_keeps_retry_state_when_exact_aftermath_memory_is_not_ready(tmp_path):
     db = DatabaseConnection(str(tmp_path / "worldline-rebuild-memory-barrier.db"))
     _seed(db)
@@ -498,6 +717,9 @@ async def test_rebuild_real_aftermath_restores_prefix_state_after_reset(tmp_path
 
     db = DatabaseConnection(str(tmp_path / "worldline-rebuild-real-aftermath.db"))
     _seed(db, import_legacy=False)
+    # The real aftermath pipeline writes tension through application.paths at
+    # call time.  Keep that auxiliary write on this test's isolated database.
+    monkeypatch.setattr("application.paths.get_db_path", lambda: db.db_path)
     conn = db.get_connection()
     for number, content in ((1, "第1章关键选择；hero前缀状态"), (2, "第2章关键选择；hero尾部状态")):
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -773,3 +995,190 @@ async def test_rebuild_real_aftermath_restores_prefix_state_after_reset(tmp_path
         restored_run["canonical_sync_status"],
         restored_run["next_action"],
     ) == ("paused", "ready", "select_run_mode")
+
+
+@pytest.mark.asyncio
+async def test_rebuild_real_pipeline_discards_aftermath_when_epoch_changes_during_extract(
+    tmp_path, monkeypatch
+):
+    db = DatabaseConnection(str(tmp_path / "worldline-rebuild-stale-pipeline.db"))
+    _seed(db, import_legacy=False)
+    conn = db.get_connection()
+    for chapter_number in (1, 2):
+        content = f"正文{chapter_number}"
+        content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        candidate_id = f"candidate-{chapter_number}"
+        conn.execute(
+            "INSERT INTO chapter_candidates "
+            "(id, novel_id, chapter_number, generation_epoch, status, llm_content) "
+            "VALUES (?, 'novel-1', ?, 0, 'committed', ?)",
+            (candidate_id, chapter_number, content),
+        )
+        conn.execute(
+            "INSERT INTO chapter_candidate_formal_commits "
+            "(candidate_id, novel_id, chapter_number, chapter_id, content_sha256, "
+            "content_revision, provenance, sync_status) "
+            "VALUES (?, 'novel-1', ?, ?, ?, 1, 'candidate_commit', 'ready')",
+            (candidate_id, chapter_number, f"chapter-{chapter_number}", content_sha256),
+        )
+    conn.commit()
+    monkeypatch.setattr("application.paths.get_db_path", lambda: db.db_path)
+    reset = WorldlineRegenerationService(db)
+    preview = reset.preview("novel-1", start_chapter=2, target_chapters=5)
+    reset.execute("novel-1", preview_token=preview.token, run_mode="continuous")
+
+    class _Indexing:
+        def __init__(self):
+            self.chapters = []
+
+        async def ensure_collection(self, _novel_id):
+            return None
+
+        async def index_chapter_summary(self, _novel_id, chapter_number, _text, **_kwargs):
+            self.chapters.append(chapter_number)
+
+    class _Memory:
+        async def update_canonical_version_from_chapter(
+            self, novel_id, chapter_number, _content, _outline, **_kwargs
+        ):
+            conn = db.get_connection()
+            conn.execute(
+                "INSERT INTO memory_engine_state "
+                "(novel_id, state_json, last_updated_chapter, updated_at) "
+                "VALUES (?, '{}', ?, datetime('now'))",
+                (novel_id, chapter_number),
+            )
+            conn.commit()
+            return {"new_beats": 0, "new_clues": 0, "errors": []}
+
+    async def _race_epoch(_llm, content, _chapter_number, **_kwargs):
+        conn = db.get_connection()
+        conn.execute(
+            "UPDATE worldline_generation_filters "
+            "SET active_generation_epoch = active_generation_epoch + 1 "
+            "WHERE novel_id = 'novel-1'"
+        )
+        conn.commit()
+        return {
+            "summary": content,
+            "key_events": content,
+            "open_threads": "",
+            "relation_triples": [],
+            "foreshadow_hints": [],
+            "consumed_foreshadows": [],
+            "storyline_progress": [],
+            "dialogues": [],
+            "timeline_events": [],
+            "causal_edges": [],
+            "character_mutations": [],
+            "character_states": [],
+        }
+
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.llm_chapter_extract_bundle",
+        _race_epoch,
+    )
+    indexing = _Indexing()
+    pipeline = ChapterAftermathPipeline(
+        knowledge_service=KnowledgeService(SqliteKnowledgeRepository(db)),
+        chapter_indexing_service=indexing,
+        llm_service=SimpleNamespace(),
+        chapter_repository=SqliteChapterRepository(db),
+        memory_engine=_Memory(),
+    )
+
+    result = await WorldlineRebuildService(db, pipeline).rebuild("novel-1")
+
+    assert result["status"] == "cancelled"
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS total FROM chapter_summaries "
+        "WHERE sync_status = 'committed'"
+    )["total"] == 0
+    assert db.fetch_one(
+        "SELECT 1 FROM memory_engine_state WHERE novel_id = 'novel-1'"
+    ) is None
+    assert indexing.chapters == []
+    claim = db.fetch_one(
+        "SELECT status, failure_reason FROM chapter_narrative_commits "
+        "WHERE novel_id = 'novel-1' AND chapter_number = 1"
+    )
+    assert (claim["status"], claim["failure_reason"]) == (
+        "failed",
+        "generation_epoch_mismatch",
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_engine_canonical_persist_is_fenced_by_generation_epoch(
+    tmp_path, monkeypatch
+):
+    db = DatabaseConnection(str(tmp_path / "memory-epoch-fence.db"))
+    _seed(db, import_legacy=False)
+    conn = db.get_connection()
+    content = "第1章关键选择"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    conn.execute(
+        "UPDATE chapters SET content = ?, content_sha256 = ?, content_revision = 1 "
+        "WHERE novel_id = 'novel-1' AND number = 1",
+        (content, content_sha256),
+    )
+    conn.execute(
+        "INSERT INTO worldline_generation_filters "
+        "(novel_id, active_generation_epoch) VALUES ('novel-1', 1) "
+        "ON CONFLICT(novel_id) DO UPDATE SET active_generation_epoch = 1"
+    )
+    conn.commit()
+
+    class _RacingLLM:
+        async def generate(self, _prompt, _config):
+            race = db.get_connection()
+            race.execute(
+                "UPDATE worldline_generation_filters "
+                "SET active_generation_epoch = 2 WHERE novel_id = 'novel-1'"
+            )
+            race.commit()
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "completed_beats": [
+                            {
+                                "beat_id": "stale-beat",
+                                "summary": content,
+                                "chapter": 1,
+                                "evidence_text": content,
+                            }
+                        ],
+                        "revealed_clues": [],
+                        "fact_violations": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    monkeypatch.setattr(
+        "application.engine.services.memory_engine.get_prompt_gateway",
+        lambda: SimpleNamespace(
+            render=lambda *_args, **_kwargs: SimpleNamespace(prompt="memory prompt")
+        ),
+    )
+    memory = MemoryEngine(
+        _RacingLLM(),
+        SimpleNamespace(get_by_novel_id=lambda _novel_id: None),
+        db,
+    )
+
+    result = await memory.update_canonical_version_from_chapter(
+        "novel-1",
+        1,
+        content,
+        "",
+        content_sha256=content_sha256,
+        content_revision=1,
+        expected_generation_epoch=1,
+    )
+
+    assert result["discarded_stale"] is True
+    assert result["errors"] == ["generation_epoch_mismatch"]
+    assert db.fetch_one(
+        "SELECT 1 FROM memory_engine_state WHERE novel_id = 'novel-1'"
+    ) is None

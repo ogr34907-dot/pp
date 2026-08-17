@@ -120,6 +120,11 @@ class ChapterCandidateRepository:
             failure_reason=str(row["failure_reason"] or ""),
             continue_after_commit=bool(row["continue_after_commit"]),
             formal_chapter_id=row["formal_chapter_id"],
+            sync_attempt=(
+                int(row["sync_attempt"] or 0)
+                if "sync_attempt" in row.keys()
+                else 0
+            ),
         )
 
     def get_run(self, novel_id: str) -> GenerationRun:
@@ -136,7 +141,12 @@ class ChapterCandidateRepository:
         conn = self._connection()
         return self._persisted_formal_chapter_head(conn, novel_id)
 
-    def formal_history_snapshot(self, novel_id: str) -> tuple[int, tuple[str, ...]]:
+    def formal_history_snapshot(
+        self,
+        novel_id: str,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> tuple[int, tuple[str, ...]]:
         """Return the unique Formal head and any unsupported completed tail.
 
         The head comes only from the legacy baseline plus exact Candidate-first
@@ -145,7 +155,7 @@ class ChapterCandidateRepository:
         the returned head.
         """
 
-        conn = self._connection()
+        conn = connection or self._connection()
         baseline = self._validated_pre_candidate_baseline(conn, novel_id)
         formal_head = self._persisted_formal_chapter_head(
             conn, novel_id, baseline=baseline
@@ -976,6 +986,209 @@ class ChapterCandidateRepository:
             )
         return candidate, run
 
+    @staticmethod
+    def _candidate_transition_snapshot(candidate: ChapterCandidate) -> tuple[object, ...]:
+        return (
+            candidate.id,
+            candidate.novel_id,
+            candidate.chapter_number,
+            candidate.generation_epoch,
+            candidate.status.value,
+            candidate.outline_chain_digest,
+            candidate.planning_authority_generation,
+            candidate.plan_revision_id,
+            candidate.plan_digest,
+            candidate.chapter_outline_digest,
+            candidate.plan_pin_fingerprint,
+            candidate.content_revision,
+            candidate.audit_revision,
+            candidate.commit_plan_revision,
+            candidate.commit_plan_content_revision,
+            candidate.feedback,
+            candidate.failure_reason,
+            candidate.continue_after_commit,
+            candidate.formal_chapter_id,
+        )
+
+    @staticmethod
+    def _run_transition_snapshot(run: GenerationRun) -> tuple[object, ...]:
+        return (
+            run.novel_id,
+            run.run_mode.value,
+            run.state.value,
+            run.generation_epoch,
+            run.target_chapters,
+            run.current_formal_chapter,
+            run.current_candidate_id,
+            run.current_candidate_chapter,
+            run.canonical_sync_status,
+            run.next_action,
+            run.last_error,
+            run.max_pending_candidates,
+            run.prefetch,
+        )
+
+    def _locked_candidate_transition(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        candidate_id: str,
+        expected_candidate: ChapterCandidate,
+        expected_run: GenerationRun,
+        allowed_statuses: tuple[CandidateStatus, ...],
+        allowed_run_states: tuple[GenerationRunState, ...],
+        allowed_canonical_sync_statuses: tuple[str, ...],
+        require_formal: bool,
+        allowed_formal_sync_statuses: tuple[str, ...] = (),
+        expected_formal_sync_attempt: Optional[int] = None,
+        require_current_plan_pin: bool = True,
+    ) -> tuple[ChapterCandidate, GenerationRun, Optional[sqlite3.Row]]:
+        """Reload one Candidate authority after the caller owns the write lock."""
+
+        candidate_row = conn.execute(
+            "SELECT * FROM chapter_candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        if candidate_row is None:
+            raise KeyError(f"candidate not found: {candidate_id}")
+        candidate = self._candidate_from_row(candidate_row)
+        run_row = conn.execute(
+            "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (candidate.novel_id,)
+        ).fetchone()
+        if run_row is None:
+            raise CandidateGateError("generation run is missing")
+        run = self._run_from_row(run_row)
+        if self._candidate_transition_snapshot(candidate) != self._candidate_transition_snapshot(
+            expected_candidate
+        ):
+            raise CandidateGateError("candidate changed before authority transition")
+        if self._run_transition_snapshot(run) != self._run_transition_snapshot(expected_run):
+            raise CandidateGateError("generation run changed before authority transition")
+        if candidate.generation_epoch != run.generation_epoch:
+            raise CandidateGateError("candidate belongs to a retired generation epoch")
+        if candidate.status not in allowed_statuses:
+            raise CandidateGateError("candidate is no longer in an authority-bearing state")
+        if run.state not in allowed_run_states:
+            raise CandidateGateError("generation run is no longer in an authority-bearing state")
+        if (
+            run.current_candidate_id != candidate.id
+            or int(run.current_candidate_chapter or 0) != candidate.chapter_number
+            or str(run.canonical_sync_status or "") not in allowed_canonical_sync_statuses
+        ):
+            raise CandidateGateError("candidate no longer belongs to the active generation authority")
+        if require_current_plan_pin:
+            self._assert_plan_pin_current(conn, candidate)
+        baseline = self._validated_pre_candidate_baseline(conn, candidate.novel_id)
+        self._ensure_no_unproven_completed_chapters(
+            conn, candidate.novel_id, len(baseline)
+        )
+        formal_head = self._persisted_formal_chapter_head(
+            conn, candidate.novel_id, baseline=baseline
+        )
+        if not require_formal and formal_head != candidate.chapter_number - 1:
+            raise CandidateGateError(
+                "generation run formal cursor does not match the persisted formal head"
+            )
+        prefix_head = candidate.chapter_number - 1
+        self.require_formal_prefix_aftermath_ready(
+            candidate.novel_id, prefix_head, connection=conn
+        )
+        if run.current_formal_chapter != prefix_head:
+            raise CandidateGateError(
+                "generation run formal cursor does not match the persisted formal head"
+            )
+
+        formal = conn.execute(
+            """
+            SELECT formal.candidate_id, formal.novel_id, formal.chapter_number, formal.chapter_id,
+                   formal.content_sha256 AS authority_content_sha256,
+                   formal.content_revision AS authority_content_revision,
+                   formal.sync_status, formal.sync_attempt,
+                   chapter.content, chapter.content_sha256 AS chapter_content_sha256,
+                   chapter.content_revision AS chapter_content_revision,
+                   chapter.status AS chapter_status
+            FROM chapter_candidate_formal_commits AS formal
+            JOIN chapters AS chapter ON chapter.id = formal.chapter_id
+            WHERE formal.candidate_id = ?
+            """,
+            (candidate_id,),
+        ).fetchone()
+        if not require_formal:
+            if candidate.formal_chapter_id or formal is not None:
+                raise CandidateGateError("formal candidate must finish or retry canonical sync")
+            return candidate, run, None
+        if (
+            formal is None
+            or not candidate.formal_chapter_id
+            or str(formal["novel_id"] or "") != candidate.novel_id
+            or int(formal["chapter_number"] or 0) != candidate.chapter_number
+            or str(formal["chapter_id"] or "") != candidate.formal_chapter_id
+            or str(formal["chapter_status"] or "") != "completed"
+            or not self._formal_version_matches(formal)
+        ):
+            raise CandidateGateError("candidate formal version changed before authority transition")
+        if (
+            allowed_formal_sync_statuses
+            and str(formal["sync_status"] or "") not in allowed_formal_sync_statuses
+        ):
+            raise CandidateGateError("candidate formal sync state changed before authority transition")
+        if (
+            expected_formal_sync_attempt is not None
+            and int(formal["sync_attempt"] or 0) != int(expected_formal_sync_attempt)
+        ):
+            raise CandidateGateError("candidate formal sync attempt changed before authority transition")
+        return candidate, run, formal
+
+    def _locked_run_transition(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: str,
+        expected_run: GenerationRun,
+        allowed_states: tuple[GenerationRunState, ...],
+    ) -> GenerationRun:
+        """Reload a no-Candidate run under lock before an authority terminal write."""
+
+        row = conn.execute(
+            "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"generation run not found: {novel_id}")
+        run = self._run_from_row(row)
+        if self._run_transition_snapshot(run) != self._run_transition_snapshot(expected_run):
+            raise CandidateGateError("generation run changed before authority transition")
+        if run.state not in allowed_states:
+            raise CandidateGateError("generation run is no longer in an authority-bearing state")
+        if (
+            run.current_candidate_id is not None
+            or run.current_candidate_chapter is not None
+            or run.canonical_sync_status != "ready"
+        ):
+            raise CandidateGateError("pending candidate or canonical sync blocks this run transition")
+        baseline = self._validated_pre_candidate_baseline(conn, novel_id)
+        self._ensure_no_unproven_completed_chapters(conn, novel_id, len(baseline))
+        formal_head = self._persisted_formal_chapter_head(
+            conn, novel_id, baseline=baseline
+        )
+        self.require_formal_prefix_aftermath_ready(
+            novel_id, formal_head, connection=conn
+        )
+        if run.current_formal_chapter != formal_head:
+            # A few legacy callers bootstrap a run before any chapter row has
+            # ever been materialized and persist only the cursor used by their
+            # completion check.  There is no Formal identity to contradict in
+            # that empty database.  Once any chapter exists, the durable
+            # Formal head remains authoritative and a cursor mismatch must
+            # fail closed.
+            has_chapter_rows = conn.execute(
+                "SELECT 1 FROM chapters WHERE novel_id = ? LIMIT 1",
+                (novel_id,),
+            ).fetchone() is not None
+            if has_chapter_rows:
+                raise CandidateGateError(
+                    "generation run formal cursor does not match the persisted formal head"
+                )
+        return run
+
     def revalidate_candidate_generation_authority(
         self, candidate_id: str
     ) -> ChapterCandidate:
@@ -1145,94 +1358,130 @@ class ChapterCandidateRepository:
         conn = self._connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            novel = conn.execute(
-                "SELECT target_chapters FROM novels WHERE id = ?", (novel_id,)
-            ).fetchone()
-            if novel is None:
-                raise KeyError(f"novel not found: {novel_id}")
-            target_chapters = int(novel["target_chapters"] or 0)
-            if target_chapters < 1:
-                raise CandidateGateError("novel target_chapters must be at least 1")
-
-            baseline = self._validated_pre_candidate_baseline(conn, novel_id)
-            self._ensure_no_unproven_completed_chapters(
-                conn, novel_id, len(baseline)
+            # The public entry uses the durable novel target.  Worldline continue
+            # supplies its preview target to the same-connection helper instead.
+            self._start_run_in_transaction(
+                conn,
+                novel_id,
+                run_mode=run_mode,
+                target_chapters=None,
             )
-            persisted_chapter_head = self._persisted_formal_chapter_head(
-                conn, novel_id, baseline=baseline
-            )
-            existing = conn.execute(
-                "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
-            ).fetchone()
-            now = self._now()
-            if existing is None:
-                inserted = conn.execute(
-                    """
-                    INSERT INTO novel_generation_runs
-                        (novel_id, run_mode, state, generation_epoch, target_chapters,
-                         current_formal_chapter, max_pending_candidates, prefetch,
-                         canonical_sync_status, next_action, updated_at)
-                    VALUES (?, ?, 'running', 0, ?, ?, 1, 0, 'ready', 'generate_candidate', ?)
-                    ON CONFLICT(novel_id) DO NOTHING
-                    """,
-                    (
-                        novel_id,
-                        run_mode.value,
-                        target_chapters,
-                        persisted_chapter_head,
-                        now,
-                    ),
-                )
-                if inserted.rowcount != 1:
-                    raise CandidateGateError("generation run changed before start")
-            else:
-                current = self._run_from_row(existing)
-                if current.canonical_sync_status not in {"ready", ""}:
-                    raise CandidateGateError(
-                        "canonical rebuild or sync is not ready; resolve the current recovery action first"
-                    )
-                if current.current_candidate_id:
-                    raise CandidateGateError("cannot start a new run while a pending candidate exists")
-                if current.state == GenerationRunState.WAITING_PLANNING:
-                    raise CandidateGateError(
-                        "outline expansion is required before starting generation"
-                    )
-                updated = conn.execute(
-                    """
-                    UPDATE novel_generation_runs
-                    SET run_mode = ?, state = 'running', target_chapters = ?,
-                        current_formal_chapter = ?, max_pending_candidates = 1,
-                        prefetch = 0, canonical_sync_status = 'ready',
-                        next_action = 'generate_candidate', last_error = '', updated_at = ?
-                    WHERE novel_id = ? AND generation_epoch = ? AND state = ?
-                      AND current_formal_chapter = ?
-                      AND current_candidate_id IS NULL
-                      AND current_candidate_chapter IS NULL
-                      AND canonical_sync_status = ?
-                    """,
-                    (
-                        run_mode.value,
-                        target_chapters,
-                        persisted_chapter_head,
-                        now,
-                        novel_id,
-                        current.generation_epoch,
-                        current.state.value,
-                        current.current_formal_chapter,
-                        current.canonical_sync_status,
-                    ),
-                )
-                if updated.rowcount != 1:
-                    raise CandidateGateError("generation run changed before start")
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
         return self.get_run(novel_id)
 
+    def _start_run_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        novel_id: str,
+        *,
+        run_mode: RunMode,
+        target_chapters: int | None,
+    ) -> GenerationRun:
+        """Start one run inside an already-owned SQLite write transaction."""
+
+        novel = conn.execute(
+            "SELECT target_chapters FROM novels WHERE id = ?", (novel_id,)
+        ).fetchone()
+        if novel is None:
+            raise KeyError(f"novel not found: {novel_id}")
+        effective_target = (
+            int(novel["target_chapters"] or 0)
+            if target_chapters is None
+            else int(target_chapters)
+        )
+        if effective_target < 1:
+            raise CandidateGateError("novel target_chapters must be at least 1")
+
+        baseline = self._validated_pre_candidate_baseline(conn, novel_id)
+        self._ensure_no_unproven_completed_chapters(
+            conn, novel_id, len(baseline)
+        )
+        persisted_chapter_head = self._persisted_formal_chapter_head(
+            conn, novel_id, baseline=baseline
+        )
+        existing = conn.execute(
+            "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+        ).fetchone()
+        now = self._now()
+        if existing is None:
+            inserted = conn.execute(
+                """
+                INSERT INTO novel_generation_runs
+                    (novel_id, run_mode, state, generation_epoch, target_chapters,
+                     current_formal_chapter, max_pending_candidates, prefetch,
+                     canonical_sync_status, next_action, updated_at)
+                VALUES (?, ?, 'running', 0, ?, ?, 1, 0, 'ready', 'generate_candidate', ?)
+                ON CONFLICT(novel_id) DO NOTHING
+                """,
+                (
+                    novel_id,
+                    run_mode.value,
+                    effective_target,
+                    persisted_chapter_head,
+                    now,
+                ),
+            )
+            if inserted.rowcount != 1:
+                raise CandidateGateError("generation run changed before start")
+        else:
+            current = self._run_from_row(existing)
+            if current.canonical_sync_status not in {"ready", ""}:
+                raise CandidateGateError(
+                    "canonical rebuild or sync is not ready; resolve the current recovery action first"
+                )
+            if current.current_candidate_id:
+                raise CandidateGateError("cannot start a new run while a pending candidate exists")
+            if current.state == GenerationRunState.WAITING_PLANNING:
+                raise CandidateGateError(
+                    "outline expansion is required before starting generation"
+                )
+            updated = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET run_mode = ?, state = 'running', target_chapters = ?,
+                    current_formal_chapter = ?, max_pending_candidates = 1,
+                    prefetch = 0, canonical_sync_status = 'ready',
+                    next_action = 'generate_candidate', last_error = '', updated_at = ?
+                WHERE novel_id = ? AND generation_epoch = ? AND state = ?
+                  AND current_formal_chapter = ?
+                  AND current_candidate_id IS NULL
+                  AND current_candidate_chapter IS NULL
+                  AND canonical_sync_status = ?
+                """,
+                (
+                    run_mode.value,
+                    effective_target,
+                    persisted_chapter_head,
+                    now,
+                    novel_id,
+                    current.generation_epoch,
+                    current.state.value,
+                    current.current_formal_chapter,
+                    current.canonical_sync_status,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before start")
+        run_row = conn.execute(
+            "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+        ).fetchone()
+        if run_row is None:
+            raise CandidateGateError("generation run was not initialized")
+        return self._run_from_row(run_row)
+
     def get_candidate(self, candidate_id: str) -> ChapterCandidate:
         row = self._connection().execute(
-            "SELECT * FROM chapter_candidates WHERE id = ?", (candidate_id,)
+            """
+            SELECT candidate.*, COALESCE(formal.sync_attempt, 0) AS sync_attempt
+            FROM chapter_candidates AS candidate
+            LEFT JOIN chapter_candidate_formal_commits AS formal
+              ON formal.candidate_id = candidate.id
+            WHERE candidate.id = ?
+            """,
+            (candidate_id,),
         ).fetchone()
         if row is None:
             raise KeyError(f"candidate not found: {candidate_id}")
@@ -1258,9 +1507,11 @@ class ChapterCandidateRepository:
     def get_current_candidate(self, novel_id: str) -> Optional[ChapterCandidate]:
         row = self._connection().execute(
             """
-            SELECT c.*
+            SELECT c.*, COALESCE(formal.sync_attempt, 0) AS sync_attempt
             FROM novel_generation_runs AS r
             JOIN chapter_candidates AS c ON c.id = r.current_candidate_id
+            LEFT JOIN chapter_candidate_formal_commits AS formal
+              ON formal.candidate_id = c.id
             WHERE r.novel_id = ?
             """,
             (novel_id,),
@@ -2017,11 +2268,11 @@ class ChapterCandidateRepository:
     def reject_and_stop(self, candidate_id: str) -> ChapterCandidate:
         """Reject an uncommitted candidate and end this run without side effects."""
 
-        candidate = self.get_candidate(candidate_id)
-        self._ensure_current_generation(candidate)
-        if candidate.formal_chapter_id:
+        expected_candidate = self.get_candidate(candidate_id)
+        expected_run = self._ensure_current_generation(expected_candidate)
+        if expected_candidate.formal_chapter_id:
             raise CandidateGateError("a formal candidate must finish or retry canonical sync")
-        if candidate.status not in {
+        if expected_candidate.status not in {
             CandidateStatus.STREAMING,
             CandidateStatus.AUDITING,
             CandidateStatus.AWAITING_REVIEW,
@@ -2033,11 +2284,54 @@ class ChapterCandidateRepository:
         now = self._now()
         conn = self._connection()
         try:
-            conn.execute("BEGIN")
-            conn.execute(
-                "UPDATE chapter_candidates SET status = 'rejected', updated_at = ? WHERE id = ?",
-                (now, candidate_id),
+            conn.execute("BEGIN IMMEDIATE")
+            candidate, run, _ = self._locked_candidate_transition(
+                conn,
+                candidate_id=candidate_id,
+                expected_candidate=expected_candidate,
+                expected_run=expected_run,
+                allowed_statuses=(
+                    CandidateStatus.STREAMING,
+                    CandidateStatus.AUDITING,
+                    CandidateStatus.AWAITING_REVIEW,
+                    CandidateStatus.STALE,
+                    CandidateStatus.REGENERATING,
+                    CandidateStatus.FAILED,
+                ),
+                allowed_run_states=(
+                    GenerationRunState.RUNNING,
+                    GenerationRunState.WAITING_REVIEW,
+                    GenerationRunState.PAUSED,
+                    GenerationRunState.ERROR,
+                ),
+                allowed_canonical_sync_statuses=("ready",),
+                require_formal=False,
+                require_current_plan_pin=(
+                    expected_candidate.status != CandidateStatus.STALE
+                ),
             )
+            updated = conn.execute(
+                """
+                UPDATE chapter_candidates
+                SET status = 'rejected', updated_at = ?
+                WHERE id = ? AND generation_epoch = ? AND status = ?
+                  AND content_revision = ? AND audit_revision = ?
+                  AND commit_plan_revision = ? AND commit_plan_content_revision = ?
+                  AND formal_chapter_id IS NULL
+                """,
+                (
+                    now,
+                    candidate_id,
+                    candidate.generation_epoch,
+                    candidate.status.value,
+                    candidate.content_revision,
+                    candidate.audit_revision,
+                    candidate.commit_plan_revision,
+                    candidate.commit_plan_content_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("candidate changed before rejection")
             conn.execute(
                 """
                 UPDATE candidate_dag_runs
@@ -2047,18 +2341,40 @@ class ChapterCandidateRepository:
                 """,
                 (now, now, candidate_id),
             )
-            conn.execute(
+            updated = conn.execute(
                 """
                 UPDATE novel_generation_runs
                 SET state = 'stopped', generation_epoch = generation_epoch + 1,
                     current_candidate_id = NULL, current_candidate_chapter = NULL,
                     next_action = 'idle', last_error = '', updated_at = ?
-                WHERE novel_id = ?
+                WHERE novel_id = ? AND run_mode = ? AND state = ?
+                  AND generation_epoch = ? AND target_chapters = ?
+                  AND current_formal_chapter = ? AND current_candidate_id = ?
+                  AND current_candidate_chapter = ? AND canonical_sync_status = ?
+                  AND next_action = ? AND last_error = ?
+                  AND max_pending_candidates = ? AND prefetch = ?
                 """,
-                (now, candidate.novel_id),
+                (
+                    now,
+                    candidate.novel_id,
+                    run.run_mode.value,
+                    run.state.value,
+                    run.generation_epoch,
+                    run.target_chapters,
+                    run.current_formal_chapter,
+                    candidate.id,
+                    candidate.chapter_number,
+                    run.canonical_sync_status,
+                    run.next_action,
+                    run.last_error,
+                    run.max_pending_candidates,
+                    run.prefetch,
+                ),
             )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before rejection")
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         return self.get_candidate(candidate_id)
@@ -2071,37 +2387,127 @@ class ChapterCandidateRepository:
         cannot write prose after the author has stopped the run.
         """
 
-        run = self.get_run(novel_id)
-        current = self.get_current_candidate(novel_id)
+        expected_run = self.get_run(novel_id)
+        expected_candidate = self.get_current_candidate(novel_id)
+        if expected_candidate is not None and expected_candidate.generation_epoch != expected_run.generation_epoch:
+            raise CandidateGateError("candidate belongs to a retired generation epoch")
         now = self._now()
         conn = self._connection()
         try:
-            conn.execute("BEGIN")
-            if current is not None and current.status == CandidateStatus.SYNCING:
-                conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            if expected_candidate is not None:
+                candidate, run, formal = self._locked_candidate_transition(
+                    conn,
+                    candidate_id=expected_candidate.id,
+                    expected_candidate=expected_candidate,
+                    expected_run=expected_run,
+                    allowed_statuses=(
+                        CandidateStatus.STREAMING,
+                        CandidateStatus.AUDITING,
+                        CandidateStatus.AWAITING_REVIEW,
+                        CandidateStatus.COMMITTING,
+                        CandidateStatus.SYNCING,
+                        CandidateStatus.REGENERATING,
+                        CandidateStatus.FAILED,
+                        CandidateStatus.STALE,
+                    ),
+                    allowed_run_states=(
+                        GenerationRunState.RUNNING,
+                        GenerationRunState.WAITING_REVIEW,
+                        GenerationRunState.PAUSED,
+                        GenerationRunState.ERROR,
+                    ),
+                    allowed_canonical_sync_statuses=("ready", "syncing", "failed"),
+                    require_formal=bool(expected_candidate.formal_chapter_id),
+                    allowed_formal_sync_statuses=(
+                        ("syncing",)
+                        if expected_candidate.status == CandidateStatus.SYNCING
+                        else ("failed",)
+                        if expected_candidate.formal_chapter_id
+                        else ()
+                    ),
+                    require_current_plan_pin=(
+                        expected_candidate.status != CandidateStatus.STALE
+                    ),
+                )
+            else:
+                candidate = None
+                formal = None
+                run = self._locked_run_transition(
+                    conn,
+                    novel_id=novel_id,
+                    expected_run=expected_run,
+                    allowed_states=tuple(GenerationRunState),
+                )
+
+            if candidate is not None and candidate.status in {
+                CandidateStatus.AWAITING_REVIEW,
+                CandidateStatus.FAILED,
+            }:
+                # These durable gates already consume no tokens. Preserve their
+                # actionable run state so review, rejection, or sync retry remains possible.
+                conn.commit()
+                return self.get_run(novel_id)
+            if candidate is not None and candidate.status == CandidateStatus.SYNCING:
+                updated = conn.execute(
                     """
                     UPDATE novel_generation_runs
                     SET state = 'paused', next_action = 'finish_sync_then_pause', updated_at = ?
-                    WHERE novel_id = ?
+                    WHERE novel_id = ? AND run_mode = ? AND state = ?
+                      AND generation_epoch = ? AND target_chapters = ?
+                      AND current_formal_chapter = ? AND current_candidate_id = ?
+                      AND current_candidate_chapter = ? AND canonical_sync_status = ?
+                      AND next_action = ? AND last_error = ?
+                      AND max_pending_candidates = ? AND prefetch = ?
                     """,
-                    (now, novel_id),
+                    (
+                        now,
+                        novel_id,
+                        run.run_mode.value,
+                        run.state.value,
+                        run.generation_epoch,
+                        run.target_chapters,
+                        run.current_formal_chapter,
+                        candidate.id,
+                        candidate.chapter_number,
+                        run.canonical_sync_status,
+                        run.next_action,
+                        run.last_error,
+                        run.max_pending_candidates,
+                        run.prefetch,
+                    ),
                 )
             else:
-                active = current is not None and current.status in {
-                CandidateStatus.STREAMING,
-                CandidateStatus.AUDITING,
-                CandidateStatus.REGENERATING,
-                CandidateStatus.COMMITTING,
+                active = candidate is not None and candidate.status in {
+                    CandidateStatus.STREAMING,
+                    CandidateStatus.AUDITING,
+                    CandidateStatus.REGENERATING,
+                    CandidateStatus.COMMITTING,
+                    CandidateStatus.STALE,
                 }
-                if active and current is not None:
-                    conn.execute(
+                if active and candidate is not None:
+                    updated = conn.execute(
                         """
                         UPDATE chapter_candidates
                         SET status = 'cancelled', failure_reason = 'stopped_by_author', updated_at = ?
-                        WHERE id = ?
+                        WHERE id = ? AND generation_epoch = ? AND status = ?
+                          AND content_revision = ? AND audit_revision = ?
+                          AND commit_plan_revision = ? AND commit_plan_content_revision = ?
+                          AND formal_chapter_id IS NULL
                         """,
-                        (now, current.id),
+                        (
+                            now,
+                            candidate.id,
+                            candidate.generation_epoch,
+                            candidate.status.value,
+                            candidate.content_revision,
+                            candidate.audit_revision,
+                            candidate.commit_plan_revision,
+                            candidate.commit_plan_content_revision,
+                        ),
                     )
+                    if updated.rowcount != 1:
+                        raise CandidateGateError("candidate changed before stopping the run")
                     conn.execute(
                         """
                         UPDATE candidate_dag_runs
@@ -2109,29 +2515,71 @@ class ChapterCandidateRepository:
                             completed_at = ?, updated_at = ?
                         WHERE candidate_id = ? AND status = 'running'
                         """,
-                        (now, now, current.id),
+                        (now, now, candidate.id),
                     )
-                    conn.execute(
+                    updated = conn.execute(
                         """
                         UPDATE novel_generation_runs
                         SET state = 'stopped', generation_epoch = generation_epoch + 1,
                             current_candidate_id = NULL, current_candidate_chapter = NULL,
                             next_action = 'idle', last_error = '', updated_at = ?
-                        WHERE novel_id = ?
+                        WHERE novel_id = ? AND run_mode = ? AND state = ?
+                          AND generation_epoch = ? AND target_chapters = ?
+                          AND current_formal_chapter = ? AND current_candidate_id IS ?
+                          AND current_candidate_chapter IS ? AND canonical_sync_status = ?
+                          AND next_action = ? AND last_error = ?
+                          AND max_pending_candidates = ? AND prefetch = ?
                         """,
-                        (now, novel_id),
+                        (
+                            now,
+                            novel_id,
+                            run.run_mode.value,
+                            run.state.value,
+                            run.generation_epoch,
+                            run.target_chapters,
+                            run.current_formal_chapter,
+                            run.current_candidate_id,
+                            run.current_candidate_chapter,
+                            run.canonical_sync_status,
+                            run.next_action,
+                            run.last_error,
+                            run.max_pending_candidates,
+                            run.prefetch,
+                        ),
                     )
                 else:
-                    conn.execute(
+                    updated = conn.execute(
                         """
                         UPDATE novel_generation_runs
                         SET state = 'stopped', next_action = 'idle', updated_at = ?
-                        WHERE novel_id = ?
+                        WHERE novel_id = ? AND run_mode = ? AND state = ?
+                          AND generation_epoch = ? AND target_chapters = ?
+                          AND current_formal_chapter = ? AND current_candidate_id IS ?
+                          AND current_candidate_chapter IS ? AND canonical_sync_status = ?
+                          AND next_action = ? AND last_error = ?
+                          AND max_pending_candidates = ? AND prefetch = ?
                         """,
-                        (now, novel_id),
+                        (
+                            now,
+                            novel_id,
+                            run.run_mode.value,
+                            run.state.value,
+                            run.generation_epoch,
+                            run.target_chapters,
+                            run.current_formal_chapter,
+                            run.current_candidate_id,
+                            run.current_candidate_chapter,
+                            run.canonical_sync_status,
+                            run.next_action,
+                            run.last_error,
+                            run.max_pending_candidates,
+                            run.prefetch,
+                        ),
                     )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before stopping")
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         return self.get_run(novel_id)
@@ -2314,9 +2762,9 @@ class ChapterCandidateRepository:
     def fail_candidate(self, candidate_id: str, reason: str) -> ChapterCandidate:
         """Persist an expected worker failure and stop further token use."""
 
-        candidate = self.get_candidate(candidate_id)
-        self._ensure_current_generation(candidate)
-        if candidate.status not in {
+        expected_candidate = self.get_candidate(candidate_id)
+        expected_run = self._ensure_current_generation(expected_candidate)
+        if expected_candidate.status not in {
             CandidateStatus.STREAMING,
             CandidateStatus.REGENERATING,
             CandidateStatus.AUDITING,
@@ -2325,39 +2773,133 @@ class ChapterCandidateRepository:
             raise CandidateGateError("only an active candidate can be marked failed")
         now = self._now()
         conn = self._connection()
-        conn.execute(
-            """
-            UPDATE chapter_candidates SET status = 'failed', failure_reason = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (reason, now, candidate_id),
-        )
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET state = 'error', next_action = 'regenerate_candidate', last_error = ?, updated_at = ?
-            WHERE novel_id = ?
-            """,
-            (reason, now, candidate.novel_id),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate, run, _ = self._locked_candidate_transition(
+                conn,
+                candidate_id=candidate_id,
+                expected_candidate=expected_candidate,
+                expected_run=expected_run,
+                allowed_statuses=(
+                    CandidateStatus.STREAMING,
+                    CandidateStatus.REGENERATING,
+                    CandidateStatus.AUDITING,
+                    CandidateStatus.COMMITTING,
+                ),
+                allowed_run_states=(
+                    GenerationRunState.RUNNING,
+                    GenerationRunState.WAITING_REVIEW,
+                ),
+                allowed_canonical_sync_statuses=("ready",),
+                require_formal=False,
+            )
+            updated = conn.execute(
+                """
+                UPDATE chapter_candidates
+                SET status = 'failed', failure_reason = ?, updated_at = ?
+                WHERE id = ? AND generation_epoch = ? AND status = ?
+                  AND content_revision = ? AND audit_revision = ?
+                  AND commit_plan_revision = ? AND commit_plan_content_revision = ?
+                  AND formal_chapter_id IS NULL
+                """,
+                (
+                    reason,
+                    now,
+                    candidate_id,
+                    candidate.generation_epoch,
+                    candidate.status.value,
+                    candidate.content_revision,
+                    candidate.audit_revision,
+                    candidate.commit_plan_revision,
+                    candidate.commit_plan_content_revision,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("candidate changed before failure could be recorded")
+            updated = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'error', next_action = 'regenerate_candidate', last_error = ?, updated_at = ?
+                WHERE novel_id = ? AND run_mode = ? AND state = ?
+                  AND generation_epoch = ? AND target_chapters = ?
+                  AND current_formal_chapter = ? AND current_candidate_id = ?
+                  AND current_candidate_chapter = ? AND canonical_sync_status = ?
+                  AND next_action = ? AND last_error = ?
+                  AND max_pending_candidates = ? AND prefetch = ?
+                """,
+                (
+                    reason,
+                    now,
+                    candidate.novel_id,
+                    run.run_mode.value,
+                    run.state.value,
+                    run.generation_epoch,
+                    run.target_chapters,
+                    run.current_formal_chapter,
+                    candidate.id,
+                    candidate.chapter_number,
+                    run.canonical_sync_status,
+                    run.next_action,
+                    run.last_error,
+                    run.max_pending_candidates,
+                    run.prefetch,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before failure could be recorded")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_candidate(candidate_id)
 
     def fail_run(self, novel_id: str, reason: str) -> GenerationRun:
         """Record a pre-candidate plan/context failure without inferring writing."""
 
-        self.get_run(novel_id)
+        expected_run = self.get_run(novel_id)
         now = self._now()
         conn = self._connection()
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET state = 'error', next_action = 'resolve_generation_error', last_error = ?, updated_at = ?
-            WHERE novel_id = ?
-            """,
-            (reason, now, novel_id),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            run = self._locked_run_transition(
+                conn,
+                novel_id=novel_id,
+                expected_run=expected_run,
+                allowed_states=(GenerationRunState.RUNNING,),
+            )
+            updated = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'error', next_action = 'resolve_generation_error', last_error = ?, updated_at = ?
+                WHERE novel_id = ? AND run_mode = ? AND state = ?
+                  AND generation_epoch = ? AND target_chapters = ?
+                  AND current_formal_chapter = ? AND current_candidate_id IS NULL
+                  AND current_candidate_chapter IS NULL AND canonical_sync_status = ?
+                  AND next_action = ? AND last_error = ?
+                  AND max_pending_candidates = ? AND prefetch = ?
+                """,
+                (
+                    reason,
+                    now,
+                    novel_id,
+                    run.run_mode.value,
+                    run.state.value,
+                    run.generation_epoch,
+                    run.target_chapters,
+                    run.current_formal_chapter,
+                    run.canonical_sync_status,
+                    run.next_action,
+                    run.last_error,
+                    run.max_pending_candidates,
+                    run.prefetch,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before failure could be recorded")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_run(novel_id)
 
     def wait_for_outline_expansion(self, novel_id: str, reason: str = "") -> GenerationRun:
@@ -2420,25 +2962,156 @@ class ChapterCandidateRepository:
             raise
         return self.get_run(novel_id)
 
+    def resume_after_outline_publication(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: str,
+        expected_generation_epoch: int,
+        expected_current_formal_chapter: int,
+        expected_active_plan_revision_id: str,
+        expected_active_plan_digest: str,
+        expected_authority_generation: int,
+        expected_projection_generation: int,
+    ) -> GenerationRun:
+        """Resume exactly one durable planning pause after a Head publication.
+
+        The caller owns the same ``BEGIN IMMEDIATE`` that sealed and projected
+        the Manifest.  Keeping this transition in that transaction prevents a
+        stale publication from reviving a newer epoch or a manually changed
+        run after the active Head has moved.
+        """
+
+        if not conn.in_transaction:
+            raise CandidateGateError(
+                "outline publication resume requires an existing write transaction"
+            )
+        head = conn.execute(
+            """
+            SELECT authority_mode, authority_generation, projection_generation,
+                   active_plan_revision_id, active_plan_digest,
+                   working_plan_revision_id
+            FROM outline_planning_heads WHERE novel_id = ?
+            """,
+            (novel_id,),
+        ).fetchone()
+        if (
+            head is None
+            or str(head["authority_mode"] or "") != "manifest"
+            or int(head["authority_generation"] or 0)
+            != int(expected_authority_generation)
+            or int(head["projection_generation"] or 0)
+            != int(expected_projection_generation)
+            or str(head["active_plan_revision_id"] or "")
+            != str(expected_active_plan_revision_id)
+            or str(head["active_plan_digest"] or "")
+            != str(expected_active_plan_digest)
+            or head["working_plan_revision_id"] is not None
+        ):
+            raise CandidateGateError("manifest planning Head changed before run resume")
+
+        row = conn.execute(
+            "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"generation run not found: {novel_id}")
+        run = self._run_from_row(row)
+        if (
+            run.state != GenerationRunState.WAITING_PLANNING
+            or run.generation_epoch != int(expected_generation_epoch)
+            or run.current_formal_chapter != int(expected_current_formal_chapter)
+            or run.current_candidate_id is not None
+            or run.current_candidate_chapter is not None
+            or run.canonical_sync_status != "ready"
+            or run.next_action != "expand_outline_cohort"
+        ):
+            raise CandidateGateError("generation run changed before outline publication resume")
+        now = self._now()
+        updated = conn.execute(
+            """
+            UPDATE novel_generation_runs
+            SET state = 'running', next_action = 'generate_candidate',
+                last_error = '', updated_at = ?
+            WHERE novel_id = ? AND run_mode = ? AND state = 'waiting_planning'
+              AND generation_epoch = ? AND target_chapters = ?
+              AND current_formal_chapter = ? AND current_candidate_id IS NULL
+              AND current_candidate_chapter IS NULL AND canonical_sync_status = 'ready'
+              AND next_action = 'expand_outline_cohort' AND last_error = ?
+              AND max_pending_candidates = ? AND prefetch = ?
+            """,
+            (
+                now,
+                novel_id,
+                run.run_mode.value,
+                run.generation_epoch,
+                run.target_chapters,
+                run.current_formal_chapter,
+                run.last_error,
+                run.max_pending_candidates,
+                run.prefetch,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise CandidateGateError("generation run changed before outline publication resume")
+        resumed_row = conn.execute(
+            "SELECT * FROM novel_generation_runs WHERE novel_id = ?", (novel_id,)
+        ).fetchone()
+        if resumed_row is None:
+            raise CandidateGateError("generation run disappeared during outline publication resume")
+        return self._run_from_row(resumed_row)
+
     def complete_run(self, novel_id: str) -> GenerationRun:
         """Mark a target-complete run only after all formal sync is ready."""
 
-        run = self.get_run(novel_id)
-        if run.current_candidate_id or run.canonical_sync_status != "ready":
+        expected_run = self.get_run(novel_id)
+        if expected_run.current_candidate_id or expected_run.canonical_sync_status != "ready":
             raise CandidateGateError("cannot complete a run with a pending candidate or canonical sync")
-        if run.current_formal_chapter < run.target_chapters:
+        if expected_run.current_formal_chapter < expected_run.target_chapters:
             raise CandidateGateError("cannot complete before the target chapter count")
         now = self._now()
         conn = self._connection()
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET state = 'completed', next_action = 'idle', last_error = '', updated_at = ?
-            WHERE novel_id = ?
-            """,
-            (now, novel_id),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            run = self._locked_run_transition(
+                conn,
+                novel_id=novel_id,
+                expected_run=expected_run,
+                allowed_states=(GenerationRunState.RUNNING,),
+            )
+            if run.current_formal_chapter < run.target_chapters:
+                raise CandidateGateError("cannot complete before the target chapter count")
+            updated = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'completed', next_action = 'idle', last_error = '', updated_at = ?
+                WHERE novel_id = ? AND run_mode = ? AND state = ?
+                  AND generation_epoch = ? AND target_chapters = ?
+                  AND current_formal_chapter = ? AND current_candidate_id IS NULL
+                  AND current_candidate_chapter IS NULL AND canonical_sync_status = ?
+                  AND next_action = ? AND last_error = ?
+                  AND max_pending_candidates = ? AND prefetch = ?
+                """,
+                (
+                    now,
+                    novel_id,
+                    run.run_mode.value,
+                    run.state.value,
+                    run.generation_epoch,
+                    run.target_chapters,
+                    run.current_formal_chapter,
+                    run.canonical_sync_status,
+                    run.next_action,
+                    run.last_error,
+                    run.max_pending_candidates,
+                    run.prefetch,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before completion")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_run(novel_id)
 
     def update_commit_plan(self, candidate_id: str, commit_plan: dict[str, Any]) -> ChapterCandidate:
@@ -2650,11 +3323,26 @@ class ChapterCandidateRepository:
             raise
         return self.get_candidate(candidate_id)
 
-    def mark_sync_succeeded(self, candidate_id: str) -> ChapterCandidate:
+    def mark_sync_succeeded(
+        self,
+        candidate_id: str,
+        *,
+        sync_attempt: Optional[int] = None,
+    ) -> ChapterCandidate:
         candidate = self.get_candidate(candidate_id)
         if candidate.status != CandidateStatus.SYNCING or not candidate.formal_chapter_id:
             raise CandidateGateError("candidate has no formal chapter awaiting sync")
         self._ensure_current_generation(candidate)
+        if sync_attempt is None:
+            expected_attempt_row = self._connection().execute(
+                "SELECT sync_attempt FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if expected_attempt_row is None:
+                raise CandidateGateError("candidate formal version is missing")
+            expected_sync_attempt = int(expected_attempt_row["sync_attempt"] or 0)
+        else:
+            expected_sync_attempt = int(sync_attempt)
         now = self._now()
         conn = self._connection()
         try:
@@ -2667,6 +3355,7 @@ class ChapterCandidateRepository:
                        formal.content_sha256 AS authority_content_sha256,
                        formal.content_revision AS authority_content_revision,
                        formal.sync_status AS authority_sync_status,
+                       formal.sync_attempt AS authority_sync_attempt,
                        candidate.llm_content, candidate.author_content,
                        candidate.content_revision AS candidate_content_revision,
                        candidate.status AS candidate_status,
@@ -2696,6 +3385,8 @@ class ChapterCandidateRepository:
                 version is None
                 or str(version["candidate_status"] or "") != CandidateStatus.SYNCING.value
                 or str(version["authority_sync_status"] or "") != "syncing"
+                or int(version["authority_sync_attempt"] or 0)
+                != expected_sync_attempt
                 or str(version["canonical_sync_status"] or "") != "syncing"
                 or int(version["candidate_generation_epoch"] or 0)
                 != int(version["active_generation_epoch"] or 0)
@@ -2738,13 +3429,14 @@ class ChapterCandidateRepository:
                 UPDATE chapter_candidate_formal_commits
                 SET sync_status = 'ready', failure_reason = '', synced_at = ?
                 WHERE candidate_id = ? AND sync_status = 'syncing'
-                  AND content_sha256 = ? AND content_revision = ?
+                  AND content_sha256 = ? AND content_revision = ? AND sync_attempt = ?
                 """,
                 (
                     now,
                     candidate_id,
                     version["authority_content_sha256"],
                     int(version["authority_content_revision"]),
+                    expected_sync_attempt,
                 ),
             )
             if updated.rowcount != 1:
@@ -2788,69 +3480,226 @@ class ChapterCandidateRepository:
     def begin_sync_retry(self, candidate_id: str) -> ChapterCandidate:
         """Retry canonical aftermath for an already-committed formal chapter."""
 
-        candidate = self.get_candidate(candidate_id)
-        self._ensure_current_generation(candidate)
-        if candidate.status != CandidateStatus.FAILED or not candidate.formal_chapter_id:
+        expected_candidate = self.get_candidate(candidate_id)
+        expected_run = self._ensure_current_generation(expected_candidate)
+        if expected_candidate.status != CandidateStatus.FAILED or not expected_candidate.formal_chapter_id:
             raise CandidateGateError("only a formally committed candidate with failed sync can retry")
         now = self._now()
         conn = self._connection()
-        conn.execute(
-            """
-            UPDATE chapter_candidate_formal_commits
-            SET sync_status = 'syncing', failure_reason = '' WHERE candidate_id = ?
-            """,
-            (candidate_id,),
-        )
-        conn.execute(
-            """
-            UPDATE chapter_candidates
-            SET status = 'syncing', failure_reason = '', updated_at = ? WHERE id = ?
-            """,
-            (now, candidate_id),
-        )
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET state = 'paused', canonical_sync_status = 'syncing', next_action = 'retry_sync',
-                last_error = '', updated_at = ?
-            WHERE novel_id = ?
-            """,
-            (now, candidate.novel_id),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate, run, formal = self._locked_candidate_transition(
+                conn,
+                candidate_id=candidate_id,
+                expected_candidate=expected_candidate,
+                expected_run=expected_run,
+                allowed_statuses=(CandidateStatus.FAILED,),
+                allowed_run_states=(GenerationRunState.PAUSED,),
+                allowed_canonical_sync_statuses=("failed",),
+                require_formal=True,
+                allowed_formal_sync_statuses=("failed",),
+                require_current_plan_pin=False,
+            )
+            if formal is None:
+                raise CandidateGateError("candidate formal version is missing")
+            updated = conn.execute(
+                """
+                UPDATE chapter_candidate_formal_commits
+                SET sync_status = 'syncing', failure_reason = '',
+                    sync_attempt = sync_attempt + 1
+                WHERE candidate_id = ? AND novel_id = ? AND chapter_number = ?
+                  AND chapter_id = ? AND content_sha256 = ? AND content_revision = ?
+                  AND sync_status = 'failed' AND sync_attempt = ?
+                """,
+                (
+                    candidate_id,
+                    candidate.novel_id,
+                    candidate.chapter_number,
+                    candidate.formal_chapter_id,
+                    formal["authority_content_sha256"],
+                    int(formal["authority_content_revision"]),
+                    int(formal["sync_attempt"] or 0),
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("candidate formal version changed before sync retry")
+            updated = conn.execute(
+                """
+                UPDATE chapter_candidates
+                SET status = 'syncing', failure_reason = '', updated_at = ?
+                WHERE id = ? AND generation_epoch = ? AND status = 'failed'
+                  AND content_revision = ? AND audit_revision = ?
+                  AND commit_plan_revision = ? AND commit_plan_content_revision = ?
+                  AND formal_chapter_id = ?
+                """,
+                (
+                    now,
+                    candidate_id,
+                    candidate.generation_epoch,
+                    candidate.content_revision,
+                    candidate.audit_revision,
+                    candidate.commit_plan_revision,
+                    candidate.commit_plan_content_revision,
+                    candidate.formal_chapter_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("candidate changed before sync retry")
+            updated = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'paused', canonical_sync_status = 'syncing', next_action = 'retry_sync',
+                    last_error = '', updated_at = ?
+                WHERE novel_id = ? AND run_mode = ? AND state = ?
+                  AND generation_epoch = ? AND target_chapters = ?
+                  AND current_formal_chapter = ? AND current_candidate_id = ?
+                  AND current_candidate_chapter = ? AND canonical_sync_status = 'failed'
+                  AND next_action = ? AND last_error = ?
+                  AND max_pending_candidates = ? AND prefetch = ?
+                """,
+                (
+                    now,
+                    candidate.novel_id,
+                    run.run_mode.value,
+                    run.state.value,
+                    run.generation_epoch,
+                    run.target_chapters,
+                    run.current_formal_chapter,
+                    candidate.id,
+                    candidate.chapter_number,
+                    run.next_action,
+                    run.last_error,
+                    run.max_pending_candidates,
+                    run.prefetch,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before sync retry")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_candidate(candidate_id)
 
-    def mark_sync_failed(self, candidate_id: str, reason: str) -> ChapterCandidate:
-        candidate = self.get_candidate(candidate_id)
-        self._ensure_current_generation(candidate)
-        if candidate.status != CandidateStatus.SYNCING:
+    def mark_sync_failed(
+        self,
+        candidate_id: str,
+        reason: str,
+        *,
+        sync_attempt: Optional[int] = None,
+    ) -> ChapterCandidate:
+        expected_candidate = self.get_candidate(candidate_id)
+        expected_run = self._ensure_current_generation(expected_candidate)
+        if expected_candidate.status != CandidateStatus.SYNCING:
             raise CandidateGateError("candidate is not awaiting canonical sync")
+        if sync_attempt is None:
+            expected_attempt_row = self._connection().execute(
+                "SELECT sync_attempt FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if expected_attempt_row is None:
+                raise CandidateGateError("candidate formal version is missing")
+            expected_sync_attempt = int(expected_attempt_row["sync_attempt"] or 0)
+        else:
+            expected_sync_attempt = int(sync_attempt)
         now = self._now()
         conn = self._connection()
-        conn.execute(
-            """
-            UPDATE chapter_candidate_formal_commits
-            SET sync_status = 'failed', failure_reason = ? WHERE candidate_id = ?
-            """,
-            (reason, candidate_id),
-        )
-        conn.execute(
-            """
-            UPDATE chapter_candidates
-            SET status = 'failed', failure_reason = ?, updated_at = ? WHERE id = ?
-            """,
-            (reason, now, candidate_id),
-        )
-        conn.execute(
-            """
-            UPDATE novel_generation_runs
-            SET state = 'paused', canonical_sync_status = 'failed', next_action = 'retry_sync',
-                last_error = ?, updated_at = ?
-            WHERE novel_id = ?
-            """,
-            (reason, now, candidate.novel_id),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate, run, formal = self._locked_candidate_transition(
+                conn,
+                candidate_id=candidate_id,
+                expected_candidate=expected_candidate,
+                expected_run=expected_run,
+                allowed_statuses=(CandidateStatus.SYNCING,),
+                allowed_run_states=(GenerationRunState.RUNNING, GenerationRunState.PAUSED),
+                allowed_canonical_sync_statuses=("syncing",),
+                require_formal=True,
+                allowed_formal_sync_statuses=("syncing",),
+                expected_formal_sync_attempt=expected_sync_attempt,
+                require_current_plan_pin=False,
+            )
+            if formal is None:
+                raise CandidateGateError("candidate formal version is missing")
+            updated = conn.execute(
+                """
+                UPDATE chapter_candidate_formal_commits
+                SET sync_status = 'failed', failure_reason = ?
+                WHERE candidate_id = ? AND novel_id = ? AND chapter_number = ?
+                  AND chapter_id = ? AND content_sha256 = ? AND content_revision = ?
+                  AND sync_status = 'syncing' AND sync_attempt = ?
+                """,
+                (
+                    reason,
+                    candidate_id,
+                    candidate.novel_id,
+                    candidate.chapter_number,
+                    candidate.formal_chapter_id,
+                    formal["authority_content_sha256"],
+                    int(formal["authority_content_revision"]),
+                    expected_sync_attempt,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("candidate formal version changed before sync failure")
+            updated = conn.execute(
+                """
+                UPDATE chapter_candidates
+                SET status = 'failed', failure_reason = ?, updated_at = ?
+                WHERE id = ? AND generation_epoch = ? AND status = 'syncing'
+                  AND content_revision = ? AND audit_revision = ?
+                  AND commit_plan_revision = ? AND commit_plan_content_revision = ?
+                  AND formal_chapter_id = ?
+                """,
+                (
+                    reason,
+                    now,
+                    candidate_id,
+                    candidate.generation_epoch,
+                    candidate.content_revision,
+                    candidate.audit_revision,
+                    candidate.commit_plan_revision,
+                    candidate.commit_plan_content_revision,
+                    candidate.formal_chapter_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("candidate changed before sync failure")
+            updated = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'paused', canonical_sync_status = 'failed', next_action = 'retry_sync',
+                    last_error = ?, updated_at = ?
+                WHERE novel_id = ? AND run_mode = ? AND state = ?
+                  AND generation_epoch = ? AND target_chapters = ?
+                  AND current_formal_chapter = ? AND current_candidate_id = ?
+                  AND current_candidate_chapter = ? AND canonical_sync_status = 'syncing'
+                  AND next_action = ? AND last_error = ?
+                  AND max_pending_candidates = ? AND prefetch = ?
+                """,
+                (
+                    reason,
+                    now,
+                    candidate.novel_id,
+                    run.run_mode.value,
+                    run.state.value,
+                    run.generation_epoch,
+                    run.target_chapters,
+                    run.current_formal_chapter,
+                    candidate.id,
+                    candidate.chapter_number,
+                    run.next_action,
+                    run.last_error,
+                    run.max_pending_candidates,
+                    run.prefetch,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before sync failure")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return self.get_candidate(candidate_id)
 
     def stale_candidates_for_outline_contract(

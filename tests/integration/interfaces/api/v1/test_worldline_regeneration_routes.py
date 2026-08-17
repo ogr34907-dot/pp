@@ -5,6 +5,10 @@ import hashlib
 from infrastructure.persistence.database.chapter_candidate_repository import (
     ChapterCandidateRepository,
 )
+from tests.integration.application.engine.test_worldline_regeneration_service import (
+    _materialize_manifest_worldline,
+    _seed,
+)
 
 
 def _seed_chapters(db, novel_id: str) -> None:
@@ -66,3 +70,69 @@ def test_worldline_preview_execute_and_restore_are_explicit_and_idempotent(clien
     assert db.get_connection().execute(
         "SELECT COUNT(*) FROM chapters WHERE novel_id = ?", (test_novel_id,)
     ).fetchone()[0] == 2
+
+
+def test_manifest_worldline_routes_rebase_and_restore_the_bound_head(client, db):
+    _seed(db)
+    original = _materialize_manifest_worldline(db)
+
+    preview = client.post(
+        "/api/v1/worldline-regeneration/novels/novel-1/preview",
+        json={"start_chapter": 2, "target_chapters": 6},
+    )
+    assert preview.status_code == 200
+    assert preview.json()["data"]["operation"] == "regenerate"
+
+    executed = client.post(
+        "/api/v1/worldline-regeneration/novels/novel-1/execute",
+        json={
+            "preview_token": preview.json()["data"]["token"],
+            "run_mode": "chapter_review",
+            "idempotency_key": "manifest-regenerate-v1",
+        },
+    )
+    assert executed.status_code == 200
+    archive_id = executed.json()["data"]["archive_id"]
+    assert db.get_connection().execute(
+        "SELECT active_plan_revision_id FROM outline_planning_heads "
+        "WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] != original.id
+
+    restored = client.post(
+        f"/api/v1/worldline-regeneration/novels/novel-1/archives/{archive_id}/restore",
+        json={"run_mode": "chapter_review", "idempotency_key": "manifest-restore-v1"},
+    )
+    assert restored.status_code == 200
+    assert restored.json()["data"]["operation"] == "restore"
+    assert db.get_connection().execute(
+        "SELECT active_plan_revision_id FROM outline_planning_heads "
+        "WHERE novel_id = 'novel-1'"
+    ).fetchone()[0] == original.id
+
+
+def test_manifest_worldline_continue_route_replays_the_same_key(client, db):
+    _seed(db)
+    _materialize_manifest_worldline(db)
+
+    preview = client.post(
+        "/api/v1/worldline-regeneration/novels/novel-1/preview",
+        json={"start_chapter": 4, "target_chapters": 8},
+    )
+    assert preview.status_code == 200
+    assert preview.json()["data"]["operation"] == "continue"
+    request = {
+        "preview_token": preview.json()["data"]["token"],
+        "run_mode": "continuous",
+        "idempotency_key": "manifest-continue-v1",
+    }
+
+    first = client.post(
+        "/api/v1/worldline-regeneration/novels/novel-1/execute", json=request
+    )
+    repeated = client.post(
+        "/api/v1/worldline-regeneration/novels/novel-1/execute", json=request
+    )
+
+    assert first.status_code == 200
+    assert repeated.status_code == 200
+    assert repeated.json()["data"] == first.json()["data"]

@@ -165,6 +165,7 @@ const savedDraft = ref<ReviewDraft>({
 })
 const hasUnsavedDraft = computed(() => isReviewDraftDirty(currentDraft(), savedDraft.value))
 let pollTimer: number | null = null
+let refreshEpoch = 0
 
 function listText(value: unknown) { return Array.isArray(value) ? value.map(item => String(item)).join('\n') : '' }
 function currentDraft(): ReviewDraft {
@@ -205,15 +206,28 @@ function lines(value: string) { return value.split(/\r?\n/).map(item => item.tri
 
 async function refresh(options: { force?: boolean; preserveFeedback?: boolean } = {}) {
   if (!novelId.value) return
+  const requestEpoch = ++refreshEpoch
   loading.value = true
   error.value = ''
   try {
-    run.value = await getGenerationRunOrNull(novelId.value)
-    syncEditorFromCandidate(candidate.value, options)
-    versions.value = candidate.value ? await generationApi.listCandidateVersions(candidate.value.id) : []
+    const refreshedRun = await getGenerationRunOrNull(novelId.value)
+    if (requestEpoch !== refreshEpoch) return
+    const refreshedCandidate = refreshedRun?.candidate || null
+    const refreshedVersions = refreshedCandidate
+      ? await generationApi.listCandidateVersions(refreshedCandidate.id)
+      : []
+    if (requestEpoch !== refreshEpoch) return
+    run.value = refreshedRun
+    versions.value = refreshedVersions
+    syncEditorFromCandidate(refreshedCandidate, options)
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : '读取候选状态失败'
-  } finally { loading.value = false }
+    if (requestEpoch === refreshEpoch) {
+      versions.value = []
+      error.value = cause instanceof Error ? cause.message : '读取候选状态失败'
+    }
+  } finally {
+    if (requestEpoch === refreshEpoch) loading.value = false
+  }
 }
 
 async function applyAction(

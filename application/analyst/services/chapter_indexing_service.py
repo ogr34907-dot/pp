@@ -79,6 +79,8 @@ class ChapterIndexingService:
         content_revision: Optional[int] = None,
         pipeline_version: Optional[str] = None,
         sync_status: str = "committed",
+        expected_generation_epoch: Optional[int] = None,
+        generation_epoch_db: Optional[object] = None,
     ) -> None:
         """索引章节摘要到向量存储
 
@@ -98,18 +100,36 @@ class ChapterIndexingService:
         if not summary or not summary.strip():
             raise ValueError("summary cannot be empty")
 
+        def tag_for_current_epoch(payload):
+            if generation_epoch_db is None:
+                tagged = tag_payload_for_active_epoch(novel_id, payload)
+            else:
+                tagged = tag_payload_for_active_epoch(
+                    novel_id, payload, generation_epoch_db
+                )
+            if (
+                expected_generation_epoch is not None
+                and int(tagged["generation_epoch"]) != int(expected_generation_epoch)
+            ):
+                raise RuntimeError("generation_epoch_mismatch")
+            return tagged
+
+        if expected_generation_epoch is not None:
+            tag_for_current_epoch({})
+
         # 确保 collection 存在
         await self.ensure_collection(novel_id)
 
         # 生成 embedding
         vector = await self._embedding_service.embed(summary)
 
-        # 构造 payload
-        payload = tag_payload_for_active_epoch(novel_id, {
+        # Construct the payload after embedding so a long-running old epoch
+        # cannot carry a stale tag into a newer write.
+        payload = tag_for_current_epoch({
             "chapter_number": chapter_number,
             "text": summary,
             "kind": "chapter_summary",
-            "novel_id": novel_id
+            "novel_id": novel_id,
         })
         if content_sha256 is not None:
             payload["content_sha256"] = content_sha256
@@ -121,6 +141,12 @@ class ChapterIndexingService:
 
         # 领域层使用可读、确定性的业务 ID；具体存储若要求 UUID，由适配器内部转换。
         point_id = f"{novel_id}_ch{chapter_number}_summary"
+        # A caller without a durable database fence needs an epoch-specific
+        # point so a delayed insert cannot overwrite newer retrieval data.
+        # Worldline replay supplies that fence and must retain the established
+        # stable chapter id, which is also used by vector maintenance paths.
+        if expected_generation_epoch is not None and generation_epoch_db is None:
+            point_id = f"{point_id}_epoch{int(expected_generation_epoch)}"
 
         # 写入向量存储
         collection_name = self._get_collection_name(novel_id)
@@ -128,7 +154,7 @@ class ChapterIndexingService:
             collection=collection_name,
             id=point_id,
             vector=vector,
-            payload=payload
+            payload=payload,
         )
 
     async def index_bible_snippet(

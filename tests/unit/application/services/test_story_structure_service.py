@@ -1,15 +1,24 @@
 import asyncio
+import sqlite3
 from types import SimpleNamespace
 from typing import Optional
 
 import pytest
 
+import application.blueprint.services.story_structure_service as story_structure_service_module
 from application.blueprint.services.chapter_book_structure_sync import (
     purge_chapter_book_rows_not_matching_structure,
 )
 from application.blueprint.services.story_structure_service import StoryStructureService
 from domain.novel.value_objects.chapter_id import ChapterId
 from domain.structure.story_node import NodeType
+from infrastructure.persistence.database.connection import DatabaseConnection
+from infrastructure.persistence.database.planning_authority_guard import PlanningAuthorityError
+from infrastructure.persistence.database.sqlite_chapter_repository import (
+    SqliteChapterRepository,
+)
+from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
 
 
 class _FakeStoryRepo:
@@ -95,6 +104,56 @@ def _chapter(number: int):
     return SimpleNamespace(id=f"chapter-{number}", number=number)
 
 
+def _sqlite_delete_service(tmp_path, *, fail_root=False, orphan=False, foreign_keys=True):
+    database = DatabaseConnection(str(tmp_path / "atomic-structure-delete.db"))
+    connection = database.get_connection()
+    connection.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys else 'OFF'}")
+    connection.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel-1')"
+    )
+    connection.execute(
+        """
+        INSERT INTO story_nodes
+            (id, novel_id, parent_id, node_type, number, title, order_index)
+        VALUES
+            ('act-1', 'novel-1', NULL, 'act', 1, 'Act', 0),
+            ('chapter-1', 'novel-1', 'act-1', 'chapter', 1, 'Chapter', 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO chapters (id, novel_id, number, title, content, status)
+        VALUES ('chapter-row-1', 'novel-1', 1, 'Chapter', '', 'draft')
+        """
+    )
+    if orphan:
+        connection.execute(
+            """
+            INSERT INTO chapters (id, novel_id, number, title, content, status)
+            VALUES ('orphan-row-2', 'novel-1', 2, 'Orphan', '', 'draft')
+            """
+        )
+    if fail_root:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_act_delete
+            BEFORE DELETE ON story_nodes
+            WHEN OLD.id = 'act-1'
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END
+            """
+        )
+    connection.commit()
+    coordinator = _FakeCoordinator()
+    service = StoryStructureService(
+        StoryNodeRepository(database),
+        chapter_repository=SqliteChapterRepository(database),
+        chapter_renumber_coordinator=coordinator,
+    )
+    return database, connection, service, coordinator
+
+
 def test_delete_node_removes_descendant_chapters_before_deleting_structure_node():
     repo = _FakeStoryRepo(
         [
@@ -165,24 +224,114 @@ def test_delete_node_succeeds_when_repo_delete_returns_false_but_node_is_gone():
     assert asyncio.run(service.delete_node("chapter-1")) is True
 
 
-def test_delete_node_returns_false_when_structure_delete_fails_after_chapter_cleanup():
-    class _FailingDeleteStoryRepo(_FakeStoryRepo):
-        async def delete(self, node_id):
-            return False
+def test_delete_node_rolls_back_chapters_when_structure_delete_fails(tmp_path):
+    database, connection, service, coordinator = _sqlite_delete_service(
+        tmp_path, fail_root=True
+    )
 
-    repo = _FailingDeleteStoryRepo(
+    with sqlite_writes_bypass_queue():
+        result = asyncio.run(service.delete_node("act-1"))
+
+    assert result is False
+    assert [row[0] for row in connection.execute(
+        "SELECT id FROM chapters WHERE novel_id = 'novel-1'"
+    )] == ["chapter-row-1"]
+    assert [row[0] for row in connection.execute(
+        "SELECT id FROM story_nodes WHERE novel_id = 'novel-1' ORDER BY order_index"
+    )] == ["act-1", "chapter-1"]
+    assert coordinator.calls == []
+    database.close()
+
+
+def test_delete_node_purges_orphan_chapters_after_atomic_commit(tmp_path):
+    database, connection, service, coordinator = _sqlite_delete_service(tmp_path, orphan=True)
+
+    with sqlite_writes_bypass_queue():
+        assert asyncio.run(service.delete_node("act-1")) is True
+
+    assert connection.execute(
+        "SELECT id FROM chapters WHERE novel_id = 'novel-1'"
+    ).fetchall() == []
+    assert coordinator.calls == [("novel-1", 1), ("novel-1", 1)]
+    database.close()
+
+
+def test_delete_node_rechecks_authority_after_begin_immediate(monkeypatch):
+    class _BeginAwareConnection:
+        def __init__(self):
+            self._connection = sqlite3.connect(":memory:")
+            self._connection.execute("PRAGMA foreign_keys = OFF")
+            self.authority_changed = False
+            self.begin_seen = False
+
+        @property
+        def in_transaction(self):
+            return self._connection.in_transaction
+
+        def execute(self, sql, params=()):
+            if sql.strip().upper() == "BEGIN IMMEDIATE":
+                self.authority_changed = True
+                self.begin_seen = True
+            return self._connection.execute(sql, params)
+
+        def commit(self):
+            return self._connection.commit()
+
+        def rollback(self):
+            return self._connection.rollback()
+
+    class _TransactionalStoryRepo(_FakeStoryRepo):
+        def __init__(self, nodes, connection):
+            super().__init__(nodes)
+            self._connection = connection
+
+        def _get_connection(self):
+            return self._connection
+
+    class _TransactionalChapterRepo(_FakeChapterRepo):
+        def __init__(self, chapters, connection):
+            super().__init__(chapters)
+            self.db = SimpleNamespace(get_connection=lambda: connection)
+            self.transaction_body_calls = []
+
+        def _delete_chapter_transaction_body(self, *args):
+            self.transaction_body_calls.append(args)
+
+    connection = _BeginAwareConnection()
+    repo = _TransactionalStoryRepo(
         [
             _node("act-1", NodeType.ACT, 1),
             _node("chapter-1", NodeType.CHAPTER, 1, parent_id="act-1"),
-        ]
+        ],
+        connection,
     )
-    chapter_repo = _FakeChapterRepo({1: _chapter(1)})
-    service = StoryStructureService(repo, chapter_repository=chapter_repo)
+    chapter_repo = _TransactionalChapterRepo({1: _chapter(1)}, connection)
+    coordinator = _FakeCoordinator()
 
-    result = asyncio.run(service.delete_node("act-1"))
+    def assert_current_authority(conn, novel_id, *, operation):
+        if conn.in_transaction and conn.authority_changed:
+            raise PlanningAuthorityError("authority changed")
 
-    assert result is False
-    assert chapter_repo.deleted_numbers == [1]
+    monkeypatch.setattr(
+        story_structure_service_module,
+        "assert_story_node_write_allowed",
+        assert_current_authority,
+    )
+    service = StoryStructureService(
+        repo,
+        chapter_repository=chapter_repo,
+        chapter_renumber_coordinator=coordinator,
+    )
+
+    with pytest.raises(PlanningAuthorityError, match="authority changed"):
+        asyncio.run(service.delete_node("act-1"))
+
+    assert connection.begin_seen is True
+    assert connection._connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+    assert chapter_repo.transaction_body_calls == []
+    assert chapter_repo.deleted_numbers == []
+    assert repo.deleted_ids == []
+    assert coordinator.calls == []
 
 
 def test_get_tree_does_not_delete_orphan_chapter_rows():
@@ -213,3 +362,54 @@ def test_structure_sync_rejects_an_orphan_row_with_authored_prose():
         purge_chapter_book_rows_not_matching_structure(repo, chapter_repo, "novel-1")
 
     assert chapter_repo.deleted_numbers == []
+
+
+def test_delete_node_preflights_all_descendants_before_queueing_a_formal_baseline():
+    """A later protected descendant must stop the whole structural delete up front."""
+
+    class _IdentityAwareStoryRepo(_FakeStoryRepo):
+        def __init__(self, nodes, connection):
+            super().__init__(nodes)
+            self._connection = connection
+
+        def _get_connection(self):
+            return self._connection
+
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        """
+        CREATE TABLE pre_candidate_formal_history (
+            novel_id TEXT NOT NULL,
+            chapter_number INTEGER NOT NULL,
+            chapter_id TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO pre_candidate_formal_history (novel_id, chapter_number, chapter_id)
+        VALUES ('novel-1', 2, 'chapter-2')
+        """
+    )
+    connection.commit()
+    repo = _IdentityAwareStoryRepo(
+        [
+            _node("act-1", NodeType.ACT, 1),
+            _node("chapter-1", NodeType.CHAPTER, 1, parent_id="act-1"),
+            _node("chapter-2", NodeType.CHAPTER, 2, parent_id="act-1"),
+        ],
+        connection,
+    )
+    chapter_repo = _FakeChapterRepo(
+        {
+            1: SimpleNamespace(id="chapter-1", number=1, content=""),
+            2: SimpleNamespace(id="chapter-2", number=2, content=""),
+        }
+    )
+    service = StoryStructureService(repo, chapter_repository=chapter_repo)
+
+    with pytest.raises(ValueError, match="Formal|正式|保护"):
+        asyncio.run(service.delete_node("act-1"))
+
+    assert chapter_repo.deleted_numbers == []
+    assert repo.deleted_ids == []

@@ -81,6 +81,7 @@ class ChapterCandidate:
     failure_reason: str = ""
     continue_after_commit: bool = False
     formal_chapter_id: Optional[str] = None
+    sync_attempt: int = 0
 
     @property
     def final_content(self) -> str:

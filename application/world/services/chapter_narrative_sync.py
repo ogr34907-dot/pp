@@ -12,6 +12,8 @@ import logging
 import re
 import uuid
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -39,6 +41,28 @@ from application.world.services.storyline_normalization import (
 logger = logging.getLogger(__name__)
 
 CHAPTER_NARRATIVE_PIPELINE_VERSION = "chapter-narrative-sync:v1"
+_WORLDLINE_REBUILD_EPOCH: ContextVar[tuple[str, int] | None] = ContextVar(
+    "worldline_rebuild_epoch",
+    default=None,
+)
+
+
+@contextmanager
+def worldline_rebuild_epoch_fence(
+    novel_id: str, generation_epoch: int
+) -> Iterator[None]:
+    token = _WORLDLINE_REBUILD_EPOCH.set((novel_id, int(generation_epoch)))
+    try:
+        yield
+    finally:
+        _WORLDLINE_REBUILD_EPOCH.reset(token)
+
+
+def worldline_rebuild_generation_epoch(novel_id: str) -> int | None:
+    expected = _WORLDLINE_REBUILD_EPOCH.get()
+    if expected is None or expected[0] != novel_id:
+        return None
+    return int(expected[1])
 
 
 def _final_text_evidence(content: str, item: Any, *terms: str) -> str:
@@ -2463,7 +2487,12 @@ async def _sync_chapter_narrative_after_save_once(
         )
 
     flags = _aftermath_flags()
+    expected_rebuild_epoch = _WORLDLINE_REBUILD_EPOCH.get()
     commit_repository = _resolve_commit_repository(knowledge_service, chapter_repository)
+    generation_epoch_db = (
+        getattr(chapter_repository, "db", None)
+        or getattr(commit_repository, "_db", None)
+    )
     if commit_repository is None:
         return AftermathCommitResult(
             content_sha256=content_sha256,
@@ -2498,13 +2527,21 @@ async def _sync_chapter_narrative_after_save_once(
                 if not committed_summary:
                     raise RuntimeError("committed_summary_unavailable")
                 await indexing_svc.ensure_collection(novel_id)
+                vector_provenance = {
+                    "content_sha256": content_sha256,
+                    "content_revision": claim.content_revision,
+                    "pipeline_version": CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                }
+                if expected_rebuild_epoch is not None:
+                    vector_provenance["expected_generation_epoch"] = int(
+                        expected_rebuild_epoch[1]
+                    )
+                    vector_provenance["generation_epoch_db"] = generation_epoch_db
                 await indexing_svc.index_chapter_summary(
                     novel_id,
                     chapter_number,
                     committed_summary,
-                    content_sha256=content_sha256,
-                    content_revision=claim.content_revision,
-                    pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                    **vector_provenance,
                 )
                 vector_status = "stored"
             except Exception as e:
@@ -2575,8 +2612,54 @@ async def _sync_chapter_narrative_after_save_once(
     except Exception as e:
         return failed_result(str(e) or "generation_epoch_unavailable")
 
+    def epoch_mismatch_result() -> AftermathCommitResult:
+        commit_repository.fail(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            content_revision=claim.content_revision,
+            failure_reason="generation_epoch_mismatch",
+        )
+        return AftermathCommitResult(
+            content_sha256=content_sha256,
+            pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            commit_status="failed",
+            failure_reason="generation_epoch_mismatch",
+            attempt_count=claim.attempt_count,
+            content_revision=claim.content_revision,
+            retryable=False,
+            memory_status=claim.memory_status,
+            flags=flags,
+        )
+
+    def stale_epoch_result() -> AftermathCommitResult | None:
+        try:
+            current_epoch = active_generation_epoch(
+                novel_id,
+                getattr(chapter_repository, "db", None)
+                or getattr(commit_repository, "_db", None),
+            )
+        except Exception:
+            return epoch_mismatch_result()
+        if current_epoch != generation_epoch:
+            return epoch_mismatch_result()
+        if (
+            expected_rebuild_epoch is not None
+            and expected_rebuild_epoch != (novel_id, current_epoch)
+        ):
+            return epoch_mismatch_result()
+        return None
+
+    stale_epoch = stale_epoch_result()
+    if stale_epoch is not None:
+        return stale_epoch
+
     def stale_claim_result() -> AftermathCommitResult | None:
         """Fail closed when a long-running extraction lost its source version."""
+        stale_epoch = stale_epoch_result()
+        if stale_epoch is not None:
+            return stale_epoch
         if commit_repository.is_current_claim_in_progress(
             novel_id=novel_id,
             chapter_number=chapter_number,
@@ -2633,6 +2716,10 @@ async def _sync_chapter_narrative_after_save_once(
     except Exception as e:
         logger.warning("LLM 章末 bundle 失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
         return failed_result(str(e) or type(e).__name__)
+
+    stale_epoch = stale_epoch_result()
+    if stale_epoch is not None:
+        return stale_epoch
 
     if not summary.strip():
         return failed_result("empty_summary")
@@ -2741,6 +2828,9 @@ async def _sync_chapter_narrative_after_save_once(
     stale = stale_claim_result()
     if stale is not None:
         return stale
+    stale_epoch = stale_epoch_result()
+    if stale_epoch is not None:
+        return stale_epoch
 
     try:
         from infrastructure.persistence.database.write_dispatch import (
@@ -2780,6 +2870,7 @@ async def _sync_chapter_narrative_after_save_once(
                 pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
                 attempt_count=claim.attempt_count,
                 canonical_payload_sha256=canonical_payload_sha256,
+                expected_generation_epoch=generation_epoch,
             ):
                 return failed_result("source_hash_mismatch")
         else:
@@ -3000,6 +3091,10 @@ async def _sync_chapter_narrative_after_save_once(
         len(summary),
     )
 
+    stale = stale_claim_result()
+    if stale is not None:
+        return stale
+
     try:
         commit_repository.commit(
             novel_id=novel_id,
@@ -3037,13 +3132,19 @@ async def _sync_chapter_narrative_after_save_once(
         text_for_vector = summary.strip() if summary.strip() else "；".join(beat_sections) if beat_sections else content[:800]
         try:
             await indexing_svc.ensure_collection(novel_id)
+            vector_provenance = {
+                "content_sha256": content_sha256,
+                "content_revision": claim.content_revision,
+                "pipeline_version": CHAPTER_NARRATIVE_PIPELINE_VERSION,
+            }
+            if expected_rebuild_epoch is not None:
+                vector_provenance["expected_generation_epoch"] = generation_epoch
+                vector_provenance["generation_epoch_db"] = generation_epoch_db
             await indexing_svc.index_chapter_summary(
                 novel_id,
                 chapter_number,
                 text_for_vector,
-                content_sha256=content_sha256,
-                content_revision=claim.content_revision,
-                pipeline_version=CHAPTER_NARRATIVE_PIPELINE_VERSION,
+                **vector_provenance,
             )
             flags["vector_stored"] = True
             vector_status = "stored"
@@ -3051,6 +3152,9 @@ async def _sync_chapter_narrative_after_save_once(
         except Exception as e:
             vector_status = "failed"
             logger.warning("章节向量索引失败 novel=%s ch=%s: [%s] %s", novel_id, chapter_number, type(e).__name__, e, exc_info=True)
+        stale_epoch = stale_epoch_result()
+        if stale_epoch is not None:
+            return stale_epoch
         try:
             commit_repository.set_vector_status(
                 novel_id=novel_id,

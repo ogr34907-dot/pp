@@ -6,12 +6,14 @@
 """
 
 import uuid
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, TYPE_CHECKING, Set
 
 from domain.novel.value_objects.chapter_id import ChapterId
 from domain.novel.value_objects.novel_id import NovelId
 from domain.structure.story_node import StoryNode, NodeType
 from application.blueprint.services.chapter_book_structure_sync import (
+    assert_chapter_rows_safe_to_delete,
     purge_chapter_book_rows_not_matching_structure,
 )
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
@@ -208,22 +210,195 @@ class StoryStructureService:
         if not node:
             return False
         get_connection = getattr(self.repository, "_get_connection", None)
+        chapter_delete_body = getattr(
+            self._chapter_repository, "_delete_chapter_transaction_body", None
+        )
+        chapter_db = getattr(self._chapter_repository, "db", None)
+        get_chapter_connection = getattr(chapter_db, "get_connection", None)
         if callable(get_connection):
+            connection = get_connection()
             assert_story_node_write_allowed(
-                get_connection(),
+                connection,
                 node.novel_id,
                 operation="structure delete",
             )
+            if callable(chapter_delete_body):
+                if not callable(get_chapter_connection):
+                    raise RuntimeError("transactional chapter repository has no database connection")
+                if get_chapter_connection() is not connection:
+                    raise RuntimeError("story and chapter repositories must share one SQLite connection")
+                if connection.in_transaction:
+                    raise RuntimeError("structure delete requires a clean SQLite connection")
+
+                foreign_keys_enabled = bool(
+                    connection.execute("PRAGMA foreign_keys").fetchone()[0]
+                )
+                connection.execute("PRAGMA foreign_keys = OFF")
+                deleted_chapters: list[int] = []
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    locked_node = await self.repository.get_by_id(node_id)
+                    if locked_node is None:
+                        connection.rollback()
+                        return False
+                    assert_story_node_write_allowed(
+                        connection,
+                        locked_node.novel_id,
+                        operation="structure delete",
+                    )
+
+                    nodes = self.repository.get_by_novel_sync(locked_node.novel_id)
+                    children_by_parent: Dict[str, List[StoryNode]] = {}
+                    for candidate in nodes:
+                        if candidate.parent_id:
+                            children_by_parent.setdefault(candidate.parent_id, []).append(candidate)
+                    subtree = []
+                    stack = [locked_node]
+                    while stack:
+                        candidate = stack.pop()
+                        subtree.append(candidate)
+                        stack.extend(children_by_parent.get(candidate.id, []))
+
+                    chapter_numbers = sorted(
+                        {
+                            int(candidate.number)
+                            for candidate in subtree
+                            if candidate.node_type == NodeType.CHAPTER
+                        },
+                        reverse=True,
+                    )
+                    chapters = []
+                    for chapter_number in chapter_numbers:
+                        chapter = self._chapter_repository.get_by_novel_and_number(
+                            NovelId(locked_node.novel_id), chapter_number
+                        )
+                        if chapter is not None:
+                            chapters.append((chapter_number, chapter))
+                    assert_chapter_rows_safe_to_delete(
+                        [chapter for _, chapter in chapters],
+                        novel_id=locked_node.novel_id,
+                        operation="结构删除章节",
+                        connection=connection,
+                    )
+
+                    now = datetime.now(timezone.utc).isoformat()
+                    for chapter_number, chapter in chapters:
+                        chapter_id = (
+                            chapter.id.value if hasattr(chapter.id, "value") else chapter.id
+                        )
+                        chapter_delete_body(
+                            connection,
+                            locked_node.novel_id,
+                            chapter_number,
+                            chapter_id,
+                            now,
+                        )
+                        deleted_chapters.append(chapter_number)
+
+                    for candidate in subtree:
+                        if candidate.id == node_id:
+                            continue
+                        if connection.execute(
+                            "SELECT 1 FROM story_nodes WHERE id = ?", (candidate.id,)
+                        ).fetchone() is None:
+                            continue
+                        cursor = connection.execute(
+                            "DELETE FROM story_nodes WHERE id = ?", (candidate.id,)
+                        )
+                        if cursor.rowcount <= 0:
+                            connection.rollback()
+                            return False
+
+                    if connection.execute(
+                        "SELECT 1 FROM story_nodes WHERE id = ?", (node_id,)
+                    ).fetchone() is not None:
+                        cursor = connection.execute(
+                            "DELETE FROM story_nodes WHERE id = ?", (node_id,)
+                        )
+                        if cursor.rowcount <= 0:
+                            connection.rollback()
+                            return False
+                    if connection.execute(
+                        "SELECT 1 FROM story_nodes WHERE id = ?", (node_id,)
+                    ).fetchone() is not None:
+                        connection.rollback()
+                        return False
+
+                    remaining_structure_numbers = set()
+                    for candidate in self.repository.get_by_novel_sync(locked_node.novel_id):
+                        if candidate.node_type != NodeType.CHAPTER:
+                            continue
+                        try:
+                            remaining_structure_numbers.add(int(candidate.number))
+                        except (TypeError, ValueError):
+                            continue
+                    orphan_chapters = []
+                    for chapter in self._chapter_repository.list_by_novel(
+                        NovelId(locked_node.novel_id)
+                    ):
+                        try:
+                            chapter_number = int(chapter.number)
+                        except (TypeError, ValueError):
+                            continue
+                        if chapter_number not in remaining_structure_numbers:
+                            orphan_chapters.append((chapter_number, chapter))
+                    orphan_chapters.sort(key=lambda item: item[0], reverse=True)
+                    assert_chapter_rows_safe_to_delete(
+                        [chapter for _, chapter in orphan_chapters],
+                        novel_id=locked_node.novel_id,
+                        operation="结构同步删除章节",
+                        connection=connection,
+                    )
+                    for chapter_number, chapter in orphan_chapters:
+                        chapter_id = (
+                            chapter.id.value if hasattr(chapter.id, "value") else chapter.id
+                        )
+                        chapter_delete_body(
+                            connection,
+                            locked_node.novel_id,
+                            chapter_number,
+                            chapter_id,
+                            now,
+                        )
+                        deleted_chapters.append(chapter_number)
+                    connection.commit()
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    raise
+                finally:
+                    connection.execute(
+                        "PRAGMA foreign_keys = "
+                        + ("ON" if foreign_keys_enabled else "OFF")
+                    )
+
+                coordinator = self._chapter_renumber_coordinator
+                if coordinator is not None:
+                    for chapter_number in deleted_chapters:
+                        coordinator.on_chapter_deleted(
+                            locked_node.novel_id, chapter_number
+                        )
+                return True
 
         deleted_any = False
         if self._chapter_repository is not None:
             chapter_numbers = self._collect_descendant_chapter_numbers(node.novel_id, node_id)
+            chapters = []
             for chapter_number in chapter_numbers:
                 chapter = self._chapter_repository.get_by_novel_and_number(
                     NovelId(node.novel_id), chapter_number
                 )
                 if chapter is None:
                     continue
+                chapters.append((chapter_number, chapter))
+            connection = get_connection() if callable(get_connection) else None
+            assert_chapter_rows_safe_to_delete(
+                [chapter for _, chapter in chapters],
+                novel_id=node.novel_id,
+                operation="结构删除章节",
+                connection=connection,
+            )
+            for chapter_number, chapter in chapters:
                 chapter_id = chapter.id.value if hasattr(chapter.id, "value") else chapter.id
                 self._chapter_repository.delete(ChapterId(chapter_id))
                 coordinator = self._chapter_renumber_coordinator

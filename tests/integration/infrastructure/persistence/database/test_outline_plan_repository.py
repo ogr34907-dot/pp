@@ -20,6 +20,8 @@ from infrastructure.persistence.database.outline_contract_repository import (
 from infrastructure.persistence.database.planning_authority_guard import (
     PlanningAuthorityError,
 )
+from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+from domain.structure.story_node import NodeType, StoryNode
 
 
 @pytest.fixture
@@ -731,6 +733,276 @@ def test_manifest_cohort_attempt_is_bound_to_the_open_draft_and_resumable(plan_r
 
     assert retry["retry_of_attempt_id"] == cancelled["id"]
     assert retry["prompt_snapshot"] == {"intent": "规划全部部纲"}
+
+
+def test_clone_active_manifest_draft_copies_frozen_projection_bindings(plan_repo):
+    """An editable plan must inherit the active plan's immutable projection map."""
+
+    database, repository = plan_repo
+    _published_root(database, repository)
+    active = repository.backfill_initial_plan("novel-1").plan
+    assert active is not None
+    _cut_over_to_manifest(database, active.id, active.digest)
+
+    draft = repository.clone_active_plan_draft("novel-1")
+    conn = database.get_connection()
+    rows = conn.execute(
+        """
+        SELECT source.logical_node_id,
+               source_binding.story_node_id, source_binding.parent_story_node_id,
+               source_binding.number, source_binding.order_index,
+               draft_binding.plan_revision_item_id,
+               draft_binding.story_node_id, draft_binding.parent_story_node_id,
+               draft_binding.number, draft_binding.order_index
+        FROM outline_plan_revision_items AS source
+        JOIN outline_plan_projection_bindings AS source_binding
+          ON source_binding.plan_revision_item_id = source.id
+        JOIN outline_plan_revision_items AS draft_item
+          ON draft_item.plan_revision_id = ?
+         AND draft_item.logical_node_id = source.logical_node_id
+        LEFT JOIN outline_plan_projection_bindings AS draft_binding
+          ON draft_binding.plan_revision_item_id = draft_item.id
+        WHERE source.plan_revision_id = ?
+        """,
+        (draft.id, active.id),
+    ).fetchall()
+
+    assert len(rows) == len(active.items)
+    assert all(row[5] is not None for row in rows)
+    assert all(row[6:] == row[1:5] for row in rows)
+
+
+def test_seal_rejects_a_clone_with_a_missing_reused_physical_story_node(plan_repo):
+    database, repository = plan_repo
+    _published_root(database, repository)
+    root = repository.ensure_root("novel-1")
+    StoryNodeRepository(database).save_sync(
+        StoryNode(
+            id="part-node-1",
+            novel_id="novel-1",
+            node_type=NodeType.PART,
+            number=1,
+            title="第一部",
+            order_index=0,
+        )
+    )
+    part = repository.create_contract(
+        novel_id="novel-1",
+        level=OutlineLevel.PART,
+        parent_contract_id=root.id,
+        story_node_id="part-node-1",
+    )
+    draft = repository.save_draft(
+        part.id,
+        OutlinePayload(
+            title="第一部",
+            narrative_text="第一部推动人物付出不可逆代价。",
+            creative_goal="推进主线冲突",
+            entry_state="旧秩序仍然完整",
+            exit_state="新秩序建立但付出代价",
+        ),
+        source=OutlineSource.AUTHOR,
+    )
+    repository.publish_and_sync(part.id, expected_revision=draft.draft.revision)
+    active = repository.backfill_initial_plan("novel-1").plan
+    assert active is not None
+    _cut_over_to_manifest(database, active.id, active.digest)
+    cloned = repository.clone_active_plan_draft("novel-1")
+    conn = database.get_connection()
+    physical = conn.execute(
+        """
+        SELECT binding.story_node_id
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ? AND item.logical_node_id = ?
+        """,
+        (cloned.id, part.id),
+    ).fetchone()
+    assert physical is not None and physical["story_node_id"] is not None
+    conn.execute("DELETE FROM story_nodes WHERE id = ?", (physical["story_node_id"],))
+    conn.commit()
+
+    with pytest.raises(OutlineGateError, match="StoryNode is missing"):
+        repository.seal_plan_revision(cloned.id)
+
+    assert repository.get_plan_revision(cloned.id).sealed_at is None
+    assert repository.get_planning_head("novel-1").working_plan_revision_id == cloned.id
+
+
+def test_projection_binding_accessors_validate_the_sealed_snapshot(plan_repo):
+    """Consumers can inspect and strictly validate one frozen revision."""
+
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    plan = repository.backfill_initial_plan("novel-1").plan
+    assert plan is not None
+
+    bindings = repository.projection_bindings_for_revision(plan.id)
+    validated = repository.validate_projection_bindings(
+        plan.id, database.get_connection()
+    )
+
+    assert len(bindings) == 1
+    assert bindings[0]["logical_node_id"] == root_item.logical_node_id
+    assert set(validated) == {root_item.logical_node_id}
+
+
+def test_manifest_cohort_declares_physical_bindings_before_sealing(plan_repo):
+    """A generated sibling cohort cannot rely on mutable contract projection cache."""
+
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    active = repository.backfill_initial_plan("novel-1").plan
+    assert active is not None
+    _cut_over_to_manifest(database, active.id, active.digest)
+    draft = repository.clone_active_plan_draft("novel-1")
+
+    expanded = repository.replace_draft_cohort_payloads(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        payloads=(
+            OutlinePayload(
+                title="第一部",
+                narrative_text="主角离开故乡并失去依靠。",
+                creative_goal="迫使主角做出选择",
+                entry_state="旧秩序仍然完整",
+                exit_state="主角失去依靠",
+                chapter_start=1,
+                chapter_end=10,
+            ),
+        ),
+    )
+    part = next(item for item in expanded.items if item.level == OutlineLevel.PART)
+    binding = database.get_connection().execute(
+        """
+        SELECT binding.story_node_id, binding.parent_story_node_id,
+               binding.number, binding.order_index
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ? AND item.logical_node_id = ?
+        """,
+        (expanded.id, part.logical_node_id),
+    ).fetchone()
+
+    assert binding is not None
+    assert binding[0] is not None
+    assert tuple(binding[1:]) == (None, 1, 0)
+
+
+def test_manifest_chapter_bindings_use_global_chapter_numbers(plan_repo):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    active = repository.backfill_initial_plan("novel-1").plan
+    assert active is not None
+    _cut_over_to_manifest(database, active.id, active.digest)
+    draft = repository.clone_active_plan_draft("novel-1")
+    parent = root_item
+    for title in ("第一部", "第一卷", "第一幕"):
+        draft = repository.replace_draft_cohort_payloads(
+            plan_revision_id=draft.id,
+            parent_logical_node_id=parent.logical_node_id,
+            payloads=(
+                OutlinePayload(
+                    title=title,
+                    narrative_text=f"{title}叙事",
+                    creative_goal=f"{title}目标",
+                    entry_state="旧秩序仍然完整",
+                    exit_state="新秩序建立但付出代价",
+                    chapter_start=7,
+                    chapter_end=8,
+                ),
+            ),
+        )
+        parent = next(
+            item
+            for item in draft.items
+            if item.parent_logical_node_id == parent.logical_node_id
+        )
+
+    draft = repository.replace_draft_cohort_payloads(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=parent.logical_node_id,
+        payloads=(
+            OutlinePayload(
+                title="第七章",
+                narrative_text="转折开始",
+                creative_goal="迫使主角选择",
+                entry_state="旧秩序仍然完整",
+                exit_state="转折发生",
+                chapter_start=7,
+                chapter_end=7,
+            ),
+            OutlinePayload(
+                title="第八章",
+                narrative_text="转折完成",
+                creative_goal="让代价落地",
+                entry_state="转折发生",
+                exit_state="新秩序建立但付出代价",
+                chapter_start=8,
+                chapter_end=8,
+            ),
+        ),
+    )
+    rows = database.get_connection().execute(
+        """
+        SELECT binding.number, binding.order_index
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ? AND item.level = 'chapter'
+        ORDER BY item.sibling_index
+        """,
+        (draft.id,),
+    ).fetchall()
+
+    assert [tuple(row) for row in rows] == [(7, 0), (8, 1)]
+
+
+def test_manifest_draft_seals_declared_bindings_before_projection_materializes(plan_repo):
+    """Sealing freezes the declared projection; physical writes happen later in publish."""
+
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    active = repository.backfill_initial_plan("novel-1").plan
+    assert active is not None
+    _cut_over_to_manifest(database, active.id, active.digest)
+    draft = repository.clone_active_plan_draft("novel-1")
+    expanded = repository.replace_draft_cohort_payloads(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        payloads=(
+            OutlinePayload(
+                title="第一部",
+                narrative_text="主角离开故乡并失去依靠。",
+                creative_goal="迫使主角做出选择",
+                entry_state="旧秩序仍然完整",
+                exit_state="主角失去依靠",
+                chapter_start=1,
+                chapter_end=10,
+            ),
+        ),
+    )
+    part = next(item for item in expanded.items if item.level == OutlineLevel.PART)
+
+    sealed = repository.seal_plan_revision(expanded.id)
+    binding = database.get_connection().execute(
+        """
+        SELECT binding.story_node_id
+        FROM outline_plan_projection_bindings AS binding
+        JOIN outline_plan_revision_items AS item
+          ON item.id = binding.plan_revision_item_id
+        WHERE item.plan_revision_id = ? AND item.logical_node_id = ?
+        """,
+        (sealed.id, part.logical_node_id),
+    ).fetchone()
+
+    assert sealed.sealed_at is not None
+    assert binding is not None and binding[0] is not None
+    assert database.get_connection().execute(
+        "SELECT COUNT(*) FROM story_nodes WHERE id = ?", (binding[0],)
+    ).fetchone()[0] == 0
 
 
 def test_manifest_cohort_attempt_rejects_sealed_or_nonworking_plan(plan_repo):

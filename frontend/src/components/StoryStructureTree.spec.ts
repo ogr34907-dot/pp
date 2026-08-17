@@ -7,9 +7,11 @@ const mocks = vi.hoisted(() => ({
   createNode: vi.fn(),
   updateNode: vi.fn(),
   deleteNode: vi.fn(),
+  listChapters: vi.fn(),
   getStatus: vi.fn(),
   selectChapter: vi.fn(),
   messageError: vi.fn(),
+  dialogWarning: vi.fn(),
 }))
 
 vi.mock('naive-ui', () => {
@@ -25,7 +27,7 @@ vi.mock('naive-ui', () => {
     NModal: component,
     NInput: component,
     useMessage: () => ({ error: mocks.messageError, success: vi.fn() }),
-    useDialog: () => ({ warning: vi.fn() }),
+    useDialog: () => ({ warning: mocks.dialogWarning }),
   }
 })
 
@@ -39,7 +41,7 @@ vi.mock('@/api/structure', () => ({
 }))
 
 vi.mock('@/api/chapter', () => ({
-  chapterApi: { listChapters: vi.fn().mockResolvedValue([]) },
+  chapterApi: { listChapters: mocks.listChapters },
 }))
 
 vi.mock('@/api/autopilot', () => ({
@@ -135,6 +137,107 @@ describe('StoryStructureTree manifest authority', () => {
       expect(mocks.createNode).not.toHaveBeenCalled()
       expect(mocks.updateNode).not.toHaveBeenCalled()
       expect(mocks.deleteNode).not.toHaveBeenCalled()
+    } finally {
+      await mounted.finish()
+    }
+  })
+
+  it('invalidates legacy write interactions already opened before manifest cutover', async () => {
+    const chapter = {
+      id: 'chapter-1',
+      novel_id: 'novel-1',
+      parent_id: null,
+      node_type: 'chapter',
+      number: 1,
+      title: 'Opening',
+      order_index: 0,
+      chapter_count: 0,
+      metadata: {},
+      created_at: '',
+      updated_at: '',
+      level: 1,
+      icon: '',
+      display_name: '',
+      children: [],
+    }
+    const legacyTree = {
+      novel_id: 'novel-1',
+      tree: { nodes: [chapter] },
+      manifest_authority: false,
+    }
+    mocks.getTree.mockReset()
+      .mockResolvedValueOnce(legacyTree)
+      .mockResolvedValue({ ...legacyTree, manifest_authority: true })
+    mocks.deleteNode.mockReset().mockResolvedValue(true)
+    mocks.dialogWarning.mockClear()
+
+    const mounted = await setupTree()
+    try {
+      await mounted.state.loadTree()
+      mounted.state.menuTargetNode = chapter
+      mounted.state.handleMenuSelect('delete')
+      const pendingDelete = mocks.dialogWarning.mock.calls[0][0]
+      mounted.state.menuVisible = true
+      mounted.state.showRename = true
+      mounted.state.showAddChild = true
+
+      await mounted.state.loadTree()
+
+      expect(mounted.state.menuVisible).toBe(false)
+      expect(mounted.state.showRename).toBe(false)
+      expect(mounted.state.showAddChild).toBe(false)
+      await pendingDelete.onPositiveClick()
+      expect(mocks.deleteNode).not.toHaveBeenCalled()
+    } finally {
+      await mounted.finish()
+    }
+  })
+
+  it('does not create a legacy child when manifest authority changes during chapter lookup', async () => {
+    const act = {
+      id: 'act-1',
+      novel_id: 'novel-1',
+      parent_id: null,
+      node_type: 'act',
+      number: 1,
+      title: 'Act one',
+      order_index: 0,
+      chapter_count: 0,
+      metadata: {},
+      created_at: '',
+      updated_at: '',
+      level: 1,
+      icon: '',
+      display_name: '',
+      children: [],
+    }
+    const legacyTree = {
+      novel_id: 'novel-1',
+      tree: { nodes: [act] },
+      manifest_authority: false,
+    }
+    let releaseChapterLookup!: (chapters: unknown[]) => void
+    mocks.getTree.mockReset()
+      .mockResolvedValueOnce(legacyTree)
+      .mockResolvedValue({ ...legacyTree, manifest_authority: true })
+    mocks.listChapters.mockReset().mockImplementation(
+      () => new Promise((resolve) => { releaseChapterLookup = resolve })
+    )
+    mocks.createNode.mockReset().mockResolvedValue(true)
+
+    const mounted = await setupTree()
+    try {
+      await mounted.state.loadTree()
+      mounted.state.menuTargetNode = act
+      mounted.state.addChildValue = 'Chapter one'
+      const pendingAdd = mounted.state.doAddChild()
+      await Promise.resolve()
+
+      await mounted.state.loadTree()
+      releaseChapterLookup([])
+      await pendingAdd
+
+      expect(mocks.createNode).not.toHaveBeenCalled()
     } finally {
       await mounted.finish()
     }

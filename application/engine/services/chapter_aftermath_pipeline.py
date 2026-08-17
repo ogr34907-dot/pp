@@ -282,7 +282,10 @@ class ChapterAftermathPipeline:
         try:
             from application.world.services.chapter_narrative_sync import (
                 sync_chapter_narrative_after_save,
+                worldline_rebuild_generation_epoch,
             )
+
+            expected_generation_epoch = worldline_rebuild_generation_epoch(novel_id)
 
             async def _sync_narrative() -> Dict[str, Any]:
                 sync_kwargs: Dict[str, Any] = {}
@@ -447,6 +450,10 @@ class ChapterAftermathPipeline:
                     "pipeline_version": CHAPTER_NARRATIVE_PIPELINE_VERSION,
                     "content_revision": int(memory_content_revision),
                 }
+                if expected_generation_epoch is not None:
+                    memory_kwargs["expected_generation_epoch"] = (
+                        expected_generation_epoch
+                    )
                 for retry_index in range(MAX_MEMORY_SYNC_ATTEMPTS):
                     try:
                         memory_claim = memory_commit_repository.claim_memory_sync(
@@ -493,6 +500,16 @@ class ChapterAftermathPipeline:
                             }
                         )
                         return out
+                    if memory_claim == "generation_epoch_mismatch":
+                        out.update(
+                            {
+                                "memory_engine_ok": False,
+                                "narrative_sync_ok": False,
+                                "discarded_stale": True,
+                                "failure_reason": "generation_epoch_mismatch",
+                            }
+                        )
+                        return out
                     if memory_claim != "claimed":
                         out.update(
                             {
@@ -522,6 +539,7 @@ class ChapterAftermathPipeline:
                                 outline,
                                 content_sha256=str(memory_content_sha256),
                                 content_revision=int(memory_content_revision),
+                                expected_generation_epoch=expected_generation_epoch,
                             )
                         else:
                             memory_delta = await self._memory_engine.update_from_chapter(

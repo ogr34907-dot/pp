@@ -661,6 +661,12 @@ const loadTree = async () => {
     manifestAuthority.value = Boolean(
       (res as typeof res & { manifest_authority?: boolean }).manifest_authority
     )
+    if (manifestAuthority.value) {
+      menuVisible.value = false
+      showRename.value = false
+      showAddChild.value = false
+      menuTargetNode.value = null
+    }
     treeData.value = nodes.length > 0 ? nodes.map(convertToTreeNode) : buildChapterFallbackTree()
 
     const hasData = treeData.value.length > 0
@@ -787,6 +793,7 @@ const handleMenuSelect = (key: string) => {
       positiveText: '删除',
       negativeText: '取消',
       onPositiveClick: async () => {
+        if (manifestAuthority.value) return
         try {
           await structureApi.deleteNode(props.slug, node.id)
           message.success('已删除')
@@ -836,6 +843,7 @@ const doAddChild = async () => {
         // 若查询失败则退回 number=1，后端 ensure 时会按章节号创建
       }
     }
+    if (manifestAuthority.value) return
     await structureApi.createNode(props.slug, {
       node_type: childType as any,
       parent_id: node.id,

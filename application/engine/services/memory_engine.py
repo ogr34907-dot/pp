@@ -826,6 +826,7 @@ class MemoryEngine:
         *,
         content_sha256: str,
         content_revision: int,
+        expected_generation_epoch: int | None = None,
     ) -> Dict[str, Any]:
         """Apply one canonical aftermath version at most once."""
         return await self._update_from_chapter(
@@ -839,6 +840,7 @@ class MemoryEngine:
                 "content_sha256": str(content_sha256),
                 "content_revision": int(content_revision),
             },
+            expected_generation_epoch=expected_generation_epoch,
         )
 
     async def _update_from_chapter(
@@ -849,6 +851,7 @@ class MemoryEngine:
         outline: str,
         *,
         canonical_version: Dict[str, Any] | None = None,
+        expected_generation_epoch: int | None = None,
     ) -> Dict[str, Any]:
         """章后状态回写：调用 LLM 提取增量 + 去重合并 + 持久化
         
@@ -964,13 +967,15 @@ class MemoryEngine:
             state.last_updated_chapter = max(state.last_updated_chapter, chapter_number)
             if canonical_version is not None:
                 state.applied_aftermath_versions.append(canonical_version)
-                if not self._persist_canonical_state(
+                persisted, failure_reason = self._persist_canonical_state(
                     novel_id,
                     state,
                     canonical_version,
-                ):
+                    expected_generation_epoch=expected_generation_epoch,
+                )
+                if not persisted:
                     result["discarded_stale"] = True
-                    result["errors"].append("source_version_mismatch")
+                    result["errors"].append(failure_reason)
                     return result
             else:
                 self._persist_state(novel_id, state)
@@ -1117,15 +1122,29 @@ class MemoryEngine:
         state: MemoryState,
         canonical_version: Dict[str, Any],
         *,
+        expected_generation_epoch: int | None = None,
         _retry_after_table_create: bool = False,
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """Persist one canonical version only while its source prose is current."""
         if self.db_connection is None:
-            return False
+            return False, "source_version_mismatch"
         try:
             with sqlite_writes_bypass_queue():
                 if hasattr(self.db_connection, "transaction"):
                     with self.db_connection.transaction() as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        expected_epoch = expected_generation_epoch
+                        if expected_epoch is not None:
+                            epoch = conn.execute(
+                                "SELECT active_generation_epoch "
+                                "FROM worldline_generation_filters WHERE novel_id = ?",
+                                (novel_id,),
+                            ).fetchone()
+                            current_epoch = (
+                                int(epoch[0] or 0) if epoch is not None else 0
+                            )
+                            if current_epoch != int(expected_epoch):
+                                return False, "generation_epoch_mismatch"
                         source = conn.execute(
                             "SELECT content, content_sha256, content_revision FROM chapters "
                             "WHERE novel_id = ? AND number = ?",
@@ -1138,9 +1157,9 @@ class MemoryEngine:
                             source,
                             canonical_version,
                         ):
-                            return False
+                            return False, "source_version_mismatch"
                         self._upsert_state_row(novel_id, state, connection=conn)
-                    return True
+                    return True, ""
 
                 source = self.db_connection.execute(
                     "SELECT content, content_sha256, content_revision FROM chapters "
@@ -1151,9 +1170,9 @@ class MemoryEngine:
                     ),
                 ).fetchone()
                 if not self._source_matches_canonical_version(source, canonical_version):
-                    return False
+                    return False, "source_version_mismatch"
                 self._upsert_state_row(novel_id, state)
-                return True
+                return True, ""
         except Exception as exc:
             if (
                 not _retry_after_table_create
@@ -1164,6 +1183,7 @@ class MemoryEngine:
                     novel_id,
                     state,
                     canonical_version,
+                    expected_generation_epoch=expected_generation_epoch,
                     _retry_after_table_create=True,
                 )
             raise RuntimeError(f"MemoryEngine state persistence failed: {exc}") from exc

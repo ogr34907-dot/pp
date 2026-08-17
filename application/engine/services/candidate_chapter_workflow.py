@@ -391,10 +391,21 @@ class CandidateChapterWorkflowService:
                 reason = "canonical_aftermath_not_ready"
                 if isinstance(result, dict) and result.get("failure_reason"):
                     reason = str(result["failure_reason"])
-                return self.repository.mark_sync_failed(candidate.id, reason)
+                return self.repository.mark_sync_failed(
+                    candidate.id,
+                    reason,
+                    sync_attempt=candidate.sync_attempt,
+                )
         except Exception as exc:
-            return self.repository.mark_sync_failed(candidate.id, str(exc))
-        return self.repository.mark_sync_succeeded(candidate.id)
+            return self.repository.mark_sync_failed(
+                candidate.id,
+                str(exc),
+                sync_attempt=candidate.sync_attempt,
+            )
+        return self.repository.mark_sync_succeeded(
+            candidate.id,
+            sync_attempt=candidate.sync_attempt,
+        )
 
     @staticmethod
     def _outline_text(outline_chain: dict[str, Any]) -> str:

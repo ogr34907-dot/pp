@@ -12,6 +12,9 @@ from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.planning_authority_guard import (
     assert_story_node_write_allowed,
 )
+from application.blueprint.services.chapter_book_structure_sync import (
+    assert_chapter_rows_safe_to_delete,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +150,19 @@ class SqliteChapterRepository(ChapterRepository):
             return
 
         cid = chapter_id.value
+        novel_id = chapter.novel_id.value if hasattr(chapter.novel_id, "value") else chapter.novel_id
+        affected = [
+            item
+            for item in self.list_by_novel(chapter.novel_id)
+            if int(item.number) >= int(chapter.number)
+        ]
+        assert_chapter_rows_safe_to_delete(
+            affected,
+            novel_id=novel_id,
+            operation="章节删除入队",
+            connection=self.db.get_connection(),
+            require_empty_content=False,
+        )
         if enqueue_delete_chapter(cid):
             logger.info(
                 "章节删除已入队 %s novel=%s number=%s",
@@ -162,24 +178,49 @@ class SqliteChapterRepository(ChapterRepository):
 
     def execute_delete_on_writer(self, chapter_id: ChapterId) -> None:
         """仅在持久化消费者线程或直接写库模式下调用；保持原事务体（含 FK 切换与容错 DELETE）。"""
-        chapter = self.get_by_id(chapter_id)
-        if not chapter:
-            logger.warning(f"Chapter not found for deletion (writer): {chapter_id.value}")
-            return
-
-        novel_id = chapter.novel_id.value if hasattr(chapter.novel_id, 'value') else chapter.novel_id
-        deleted_number = chapter.number
         cid = chapter_id.value
         now = datetime.now(timezone.utc).isoformat()
 
         with self.db.transaction() as conn:
+            # SQLite only applies the FK toggle outside a transaction.  Once it
+            # is set, own the writer lock before rechecking Formal provenance.
+            foreign_keys_enabled = bool(
+                conn.execute("PRAGMA foreign_keys").fetchone()[0]
+            )
             conn.execute("PRAGMA foreign_keys = OFF")
             try:
+                conn.execute("BEGIN IMMEDIATE")
+                target = conn.execute(
+                    "SELECT novel_id, number FROM chapters WHERE id = ?",
+                    (cid,),
+                ).fetchone()
+                if target is None:
+                    conn.commit()
+                    logger.warning(f"Chapter not found for deletion (writer): {cid}")
+                    return
+
+                novel_id = str(target["novel_id"])
+                deleted_number = int(target["number"])
+                assert_chapter_rows_safe_to_delete(
+                    self._affected_chapter_rows_for_delete(conn, novel_id, deleted_number),
+                    novel_id=novel_id,
+                    operation="章节删除执行",
+                    connection=conn,
+                    require_empty_content=False,
+                )
                 self._delete_chapter_transaction_body(
                     conn, novel_id, deleted_number, cid, now
                 )
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
             finally:
-                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute(
+                    "PRAGMA foreign_keys = "
+                    + ("ON" if foreign_keys_enabled else "OFF")
+                )
 
         logger.info(
             "Deleted chapter %s novel=%s deleted_number=%s (renumber cascade applied)",
@@ -187,6 +228,20 @@ class SqliteChapterRepository(ChapterRepository):
             novel_id,
             deleted_number,
         )
+
+    @staticmethod
+    def _affected_chapter_rows_for_delete(
+        conn: sqlite3.Connection, novel_id: str, deleted_number: int
+    ) -> list[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT id, novel_id, number, content
+            FROM chapters
+            WHERE novel_id = ? AND number >= ?
+            ORDER BY number
+            """,
+            (novel_id, deleted_number),
+        ).fetchall()
 
     def _delete_chapter_transaction_body(
         self,
@@ -202,6 +257,13 @@ class SqliteChapterRepository(ChapterRepository):
             conn,
             novel_id,
             operation="chapter delete/reorder",
+        )
+        assert_chapter_rows_safe_to_delete(
+            self._affected_chapter_rows_for_delete(conn, novel_id, deleted_number),
+            novel_id=novel_id,
+            operation="章节删除/重编号",
+            connection=conn,
+            require_empty_content=False,
         )
 
         conn.execute(

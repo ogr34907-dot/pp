@@ -1243,6 +1243,63 @@ def test_changed_manifest_head_cannot_revive_a_stale_candidate(tmp_path, operati
 
 
 @pytest.mark.parametrize(
+    ("operation", "expected_status"),
+    (
+        ("reject", CandidateStatus.REJECTED),
+        ("stop", CandidateStatus.CANCELLED),
+    ),
+)
+def test_stale_candidate_can_be_terminally_retired_after_manifest_head_change(
+    tmp_path, operation, expected_status
+):
+    """A stale draft cannot revive, but it must never block terminal cleanup."""
+
+    db, repo, candidate = _manifest_candidate_for_pin_boundary(
+        tmp_path, boundary="revalidation"
+    )
+    _switch_to_changed_manifest_head(db, active_plan_id=str(candidate.plan_revision_id))
+    conn = db.get_connection()
+    conn.execute(
+        """
+        UPDATE chapter_candidates
+        SET status = 'stale', failure_reason = 'outline_revision_changed'
+        WHERE id = ?
+        """,
+        (candidate.id,),
+    )
+    conn.execute(
+        """
+        UPDATE novel_generation_runs
+        SET state = 'paused', next_action = 'regenerate_stale_candidate',
+            last_error = 'outline_revision_changed'
+        WHERE novel_id = ?
+        """,
+        (candidate.novel_id,),
+    )
+    conn.commit()
+
+    if operation == "reject":
+        retired = repo.reject_and_stop(candidate.id)
+        assert retired.status == expected_status
+    else:
+        stopped = repo.stop_run(candidate.novel_id)
+        assert stopped.state == GenerationRunState.STOPPED
+        assert repo.get_candidate(candidate.id).status == expected_status
+
+    run = repo.get_run(candidate.novel_id)
+    assert run.state == GenerationRunState.STOPPED
+    assert run.generation_epoch == candidate.generation_epoch + 1
+    assert run.current_candidate_id is None
+    assert run.current_candidate_chapter is None
+
+    resumed = repo.start_run(
+        candidate.novel_id, run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+    assert resumed.state == GenerationRunState.RUNNING
+    assert resumed.current_candidate_id is None
+
+
+@pytest.mark.parametrize(
     ("operation", "boundary"),
     (
         ("mark_auditing", "revalidation"),
@@ -2280,6 +2337,37 @@ def test_start_run_does_not_overwrite_a_new_waiting_planning_pause(candidates):
     assert run.next_action == "expand_outline_cohort"
 
 
+def test_manifest_publication_resumes_only_the_exact_waiting_planning_run(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "resume-outline-publication.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("resume-outline", "Resume Outline", "resume-outline", 20),
+    )
+    conn.commit()
+    _, _, plan = _activate_manifest_five_level_chain(db, novel_id="resume-outline")
+    repo = ChapterCandidateRepository(db)
+    repo.start_run("resume-outline", run_mode=RunMode.CONTINUOUS, target_chapters=20)
+    paused = repo.wait_for_outline_expansion("resume-outline")
+
+    conn.execute("BEGIN IMMEDIATE")
+    resumed = repo.resume_after_outline_publication(
+        conn,
+        novel_id="resume-outline",
+        expected_generation_epoch=paused.generation_epoch,
+        expected_current_formal_chapter=paused.current_formal_chapter,
+        expected_active_plan_revision_id=plan.id,
+        expected_active_plan_digest=plan.digest,
+        expected_authority_generation=1,
+        expected_projection_generation=1,
+    )
+    conn.commit()
+
+    assert resumed.state == GenerationRunState.RUNNING
+    assert resumed.next_action == "generate_candidate"
+    assert resumed.generation_epoch == paused.generation_epoch
+
+
 def test_start_run_uses_persisted_novel_target_chapters(tmp_path):
     db = DatabaseConnection(str(tmp_path / "persisted-target.db"))
     db.execute(
@@ -2339,7 +2427,7 @@ def test_create_candidate_requires_the_immediate_next_formal_chapter(candidates)
         )
 
 
-def test_stopped_review_candidate_must_be_resolved_before_a_new_run(candidates):
+def test_stop_preserves_review_candidate_until_it_is_resolved(candidates):
     repo, _db = candidates
     candidate = repo.create_streaming_candidate(
         novel_id="novel-1", chapter_number=1, title="第一章", outline_chain=_chain(), llm_content="候选"
@@ -2348,11 +2436,17 @@ def test_stopped_review_candidate_must_be_resolved_before_a_new_run(candidates):
     repo.finish_audit(candidate.id, audit={}, commit_plan={})
     stopped = repo.stop_run("novel-1")
 
-    assert stopped.state == GenerationRunState.STOPPED
+    assert stopped.state == GenerationRunState.WAITING_REVIEW
     assert stopped.current_candidate_id == candidate.id
     with pytest.raises(CandidateGateError, match="pending candidate"):
         repo.start_run("novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3)
-    assert repo.get_run("novel-1").state == GenerationRunState.STOPPED
+
+    rejected = repo.reject_and_stop(candidate.id)
+    assert rejected.status == CandidateStatus.REJECTED
+    resumed = repo.start_run(
+        "novel-1", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=3
+    )
+    assert resumed.state == GenerationRunState.RUNNING
 
 
 def test_author_edit_stales_audit_and_commit_plan_until_reaudited(candidates):
@@ -2599,6 +2693,30 @@ def test_stopping_during_canonical_sync_finishes_sync_then_pauses(candidates):
     assert resumed.state == GenerationRunState.PAUSED
     assert resumed.current_formal_chapter == 1
     assert resumed.current_candidate_id is None
+
+
+def test_stop_preserves_failed_formal_candidate_for_sync_retry(candidates):
+    repo, _db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选",
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    repo.approve_for_commit(candidate.id, continue_after_commit=True)
+    repo.commit_formal(candidate.id)
+    repo.mark_sync_failed(candidate.id, "canonical aftermath unavailable")
+
+    stopped = repo.stop_run("novel-1")
+
+    assert stopped.state == GenerationRunState.PAUSED
+    assert stopped.canonical_sync_status == "failed"
+    assert stopped.current_candidate_id == candidate.id
+    retried = repo.begin_sync_retry(candidate.id)
+    assert retried.status == CandidateStatus.SYNCING
 
 
 def test_stopping_an_inflight_candidate_retires_late_worker_writes(candidates):
@@ -2850,3 +2968,319 @@ def test_service_restart_does_not_regress_sync_published_before_recovery_transac
         "SELECT sync_status FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
         (candidate.id,),
     )["sync_status"] == "ready"
+
+
+def _replace_generation_run_with_new_epoch(
+    db: DatabaseConnection,
+    *,
+    novel_id: str,
+) -> None:
+    """Model a completed competing worldline reset before an old worker locks."""
+
+    conn = db.get_connection()
+    updated = conn.execute(
+        """
+        UPDATE novel_generation_runs
+        SET generation_epoch = generation_epoch + 1,
+            state = 'paused', current_candidate_id = NULL,
+            current_candidate_chapter = NULL, canonical_sync_status = 'rebuilding',
+            next_action = 'rebuild_worldline', last_error = 'new_epoch_owner'
+        WHERE novel_id = ?
+        """,
+        (novel_id,),
+    )
+    assert updated.rowcount == 1
+    conn.commit()
+
+
+def _assert_new_epoch_owner_is_untouched(
+    db: DatabaseConnection,
+    *,
+    novel_id: str = "novel-1",
+) -> None:
+    row = db.fetch_one(
+        """
+        SELECT generation_epoch, state, current_candidate_id, current_candidate_chapter,
+               canonical_sync_status, next_action, last_error
+        FROM novel_generation_runs
+        WHERE novel_id = ?
+        """,
+        (novel_id,),
+    )
+    assert row is not None
+    assert tuple(row[key] for key in row) == (
+        1,
+        "paused",
+        None,
+        None,
+        "rebuilding",
+        "rebuild_worldline",
+        "new_epoch_owner",
+    )
+
+
+def _failed_sync_candidate(repo: ChapterCandidateRepository):
+    syncing = _syncing_candidate(repo)
+    return repo.mark_sync_failed(syncing.id, "canonical_aftermath_not_ready")
+
+
+@pytest.mark.parametrize("operation", ("retry", "failure"))
+def test_sync_authority_transitions_reject_a_new_epoch_before_their_lock(
+    candidates,
+    operation,
+):
+    """An old sync worker may not rewrite Formal/Candidate/Run after reset."""
+
+    repo, db = candidates
+    candidate = _failed_sync_candidate(repo)
+    expected_candidate_status = CandidateStatus.FAILED
+    expected_formal_status = "failed"
+    if operation == "failure":
+        candidate = repo.begin_sync_retry(candidate.id)
+        expected_candidate_status = CandidateStatus.SYNCING
+        expected_formal_status = "syncing"
+
+    competing = DatabaseConnection(db.db_path)
+    wrapped = _BeforeBeginConnection(
+        db.get_connection(),
+        lambda: _replace_generation_run_with_new_epoch(competing, novel_id=candidate.novel_id),
+    )
+    repo._connection = lambda: wrapped
+
+    with pytest.raises(CandidateGateError, match="generation.*changed|retired"):
+        if operation == "retry":
+            repo.begin_sync_retry(candidate.id)
+        else:
+            repo.mark_sync_failed(candidate.id, "late_sync_failure")
+
+    assert repo.get_candidate(candidate.id).status == expected_candidate_status
+    assert db.fetch_one(
+        "SELECT sync_status FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+        (candidate.id,),
+    )["sync_status"] == expected_formal_status
+    _assert_new_epoch_owner_is_untouched(db)
+
+
+def test_sync_failure_from_a_retired_retry_attempt_cannot_fail_the_latest_attempt(
+    candidates,
+):
+    """A delayed failure must carry a durable retry identity, not only state values."""
+
+    repo, db = candidates
+    failed = _failed_sync_candidate(repo)
+    first_retry = repo.begin_sync_retry(failed.id)
+    competing = DatabaseConnection(db.db_path)
+
+    def fail_then_open_the_next_retry() -> None:
+        competing_repo = ChapterCandidateRepository(competing)
+        competing_repo.mark_sync_failed(
+            first_retry.id,
+            "first_retry_failed",
+            sync_attempt=first_retry.sync_attempt,
+        )
+        retried = competing_repo.begin_sync_retry(first_retry.id)
+        assert retried.status == CandidateStatus.SYNCING
+
+    repo._connection = lambda: _BeforeBeginConnection(
+        db.get_connection(), fail_then_open_the_next_retry
+    )
+
+    with pytest.raises(
+        CandidateGateError,
+        match="sync attempt|authority transition|formal version changed",
+    ):
+        repo.mark_sync_failed(
+            first_retry.id,
+            "late_retry_failure",
+            sync_attempt=first_retry.sync_attempt,
+        )
+
+    candidate = ChapterCandidateRepository(db).get_candidate(first_retry.id)
+    formal = db.fetch_one(
+        "SELECT sync_status, failure_reason FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+        (first_retry.id,),
+    )
+    assert candidate.status == CandidateStatus.SYNCING
+    assert candidate.failure_reason == ""
+    assert tuple(formal[field] for field in ("sync_status", "failure_reason")) == (
+        "syncing",
+        "",
+    )
+
+
+def test_sync_success_from_a_retired_retry_attempt_cannot_complete_the_latest_attempt(
+    candidates,
+):
+    """A delayed success must carry the retry token it actually executed."""
+
+    repo, db = candidates
+    failed = _failed_sync_candidate(repo)
+    first_retry = repo.begin_sync_retry(failed.id)
+    competing = DatabaseConnection(db.db_path)
+
+    def fail_then_open_the_next_retry() -> None:
+        competing_repo = ChapterCandidateRepository(competing)
+        competing_repo.mark_sync_failed(
+            first_retry.id,
+            "first_retry_failed",
+            sync_attempt=first_retry.sync_attempt,
+        )
+        retried = competing_repo.begin_sync_retry(first_retry.id)
+        assert retried.status == CandidateStatus.SYNCING
+
+    repo._connection = lambda: _BeforeBeginConnection(
+        db.get_connection(), fail_then_open_the_next_retry
+    )
+
+    with pytest.raises(
+        CandidateGateError,
+        match="sync attempt|authority transition|formal version changed",
+    ):
+        repo.mark_sync_succeeded(
+            first_retry.id,
+            sync_attempt=first_retry.sync_attempt,
+        )
+
+    formal = db.fetch_one(
+        "SELECT sync_status, sync_attempt FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+        (first_retry.id,),
+    )
+    assert tuple(formal[field] for field in ("sync_status", "sync_attempt")) == (
+        "syncing",
+        first_retry.sync_attempt + 1,
+    )
+
+
+@pytest.mark.parametrize("operation", ("fail_run", "complete_run"))
+def test_run_terminal_transitions_cannot_overwrite_a_stopped_run(candidates, operation):
+    """Late pre-candidate workers cannot rewrite a durable terminal run."""
+
+    repo, db = candidates
+    repo.stop_run("novel-1")
+    db.execute(
+        "UPDATE novel_generation_runs SET target_chapters = 0 WHERE novel_id = 'novel-1'"
+    )
+    db.get_connection().commit()
+
+    with pytest.raises(CandidateGateError, match="authority-bearing state"):
+        if operation == "fail_run":
+            repo.fail_run("novel-1", "late_preflight_failure")
+        else:
+            repo.complete_run("novel-1")
+
+    assert repo.get_run("novel-1").state == GenerationRunState.STOPPED
+
+
+def test_formal_sync_retry_survives_a_new_manifest_head(tmp_path):
+    """Canonical retry remains actionable after planning authority advances."""
+
+    manifest_db = DatabaseConnection(str(tmp_path / "formal-retry-manifest.db"))
+    conn = manifest_db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-retry", "Manifest Retry", "manifest-retry", 20),
+    )
+    conn.commit()
+    service, chapter_node, active_plan = _activate_manifest_five_level_chain(
+        manifest_db, novel_id="manifest-retry"
+    )
+    retry_repo = ChapterCandidateRepository(manifest_db)
+    retry_repo.start_run("manifest-retry", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20)
+    candidate = retry_repo.create_streaming_candidate(
+        novel_id="manifest-retry",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=service.published_context_for_chapter("manifest-retry", chapter_node.id),
+        llm_content="候选正文",
+    )
+    retry_repo.mark_auditing(candidate.id)
+    retry_repo.finish_audit(candidate.id, audit={}, commit_plan={}, require_author_review=True)
+    retry_repo.approve_for_commit(candidate.id, continue_after_commit=False)
+    retry_repo.commit_formal(candidate.id)
+    retry_repo.mark_sync_failed(candidate.id, "canonical_aftermath_not_ready")
+
+    changed = _switch_to_changed_manifest_head(
+        manifest_db,
+        active_plan_id=active_plan.id,
+        retain_candidate_chain=False,
+    )
+    assert changed.id != active_plan.id
+
+    retried = retry_repo.begin_sync_retry(candidate.id)
+    assert retried.status == CandidateStatus.SYNCING
+
+
+@pytest.mark.parametrize("operation", ("fail_candidate", "stop_run", "reject"))
+def test_candidate_terminal_transitions_reject_a_new_epoch_before_their_lock(
+    candidates,
+    operation,
+):
+    """Old candidate failure/stop/reject paths cannot terminate a replacement run."""
+
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选正文",
+    )
+    expected_status = CandidateStatus.STREAMING
+    if operation == "reject":
+        repo.mark_auditing(candidate.id)
+        candidate = repo.finish_audit(candidate.id, audit={}, commit_plan={})
+        expected_status = CandidateStatus.AWAITING_REVIEW
+
+    competing = DatabaseConnection(db.db_path)
+    wrapped = _BeforeBeginConnection(
+        db.get_connection(),
+        lambda: _replace_generation_run_with_new_epoch(competing, novel_id=candidate.novel_id),
+    )
+    repo._connection = lambda: wrapped
+
+    with pytest.raises(CandidateGateError, match="generation.*changed|retired"):
+        if operation == "fail_candidate":
+            repo.fail_candidate(candidate.id, "late_worker_failure")
+        elif operation == "stop_run":
+            repo.stop_run(candidate.novel_id)
+        else:
+            repo.reject_and_stop(candidate.id)
+
+    assert repo.get_candidate(candidate.id).status == expected_status
+    _assert_new_epoch_owner_is_untouched(db)
+
+
+@pytest.mark.parametrize("operation", ("fail_run", "complete_run"))
+def test_run_terminal_transitions_reject_a_new_epoch_before_their_lock(
+    candidates,
+    operation,
+):
+    """A pre-candidate failure or completion cannot overwrite a newer run."""
+
+    repo, db = candidates
+    if operation == "complete_run":
+        syncing = _syncing_candidate(repo)
+        _persist_durable_aftermath(db, syncing)
+        repo.mark_sync_succeeded(syncing.id)
+        db.execute(
+            "UPDATE novels SET target_chapters = 1 WHERE id = 'novel-1'"
+        )
+        db.execute(
+            "UPDATE novel_generation_runs SET target_chapters = 1 WHERE novel_id = 'novel-1'"
+        )
+        db.get_connection().commit()
+
+    competing = DatabaseConnection(db.db_path)
+    wrapped = _BeforeBeginConnection(
+        db.get_connection(),
+        lambda: _replace_generation_run_with_new_epoch(competing, novel_id="novel-1"),
+    )
+    repo._connection = lambda: wrapped
+
+    with pytest.raises(CandidateGateError, match="generation.*changed|retired"):
+        if operation == "fail_run":
+            repo.fail_run("novel-1", "late_preflight_failure")
+        else:
+            repo.complete_run("novel-1")
+
+    _assert_new_epoch_owner_is_untouched(db)

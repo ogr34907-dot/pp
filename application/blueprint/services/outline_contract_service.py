@@ -336,7 +336,11 @@ class OutlineContractService:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def compute_canonical_prefix(
-        self, novel_id: str, through_chapter: int
+        self,
+        novel_id: str,
+        through_chapter: int,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> CanonicalPrefix:
         """Build a stable formal prefix from persisted historical identities.
 
@@ -349,7 +353,7 @@ class OutlineContractService:
         requested = int(through_chapter)
         if requested < 0:
             raise ValueError("through_chapter must be non-negative")
-        conn = self.contract_repository._connection()
+        conn = connection or self.contract_repository._connection()
         identities: list[dict[str, Any]] = []
         blockers: list[str] = []
         formal_head = 0
@@ -422,9 +426,16 @@ class OutlineContractService:
         )
 
     def reconcile_plan_boundary(
-        self, *, novel_id: str, plan_revision_id: str
+        self,
+        *,
+        novel_id: str,
+        plan_revision_id: str,
+        connection: Optional[sqlite3.Connection] = None,
     ) -> PlanReconciliationReport:
-        plan = self.contract_repository.get_plan_revision(plan_revision_id)
+        plan = self.contract_repository.get_plan_revision(
+            plan_revision_id,
+            _connection=connection,
+        )
         if plan.novel_id != novel_id:
             raise ValueError("outline plan belongs to another novel")
         boundary = dict(plan.canonical_boundary or {})
@@ -433,19 +444,28 @@ class OutlineContractService:
             if boundary.get("formal_head") is not None
             else max(0, int(plan.replan_start_chapter or 1) - 1)
         )
-        expected_prefix = self.compute_canonical_prefix(novel_id, expected_head)
+        expected_prefix = self.compute_canonical_prefix(
+            novel_id,
+            expected_head,
+            connection=connection,
+        )
         expected_digest = str(plan.canonical_prefix_digest or "")
         formal_repository = ChapterCandidateRepository(
             self.contract_repository._db or self.contract_repository.db_path
         )
         try:
             actual_head, authority_blockers = formal_repository.formal_history_snapshot(
-                novel_id
+                novel_id,
+                connection=connection,
             )
         except CandidateGateError:
             actual_head = 0
             authority_blockers = ("formal:history_invalid",)
-        current_prefix = self.compute_canonical_prefix(novel_id, actual_head)
+        current_prefix = self.compute_canonical_prefix(
+            novel_id,
+            actual_head,
+            connection=connection,
+        )
         blockers = [
             *expected_prefix.blockers,
             *current_prefix.blockers,
@@ -488,6 +508,10 @@ class OutlineContractService:
         call can occur.
         """
 
+        # Read the active Manifest before interpreting an absent physical node
+        # as a normal cohort-expansion boundary. A damaged Manifest must fail
+        # closed instead of becoming a resumable planning pause.
+        manifest_rows = self._manifest_rows(novel_id)
         nodes = sorted(
             (
                 node
@@ -496,6 +520,27 @@ class OutlineContractService:
             ),
             key=lambda node: (node.number, node.order_index, node.id),
         )
+        if manifest_rows is not None:
+            bound_story_node_ids = {
+                str(row["story_node_id"])
+                for row in manifest_rows
+                if row.get("story_node_id") not in (None, "")
+            }
+            for node in nodes:
+                if str(node.id) not in bound_story_node_ids:
+                    raise ValueError(
+                        "physical chapter node is not bound to the active manifest"
+                    )
+        expected_chapter = after_chapter + 1
+        if (
+            manifest_rows is not None
+            and nodes
+            and int(nodes[0].number) > expected_chapter
+        ):
+            raise OutlineExpansionRequired(
+                "the next projected Manifest chapter follows a gap after the "
+                "formal cursor; expand outline cohort"
+            )
         blockers: list[str] = []
         for node in nodes:
             try:

@@ -14,5 +14,8 @@ export default defineConfig({
     include: ['src/**/*.spec.ts'],
     clearMocks: true,
     restoreMocks: true,
+    pool: 'threads',
+    fileParallelism: false,
+    maxWorkers: 1,
   },
 })

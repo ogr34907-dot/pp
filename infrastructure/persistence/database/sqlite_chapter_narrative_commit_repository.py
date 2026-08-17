@@ -1614,6 +1614,7 @@ class SqliteChapterNarrativeCommitRepository:
         content_revision: int,
         memory_status: str,
         failure_reason: str = "",
+        expected_generation_epoch: int | None = None,
     ) -> bool:
         """Persist the MemoryEngine barrier for one current canonical version."""
         if memory_status not in {"pending", "committed", "failed"}:
@@ -1623,6 +1624,16 @@ class SqliteChapterNarrativeCommitRepository:
         reason = "" if memory_status == "committed" else str(failure_reason or "")[:1000]
         with sqlite_writes_bypass_queue():
             with self._db.transaction() as conn:
+                if expected_generation_epoch is not None:
+                    conn.execute("BEGIN IMMEDIATE")
+                    epoch = conn.execute(
+                        "SELECT active_generation_epoch "
+                        "FROM worldline_generation_filters WHERE novel_id = ?",
+                        (novel_id,),
+                    ).fetchone()
+                    current_epoch = int(epoch[0] or 0) if epoch is not None else 0
+                    if current_epoch != int(expected_generation_epoch):
+                        return False
                 source = conn.execute(
                     "SELECT content, content_sha256, content_revision FROM chapters "
                     "WHERE novel_id = ? AND number = ?",
@@ -1669,6 +1680,7 @@ class SqliteChapterNarrativeCommitRepository:
         content_sha256: str,
         pipeline_version: str,
         content_revision: int,
+        expected_generation_epoch: int | None = None,
     ) -> str:
         """Atomically reserve one committed narrative version for MemoryEngine."""
         now = datetime.now(timezone.utc).isoformat()
@@ -1678,6 +1690,16 @@ class SqliteChapterNarrativeCommitRepository:
         ).isoformat()
         with sqlite_writes_bypass_queue():
             with self._db.transaction() as conn:
+                if expected_generation_epoch is not None:
+                    conn.execute("BEGIN IMMEDIATE")
+                    epoch = conn.execute(
+                        "SELECT active_generation_epoch "
+                        "FROM worldline_generation_filters WHERE novel_id = ?",
+                        (novel_id,),
+                    ).fetchone()
+                    current_epoch = int(epoch[0] or 0) if epoch is not None else 0
+                    if current_epoch != int(expected_generation_epoch):
+                        return "generation_epoch_mismatch"
                 source = conn.execute(
                     "SELECT content, content_sha256, content_revision FROM chapters "
                     "WHERE novel_id = ? AND number = ?",
@@ -1759,6 +1781,7 @@ class SqliteChapterNarrativeCommitRepository:
         content_sha256: str,
         pipeline_version: str,
         content_revision: int,
+        expected_generation_epoch: int | None = None,
     ) -> bool:
         """Mark a claimed MemoryEngine update readable after its state is durable."""
         return self.set_memory_sync_status(
@@ -1768,6 +1791,7 @@ class SqliteChapterNarrativeCommitRepository:
             pipeline_version=pipeline_version,
             content_revision=content_revision,
             memory_status="committed",
+            expected_generation_epoch=expected_generation_epoch,
         )
 
     def fail_memory_sync(
@@ -1779,12 +1803,23 @@ class SqliteChapterNarrativeCommitRepository:
         pipeline_version: str,
         content_revision: int,
         failure_reason: str,
+        expected_generation_epoch: int | None = None,
     ) -> bool:
         """Record a failed claimed MemoryEngine update without touching a newer version."""
         now = datetime.now(timezone.utc).isoformat()
         reason = str(failure_reason or "memory_engine_update_failed")[:1000]
         with sqlite_writes_bypass_queue():
             with self._db.transaction() as conn:
+                if expected_generation_epoch is not None:
+                    conn.execute("BEGIN IMMEDIATE")
+                    epoch = conn.execute(
+                        "SELECT active_generation_epoch "
+                        "FROM worldline_generation_filters WHERE novel_id = ?",
+                        (novel_id,),
+                    ).fetchone()
+                    current_epoch = int(epoch[0] or 0) if epoch is not None else 0
+                    if current_epoch != int(expected_generation_epoch):
+                        return False
                 source = conn.execute(
                     "SELECT content, content_sha256, content_revision FROM chapters "
                     "WHERE novel_id = ? AND number = ?",

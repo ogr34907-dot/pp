@@ -1,6 +1,7 @@
 import hashlib
 import asyncio
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -23,6 +24,7 @@ from application.world.services.chapter_narrative_sync import (
     update_narrative_debts,
 )
 from application.world.services.knowledge_service import KnowledgeService
+from application.analyst.services.chapter_indexing_service import ChapterIndexingService
 from application.core.services.chapter_rewrite_coordinator import ChapterRewriteCoordinator
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.sqlite_chapter_repository import (
@@ -132,6 +134,266 @@ class _NarrativeEventRepo:
 
     def upsert_event(self, **event):
         self.events[event["event_id"]] = event
+
+
+@pytest.mark.asyncio
+async def test_chapter_indexing_rejects_epoch_changed_during_embedding(monkeypatch):
+    active_epoch = 1
+    vector_store = SimpleNamespace(
+        list_collections=AsyncMock(return_value=["novel_novel-1_chunks"]),
+        create_collection=AsyncMock(),
+        insert=AsyncMock(),
+    )
+
+    async def _embed(_text):
+        nonlocal active_epoch
+        active_epoch = 2
+        return [0.1, 0.2]
+
+    embedding = SimpleNamespace(get_dimension=lambda: 2, embed=_embed)
+
+    def _tag(_novel_id, payload):
+        return {**payload, "generation_epoch": active_epoch}
+
+    monkeypatch.setattr(
+        "application.analyst.services.chapter_indexing_service.tag_payload_for_active_epoch",
+        _tag,
+    )
+    service = ChapterIndexingService(vector_store, embedding)
+
+    with pytest.raises(RuntimeError, match="generation_epoch_mismatch"):
+        await service.index_chapter_summary(
+            "novel-1",
+            1,
+            "summary",
+            expected_generation_epoch=1,
+        )
+
+    vector_store.insert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chapter_indexing_old_epoch_cannot_overwrite_new_epoch_after_insert_wait(
+    monkeypatch,
+):
+    active_epoch = 1
+
+    class _BlockingVectorStore:
+        def __init__(self):
+            self.points = {}
+            self.old_insert_started = asyncio.Event()
+            self.release_old_insert = asyncio.Event()
+
+        async def list_collections(self):
+            return ["novel_novel-1_chunks"]
+
+        async def create_collection(self, **_kwargs):
+            return None
+
+        async def insert(self, *, id, payload, **_kwargs):
+            if int(payload["generation_epoch"]) == 1:
+                self.old_insert_started.set()
+                await self.release_old_insert.wait()
+            self.points[id] = dict(payload)
+
+    async def _embed(text):
+        return [float(len(text)), 0.2]
+
+    def _tag(_novel_id, payload):
+        return {**payload, "generation_epoch": active_epoch}
+
+    monkeypatch.setattr(
+        "application.analyst.services.chapter_indexing_service.tag_payload_for_active_epoch",
+        _tag,
+    )
+    store = _BlockingVectorStore()
+    service = ChapterIndexingService(
+        store,
+        SimpleNamespace(get_dimension=lambda: 2, embed=_embed),
+    )
+
+    old_write = asyncio.create_task(
+        service.index_chapter_summary(
+            "novel-1",
+            1,
+            "old summary",
+            expected_generation_epoch=1,
+        )
+    )
+    await store.old_insert_started.wait()
+    active_epoch = 2
+    await service.index_chapter_summary(
+        "novel-1",
+        1,
+        "new summary",
+        expected_generation_epoch=2,
+    )
+    store.release_old_insert.set()
+    await old_write
+
+    active_points = [
+        payload
+        for payload in store.points.values()
+        if int(payload["generation_epoch"]) == active_epoch
+    ]
+    assert active_points == [
+        {
+            "chapter_number": 1,
+            "text": "new summary",
+            "kind": "chapter_summary",
+            "novel_id": "novel-1",
+            "generation_epoch": 2,
+            "sync_status": "committed",
+        }
+    ]
+    assert len(store.points) == 2
+
+
+def test_canonical_summary_write_rechecks_generation_epoch_under_write_lock(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "canonical-epoch-fence.db"))
+    conn = db.get_connection()
+    content = "canonical chapter"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel')"
+    )
+    conn.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, title, content, content_sha256, content_revision, status) "
+        "VALUES ('chapter-1', 'novel-1', 1, 'Chapter', ?, ?, 1, 'completed')",
+        (content, content_sha256),
+    )
+    conn.execute(
+        "INSERT INTO worldline_generation_filters "
+        "(novel_id, active_generation_epoch) VALUES ('novel-1', 1)"
+    )
+    conn.commit()
+    claim = SqliteChapterNarrativeCommitRepository(db).claim(
+        novel_id="novel-1",
+        chapter_number=1,
+        content_sha256=content_sha256,
+        pipeline_version="test:v1",
+        expected_content_revision=1,
+    )
+    assert claim.disposition == "claimed"
+
+    original_transaction = db.transaction
+
+    @contextmanager
+    def _racing_transaction():
+        competing = DatabaseConnection(db.db_path)
+        try:
+            competing.execute(
+                "UPDATE worldline_generation_filters "
+                "SET active_generation_epoch = 2 WHERE novel_id = 'novel-1'"
+            )
+            competing.get_connection().commit()
+        finally:
+            competing.close()
+        with original_transaction() as transaction:
+            yield transaction
+
+    db.transaction = _racing_transaction
+    payload_sha256 = canonical_summary_payload_sha256(
+        summary="summary",
+        key_events="event",
+        open_threads="thread",
+        consistency_note="",
+        beat_sections=[],
+        micro_beats=[],
+    )
+
+    saved = SqliteKnowledgeRepository(db).save_canonical_chapter_summary(
+        novel_id="novel-1",
+        chapter_number=1,
+        summary="summary",
+        key_events="event",
+        open_threads="thread",
+        consistency_note="",
+        beat_sections=[],
+        micro_beats=[],
+        content_sha256=content_sha256,
+        content_revision=1,
+        pipeline_version="test:v1",
+        attempt_count=claim.attempt_count,
+        canonical_payload_sha256=payload_sha256,
+        expected_generation_epoch=1,
+    )
+
+    assert saved is False
+    assert db.fetch_one(
+        "SELECT 1 FROM chapter_summaries WHERE knowledge_id = 'novel-1-knowledge'"
+    ) is None
+
+
+@pytest.mark.parametrize("transition", ["claim", "finish"])
+def test_memory_sync_transition_rechecks_generation_epoch_under_write_lock(
+    tmp_path, transition
+):
+    db = DatabaseConnection(str(tmp_path / f"memory-{transition}-epoch-fence.db"))
+    conn = db.get_connection()
+    content = "canonical chapter"
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    initial_status = "pending" if transition == "claim" else "in_progress"
+    conn.execute(
+        "INSERT INTO novels (id, title, slug) VALUES ('novel-1', 'Novel', 'novel')"
+    )
+    conn.execute(
+        "INSERT INTO chapters "
+        "(id, novel_id, number, title, content, content_sha256, content_revision, status) "
+        "VALUES ('chapter-1', 'novel-1', 1, 'Chapter', ?, ?, 1, 'completed')",
+        (content, content_sha256),
+    )
+    conn.execute(
+        "INSERT INTO worldline_generation_filters "
+        "(novel_id, active_generation_epoch) VALUES ('novel-1', 1)"
+    )
+    conn.execute(
+        "INSERT INTO chapter_narrative_commits "
+        "(novel_id, chapter_number, content_sha256, pipeline_version, "
+        "content_revision, status, memory_status) "
+        "VALUES ('novel-1', 1, ?, 'test:v1', 1, 'committed', ?)",
+        (content_sha256, initial_status),
+    )
+    conn.commit()
+
+    original_transaction = db.transaction
+
+    @contextmanager
+    def _racing_transaction():
+        competing = DatabaseConnection(db.db_path)
+        try:
+            competing.execute(
+                "UPDATE worldline_generation_filters "
+                "SET active_generation_epoch = 2 WHERE novel_id = 'novel-1'"
+            )
+            competing.get_connection().commit()
+        finally:
+            competing.close()
+        with original_transaction() as transaction:
+            yield transaction
+
+    db.transaction = _racing_transaction
+    repository = SqliteChapterNarrativeCommitRepository(db)
+    kwargs = {
+        "novel_id": "novel-1",
+        "chapter_number": 1,
+        "content_sha256": content_sha256,
+        "pipeline_version": "test:v1",
+        "content_revision": 1,
+        "expected_generation_epoch": 1,
+    }
+
+    if transition == "claim":
+        assert repository.claim_memory_sync(**kwargs) == "generation_epoch_mismatch"
+    else:
+        assert repository.finish_memory_sync(**kwargs) is False
+
+    row = db.fetch_one(
+        "SELECT memory_status, memory_attempt_count FROM chapter_narrative_commits "
+        "WHERE novel_id = 'novel-1' AND chapter_number = 1"
+    )
+    assert (row["memory_status"], row["memory_attempt_count"]) == (initial_status, 0)
 
 
 def _canonical_bundle(summary="章末摘要"):

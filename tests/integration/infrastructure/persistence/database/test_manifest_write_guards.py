@@ -248,7 +248,7 @@ def test_manifest_head_rejects_raw_switch_to_unbound_cloned_draft(manifest_book)
     draft = contracts.clone_active_plan_draft("novel-1")
     conn = database.get_connection()
     before = _head_snapshot(database)
-    assert conn.execute(
+    binding_count = conn.execute(
         """
         SELECT COUNT(*)
         FROM outline_plan_projection_bindings AS binding
@@ -257,7 +257,21 @@ def test_manifest_head_rejects_raw_switch_to_unbound_cloned_draft(manifest_book)
         WHERE item.plan_revision_id = ?
         """,
         (draft.id,),
-    ).fetchone()[0] == 0
+    ).fetchone()[0]
+    assert binding_count == len(draft.items)
+    conn.execute(
+        """
+        DELETE FROM outline_plan_projection_bindings
+        WHERE plan_revision_item_id = (
+            SELECT id FROM outline_plan_revision_items
+            WHERE plan_revision_id = ?
+            ORDER BY id
+            LIMIT 1
+        )
+        """,
+        (draft.id,),
+    )
+    conn.commit()
     draft_digest = canonical_plan_digest(
         canonical_prefix_digest=draft.canonical_prefix_digest,
         items=draft.items,

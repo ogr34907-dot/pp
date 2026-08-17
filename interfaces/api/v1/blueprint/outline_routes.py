@@ -10,10 +10,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from application.blueprint.services.outline_contract_service import OutlineContractService
+from application.blueprint.services.outline_cohort_generation_service import (
+    OutlineCohortGenerationError,
+    OutlineCohortGenerationService,
+)
 from application.blueprint.services.outline_draft_generation_service import (
     OutlineDraftGenerationService,
 )
-from domain.structure.outline_contract import OutlinePayload, OutlineSource
+from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
 from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
     OutlineContractSlot,
@@ -69,6 +73,12 @@ class PublishRequest(BaseModel):
     author_locked: Optional[bool] = None
 
 
+class CohortExpandRequest(BaseModel):
+    parent_logical_node_id: str = Field(..., min_length=1)
+    level: OutlineLevel
+    author_payloads: list[OutlinePayloadDTO] = Field(default_factory=list)
+
+
 def get_outline_service() -> OutlineContractService:
     db = api_dependencies.get_database()
     return OutlineContractService(
@@ -81,6 +91,20 @@ def get_outline_draft_generation_service() -> OutlineDraftGenerationService:
     db = api_dependencies.get_database()
     return OutlineDraftGenerationService(
         OutlineContractRepository(db), api_dependencies.get_llm_service(), db
+    )
+
+
+def get_outline_cohort_generation_service() -> OutlineCohortGenerationService:
+    db = api_dependencies.get_database()
+    repository = OutlineContractRepository(db)
+    return OutlineCohortGenerationService(
+        repository,
+        OutlineContractService(
+            contract_repository=repository,
+            story_node_repository=StoryNodeRepository(db),
+        ),
+        api_dependencies.get_llm_service(),
+        db,
     )
 
 
@@ -118,6 +142,19 @@ def _raise_contract_error(exc: Exception) -> None:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if isinstance(exc, OutlineGateError):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    raise exc
+
+
+def _raise_manifest_cohort_error(exc: Exception) -> None:
+    if isinstance(
+        exc,
+        (PlanningAuthorityError, OutlineGateError, OutlineCohortGenerationError),
+    ):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(exc, KeyError):
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     raise exc
@@ -217,6 +254,50 @@ def publish_outline_contract(
         }
     except Exception as exc:
         _raise_contract_error(exc)
+
+
+@router.post("/novels/{novel_id}/cohorts/expand")
+async def expand_manifest_cohort(
+    novel_id: str,
+    body: CohortExpandRequest,
+    service: OutlineCohortGenerationService = Depends(
+        get_outline_cohort_generation_service
+    ),
+):
+    """Open (or recover) the Manifest draft, then generate one sibling cohort."""
+
+    try:
+        draft = service.open_or_clone_cohort_draft(novel_id)
+        result = await service.generate_cohort(
+            plan_revision_id=draft.id,
+            parent_logical_node_id=body.parent_logical_node_id,
+            level=body.level,
+            author_payloads=tuple(
+                OutlinePayload.from_dict(payload.model_dump())
+                for payload in body.author_payloads
+            ),
+        )
+        return {"success": True, "data": result}
+    except Exception as exc:
+        _raise_manifest_cohort_error(exc)
+
+
+@router.post("/cohort-attempts/{attempt_id}/publish")
+async def publish_manifest_cohort(
+    attempt_id: str,
+    service: OutlineCohortGenerationService = Depends(
+        get_outline_cohort_generation_service
+    ),
+):
+    """Publish a completed Manifest cohort without legacy node publication."""
+
+    try:
+        return {
+            "success": True,
+            "data": await service.publish_completed_cohort(attempt_id=attempt_id),
+        }
+    except Exception as exc:
+        _raise_manifest_cohort_error(exc)
 
 
 @router.post("/novels/{novel_id}/story-nodes/{story_node_id}/contract")
