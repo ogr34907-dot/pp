@@ -792,3 +792,49 @@ async def test_publish_completed_cohort_requires_waiting_run_before_sealing(tmp_
         for node in nodes.get_by_novel_sync("novel-1")
         if node.node_type.value == "part"
     ]
+
+
+@pytest.mark.asyncio
+async def test_author_publish_refuses_the_exact_waiting_planning_run(tmp_path):
+    """Runtime planning pauses must use runtime publish, never author publish."""
+
+    database = DatabaseConnection(str(tmp_path / "author-publish-waiting-run.db"))
+    database.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES "
+        "('novel-1', 'Novel', 'author-publish-waiting-run', 10)"
+    )
+    database.get_connection().commit()
+    repository = OutlineContractRepository(database)
+    _, draft, root_item = _root_item(database, repository)
+    nodes = StoryNodeRepository(database)
+    service = OutlineCohortGenerationService(
+        repository,
+        OutlineContractService(contract_repository=repository, story_node_repository=nodes),
+        _LLM(
+            '[{"title":"第一部","narrative_text":"主角离开故乡。",'
+            '"creative_goal":"逼迫主角选择","entry_state":"旧秩序",'
+            '"exit_state":"新秩序","chapter_start":1,"chapter_end":10}]'
+        ),
+        database,
+    )
+    candidates = ChapterCandidateRepository(database)
+    candidates.start_run("novel-1", run_mode=RunMode.CONTINUOUS, target_chapters=10)
+    paused = candidates.wait_for_outline_expansion("novel-1")
+    generated = await service.generate_cohort(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        level=OutlineLevel.PART,
+    )
+
+    with pytest.raises(
+        OutlineCohortGenerationError, match="runtime_planning_publication_required"
+    ):
+        await service.publish_author_planning_cohort(
+            attempt_id=generated["attempt"]["id"]
+        )
+
+    run = candidates.get_run("novel-1")
+    assert run.state == paused.state == GenerationRunState.WAITING_PLANNING
+    assert run.next_action == "expand_outline_cohort"
+    assert repository.get_planning_head("novel-1").working_plan_revision_id == draft.id
+    assert repository.get_plan_revision(draft.id).sealed_at is None

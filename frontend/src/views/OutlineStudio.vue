@@ -24,27 +24,27 @@
         <div class="outline-panel__head">
           <div>
             <span class="outline-panel__kicker">结构</span>
-            <h2>当前计划树</h2>
+            <h2>{{ workingTree ? '审核中的 Working Tree' : '当前计划树' }}</h2>
           </div>
           <span class="outline-count">{{ flattenedTree.length }} 节点</span>
         </div>
-        <div v-if="loading && !tree" class="outline-tree-empty">正在读取大纲…</div>
-        <div v-else-if="!tree" class="outline-tree-empty">尚未建立规划结构。</div>
+        <div v-if="loading && !displayTree" class="outline-tree-empty">正在读取大纲…</div>
+        <div v-else-if="!displayTree" class="outline-tree-empty">尚未建立规划结构。</div>
         <nav v-else class="outline-tree" aria-label="大纲节点">
           <button
             v-for="item in flattenedTree"
-            :key="item.node.id"
+            :key="nodeKey(item.node)"
             type="button"
             class="outline-tree__node"
-            :class="{ 'is-selected': selectedNode?.id === item.node.id }"
+            :class="{ 'is-selected': selectedNode && nodeKey(selectedNode) === nodeKey(item.node) }"
             :style="{ '--tree-depth': item.depth }"
-            :aria-current="selectedNode?.id === item.node.id ? 'page' : undefined"
+            :aria-current="selectedNode && nodeKey(selectedNode) === nodeKey(item.node) ? 'page' : undefined"
             @click="selectNode(item.node)"
           >
             <span class="outline-tree__level">{{ levelLabel(item.node.node_type) }}</span>
             <span class="outline-tree__copy">
               <strong>{{ item.node.title || defaultTitle(item.node.node_type) }}</strong>
-              <small>{{ nodeStatusLabel(item.node) }}</small>
+            <small>{{ nodeStatusLabel(item.node) }}</small>
             </span>
             <span class="outline-tree__state" :class="`is-${nodeStatus(item.node)}`" aria-hidden="true" />
           </button>
@@ -107,18 +107,28 @@
             <n-input v-model:value="form.ending_hook" placeholder="结尾钩子" aria-label="结尾钩子" />
           </div>
           <div class="outline-editor__actions">
-            <n-button type="primary" attr-type="submit" :loading="saving">保存草稿</n-button>
+            <n-button type="primary" attr-type="submit" :loading="saving">{{ isWorkingNode(selectedNode) ? '保存 Working 草稿' : '保存草稿' }}</n-button>
             <n-button secondary :loading="streaming" @click.prevent="generateDraftStream">
               <template #icon><n-icon :component="SparklesOutline" /></template>
-              AI 流式生成草稿
+              {{ draftButtonLabel }}
             </n-button>
             <n-button
-              :disabled="!selectedContract.draft"
+              :disabled="isWorkingNode(selectedNode) ? !cohortAttemptId : !selectedContract.draft"
               :loading="publishing"
               @click.prevent="publishAndSync"
             >
               <template #icon><n-icon :component="CloudUploadOutline" /></template>
-              发布并同步
+              {{ isWorkingNode(selectedNode) ? '作者发布规划' : '发布并同步' }}
+            </n-button>
+            <n-button
+              v-if="nextLevel && canGenerateNextCohort"
+              secondary
+              :loading="cohortLoading"
+              :disabled="cohortLoading"
+              @click.prevent="generateNextCohort"
+            >
+              <template #icon><n-icon :component="SparklesOutline" /></template>
+              {{ cohortButtonLabel }}
             </n-button>
           </div>
           <p class="outline-editor__note">草稿不会进入正文提示词；发布后会切换计划投影，并使受影响的未锁定子纲过期。</p>
@@ -199,12 +209,15 @@ type FormState = {
   chapter_start: number | null; chapter_end: number | null; word_budget: number | null
   pov: string; scenesText: string; beatsText: string; conflictsText: string; ending_hook: string
 }
+type OutlineLevel = 'outline' | 'part' | 'volume' | 'act' | 'chapter'
+type CohortLevel = Exclude<OutlineLevel, 'outline'>
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const novelId = computed(() => String(route.params.slug || ''))
 const tree = ref<OutlineTreeNode | null>(null)
+const workingTree = ref<OutlineTreeNode | null>(null)
 const selectedNode = ref<OutlineTreeNode | null>(null)
 const selectedParent = ref<OutlineTreeNode | undefined>()
 const selectedContract = ref<OutlineContract | null>(null)
@@ -213,9 +226,11 @@ const saving = ref(false)
 const publishing = ref(false)
 const binding = ref(false)
 const streaming = ref(false)
+const cohortLoading = ref(false)
 const streamText = ref('')
 const streamAttempt = ref<OutlineGenerationAttempt | null>(null)
 const error = ref('')
+const cohortAttemptId = ref<string | null>(null)
 let streamController: AbortController | null = null
 let selectionEpoch = 0
 let streamEpoch = 0
@@ -234,15 +249,70 @@ const flattenedTree = computed<FlattenedNode[]>(() => {
     result.push({ node, depth, parent })
     for (const child of node.children || []) visit(child, depth + 1, node)
   }
-  if (tree.value) visit(tree.value, 0)
+  if (displayTree.value) visit(displayTree.value, 0)
   return result
 })
+
+const displayTree = computed(() => workingTree.value || tree.value)
+
+const nextLevel = computed<CohortLevel | null>(() => {
+  const node = selectedNode.value
+  if (!node || nodeStatus(node) !== 'synced') return null
+  return ({
+    outline: 'part',
+    part: 'volume',
+    volume: 'act',
+    act: 'chapter',
+  } as Partial<Record<OutlineLevel, CohortLevel>>)[String(node.node_type) as OutlineLevel] || null
+})
+
+const cohortButtonLabel = computed(() => ({
+  part: 'AI 一键生成全部部纲',
+  volume: 'AI 一键生成该部全部卷纲',
+  act: 'AI 一键生成该卷全部幕纲',
+  chapter: 'AI 一键生成该幕全部章纲',
+} as Record<string, string>)[nextLevel.value || ''] || '')
+
+const draftButtonLabel = computed(() => (
+  String(selectedNode.value?.node_type || '') === 'outline'
+    ? 'AI 一键生成总纲草稿'
+    : 'AI 流式生成草稿'
+))
+
+const canGenerateNextCohort = computed(() => Boolean(
+  selectedNode.value
+  && nextLevel.value
+  && !isWorkingNode(selectedNode.value)
+  && !flattenedTree.value.some(item => (
+    item.parent && nodeKey(item.parent) === nodeKey(selectedNode.value as OutlineTreeNode)
+    && String(item.node.node_type) === nextLevel.value
+  )),
+))
 
 function levelLabel(level?: string) {
   return ({ outline: '总纲', part: '部纲', volume: '卷纲', act: '幕纲', chapter: '章纲' } as Record<string, string>)[String(level)] || '计划'
 }
 function defaultTitle(level?: string) { return `${levelLabel(level)}（未命名）` }
-function nodeStatus(node: OutlineTreeNode) { return String(node.outline_contract?.status || 'missing') }
+function nodeKey(node: OutlineTreeNode) { return String(node.logical_node_id || node.id) }
+function isWorkingNode(node?: OutlineTreeNode | null) {
+  return Boolean(node && node.status === 'draft' && node.plan_revision_id && node.logical_node_id)
+}
+function findFirstChild(
+  root: OutlineTreeNode | null,
+  parentKey: string,
+  level: CohortLevel,
+): OutlineTreeNode | null {
+  if (!root) return null
+  if (nodeKey(root) === parentKey) {
+    return (root.children || []).find(child => String(child.node_type) === level) || null
+  }
+  for (const child of root.children || []) {
+    const match = findFirstChild(child, parentKey, level)
+    if (match) return match
+  }
+  return null
+}
+function nodeStatus(node: OutlineTreeNode) { return String(node.status || node.outline_contract?.status || 'missing') }
 function nodeStatusLabel(node: OutlineTreeNode) {
   return ({ synced: '已发布 · 已同步', syncing: '发布同步中', published: '已发布', draft: '草稿待发布', stale: '需要重新校验', conflict: '需要处理冲突', missing: '等待父级开放' } as Record<string, string>)[nodeStatus(node)] || '等待配置'
 }
@@ -305,11 +375,11 @@ function formToPayload(): OutlinePayload {
 type ContractContext = { selection: number; nodeId: string; contractId: string }
 
 function isCurrentNode(selection: number, nodeId: string) {
-  return selection === selectionEpoch && selectedNode.value?.id === nodeId
+  return selection === selectionEpoch && selectedNode.value && nodeKey(selectedNode.value) === nodeId
 }
 
 function captureContractContext(contract: OutlineContract): ContractContext | null {
-  const nodeId = selectedNode.value?.id
+  const nodeId = selectedNode.value ? nodeKey(selectedNode.value) : undefined
   if (!nodeId || selectedContract.value?.id !== contract.id) return null
   return { selection: selectionEpoch, nodeId, contractId: contract.id }
 }
@@ -334,7 +404,17 @@ async function loadTree() {
   error.value = ''
   try {
     tree.value = await outlineApi.getTree(novelId.value)
-    if (!selectedNode.value) await selectNode(tree.value)
+    try {
+      workingTree.value = await outlineApi.getWorkingTree(novelId.value)
+    } catch {
+      workingTree.value = null
+    }
+    if (!selectedNode.value && displayTree.value) await selectNode(displayTree.value)
+    else if (selectedNode.value) {
+      const currentKey = nodeKey(selectedNode.value)
+      const replacement = flattenedTree.value.find(item => nodeKey(item.node) === currentKey)?.node
+      if (replacement) selectedNode.value = replacement
+    }
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : '读取五级大纲失败'
   } finally { loading.value = false }
@@ -346,7 +426,7 @@ async function selectNode(node: OutlineTreeNode) {
   streamController?.abort()
   streamController = null
   selectedNode.value = node
-  selectedParent.value = flattenedTree.value.find(item => item.node.id === node.id)?.parent
+  selectedParent.value = flattenedTree.value.find(item => nodeKey(item.node) === nodeKey(node))?.parent
   selectedContract.value = null
   streamText.value = ''
   streamAttempt.value = null
@@ -354,6 +434,8 @@ async function selectNode(node: OutlineTreeNode) {
   saving.value = false
   publishing.value = false
   binding.value = false
+  cohortLoading.value = false
+  cohortAttemptId.value = node.cohort_attempt_id || null
   error.value = ''
   payloadToForm(null)
   const contractId = node.outline_contract?.contract_id
@@ -362,14 +444,14 @@ async function selectNode(node: OutlineTreeNode) {
   try {
     contract = await outlineApi.getContract(contractId)
   } catch (cause) {
-    if (!isCurrentNode(requestEpoch, node.id)) return
+    if (!isCurrentNode(requestEpoch, nodeKey(node))) return
     selectedContract.value = null
     error.value = cause instanceof Error ? cause.message : '读取大纲节点失败'
     return
   }
-  if (!isCurrentNode(requestEpoch, node.id) || contract.id !== contractId) return
+  if (!isCurrentNode(requestEpoch, nodeKey(node)) || contract.id !== contractId) return
   selectedContract.value = contract
-  payloadToForm(contract.draft?.payload || contract.active?.payload)
+  payloadToForm(isWorkingNode(node) ? node.payload : (contract.draft?.payload || contract.active?.payload))
   const context = captureContractContext(contract)
   if (!context) return
   const recoveryStreamEpoch = streamEpoch
@@ -390,15 +472,15 @@ async function bindSelectedNode() {
   error.value = ''
   try {
     const contract = await outlineApi.bindNode(novelId.value, node.id)
-    if (!isCurrentNode(requestEpoch, node.id)) return
+    if (!isCurrentNode(requestEpoch, nodeKey(node))) return
     selectedContract.value = contract
     payloadToForm(contract.draft?.payload || contract.active?.payload)
     await loadTree()
-    if (isCurrentNode(requestEpoch, node.id)) message.success('本层契约已建立；现在可以生成或编辑草稿。')
+    if (isCurrentNode(requestEpoch, nodeKey(node))) message.success('本层契约已建立；现在可以生成或编辑草稿。')
   } catch (cause) {
-    if (isCurrentNode(requestEpoch, node.id)) error.value = cause instanceof Error ? cause.message : '建立本层契约失败'
+    if (isCurrentNode(requestEpoch, nodeKey(node))) error.value = cause instanceof Error ? cause.message : '建立本层契约失败'
   } finally {
-    if (isCurrentNode(requestEpoch, node.id)) binding.value = false
+    if (isCurrentNode(requestEpoch, nodeKey(node))) binding.value = false
   }
 }
 
@@ -410,6 +492,22 @@ async function saveDraft() {
   saving.value = true
   error.value = ''
   try {
+    const node = selectedNode.value
+    if (node && isWorkingNode(node)) {
+      if (!node.plan_revision_id || !node.logical_node_id || !node.plan_digest || !node.version_digest) {
+        throw new Error('Working 草稿缺少版本校验信息')
+      }
+      const saved = await outlineApi.saveWorkingItem(node.plan_revision_id, node.logical_node_id, {
+        payload: formToPayload(),
+        expected_plan_digest: node.plan_digest,
+        expected_version_digest: node.version_digest,
+      })
+      if (!isCurrentContract(context) || saved.logical_node_id !== node.logical_node_id) return
+      payloadToForm(saved.payload)
+      await loadTree()
+      if (isCurrentContract(context)) message.success('Working 草稿已保存，尚未进入正文上下文。')
+      return
+    }
     const saved = await outlineApi.saveDraft(contract.id, formToPayload())
     if (!isCurrentContract(context) || saved.id !== contract.id) return
     selectedContract.value = saved
@@ -425,13 +523,25 @@ async function saveDraft() {
 
 async function publishAndSync() {
   const contract = selectedContract.value
+  const node = selectedNode.value
   const draft = contract?.draft
-  if (!contract || !draft) return
+  if (!contract || (!draft && !isWorkingNode(node))) return
   const context = captureContractContext(contract)
   if (!context) return
   publishing.value = true
   error.value = ''
   try {
+    if (node && isWorkingNode(node)) {
+      if (!cohortAttemptId.value) throw new Error('当前 Working 草稿没有可发布的 Cohort Attempt')
+      await outlineApi.authorPublishCohort(cohortAttemptId.value)
+      if (!isCurrentContract(context)) return
+      workingTree.value = null
+      cohortAttemptId.value = null
+      await loadTree()
+      if (isCurrentContract(context)) message.success('规划已由作者发布并切换为 Active Manifest。')
+      return
+    }
+    if (!draft) return
     const published = await outlineApi.publish(contract.id, draft.revision, idempotencyKey('outline-publish'))
     if (!isCurrentContract(context) || published.id !== contract.id) return
     selectedContract.value = published
@@ -441,6 +551,41 @@ async function publishAndSync() {
     if (isCurrentContract(context)) error.value = cause instanceof Error ? cause.message : '发布并同步失败'
   } finally {
     if (isCurrentContract(context)) publishing.value = false
+  }
+}
+
+async function generateNextCohort() {
+  const node = selectedNode.value
+  const level = nextLevel.value
+  if (!node || !level || !canGenerateNextCohort.value) return
+  const requestEpoch = selectionEpoch
+  const selectedKey = nodeKey(node)
+  cohortLoading.value = true
+  error.value = ''
+  try {
+    const result = await outlineApi.expandCohort(novelId.value, {
+      logical_node_id: node.logical_node_id || node.id,
+      level,
+      author_payloads: [],
+    })
+    if (!isCurrentNode(requestEpoch, selectedKey)) return
+    const attemptId = String((result as any)?.attempt?.id || '') || null
+    cohortAttemptId.value = attemptId
+    const refreshedWorkingTree = await outlineApi.getWorkingTree(novelId.value)
+    workingTree.value = refreshedWorkingTree
+    if (!isCurrentNode(requestEpoch, selectedKey)) return
+    const firstGeneratedChild = findFirstChild(refreshedWorkingTree, selectedKey, level)
+    if (firstGeneratedChild) {
+      await selectNode(firstGeneratedChild)
+      if (attemptId && !cohortAttemptId.value) cohortAttemptId.value = attemptId
+    }
+    message.success('下一层 Cohort 已生成，当前仍处于 Working 草稿状态。')
+  } catch (cause) {
+    if (isCurrentNode(requestEpoch, selectedKey)) {
+      error.value = cause instanceof Error ? cause.message : '生成下一层规划失败'
+    }
+  } finally {
+    if (isCurrentNode(requestEpoch, selectedKey)) cohortLoading.value = false
   }
 }
 

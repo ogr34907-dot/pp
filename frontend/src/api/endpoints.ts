@@ -95,6 +95,12 @@ export const apiRoutes = {
   },
   outline: {
     tree: (novelId: string) => apiRootPath('outline', 'novels', novelId, 'tree'),
+    workingTree: (novelId: string) => apiRootPath('outline', 'novels', novelId, 'working-tree'),
+    workingItem: (planRevisionId: string, logicalNodeId: string) =>
+      apiRootPath('outline', 'plan-revisions', planRevisionId, 'items', logicalNodeId),
+    cohortExpand: (novelId: string) => apiRootPath('outline', 'novels', novelId, 'cohorts', 'expand'),
+    authorPublishCohort: (attemptId: string) =>
+      apiRootPath('outline', 'cohort-attempts', attemptId, 'author-publish'),
     contract: (contractId: string) => apiRootPath('outline', 'contracts', contractId),
     draft: (contractId: string) => apiRootPath('outline', 'contracts', contractId, 'draft'),
     publish: (contractId: string) => apiRootPath('outline', 'contracts', contractId, 'publish'),

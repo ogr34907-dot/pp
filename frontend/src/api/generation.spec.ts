@@ -110,4 +110,53 @@ describe('getGenerationRunOrNull', () => {
     await consuming
     expect(callbackFinished).toBe(true)
   })
+
+  it('uses the Manifest working-tree and working-item endpoints with CAS digests', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        data: { id: 'manifest-node-1', logical_node_id: 'logical-1', plan_revision_id: 'plan-1', status: 'draft', children: [] },
+      }), { headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: true,
+        data: { logical_node_id: 'logical-1', version_digest: 'v2', payload: { title: 'Edited' } },
+      }), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(outlineApi.getWorkingTree('novel-1')).resolves.toMatchObject({
+      plan_revision_id: 'plan-1',
+    })
+    await expect(outlineApi.saveWorkingItem('plan-1', 'logical-1', {
+      payload: { title: 'Edited' }, expected_plan_digest: 'p1', expected_version_digest: 'v1',
+    })).resolves.toMatchObject({ version_digest: 'v2' })
+
+    expect(fetchMock.mock.calls[0][0]).toMatch(/outline\/novels\/novel-1\/working-tree$/)
+    expect(fetchMock.mock.calls[1][0]).toMatch(/outline\/plan-revisions\/plan-1\/items\/logical-1$/)
+    expect(fetchMock.mock.calls[1][1]).toEqual(expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({
+        payload: { title: 'Edited' }, expected_plan_digest: 'p1', expected_version_digest: 'v1',
+      }),
+    }))
+  })
+
+  it('expands a cohort with logical_node_id and keeps author publish separate', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, data: { attempt: { id: 'attempt-1' } } }), { headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, data: { attempt: { id: 'attempt-1' }, run: null } }), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await outlineApi.expandCohort('novel-1', {
+      id: 'story-node-should-not-be-sent',
+      logical_node_id: 'logical-parent',
+      level: 'part',
+    })
+    await outlineApi.authorPublishCohort('attempt-1')
+
+    expect(fetchMock.mock.calls[0][1]).toEqual(expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ parent_logical_node_id: 'logical-parent', level: 'part', author_payloads: [] }),
+    }))
+    expect(fetchMock.mock.calls[1][0]).toMatch(/cohort-attempts\/attempt-1\/author-publish$/)
+  })
 })

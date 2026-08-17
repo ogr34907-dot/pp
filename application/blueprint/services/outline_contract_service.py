@@ -264,6 +264,71 @@ class OutlineContractService:
             "children": [render(node) for node in nodes_by_parent.get(None, [])],
         }
 
+    def working_tree(self, novel_id: str) -> Optional[dict[str, Any]]:
+        """Return the current Manifest draft tree, never the prose-active tree."""
+
+        rows = self.contract_repository.working_plan_items_with_payload(novel_id)
+        if not rows:
+            return None
+        by_parent: dict[Optional[str], list[dict[str, Any]]] = {}
+        for row in rows:
+            by_parent.setdefault(row.get("parent_logical_node_id"), []).append(row)
+        for siblings in by_parent.values():
+            siblings.sort(
+                key=lambda row: (
+                    int(row.get("sibling_index") or 0),
+                    str(row.get("logical_node_id") or ""),
+                )
+            )
+        roots = [
+            row
+            for row in by_parent.get(None, [])
+            if str(row.get("level")) == OutlineLevel.OUTLINE.value
+        ]
+        if len(roots) != 1:
+            raise ValueError("working manifest must contain exactly one outline root")
+
+        def render(row: Mapping[str, Any]) -> dict[str, Any]:
+            result = {
+                key: row[key]
+                for key in (
+                    "id",
+                    "logical_node_id",
+                    "story_node_id",
+                    "parent_logical_node_id",
+                    "parent_story_node_id",
+                    "novel_id",
+                    "node_type",
+                    "level",
+                    "number",
+                    "order_index",
+                    "sibling_index",
+                    "title",
+                    "description",
+                    "outline",
+                    "chapter_start",
+                    "chapter_end",
+                    "plan_revision_id",
+                    "plan_digest",
+                    "version_id",
+                    "version_revision",
+                    "version_digest",
+                    "version_source",
+                    "cohort_attempt_id",
+                    "payload",
+                    "status",
+                    "outline_contract",
+                )
+                if key in row
+            }
+            result["children"] = [
+                render(child)
+                for child in by_parent.get(str(row["logical_node_id"]), [])
+            ]
+            return result
+
+        return render(roots[0])
+
     def ensure_contract_for_story_node(
         self, novel_id: str, story_node_id: str
     ) -> OutlineContractSlot:

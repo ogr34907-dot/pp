@@ -5,9 +5,13 @@ import type { OutlineTreeNode } from '@/api/generation'
 
 const mocks = vi.hoisted(() => ({
   getTree: vi.fn(),
+  getWorkingTree: vi.fn(),
   getContract: vi.fn(),
   saveDraft: vi.fn(),
+  saveWorkingItem: vi.fn(),
   publish: vi.fn(),
+  authorPublishCohort: vi.fn(),
+  expandCohort: vi.fn(),
   bindNode: vi.fn(),
   getLatestGenerationAttempt: vi.fn(),
   cancelGenerationAttempt: vi.fn(),
@@ -35,9 +39,13 @@ vi.mock('@/components/outline/OutlineStatusPill.vue', () => ({
 vi.mock('@/api/generation', () => ({
   outlineApi: {
     getTree: mocks.getTree,
+    getWorkingTree: mocks.getWorkingTree,
     getContract: mocks.getContract,
     saveDraft: mocks.saveDraft,
+    saveWorkingItem: mocks.saveWorkingItem,
     publish: mocks.publish,
+    authorPublishCohort: mocks.authorPublishCohort,
+    expandCohort: mocks.expandCohort,
     bindNode: mocks.bindNode,
     getLatestGenerationAttempt: mocks.getLatestGenerationAttempt,
     cancelGenerationAttempt: mocks.cancelGenerationAttempt,
@@ -94,6 +102,7 @@ describe('OutlineStudio request and payload isolation', () => {
     vi.clearAllMocks()
     mocks.getLatestGenerationAttempt.mockResolvedValue(null)
     mocks.consumeOutlineDraftStream.mockResolvedValue(undefined)
+    mocks.getWorkingTree.mockResolvedValue(null)
   })
 
   it('preserves a rich payload byte-for-byte when the form is saved without edits', async () => {
@@ -131,6 +140,7 @@ describe('OutlineStudio request and payload isolation', () => {
 
     const state = await setupStudio()
     await state.loadTree()
+    expect(state.draftButtonLabel).toBe('AI 一键生成总纲草稿')
     await state.saveDraft()
 
     expect(mocks.saveDraft).toHaveBeenCalledWith('contract-root', richPayload)
@@ -307,5 +317,158 @@ describe('OutlineStudio request and payload isolation', () => {
         author_notes: ['New author note'],
       },
     })
+  })
+
+  it('generates only the next cohort from logical_node_id and refreshes Working Tree', async () => {
+    const root = node('root')
+    const selected = {
+      ...node('story-part', 'contract-part'),
+      node_type: 'part',
+      logical_node_id: 'logical-part',
+      story_node_id: 'story-part',
+      outline_contract: { contract_id: 'contract-part', status: 'synced' },
+    }
+    root.children = [selected]
+    const current = contract('contract-part', { title: '第一部' })
+    const working = {
+      ...selected,
+      id: 'manifest-node-volume',
+      logical_node_id: 'logical-volume',
+      node_type: 'volume',
+      status: 'draft',
+      plan_revision_id: 'plan-1',
+      version_digest: 'volume-v1',
+      payload: { title: '第一卷' },
+      children: [],
+    }
+    mocks.getTree.mockResolvedValue(root)
+    mocks.getContract.mockResolvedValue(current)
+    mocks.expandCohort.mockResolvedValue({ attempt: { id: 'attempt-1', status: 'completed' } })
+    mocks.getWorkingTree.mockResolvedValueOnce(null).mockResolvedValueOnce(working)
+
+    const state = await setupStudio()
+    await state.loadTree()
+    await state.selectNode(selected)
+    await state.generateNextCohort()
+
+    expect(mocks.expandCohort).toHaveBeenCalledWith('novel-1', expect.objectContaining({
+      logical_node_id: 'logical-part',
+      level: 'volume',
+    }))
+    expect(mocks.getWorkingTree).toHaveBeenCalledTimes(2)
+    expect(state.workingTree.logical_node_id).toBe('logical-volume')
+    expect(mocks.publish).not.toHaveBeenCalled()
+  })
+
+  it('selects the first generated child after refreshing Working Tree', async () => {
+    const root = node('root')
+    const selected = {
+      ...node('story-part', 'contract-part'),
+      node_type: 'part',
+      logical_node_id: 'logical-part',
+      story_node_id: 'story-part',
+      outline_contract: { contract_id: 'contract-part', status: 'synced' },
+    }
+    root.children = [selected]
+    const workingRoot = {
+      ...root,
+      status: 'draft',
+      plan_revision_id: 'plan-1',
+      plan_digest: 'plan-v2',
+      children: [{
+        ...selected,
+        status: 'draft',
+        plan_revision_id: 'plan-1',
+        plan_digest: 'plan-v2',
+        version_digest: 'part-v2',
+        children: [{
+          ...node('manifest-volume', 'contract-volume'),
+          node_type: 'volume',
+          logical_node_id: 'logical-volume',
+          story_node_id: 'manifest-volume',
+          status: 'draft',
+          plan_revision_id: 'plan-1',
+          plan_digest: 'plan-v2',
+          version_digest: 'volume-v1',
+          cohort_attempt_id: 'attempt-1',
+          payload: { title: '第一卷' },
+          children: [],
+        }],
+      }],
+    }
+    mocks.getTree.mockResolvedValue(root)
+    mocks.getContract.mockImplementation((id: string) => Promise.resolve(
+      id === 'contract-volume'
+        ? contract('contract-volume', { title: '第一卷' })
+        : contract('contract-part', { title: '第一部' }),
+    ))
+    mocks.expandCohort.mockResolvedValue({ attempt: { id: 'attempt-1', status: 'completed' } })
+    mocks.getWorkingTree.mockResolvedValueOnce(null).mockResolvedValueOnce(workingRoot)
+
+    const state = await setupStudio()
+    await state.loadTree()
+    await state.selectNode(selected)
+    await state.generateNextCohort()
+
+    expect(state.selectedNode.logical_node_id).toBe('logical-volume')
+    expect(state.cohortLoading).toBe(false)
+  })
+
+  it('hides next-cohort generation when the selected parent already has active children', async () => {
+    const root = node('root')
+    const selected = {
+      ...node('story-part', 'contract-part'),
+      node_type: 'part',
+      logical_node_id: 'logical-part',
+      outline_contract: { contract_id: 'contract-part', status: 'synced' },
+      children: [{
+        ...node('story-volume', 'contract-volume'),
+        node_type: 'volume',
+        logical_node_id: 'logical-volume',
+        outline_contract: { contract_id: 'contract-volume', status: 'synced' },
+      }],
+    }
+    root.children = [selected]
+    mocks.getTree.mockResolvedValue(root)
+    mocks.getContract.mockResolvedValue(contract('contract-part', { title: '第一部' }))
+
+    const state = await setupStudio()
+    await state.loadTree()
+    await state.selectNode(selected)
+
+    expect(state.canGenerateNextCohort).toBe(false)
+    await state.generateNextCohort()
+    expect(mocks.expandCohort).not.toHaveBeenCalled()
+  })
+
+  it('saves a Working node through the Manifest item endpoint and never legacy saveDraft', async () => {
+    const working = {
+      ...node('manifest-node-part', 'contract-part'),
+      logical_node_id: 'logical-part',
+      node_type: 'part',
+      status: 'draft',
+      plan_revision_id: 'plan-1',
+      plan_digest: 'plan-v1',
+      version_digest: 'version-v1',
+      payload: { title: 'Original', state_changes: { world: [{ to: 'storm' }] } },
+      children: [],
+    }
+    const current = contract('contract-part', working.payload)
+    mocks.getTree.mockResolvedValue(node('root'))
+    mocks.getWorkingTree.mockResolvedValue(working)
+    mocks.getContract.mockResolvedValue(current)
+    mocks.saveWorkingItem.mockResolvedValue({ ...working, version_digest: 'version-v2' })
+
+    const state = await setupStudio()
+    await state.loadTree()
+    await state.selectNode(working)
+    state.form.title = 'Edited'
+    await state.saveDraft()
+
+    expect(mocks.saveWorkingItem).toHaveBeenCalledWith('plan-1', 'logical-part', expect.objectContaining({
+      expected_plan_digest: 'plan-v1',
+      expected_version_digest: 'version-v1',
+    }))
+    expect(mocks.saveDraft).not.toHaveBeenCalled()
   })
 })

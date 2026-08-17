@@ -300,3 +300,197 @@ def test_manifest_cohort_publish_maps_service_state_conflict_to_conflict(client)
         app.dependency_overrides.pop(
             outline_routes.get_outline_cohort_generation_service, None
         )
+
+
+def test_working_tree_and_item_routes_are_manifest_native(client, db, test_novel_id):
+    from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
+
+    repository = OutlineContractRepository(db)
+    root = repository.ensure_root(test_novel_id)
+    draft = repository.save_draft(
+        root.id,
+        OutlinePayload(
+            title="总纲",
+            narrative_text="根计划",
+            creative_goal="完成主线",
+            entry_state="开始",
+            exit_state="结束",
+        ),
+        source=OutlineSource.AUTHOR,
+    )
+    published = repository.publish_and_sync(
+        root.id, expected_revision=draft.draft.revision, idempotency_key="root-v1"
+    )
+    plan = repository.backfill_initial_plan(test_novel_id).plan
+    assert plan is not None
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 "
+        "WHERE novel_id=?",
+        (test_novel_id,),
+    )
+    conn.commit()
+    working = repository.clone_active_plan_draft(test_novel_id)
+    working = repository.replace_draft_cohort_payloads(
+        plan_revision_id=working.id,
+        parent_logical_node_id=published.id,
+        payloads=(
+            OutlinePayload(
+                title="第一部",
+                narrative_text="部纲",
+                creative_goal="推进",
+                entry_state="开始",
+                exit_state="结束",
+                chapter_start=1,
+                chapter_end=10,
+            ),
+        ),
+    )
+
+    response = client.get(f"/api/v1/outline/novels/{test_novel_id}/working-tree")
+    assert response.status_code == 200
+    tree = response.json()["data"]
+    assert tree["plan_revision_id"] == working.id
+    assert tree["status"] == "draft"
+    part = tree["children"][0]
+
+    edited = client.patch(
+        f"/api/v1/outline/plan-revisions/{working.id}/items/{part['logical_node_id']}",
+        json={
+            "payload": {"title": "第一部（作者修改）", "future_field": {"keep": True}},
+            "expected_plan_digest": working.digest,
+            "expected_version_digest": part["version_digest"],
+        },
+    )
+    assert edited.status_code == 200
+    assert edited.json()["data"]["payload"]["title"] == "第一部（作者修改）"
+    assert edited.json()["data"]["payload"]["extra"]["future_field"] == {"keep": True}
+
+
+def test_author_publish_route_is_separate_from_runtime_publish(client, test_novel_id):
+    from interfaces.main import app
+
+    class _Service:
+        def __init__(self):
+            self.calls = []
+
+        async def publish_author_planning_cohort(self, *, attempt_id: str):
+            self.calls.append(attempt_id)
+            return {"attempt": {"id": attempt_id}, "run": None}
+
+    service = _Service()
+    app.dependency_overrides[outline_routes.get_outline_cohort_generation_service] = (
+        lambda: service
+    )
+    try:
+        response = client.post(
+            "/api/v1/outline/cohort-attempts/attempt-author/author-publish"
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["run"] is None
+        assert service.calls == ["attempt-author"]
+    finally:
+        app.dependency_overrides.pop(
+            outline_routes.get_outline_cohort_generation_service, None
+        )
+
+
+def test_author_publish_actual_service_does_not_require_a_generation_run(
+    client, db, test_novel_id
+):
+    from application.blueprint.services.outline_cohort_generation_service import (
+        OutlineCohortGenerationService,
+    )
+    from application.blueprint.services.outline_contract_service import OutlineContractService
+    from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
+    from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+    from interfaces.main import app
+
+    repository = OutlineContractRepository(db)
+    root = repository.ensure_root(test_novel_id)
+    root_draft = repository.save_draft(
+        root.id,
+        OutlinePayload(
+            title="总纲",
+            narrative_text="主线",
+            creative_goal="完成目标",
+            entry_state="开始",
+            exit_state="结束",
+        ),
+        source=OutlineSource.AUTHOR,
+    )
+    repository.publish_and_sync(
+        root.id, expected_revision=root_draft.draft.revision, idempotency_key="author-root"
+    )
+    plan = repository.backfill_initial_plan(test_novel_id).plan
+    assert plan is not None
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id=?",
+        (test_novel_id,),
+    )
+    conn.commit()
+    working = repository.clone_active_plan_draft(test_novel_id)
+    parent_digest = next(
+        item for item in working.items if item.logical_node_id == root.id
+    ).version_digest
+    attempt = repository.start_manifest_cohort_attempt(
+        plan_revision_id=working.id,
+        parent_logical_node_id=root.id,
+        level=OutlineLevel.PART,
+        scope={
+            "plan_digest": working.digest,
+            "parent_logical_node_id": root.id,
+            "parent_version_digest": parent_digest,
+            "level": "part",
+        },
+        context_digest="author-context",
+        prompt_snapshot={"system": "test", "user": "test"},
+    )
+    repository.complete_manifest_cohort_attempt_with_payloads(
+        attempt_id=attempt["id"],
+        payloads=(
+            OutlinePayload(
+                title="第一部",
+                narrative_text="部纲",
+                creative_goal="推进",
+                entry_state="开始",
+                exit_state="结束",
+                chapter_start=1,
+                chapter_end=10,
+            ),
+        ),
+        expected_plan_digest=working.digest,
+        expected_parent_digest=parent_digest,
+        expected_context_digest="author-context",
+    )
+    service = OutlineCohortGenerationService(
+        repository,
+        OutlineContractService(
+            contract_repository=repository,
+            story_node_repository=StoryNodeRepository(db),
+        ),
+        llm_service=object(),
+        db=db,
+    )
+    app.dependency_overrides[outline_routes.get_outline_cohort_generation_service] = (
+        lambda: service
+    )
+    try:
+        response = client.post(
+            f"/api/v1/outline/cohort-attempts/{attempt['id']}/author-publish"
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["run"] is None
+        assert repository.get_planning_head(test_novel_id).working_plan_revision_id is None
+        replay = client.post(
+            f"/api/v1/outline/cohort-attempts/{attempt['id']}/author-publish"
+        )
+        assert replay.status_code == 200
+        assert replay.json()["data"]["run"] is None
+    finally:
+        app.dependency_overrides.pop(
+            outline_routes.get_outline_cohort_generation_service, None
+        )

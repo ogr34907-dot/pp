@@ -739,6 +739,337 @@ class OutlineContractRepository:
             raise OutlineGateError("active manifest item set is incomplete")
         return [dict(row) for row in rows]
 
+    def working_plan_items_with_payload(
+        self,
+        novel_id: str,
+        *,
+        _connection: Optional[sqlite3.Connection] = None,
+    ) -> list[dict[str, Any]]:
+        """Return the open Manifest draft without changing Active semantics."""
+
+        conn = _connection or self._connection()
+        head_row = conn.execute(
+            "SELECT * FROM outline_planning_heads WHERE novel_id = ?",
+            (novel_id,),
+        ).fetchone()
+        if head_row is None:
+            raise KeyError(f"outline planning head not found: {novel_id}")
+        head = self._head_from_row(head_row)
+        if head.authority_mode != PlanningAuthorityMode.MANIFEST:
+            raise OutlineGateError("working outline tree requires manifest planning authority")
+        if not head.working_plan_revision_id:
+            return []
+        plan = self.get_plan_revision(head.working_plan_revision_id, _connection=conn)
+        if plan.novel_id != novel_id:
+            raise OutlineGateError("working outline plan belongs to another novel")
+        if plan.sealed_at or plan.status not in {
+            PlanRevisionStatus.DRAFT,
+            PlanRevisionStatus.GENERATING,
+            PlanRevisionStatus.VALIDATING,
+        }:
+            raise OutlineGateError("working outline plan is not editable")
+        self._validate_plan_projection_bindings(conn, plan, allow_unmaterialized=True)
+        rows = conn.execute(
+            """
+            SELECT item.id AS item_id, item.logical_node_id,
+                   item.parent_logical_node_id, item.level, item.sibling_index,
+                   item.expansion_state, item.validated_parent_digest,
+                   item.validated_previous_sibling_digest,
+                   contract.novel_id, binding.story_node_id,
+                   binding.parent_story_node_id, binding.number,
+                   binding.order_index, version.id AS version_id,
+                   version.revision AS version_revision, version.digest AS version_digest,
+                   version.payload_json, version.source AS version_source,
+                   version.status AS version_status,
+                   (SELECT attempt.id
+                    FROM outline_plan_cohort_attempts AS attempt
+                    WHERE attempt.plan_revision_id = item.plan_revision_id
+                      AND attempt.parent_logical_node_id = item.parent_logical_node_id
+                      AND attempt.level = item.level
+                      AND attempt.status = 'completed'
+                    ORDER BY attempt.created_at DESC, attempt.id DESC
+                    LIMIT 1) AS cohort_attempt_id
+            FROM outline_plan_revision_items AS item
+            JOIN outline_contracts AS contract
+              ON contract.id = item.logical_node_id AND contract.novel_id = ?
+            JOIN outline_contract_versions AS version
+              ON version.id = item.version_id
+            JOIN outline_plan_projection_bindings AS binding
+              ON binding.plan_revision_item_id = item.id
+            WHERE item.plan_revision_id = ?
+            ORDER BY CASE item.level
+                WHEN 'outline' THEN 0 WHEN 'part' THEN 1 WHEN 'volume' THEN 2
+                WHEN 'act' THEN 3 ELSE 4 END,
+                COALESCE(item.parent_logical_node_id, ''), item.sibling_index,
+                item.logical_node_id
+            """,
+            (novel_id, plan.id),
+        ).fetchall()
+        if len(rows) != len(plan.items):
+            raise OutlineGateError("working outline item set is incomplete")
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = OutlinePayload.from_dict(
+                    json.loads(str(row["payload_json"] or "{}"))
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise OutlineGateError("working outline payload is invalid") from exc
+            story_node_id = (
+                str(row["story_node_id"])
+                if row["story_node_id"] is not None
+                else None
+            )
+            result.append(
+                {
+                    "id": story_node_id or str(row["logical_node_id"]),
+                    "item_id": str(row["item_id"]),
+                    "logical_node_id": str(row["logical_node_id"]),
+                    "novel_id": str(row["novel_id"]),
+                    "story_node_id": story_node_id,
+                    "parent_story_node_id": row["parent_story_node_id"],
+                    "parent_logical_node_id": row["parent_logical_node_id"],
+                    "node_type": str(row["level"]),
+                    "level": str(row["level"]),
+                    "number": int(row["number"])
+                    if row["number"] is not None
+                    else int(row["sibling_index"] or 0) + 1,
+                    "order_index": int(row["order_index"])
+                    if row["order_index"] is not None
+                    else int(row["sibling_index"] or 0),
+                    "sibling_index": int(row["sibling_index"] or 0),
+                    "expansion_state": str(row["expansion_state"] or "unexpanded"),
+                    "title": payload.title,
+                    "description": payload.narrative_text,
+                    "outline": payload.narrative_text,
+                    "chapter_start": payload.chapter_start,
+                    "chapter_end": payload.chapter_end,
+                    "plan_revision_id": plan.id,
+                    "plan_digest": plan.digest,
+                    "version_id": str(row["version_id"]),
+                    "version_revision": int(row["version_revision"] or 0),
+                    "version_digest": str(row["version_digest"] or ""),
+                    "version_source": str(row["version_source"] or "ai"),
+                    "cohort_attempt_id": row["cohort_attempt_id"],
+                    "payload": payload.canonical_dict(),
+                    "status": "draft",
+                    "outline_contract": {
+                        "contract_id": str(row["logical_node_id"]),
+                        "level": str(row["level"]),
+                        "status": "draft",
+                        "version_digest": str(row["version_digest"] or ""),
+                        "draft_revision": int(row["version_revision"] or 0),
+                    },
+                }
+            )
+        return result
+
+    def update_working_plan_item(
+        self,
+        *,
+        plan_revision_id: str,
+        logical_node_id: str,
+        payload: OutlinePayload,
+        expected_plan_digest: str,
+        expected_version_digest: str,
+        source: OutlineSource = OutlineSource.AUTHOR,
+    ) -> OutlinePlanRevision:
+        """Edit one leaf in the open Manifest draft using a single CAS transaction."""
+
+        conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("working outline item edit requires a clean connection")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            head_row = conn.execute(
+                "SELECT * FROM outline_planning_heads WHERE novel_id = ("
+                "SELECT novel_id FROM outline_plan_revisions WHERE id = ?)",
+                (plan_revision_id,),
+            ).fetchone()
+            if head_row is None:
+                raise KeyError(f"outline plan revision not found: {plan_revision_id}")
+            head = self._head_from_row(head_row)
+            if head.authority_mode != PlanningAuthorityMode.MANIFEST:
+                raise OutlineGateError("working outline item edit requires manifest planning authority")
+            if head.working_plan_revision_id != plan_revision_id:
+                raise OutlineGateError("working outline plan is no longer current")
+            plan = self.get_plan_revision(plan_revision_id, _connection=conn)
+            if plan.sealed_at or plan.status not in {
+                PlanRevisionStatus.DRAFT,
+                PlanRevisionStatus.GENERATING,
+                PlanRevisionStatus.VALIDATING,
+            }:
+                raise OutlineGateError("working outline plan is not editable")
+            if expected_plan_digest != plan.digest:
+                raise OutlineGateError("working outline plan digest changed")
+            item = next(
+                (candidate for candidate in plan.items if candidate.logical_node_id == logical_node_id),
+                None,
+            )
+            if item is None:
+                raise KeyError(f"working outline item not found: {logical_node_id}")
+            child = conn.execute(
+                "SELECT 1 FROM outline_plan_revision_items "
+                "WHERE plan_revision_id = ? AND parent_logical_node_id = ? LIMIT 1",
+                (plan.id, logical_node_id),
+            ).fetchone()
+            if child is not None:
+                raise OutlineGateError(
+                    "working outline item has direct children; use the impact-closure workflow"
+                )
+            version_row = conn.execute(
+                "SELECT contract_id, revision, digest, payload_json, sealed_at "
+                "FROM outline_contract_versions WHERE id = ? AND contract_id = ?",
+                (item.version_id, logical_node_id),
+            ).fetchone()
+            if version_row is None:
+                raise OutlineGateError("working outline item version is missing")
+            if str(version_row["digest"] or "") != expected_version_digest:
+                raise OutlineGateError("working outline item version digest changed")
+            revision = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(revision), 0) + 1 FROM outline_contract_versions "
+                    "WHERE contract_id = ?",
+                    (logical_node_id,),
+                ).fetchone()[0]
+            )
+            version_id = f"outline-version-{uuid4()}"
+            now = self._now()
+            conn.execute(
+                """
+                INSERT INTO outline_contract_versions
+                    (id, contract_id, revision, payload_json, digest,
+                     parent_revision_digest, previous_sibling_digest, source,
+                     status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                """,
+                (
+                    version_id,
+                    logical_node_id,
+                    revision,
+                    json.dumps(payload.canonical_dict(), ensure_ascii=False, sort_keys=True),
+                    payload.digest,
+                    str(version_row["digest"] or ""),
+                    item.validated_previous_sibling_digest,
+                    source.value,
+                    now,
+                    now,
+                ),
+            )
+            updated_item = OutlinePlanItem(
+                id=item.id,
+                logical_node_id=item.logical_node_id,
+                version_id=version_id,
+                version_digest=payload.digest,
+                level=item.level,
+                sibling_index=item.sibling_index,
+                parent_logical_node_id=item.parent_logical_node_id,
+                expansion_state=item.expansion_state,
+                validated_parent_digest=item.validated_parent_digest,
+                validated_previous_sibling_digest=item.validated_previous_sibling_digest,
+                is_reused=item.is_reused,
+            )
+            next_sibling = next(
+                (
+                    candidate
+                    for candidate in plan.items
+                    if candidate.parent_logical_node_id == item.parent_logical_node_id
+                    and candidate.level == item.level
+                    and candidate.sibling_index == item.sibling_index + 1
+                ),
+                None,
+            )
+            updated_next_sibling = (
+                OutlinePlanItem(
+                    id=next_sibling.id,
+                    logical_node_id=next_sibling.logical_node_id,
+                    version_id=next_sibling.version_id,
+                    version_digest=next_sibling.version_digest,
+                    level=next_sibling.level,
+                    sibling_index=next_sibling.sibling_index,
+                    parent_logical_node_id=next_sibling.parent_logical_node_id,
+                    expansion_state=next_sibling.expansion_state,
+                    validated_parent_digest=next_sibling.validated_parent_digest,
+                    validated_previous_sibling_digest=payload.digest,
+                    is_reused=next_sibling.is_reused,
+                )
+                if next_sibling is not None
+                else None
+            )
+            updated_items = tuple(
+                updated_item
+                if candidate.logical_node_id == logical_node_id
+                else (
+                    updated_next_sibling
+                    if updated_next_sibling is not None
+                    and candidate.logical_node_id == updated_next_sibling.logical_node_id
+                    else candidate
+                )
+                for candidate in plan.items
+            )
+            normalized = self._validate_plan_items(plan.novel_id, updated_items, conn=conn)
+            digest = canonical_plan_digest(
+                canonical_prefix_digest=plan.canonical_prefix_digest,
+                items=normalized,
+            )
+            item_update = conn.execute(
+                """
+                UPDATE outline_plan_revision_items
+                SET version_id = ?, validated_previous_sibling_digest = ?
+                WHERE id = ? AND plan_revision_id = ? AND version_id = ?
+                """,
+                (
+                    version_id,
+                    item.validated_previous_sibling_digest,
+                    item.id,
+                    plan.id,
+                    item.version_id,
+                ),
+            )
+            if item_update.rowcount != 1:
+                raise OutlineGateError("working outline item changed during edit")
+            if updated_next_sibling is not None:
+                next_update = conn.execute(
+                    """
+                    UPDATE outline_plan_revision_items
+                    SET validated_previous_sibling_digest = ?
+                    WHERE id = ? AND plan_revision_id = ?
+                    """,
+                    (
+                        payload.digest,
+                        updated_next_sibling.id,
+                        plan.id,
+                    ),
+                )
+                if next_update.rowcount != 1:
+                    raise OutlineGateError("working sibling changed during edit")
+            plan_update = conn.execute(
+                """
+                UPDATE outline_plan_revisions
+                SET digest = ?, updated_at = ?
+                WHERE id = ? AND novel_id = ? AND sealed_at IS NULL
+                  AND status = ? AND digest = ?
+                """,
+                (digest, now, plan.id, plan.novel_id, plan.status.value, plan.digest),
+            )
+            if plan_update.rowcount != 1:
+                raise OutlineGateError("working outline plan changed during edit")
+            conn.execute(
+                """
+                UPDATE outline_contracts
+                SET draft_version_id = ?, has_author_edits = CASE WHEN ? = 'author'
+                    THEN 1 ELSE has_author_edits END, updated_at = ?
+                WHERE id = ? AND novel_id = ?
+                """,
+                (version_id, source.value, now, logical_node_id, plan.novel_id),
+            )
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        return self.get_plan_revision(plan_revision_id)
+
     def _validate_plan_items(
         self,
         novel_id: str,
@@ -1415,6 +1746,14 @@ class OutlineContractRepository:
                     now,
                     now,
                 ),
+            )
+            conn.execute(
+                """
+                UPDATE outline_contracts
+                SET draft_version_id = ?, updated_at = ?
+                WHERE id = ? AND novel_id = ?
+                """,
+                (version_id, now, contract_id, plan.novel_id),
             )
             children.append(
                 OutlinePlanItem(

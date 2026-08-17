@@ -1611,6 +1611,150 @@ def test_manifest_head_cannot_return_to_legacy_after_cutover(plan_repo):
     conn.rollback()
 
 
+def _manifest_working_draft(plan_repo, *, count: int = 1):
+    database, repository = plan_repo
+    root_item = _published_root(database, repository)
+    active = repository.backfill_initial_plan("novel-1").plan
+    assert active is not None
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 "
+        "WHERE novel_id='novel-1'"
+    )
+    conn.commit()
+    draft = repository.clone_active_plan_draft("novel-1")
+    payloads = [
+        OutlinePayload(
+            title="第一部" if index == 0 else "第二部",
+            narrative_text="主角离开故乡，承担第一次不可逆代价。",
+            creative_goal="建立主线冲突",
+            entry_state="旧秩序仍然完整" if index == 0 else "主角失去退路",
+            exit_state="主角失去退路" if index == 0 else "新秩序开始成形",
+            state_changes={"characters": [{"id": "hero", "to": "exile"}]},
+            foreshadowing={"setup": ["sealed letter"]},
+            extra={"field_provenance": {"title": "ai"}},
+            chapter_start=index * 10 + 1,
+            chapter_end=(index + 1) * 10,
+            conflicts=["主线冲突升级"],
+            handoff_conditions=["承接下一个阶段"],
+        )
+        for index in range(count)
+    ]
+    draft = repository.replace_draft_cohort_payloads(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        payloads=tuple(payloads),
+    )
+    return database, repository, active, draft
+
+
+def test_working_tree_reads_the_open_draft_without_changing_active_manifest(plan_repo):
+    database, repository, active, draft = _manifest_working_draft(plan_repo)
+
+    rows = repository.working_plan_items_with_payload("novel-1")
+
+    assert [row["logical_node_id"] for row in rows] == [
+        item.logical_node_id for item in draft.items
+    ]
+    assert all(row["status"] == "draft" for row in rows)
+    part = next(row for row in rows if row["level"] == "part")
+    assert part["plan_revision_id"] == draft.id
+    assert part["story_node_id"].startswith("manifest-node-")
+    assert part["payload"]["state_changes"] == {
+        "characters": [{"id": "hero", "to": "exile"}]
+    }
+    assert part["payload"]["extra"]["field_provenance"] == {"title": "ai"}
+    assert repository.get_planning_head("novel-1").active_plan_revision_id == active.id
+
+
+def test_working_item_edit_creates_a_new_version_and_rechecks_digests(plan_repo):
+    database, repository, active, draft = _manifest_working_draft(plan_repo)
+    part = next(item for item in draft.items if item.level == OutlineLevel.PART)
+    edited = OutlinePayload(
+        title="第一部（作者修订）",
+        narrative_text="作者明确了离开故乡的代价。",
+        creative_goal="建立主线冲突",
+        entry_state="旧秩序仍然完整",
+        exit_state="主角失去退路",
+        state_changes={"characters": [{"id": "hero", "to": "exile"}]},
+        foreshadowing={"setup": ["sealed letter"], "payoff": ["broken seal"]},
+        extra={"field_provenance": {"title": "author"}, "future": {"v": 2}},
+        chapter_start=1,
+        chapter_end=10,
+    )
+
+    updated = repository.update_working_plan_item(
+        plan_revision_id=draft.id,
+        logical_node_id=part.logical_node_id,
+        payload=edited,
+        expected_plan_digest=draft.digest,
+        expected_version_digest=part.version_digest,
+        source=OutlineSource.AUTHOR,
+    )
+
+    assert updated.id == draft.id
+    assert updated.digest != draft.digest
+    assert repository.get_planning_head("novel-1").active_plan_revision_id == active.id
+    refreshed = repository.working_plan_items_with_payload("novel-1")
+    changed = next(row for row in refreshed if row["logical_node_id"] == part.logical_node_id)
+    assert changed["version_digest"] == edited.digest
+    assert changed["payload"]["foreshadowing"]["payoff"] == ["broken seal"]
+    assert changed["payload"]["extra"]["future"] == {"v": 2}
+    with pytest.raises(OutlineGateError, match="has direct children"):
+        repository.update_working_plan_item(
+            plan_revision_id=draft.id,
+            logical_node_id=next(item for item in draft.items if item.level == OutlineLevel.OUTLINE).logical_node_id,
+            payload=edited,
+            expected_plan_digest=updated.digest,
+            expected_version_digest=next(
+                item for item in updated.items if item.level == OutlineLevel.OUTLINE
+            ).version_digest,
+        )
+
+
+def test_working_item_edit_rejects_a_stale_version_digest(plan_repo):
+    _, repository, _, draft = _manifest_working_draft(plan_repo)
+    part = next(item for item in draft.items if item.level == OutlineLevel.PART)
+
+    with pytest.raises(OutlineGateError, match="version digest changed"):
+        repository.update_working_plan_item(
+            plan_revision_id=draft.id,
+            logical_node_id=part.logical_node_id,
+            payload=OutlinePayload(title="stale"),
+            expected_plan_digest=draft.digest,
+            expected_version_digest="stale-version-digest",
+        )
+
+
+def test_working_item_edit_rewrites_the_next_sibling_handoff_digest(plan_repo):
+    _, repository, _, draft = _manifest_working_draft(plan_repo, count=2)
+    first, second = [item for item in draft.items if item.level == OutlineLevel.PART]
+    edited = OutlinePayload(
+        title="第一部（修订）",
+        narrative_text="修订后的第一部。",
+        creative_goal="建立主线冲突",
+        entry_state="旧秩序仍然完整",
+        exit_state="主角失去退路",
+        conflicts=["主线冲突升级"],
+        state_changes={"characters": [{"id": "hero", "to": "exile"}]},
+        handoff_conditions=["承接下一个阶段"],
+        chapter_start=1,
+        chapter_end=10,
+    )
+
+    updated = repository.update_working_plan_item(
+        plan_revision_id=draft.id,
+        logical_node_id=first.logical_node_id,
+        payload=edited,
+        expected_plan_digest=draft.digest,
+        expected_version_digest=first.version_digest,
+    )
+
+    refreshed = next(item for item in updated.items if item.logical_node_id == second.logical_node_id)
+    assert refreshed.validated_previous_sibling_digest == edited.digest
+
+
 def test_plan_items_require_valid_parent_level_and_parent_digest(plan_repo):
     database, repository = plan_repo
     root_item = _published_root(database, repository)

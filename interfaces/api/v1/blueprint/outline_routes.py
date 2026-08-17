@@ -79,6 +79,15 @@ class CohortExpandRequest(BaseModel):
     author_payloads: list[OutlinePayloadDTO] = Field(default_factory=list)
 
 
+class WorkingItemRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    payload: dict[str, Any] = Field(default_factory=dict)
+    expected_plan_digest: str = Field(..., min_length=1)
+    expected_version_digest: str = Field(..., min_length=1)
+    source: str = "author"
+
+
 def get_outline_service() -> OutlineContractService:
     db = api_dependencies.get_database()
     return OutlineContractService(
@@ -176,6 +185,78 @@ def get_outline_tree(
     """Logical total-outline root plus the existing physical structure tree."""
 
     return {"success": True, "data": service.logical_tree(novel_id)}
+
+
+@router.get("/novels/{novel_id}/working-tree")
+def get_working_outline_tree(
+    novel_id: str,
+    service: OutlineContractService = Depends(get_outline_service),
+):
+    """Read the open Manifest draft without changing the Active Tree contract."""
+
+    try:
+        return {"success": True, "data": service.working_tree(novel_id)}
+    except Exception as exc:
+        _raise_contract_error(exc)
+
+
+@router.patch("/plan-revisions/{plan_revision_id}/items/{logical_node_id}")
+def patch_working_outline_item(
+    plan_revision_id: str,
+    logical_node_id: str,
+    body: WorkingItemRequest,
+    service: OutlineContractService = Depends(get_outline_service),
+):
+    """Edit one leaf in the current Manifest Working Plan."""
+
+    try:
+        try:
+            source = OutlineSource(body.source)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail="source must be ai, author or imported"
+            ) from exc
+        repository = service.contract_repository
+        current = next(
+            (
+                row
+                for row in repository.working_plan_items_with_payload(
+                    repository.get_plan_revision(plan_revision_id).novel_id
+                )
+                if row["logical_node_id"] == logical_node_id
+            ),
+            None,
+        )
+        if current is None or current["plan_revision_id"] != plan_revision_id:
+            raise KeyError(f"working outline item not found: {logical_node_id}")
+        incoming = dict(body.payload)
+        merged = {**dict(current.get("payload") or {}), **incoming}
+        if "extra" in incoming:
+            merged["extra"] = {
+                **dict((current.get("payload") or {}).get("extra") or {}),
+                **dict(incoming.get("extra") or {}),
+            }
+        payload = OutlinePayload.from_dict(merged)
+        service.contract_repository.update_working_plan_item(
+            plan_revision_id=plan_revision_id,
+            logical_node_id=logical_node_id,
+            payload=payload,
+            expected_plan_digest=body.expected_plan_digest,
+            expected_version_digest=body.expected_version_digest,
+            source=source,
+        )
+        refreshed = next(
+            row
+            for row in repository.working_plan_items_with_payload(
+                current["novel_id"]
+            )
+            if row["logical_node_id"] == logical_node_id
+        )
+        return {"success": True, "data": refreshed}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_contract_error(exc)
 
 
 @router.get("/contracts/{contract_id}")
@@ -295,6 +376,24 @@ async def publish_manifest_cohort(
         return {
             "success": True,
             "data": await service.publish_completed_cohort(attempt_id=attempt_id),
+        }
+    except Exception as exc:
+        _raise_manifest_cohort_error(exc)
+
+
+@router.post("/cohort-attempts/{attempt_id}/author-publish")
+async def publish_manifest_cohort_for_author(
+    attempt_id: str,
+    service: OutlineCohortGenerationService = Depends(
+        get_outline_cohort_generation_service
+    ),
+):
+    """Publish a completed author planning cohort without resuming a run."""
+
+    try:
+        return {
+            "success": True,
+            "data": await service.publish_author_planning_cohort(attempt_id=attempt_id),
         }
     except Exception as exc:
         _raise_manifest_cohort_error(exc)

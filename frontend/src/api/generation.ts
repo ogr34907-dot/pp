@@ -54,11 +54,22 @@ export interface OutlineContract {
 
 export interface OutlineTreeNode {
   id: string
+  logical_node_id?: string
+  story_node_id?: string | null
   novel_id: string
   node_type: 'outline' | 'part' | 'volume' | 'act' | 'chapter' | string
   number?: number
+  order_index?: number
   title?: string
   description?: string
+  parent_logical_node_id?: string | null
+  plan_revision_id?: string
+  plan_digest?: string
+  version_id?: string
+  version_digest?: string
+  cohort_attempt_id?: string | null
+  payload?: OutlinePayload
+  status?: string
   outline_contract?: {
     contract_id?: string | null
     level?: string | null
@@ -254,6 +265,27 @@ export async function getGenerationRunOrNull(novelId: string): Promise<Generatio
 
 export const outlineApi = {
   getTree: (novelId: string) => unwrap<OutlineTreeNode>(apiRoutes.outline.tree(novelId)),
+  getWorkingTree: (novelId: string) => unwrap<OutlineTreeNode | null>(apiRoutes.outline.workingTree(novelId)),
+  saveWorkingItem: (
+    planRevisionId: string,
+    logicalNodeId: string,
+    request: { payload: OutlinePayload; expected_plan_digest: string; expected_version_digest: string; source?: 'author' | 'ai' | 'imported' },
+  ) => unwrap<OutlineTreeNode>(apiRoutes.outline.workingItem(planRevisionId, logicalNodeId), {
+    method: 'PATCH', body: request,
+  }),
+  expandCohort: (
+    novelId: string,
+    request: { logical_node_id?: string; id?: string; level: 'part' | 'volume' | 'act' | 'chapter'; author_payloads?: OutlinePayload[] },
+  ) => unwrap<Record<string, unknown>>(apiRoutes.outline.cohortExpand(novelId), {
+    method: 'POST',
+    body: {
+      parent_logical_node_id: request.logical_node_id || '',
+      level: request.level,
+      author_payloads: request.author_payloads || [],
+    },
+  }),
+  authorPublishCohort: (attemptId: string) =>
+    unwrap<Record<string, unknown>>(apiRoutes.outline.authorPublishCohort(attemptId), { method: 'POST' }),
   getContract: (contractId: string) => unwrap<OutlineContract>(apiRoutes.outline.contract(contractId)),
   saveDraft: (contractId: string, payload: OutlinePayload, source: 'author' | 'ai' | 'imported' = 'author') =>
     unwrap<OutlineContract>(apiRoutes.outline.draft(contractId), { method: 'POST', body: { payload, source } }),

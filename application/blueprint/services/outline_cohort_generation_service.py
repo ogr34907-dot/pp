@@ -6,6 +6,7 @@ import json
 from typing import Any, Protocol, Sequence
 
 from application.blueprint.services.outline_contract_service import OutlineContractService
+from application.blueprint.services.manifest_planning_service import ManifestPlanningService
 from domain.ai.services.llm_service import GenerationConfig
 from domain.ai.value_objects.prompt import Prompt
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload
@@ -52,6 +53,8 @@ class OutlineCohortGenerationService:
 
     def open_or_clone_cohort_draft(self, novel_id: str) -> Any:
         """Reuse a recoverable draft or anchor a new one to current Formal history."""
+
+        ManifestPlanningService(self.db).ensure_manifest_planning_authority(novel_id)
 
         formal_repository = ChapterCandidateRepository(
             self.repository._db or self.repository.db_path
@@ -351,6 +354,185 @@ class OutlineCohortGenerationService:
                 conn.rollback()
             raise
 
+    async def publish_author_planning_cohort(self, *, attempt_id: str) -> dict[str, Any]:
+        """Publish a completed author cohort without touching Generation Run state."""
+
+        conn = self.db.get_connection()
+        if conn.in_transaction:
+            raise OutlineCohortGenerationError(
+                "author cohort publication requires a clean database connection"
+            )
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            attempt = self.repository.get_manifest_cohort_attempt(
+                attempt_id, _connection=conn
+            )
+            if attempt["status"] != "completed":
+                raise OutlineCohortGenerationError(
+                    "only a completed cohort attempt can be author-published"
+                )
+            plan = self.repository.get_plan_revision(
+                str(attempt["plan_revision_id"]), _connection=conn
+            )
+            head = conn.execute(
+                """
+                SELECT authority_mode, authority_generation, projection_generation,
+                       active_plan_revision_id, active_plan_digest,
+                       working_plan_revision_id
+                FROM outline_planning_heads WHERE novel_id = ?
+                """,
+                (plan.novel_id,),
+            ).fetchone()
+            if head is None or str(head["authority_mode"] or "") != PlanningAuthorityMode.MANIFEST.value:
+                raise OutlineCohortGenerationError(
+                    "author cohort publication requires manifest planning authority"
+                )
+            receipt = (
+                self._stored_author_publication_receipt(plan, attempt_id)
+                if plan.sealed_at
+                else None
+            )
+            if receipt is not None and self._is_completed_author_publication_replay(
+                attempt_id=attempt_id, plan=plan, head=head, receipt=receipt
+            ):
+                report = self._stored_reconciliation_report(plan)
+                conn.commit()
+                return {
+                    "attempt": attempt,
+                    "plan": plan,
+                    "reconciliation": report,
+                    "run": None,
+                }
+            if str(head["working_plan_revision_id"] or "") != plan.id:
+                raise OutlineCohortGenerationError(
+                    "cohort draft is no longer the manifest working revision"
+                )
+            waiting = conn.execute(
+                "SELECT state, next_action, current_candidate_id, current_candidate_chapter, "
+                "canonical_sync_status FROM novel_generation_runs WHERE novel_id = ?",
+                (plan.novel_id,),
+            ).fetchone()
+            if waiting is not None:
+                state = str(waiting["state"] or "")
+                if (
+                    state == "waiting_planning"
+                    and str(waiting["next_action"] or "") == "expand_outline_cohort"
+                    and waiting["current_candidate_id"] is None
+                    and waiting["current_candidate_chapter"] is None
+                    and str(waiting["canonical_sync_status"] or "ready") == "ready"
+                ):
+                    raise OutlineCohortGenerationError(
+                        "runtime_planning_publication_required"
+                    )
+                if waiting["current_candidate_id"] is not None or state in {
+                    "running",
+                    "waiting_review",
+                    "waiting_planning",
+                    "paused",
+                }:
+                    raise OutlineCohortGenerationError(
+                        "author cohort publication requires no active generation candidate"
+                    )
+            if plan.sealed_at or plan.status not in {
+                PlanRevisionStatus.DRAFT,
+                PlanRevisionStatus.GENERATING,
+                PlanRevisionStatus.VALIDATING,
+            }:
+                raise OutlineCohortGenerationError(
+                    "cohort draft is no longer editable"
+                )
+            parent = next(
+                (
+                    item
+                    for item in plan.items
+                    if item.logical_node_id == attempt["parent_logical_node_id"]
+                ),
+                None,
+            )
+            if (
+                parent is None
+                or parent.level.child_level is None
+                or parent.level.child_level.value != attempt["level"]
+                or not any(
+                    item.parent_logical_node_id == parent.logical_node_id
+                    for item in plan.items
+                )
+            ):
+                raise OutlineCohortGenerationError(
+                    "completed cohort no longer matches its draft scope"
+                )
+            report = self.contract_service.reconcile_plan_boundary(
+                novel_id=plan.novel_id, plan_revision_id=plan.id, connection=conn
+            )
+            if report.status != PlanReconciliationStatus.ALIGNED:
+                raise OutlineCohortGenerationError(
+                    "author cohort publication requires an aligned formal boundary"
+                )
+            report_payload = {
+                "plan_revision_id": plan.id,
+                "status": report.status.value,
+                "expected_formal_head": report.expected_formal_head,
+                "actual_formal_head": report.actual_formal_head,
+                "expected_prefix_digest": report.expected_prefix_digest,
+                "actual_prefix_digest": report.actual_prefix_digest,
+                "canonical_ready": report.canonical_ready,
+                "memory_ready": report.memory_ready,
+                "blockers": list(report.blockers),
+                "publication": {
+                    "attempt_id": attempt_id,
+                    "mode": "author",
+                    "authority_generation": int(head["authority_generation"] or 0) + 1,
+                    "projection_generation": int(head["projection_generation"] or 0) + 1,
+                },
+            }
+            recorded = conn.execute(
+                """
+                UPDATE outline_plan_revisions
+                SET reconciliation_status = ?, reconciliation_report_json = ?,
+                    publish_idempotency_key = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND sealed_at IS NULL AND status = ? AND digest = ?
+                  AND publish_idempotency_key = ''
+                """,
+                (
+                    PlanReconciliationStatus.ALIGNED.value,
+                    json.dumps(report_payload, ensure_ascii=False, sort_keys=True),
+                    attempt_id,
+                    plan.id,
+                    plan.status.value,
+                    plan.digest,
+                ),
+            )
+            if recorded.rowcount != 1:
+                raise OutlineCohortGenerationError(
+                    "cohort draft changed before author reconciliation was recorded"
+                )
+            sealed = self.repository._seal_plan_revision_locked(
+                conn, plan.id, clear_working_plan=False
+            )
+            await PlanProjectionWriter(
+                self.contract_service.story_node_repository
+            ).apply_bound_projection(
+                conn,
+                novel_id=plan.novel_id,
+                plan_revision_id=sealed.id,
+                expected_active_plan_revision_id=head["active_plan_revision_id"],
+                expected_active_plan_digest=str(head["active_plan_digest"] or ""),
+                expected_authority_generation=int(head["authority_generation"] or 0),
+                expected_projection_generation=int(head["projection_generation"] or 0),
+                expected_working_plan_revision_id=sealed.id,
+            )
+            conn.commit()
+            return {
+                "attempt": attempt,
+                "plan": sealed,
+                "reconciliation": report,
+                "run": None,
+            }
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
     @staticmethod
     def _stored_publication_receipt(
         plan: Any, attempt_id: str
@@ -388,6 +570,37 @@ class OutlineCohortGenerationService:
         except (KeyError, TypeError, ValueError) as exc:
             raise OutlineCohortGenerationError(
                 "cohort publication has no valid immutable receipt"
+            ) from exc
+
+    @staticmethod
+    def _stored_author_publication_receipt(
+        plan: Any, attempt_id: str
+    ) -> dict[str, int | str]:
+        payload = dict(plan.reconciliation_report or {})
+        try:
+            receipt = dict(payload["publication"])
+            authority_generation = receipt["authority_generation"]
+            projection_generation = receipt["projection_generation"]
+            if (
+                receipt.get("mode") != "author"
+                or receipt.get("attempt_id") != str(attempt_id)
+                or str(plan.publish_idempotency_key or "") != str(attempt_id)
+                or not isinstance(authority_generation, int)
+                or isinstance(authority_generation, bool)
+                or not isinstance(projection_generation, int)
+                or isinstance(projection_generation, bool)
+                or authority_generation < 1
+                or projection_generation != authority_generation
+            ):
+                raise ValueError("stored author publication receipt is invalid")
+            return {
+                "attempt_id": str(attempt_id),
+                "authority_generation": authority_generation,
+                "projection_generation": projection_generation,
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise OutlineCohortGenerationError(
+                "author cohort publication has no valid immutable receipt"
             ) from exc
 
     @staticmethod
@@ -440,6 +653,32 @@ class OutlineCohortGenerationService:
 
     @classmethod
     def _is_completed_publication_replay(
+        cls,
+        *,
+        attempt_id: str,
+        plan: Any,
+        head: Any,
+        receipt: dict[str, int | str],
+    ) -> bool:
+        return bool(
+            head is not None
+            and str(head["authority_mode"] or "")
+            == PlanningAuthorityMode.MANIFEST.value
+            and str(head["active_plan_revision_id"] or "") == plan.id
+            and str(head["active_plan_digest"] or "") == plan.digest
+            and head["working_plan_revision_id"] is None
+            and int(head["authority_generation"] or 0)
+            == int(receipt["authority_generation"])
+            and int(head["projection_generation"] or 0)
+            == int(receipt["projection_generation"])
+            and plan.sealed_at
+            and plan.status == PlanRevisionStatus.READY_FOR_REVIEW
+            and plan.reconciliation_status == PlanReconciliationStatus.ALIGNED
+            and str(plan.publish_idempotency_key or "") == str(attempt_id)
+        )
+
+    @classmethod
+    def _is_completed_author_publication_replay(
         cls,
         *,
         attempt_id: str,
