@@ -15,3 +15,12 @@
 6. 章尾必须落在“主角状态变化”的重大变化上，不续写下一章事件。
 
 请生成正文内容。
+
+【本次生成的作品约束】
+作品：{novel_title}
+题材：{genre}
+风格：{writing_style}
+声线锚点：{voice_anchors}
+类型开篇画像：{genre_opening_profile}
+读者契约：{genre_reader_contract}
+节奏约束：{genre_rhythm_constraints}

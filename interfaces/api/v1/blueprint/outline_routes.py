@@ -373,9 +373,35 @@ async def publish_manifest_cohort(
     """Publish a completed Manifest cohort without legacy node publication."""
 
     try:
+        result = await service.publish_completed_cohort(attempt_id=attempt_id)
+        run = result.get("run") if isinstance(result, dict) else None
+        if run is not None:
+            novel_id = str(getattr(run, "novel_id", "") or "")
+            generation_epoch = getattr(run, "generation_epoch", None)
+            if not novel_id or generation_epoch is None:
+                raise OutlineCohortGenerationError(
+                    "runtime cohort publication returned an invalid generation run"
+                )
+            claimed = api_dependencies.get_generation_run_coordinator().claim(novel_id)
+            if not claimed:
+                reason = "runtime_publish_runner_claim_failed"
+                try:
+                    ChapterCandidateRepository(api_dependencies.get_database()).record_runner_error(
+                        novel_id,
+                        expected_generation_epoch=int(generation_epoch),
+                        reason=reason,
+                    )
+                except Exception as persist_exc:
+                    raise OutlineCohortGenerationError(
+                        "runtime cohort published but runner claim failed and the error state "
+                        "could not be persisted"
+                    ) from persist_exc
+                raise OutlineCohortGenerationError(
+                    "runtime cohort published but generation runner claim failed; run paused as error"
+                )
         return {
             "success": True,
-            "data": await service.publish_completed_cohort(attempt_id=attempt_id),
+            "data": result,
         }
     except Exception as exc:
         _raise_manifest_cohort_error(exc)

@@ -109,6 +109,7 @@ class ThemedStoryPipeline(BaseStoryPipeline):
                     "description": check,
                     "suggestion": "对照题材 Skill 审计项修订本章",
                 })
+            self._refresh_validation_status(ctx)
         except Exception as e:
             logger.warning("ThemeAgent 审计注入失败 genre=%s: %s", self.genre_key, e)
 

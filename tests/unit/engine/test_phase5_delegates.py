@@ -29,6 +29,41 @@ def test_audit_pause_gate_always_blocks_canonical_failure():
     ) is True
 
 
+@pytest.mark.parametrize("hard_fail,anti_ai_severe", [(True, False), (False, True)])
+def test_audit_pause_gate_blocks_severe_failures_in_full_auto_mode(
+    hard_fail, anti_ai_severe
+):
+    prefs = SimpleNamespace(
+        pause_after_each_chapter_audit=False,
+        audit_pause_on_hard_fail=False,
+        audit_pause_on_anti_ai_severe=False,
+    )
+
+    assert _audit_pause_gate(
+        canonical_ready=True,
+        auto=True,
+        prefs=prefs,
+        hard_fail=hard_fail,
+        anti_ai_severe=anti_ai_severe,
+    ) is True
+
+
+def test_audit_pause_gate_full_auto_does_not_pause_on_advisory_result():
+    prefs = SimpleNamespace(
+        pause_after_each_chapter_audit=True,
+        audit_pause_on_hard_fail=True,
+        audit_pause_on_anti_ai_severe=True,
+    )
+
+    assert _audit_pause_gate(
+        canonical_ready=True,
+        auto=True,
+        prefs=prefs,
+        hard_fail=False,
+        anti_ai_severe=False,
+    ) is False
+
+
 def test_legacy_chapter_cannot_skip_from_audit_number_without_canonical_claim():
     host = MagicMock()
     host._is_chapter_narrative_ready.return_value = False

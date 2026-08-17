@@ -242,10 +242,22 @@ def test_chapter_prose_inputs_are_materialized_to_variable_hub():
     assert session.metadata["input_variable_materialization"]["written"]
 
 
-def test_chapter_prose_input_bindings_keep_only_title_and_prose_context():
+def test_chapter_prose_input_bindings_include_shared_story_contract_and_prose_context():
     bindings = {binding.alias: binding for binding in _input_bindings()}
 
-    assert set(bindings) == {"novel_title", "target_words", "chapter_outline", "continuity_context"}
+    assert set(bindings) == {
+        "novel_title",
+        "genre",
+        "writing_style",
+        "style_guide",
+        "voice_anchors",
+        "genre_opening_profile",
+        "genre_reader_contract",
+        "genre_rhythm_constraints",
+        "target_words",
+        "chapter_outline",
+        "continuity_context",
+    }
     assert bindings["novel_title"].variable_key == "novel.setup.title"
     assert bindings["target_words"].variable_key == "chapter.target_words"
     assert bindings["chapter_outline"].variable_key == "chapter.outline"
@@ -342,8 +354,9 @@ def test_chapter_prose_binds_novel_title_without_other_story_setup_variables():
     assert bindings["novel_title"].variable_key == "novel.setup.title"
     assert bindings["novel_title"].scope == "novel"
     assert bindings["novel_title"].stage == "setup"
-    assert "genre" not in bindings
-    assert "style_guide" not in bindings
+    assert bindings["genre"].variable_key == "novel.setup.genre"
+    assert bindings["style_guide"].variable_key == "novel.generation.style_guide"
+    assert bindings["genre_opening_profile"].value_type == "object"
     assert "world_context" not in bindings
 
 

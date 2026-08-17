@@ -9,6 +9,7 @@ export interface CandidateGenerationProgressInput {
   current_formal_chapter?: number | null
   current_candidate_chapter?: number | null
   canonical_sync_status?: string | null
+  next_action?: string | null
   last_error?: string | null
   candidate?: { status?: string | null; chapter_number?: number | null } | null
 }
@@ -172,6 +173,14 @@ export function getCandidateGenerationProgress(
         2,
         `${candidatePrefix}待作者审核`,
         '作者确认前不会生成下一章，也不会消耗下一章 Token。',
+        'warning',
+      )
+    } else if (state === 'waiting_planning') {
+      result = activeResult(
+        ['pending', 'pending', 'pending', 'pending', 'pending'],
+        0,
+        '等待扩展五级大纲',
+        '当前已发布规划已用完，需要生成并发布下一批大纲后继续。',
         'warning',
       )
     } else if (candidateState === 'stale') {

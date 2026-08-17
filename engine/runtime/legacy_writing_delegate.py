@@ -389,6 +389,30 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
                 )
                 host._flush_novel(novel)
                 return
+            if str(e).startswith("evolution_gate_unavailable:"):
+                reason = str(e)
+                message = reason.replace("evolution_gate_unavailable:", "", 1)
+                logger.error(
+                    "[%s] EvolutionGate unavailable for chapter %s; pausing writing: %s",
+                    novel.novel_id.value,
+                    chapter_num,
+                    message,
+                )
+                novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+                novel.autopilot_status = AutopilotStatus.STOPPED
+                host._update_shared_state(
+                    novel.novel_id.value,
+                    current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+                    autopilot_status=AutopilotStatus.STOPPED.value,
+                    paused_for_review=True,
+                    writing_substep="evolution_gate_unavailable",
+                    writing_substep_label="Evolution Gate unavailable; paused",
+                    autopilot_pause_reason=reason,
+                    evolution_gate_error=reason,
+                    evolution_gate_message=message,
+                )
+                host._flush_novel(novel)
+                return
             logger.warning(f"prepare_chapter_generation 失败，尝试降级：{e}")
             try:
                 bundle = host.chapter_workflow.build_fallback_chapter_bundle(
@@ -887,9 +911,16 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
             if use_wf:
                 prompt = host.chapter_workflow.build_chapter_prompt(
                     bundle["context"], outline,
+                    novel_title=bundle.get("novel_title", ""),
+                    genre=bundle.get("genre", ""),
+                    writing_style=bundle.get("writing_style", bundle.get("style_summary", "")),
+                    style_guide=bundle.get("style_guide", bundle.get("style_summary", "")),
                     storyline_context=bundle["storyline_context"],
                     plot_tension=bundle["plot_tension"],
                     style_summary=bundle["style_summary"],
+                    genre_opening_profile=bundle.get("genre_opening_profile"),
+                    genre_reader_contract=bundle.get("genre_reader_contract"),
+                    genre_rhythm_constraints=bundle.get("genre_rhythm_constraints"),
                     beat_prompt=beat_prompt,
                     beat_index=i, total_beats=len(beats),
                     beat_target_words=int(adjusted_target),  # 使用调整后的目标
@@ -1059,9 +1090,16 @@ async def run_legacy_writing(host: Any, novel: Novel) -> None:
         if use_wf:
             prompt = host.chapter_workflow.build_chapter_prompt(
                 bundle["context"], outline,
+                novel_title=bundle.get("novel_title", ""),
+                genre=bundle.get("genre", ""),
+                writing_style=bundle.get("writing_style", bundle.get("style_summary", "")),
+                style_guide=bundle.get("style_guide", bundle.get("style_summary", "")),
                 storyline_context=bundle["storyline_context"],
                 plot_tension=bundle["plot_tension"],
                 style_summary=bundle["style_summary"],
+                genre_opening_profile=bundle.get("genre_opening_profile"),
+                genre_reader_contract=bundle.get("genre_reader_contract"),
+                genre_rhythm_constraints=bundle.get("genre_rhythm_constraints"),
                 voice_anchors=voice_anchors,
             )
             cfg = GenerationConfig(max_tokens=3000, temperature=0.85)

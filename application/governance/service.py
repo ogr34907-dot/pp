@@ -657,6 +657,21 @@ class NarrativeGovernanceService:
         if not self.db:
             return
         try:
+            from infrastructure.persistence.database.chapter_candidate_repository import (
+                ChapterCandidateRepository,
+            )
+
+            run = None
+            try:
+                run = ChapterCandidateRepository(self.db).pause_for_governance(
+                    novel_id,
+                    "narrative_governance_block",
+                )
+            except Exception:
+                # Legacy novels may not have a Candidate run yet. Preserve the
+                # compatibility mirror below while never claiming a run pause.
+                run = None
+
             conn = self.db.get_connection()
             conn.execute(
                 """
@@ -669,6 +684,8 @@ class NarrativeGovernanceService:
                 ("叙事治理发现严重结构风险，已暂停自动驾驶。", novel_id),
             )
             conn.commit()
+            if run is not None:
+                return
         except Exception:
             return
 

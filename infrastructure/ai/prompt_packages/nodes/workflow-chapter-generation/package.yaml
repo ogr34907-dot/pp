@@ -79,6 +79,38 @@ system_template: '你是一位专业的网络小说作家。根据以下上下�
 
   6. 环境互动：招式对周围环境的影响（地面崩裂/空气震动/物品损坏）'
 variables:
+- name: novel_title
+  desc: 作品标题
+  type: string
+  default: ''
+- name: genre
+  desc: 题材
+  type: string
+  default: ''
+- name: writing_style
+  desc: 写作风格
+  type: string
+  default: ''
+- name: style_guide
+  desc: 风格指南
+  type: string
+  default: ''
+- name: voice_anchors
+  desc: 声线锚点
+  type: string
+  default: ''
+- name: genre_opening_profile
+  desc: 类型开篇画像
+  type: object
+  default: {}
+- name: genre_reader_contract
+  desc: 读者契约
+  type: object
+  default: {}
+- name: genre_rhythm_constraints
+  desc: 节奏约束
+  type: object
+  default: {}
 - name: planning_section
   desc: 故事线/张力/风格约束块
   type: string

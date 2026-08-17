@@ -27,4 +27,17 @@ describe('getGenerationPresentation', () => {
       key: 'stopped', label: '已终止', tone: 'neutral',
     })
   })
+
+  it('explains that outline expansion is required before continuous generation resumes', () => {
+    expect(getGenerationPresentation({
+      state: 'waiting_planning',
+      next_action: 'expand_outline_cohort',
+    })).toMatchObject({
+      key: 'waiting_planning',
+      label: '等待扩展五级大纲',
+      tone: 'warning',
+      isActive: false,
+      cta: { label: '大纲扩展', target: 'outline' },
+    })
+  })
 })

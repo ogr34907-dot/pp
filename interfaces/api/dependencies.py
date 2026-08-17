@@ -847,6 +847,73 @@ def get_auto_workflow() -> AutoNovelGenerationWorkflow:
     return build_auto_workflow(llm_service)
 
 
+@lru_cache(maxsize=1)
+def get_candidate_workflow_service():
+    """Build the process-shared Candidate workflow used by API and runner tasks."""
+
+    from application.blueprint.services.outline_contract_service import (
+        OutlineContractService,
+    )
+    from application.engine.dag.engine import DAGEngine
+    from application.engine.dag.models import get_default_dag
+    from application.engine.services.candidate_chapter_workflow import (
+        CandidateChapterWorkflowService,
+    )
+    from infrastructure.persistence.database.chapter_candidate_repository import (
+        ChapterCandidateRepository,
+    )
+    from infrastructure.persistence.database.outline_contract_repository import (
+        OutlineContractRepository,
+    )
+
+    db = get_database()
+    return CandidateChapterWorkflowService(
+        ChapterCandidateRepository(db),
+        OutlineContractService(
+            contract_repository=OutlineContractRepository(db),
+            story_node_repository=get_story_node_repository(),
+        ),
+        get_auto_workflow(),
+        get_chapter_aftermath_pipeline(),
+        dag_engine=DAGEngine(),
+        dag_factory=get_default_dag,
+        semantic_reviewer=get_chapter_ai_review_service(),
+    )
+
+
+_generation_run_coordinator = None
+
+
+def get_generation_run_coordinator():
+    """Return the singleton in-process Candidate runner coordinator."""
+
+    global _generation_run_coordinator
+    if _generation_run_coordinator is None:
+        from application.engine.services.generation_run_coordinator import (
+            GenerationRunCoordinator,
+        )
+        from infrastructure.persistence.database.chapter_candidate_repository import (
+            ChapterCandidateRepository,
+        )
+
+        _generation_run_coordinator = GenerationRunCoordinator(
+            repository_factory=lambda: ChapterCandidateRepository(get_database()),
+            workflow_factory=get_candidate_workflow_service,
+            logger=logger,
+        )
+    return _generation_run_coordinator
+
+
+def shutdown_generation_run_coordinator_if_initialized() -> None:
+    """Cancel runner tasks without constructing the coordinator during shutdown."""
+
+    global _generation_run_coordinator
+    if _generation_run_coordinator is None:
+        return
+    _generation_run_coordinator.shutdown()
+    _generation_run_coordinator = None
+
+
 def get_auto_bible_generator() -> AutoBibleGenerator:
     """获取自动 Bible 生成器
 

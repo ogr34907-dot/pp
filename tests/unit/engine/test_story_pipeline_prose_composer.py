@@ -419,14 +419,17 @@ def test_chapter_prose_composer_keeps_full_context_before_additional_continuity(
 
     variables = composer._build_variables(request)
 
-    assert variables == {
-        "target_words": 2000,
-        "chapter_outline": "七段细纲",
-        "continuity_context": (
-            "T0 世界观事实\nT1 有效摘要\nT2 最近承接\nT3 检索证据"
-            "\n\n=== ADDITIONAL CONTINUITY ===\n章前规划补充"
-        ),
-    }
+    assert variables["target_words"] == 2000
+    assert variables["chapter_outline"] == "七段细纲"
+    assert variables["continuity_context"] == (
+        "T0 世界观事实\nT1 有效摘要\nT2 最近承接\nT3 检索证据"
+        "\n\n=== ADDITIONAL CONTINUITY ===\n章前规划补充"
+    )
+    assert variables["novel_title"] == ""
+    assert variables["genre"] == ""
+    assert variables["genre_opening_profile"] == {}
+    assert variables["genre_reader_contract"] == {}
+    assert variables["genre_rhythm_constraints"] == {}
 
 
 def test_chapter_prose_composer_does_not_duplicate_continuity_already_in_full_context():
@@ -846,6 +849,26 @@ async def test_story_pipeline_stops_when_governance_rejects_continuity(monkeypat
 
     assert result.success is False
     assert result.error == "写前连续性检查未通过：需要暂停"
+    prepare_plan.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_stops_when_governance_cannot_confirm_continuity(monkeypatch):
+    pipeline = _Pipeline()
+    find_next = AsyncMock(return_value=StepResult.ok())
+    prepare_plan = AsyncMock(return_value=StepResult.fail("should not reach planning"))
+    monkeypatch.setattr(pipeline, "_step_find_next_chapter", find_next)
+    monkeypatch.setattr(
+        pipeline,
+        "_step_prepare_governance",
+        AsyncMock(return_value=StepResult.fail("写前连续性检查无法确认：evolution backend unavailable")),
+    )
+    monkeypatch.setattr(pipeline, "_step_prepare_chapter_plan", prepare_plan)
+
+    result = await pipeline.run_chapter(PipelineContext(novel_id="novel-1"))
+
+    assert result.success is False
+    assert result.error == "写前连续性检查无法确认：evolution backend unavailable"
     prepare_plan.assert_not_awaited()
 
 

@@ -26,6 +26,12 @@ from engine.pipeline.context import PipelineContext, PipelineResult
 from engine.pipeline.recovery import StepCommitKind, boundary_for
 from engine.pipeline.steps import StepResult
 from engine.pipeline.telemetry import story_pipeline_wave_meta
+from engine.validation_status import (
+    ADVISORY_FAIL,
+    HARD_FAIL,
+    PASS,
+    UNEVALUATED,
+)
 from application.engine.services.context_budget_models import (
     ContextBudgetExceededError,
     FactLockUnavailableError,
@@ -195,10 +201,23 @@ class BaseStoryPipeline(ABC):
             # 5. 策略验证（反AI/俗套/一致性）
             self._mark_pipeline_step(ctx, "validate_content")
             r = await self._step_validate_content(ctx)
-            step_status["validate_content"] = "ok" if r.passed else "warning"
-            if not r.passed:
-                logger.warning(f"[{ctx.novel_id}] 内容验证未通过: {r.message}")
-                # 验证失败不阻断管线，记录违规但继续
+            validation_status = getattr(ctx, "validation_status", UNEVALUATED)
+            if validation_status == HARD_FAIL:
+                step_status["validate_content"] = "failed"
+                return self._make_result(
+                    ctx,
+                    success=False,
+                    error=r.message or "content_validation_hard_fail",
+                    step_status=step_status,
+                )
+            if validation_status == ADVISORY_FAIL:
+                step_status["validate_content"] = "warning"
+                if r.message:
+                    logger.warning(f"[{ctx.novel_id}] 内容验证建议: {r.message}")
+            elif validation_status == UNEVALUATED:
+                step_status["validate_content"] = "unevaluated"
+            else:
+                step_status["validate_content"] = "ok"
 
             # 6. 保存章节（独立短连接写库）
             if self._novel_stream_should_stop(ctx.novel_id):
@@ -426,7 +445,8 @@ class BaseStoryPipeline(ABC):
     async def _step_prepare_governance(self, ctx: PipelineContext) -> StepResult:
         """步骤1b：从叙事治理层领取本章预算。
 
-        失败不阻断生成；治理报告会在章后提交闸门再次落库。
+        治理预算和写前连续性是生成前置条件；无法确认时必须停止，
+        避免在未知连续性状态下继续生成正文。
         """
         try:
             from application.governance.service import NarrativeGovernanceService
@@ -469,7 +489,10 @@ class BaseStoryPipeline(ABC):
                         "写前连续性检查未通过：" + "；".join(continuity.repair_plan[:3])
                     )
             except Exception as gate_error:
-                logger.warning("[%s] 写前连续性检查失败: %s", ctx.novel_id, gate_error)
+                reason = f"写前连续性检查无法确认：{gate_error}"
+                ctx.metadata["evolution_continuity_check_error"] = str(gate_error)
+                logger.error("[%s] %s", ctx.novel_id, reason)
+                return StepResult.fail(reason)
             _writing_progress(
                 ctx,
                 "governance_prepare",
@@ -481,8 +504,10 @@ class BaseStoryPipeline(ABC):
             )
             return StepResult.ok("叙事治理预算已准备")
         except Exception as e:
-            logger.warning("[%s] 叙事治理预算准备失败: %s", ctx.novel_id, e)
-            return StepResult.skip_step(f"叙事治理预算准备失败: {e}")
+            reason = f"叙事治理预算无法确认：{e}"
+            ctx.metadata["governance_prepare_error"] = str(e)
+            logger.error("[%s] %s", ctx.novel_id, reason)
+            return StepResult.fail(reason)
 
     @staticmethod
     def _missing_required_narrative_dependencies(ctx: PipelineContext) -> List[str]:
@@ -592,6 +617,7 @@ class BaseStoryPipeline(ABC):
                 )
                 ctx.voice_anchors = bundle.get("voice_anchors", "")
                 ctx.bundle = bundle
+                self._attach_generation_contract_metadata(ctx, bundle)
                 logger.info(
                     f"[{ctx.novel_id}] 上下文（workflow）: {len(ctx.context_text)} 字符, "
                     f"约 {ctx.context_tokens} tokens"
@@ -801,6 +827,32 @@ class BaseStoryPipeline(ABC):
 
         ctx.metadata["continuity_context"] = continuity_context
 
+    @staticmethod
+    def _attach_generation_contract_metadata(
+        ctx: PipelineContext,
+        bundle: Any,
+    ) -> None:
+        """Copy the shared prose contract from a workflow bundle into the pipeline context."""
+        if not isinstance(bundle, dict):
+            return
+
+        for key in (
+            "novel_title",
+            "writing_style",
+            "style_guide",
+            "voice_anchors",
+            "genre_opening_profile",
+            "genre_reader_contract",
+            "genre_rhythm_constraints",
+        ):
+            if key in bundle and bundle[key] is not None:
+                ctx.metadata[key] = bundle[key]
+
+        genre = str(bundle.get("genre") or ctx.genre or "").strip()
+        if genre:
+            ctx.genre = genre
+            ctx.metadata["genre"] = genre
+
     async def _step_generate(self, ctx: PipelineContext) -> StepResult:
         composer = ctx.get_dep("prose_composer")
         if composer is not None:
@@ -927,18 +979,32 @@ class BaseStoryPipeline(ABC):
             accumulated_words=ctx.word_count,
         )
 
+        ctx.validation_status = UNEVALUATED
+        ctx.validation_score = None
+        ctx.validation_passed = False
+        ctx.validation_violations = []
+        ctx.validation_suggestions = []
+        ctx.validation_dimensions = {}
+
         if ctx.policy_validator is not None:
             try:
+                character_masks = self._get_character_masks(ctx)
                 report = ctx.policy_validator.advise(
                     text=ctx.chapter_content,
-                    character_masks=self._get_character_masks(ctx),
+                    character_masks=character_masks,
                     chapter_goal=ctx.outline,
-                    character_names=self._get_character_names(ctx),
+                    character_names=[
+                        mask.name
+                        for mask in character_masks.values()
+                        if getattr(mask, "name", "")
+                    ],
                     era=ctx.era,
                 )
-                ctx.validation_passed = report.passed
+                ctx.validation_status = getattr(report, "status", UNEVALUATED) or UNEVALUATED
+                ctx.validation_passed = ctx.validation_status == PASS
                 ctx.validation_score = report.overall_score
                 ctx.validation_violations = report.all_violations
+                ctx.validation_suggestions = list(getattr(report, "suggestions", []) or [])
                 ctx.validation_dimensions = {
                     "language_style": report.language_style_score,
                     "character_consistency": report.character_consistency_score,
@@ -947,21 +1013,70 @@ class BaseStoryPipeline(ABC):
                     "viewpoint": report.viewpoint_score,
                     "rhythm": report.rhythm_score,
                 }
-                return StepResult.ok() if report.passed else StepResult(
-                    passed=True,  # 不阻断
-                    message=f"验证未通过 (score={report.overall_score:.2f})",
+                if ctx.validation_status == HARD_FAIL:
+                    score = (
+                        f"{report.overall_score:.2f}"
+                        if report.overall_score is not None
+                        else "unavailable"
+                    )
+                    return StepResult.fail(
+                        f"content validation hard fail (score={score})",
+                        score=report.overall_score,
+                        violations=report.all_violations,
+                    )
+                if ctx.validation_status == ADVISORY_FAIL:
+                    score = (
+                        f"{report.overall_score:.2f}"
+                        if report.overall_score is not None
+                        else "unavailable"
+                    )
+                    return StepResult(
+                        passed=True,
+                        message=f"content validation advisory fail (score={score})",
+                        score=report.overall_score,
+                        violations=report.all_violations,
+                        suggestions=ctx.validation_suggestions,
+                    )
+                return StepResult(
+                    passed=True,
                     score=report.overall_score,
                     violations=report.all_violations,
+                    suggestions=ctx.validation_suggestions,
                 )
             except Exception as e:
                 logger.warning(f"策略验证异常: {e}")
         else:
-            # 无 PolicyValidator，跳过
-            ctx.validation_passed = True
-            ctx.validation_score = 0.85
-            ctx.validation_dimensions = {"language_style": 0.85}
+            logger.warning("[%s] PolicyValidator unavailable; validation remains UNEVALUATED", ctx.novel_id)
 
         return StepResult.ok()
+
+    def _refresh_validation_status(self, ctx: PipelineContext) -> str:
+        """Recompute validation status after a themed pipeline adds violations."""
+        hard = False
+        for violation in ctx.validation_violations or []:
+            severity = violation.get("severity") if isinstance(violation, dict) else violation
+            if isinstance(severity, (int, float)) and float(severity) >= 0.75:
+                hard = True
+                break
+            if str(severity or "").strip().lower() in {"critical", "error", "hard", "high"}:
+                hard = True
+                break
+        if hard:
+            ctx.validation_status = HARD_FAIL
+        elif (
+            ctx.validation_violations
+            and ctx.validation_status in {PASS, UNEVALUATED}
+            and any(
+                not (
+                    isinstance(violation, dict)
+                    and violation.get("type") == "validator_unavailable"
+                )
+                for violation in ctx.validation_violations
+            )
+        ):
+            ctx.validation_status = ADVISORY_FAIL
+        ctx.validation_passed = ctx.validation_status == PASS
+        return ctx.validation_status
 
     async def _step_save_chapter(self, ctx: PipelineContext) -> StepResult:
         """步骤6：保存章节（独立短连接写库）
@@ -1348,16 +1463,11 @@ class BaseStoryPipeline(ABC):
         return StepResult.ok()
 
     async def _step_finalize(self, ctx: PipelineContext) -> StepResult:
-        """步骤10：收尾（落库+状态推进）
+        """步骤10：只构建审计快照，不推进故事状态。
 
-        默认实现：
-        1. 构建审计快照
-        2. 保存 novel 状态到 DB
-        3. 推进 current_chapter_in_act / current_act
-
-        子类覆写场景：
-        - 自定义状态推进逻辑
-        - 添加额外的收尾操作
+        故事状态的唯一推进入口是
+        ``writing_delegate.advance_story_pipeline_once()``；finalize 不能重复落库或
+        移动 current_stage/current_chapter，避免审计快照和状态指针分叉。
         """
         self._log_step("finalize", "收尾落库")
 
@@ -1382,7 +1492,11 @@ class BaseStoryPipeline(ABC):
             "character_mutations_stored": ctx.character_mutations_stored,
             "debt_updated": ctx.debt_updated,
             "validation_score": ctx.validation_score,
+            "validation_status": ctx.validation_status,
             "validation_passed": ctx.validation_passed,
+            "validation_violations": list(ctx.validation_violations),
+            "validation_suggestions": list(ctx.validation_suggestions),
+            "validation_dimensions": dict(ctx.validation_dimensions),
         }
 
         return StepResult.ok()
@@ -1511,11 +1625,91 @@ class BaseStoryPipeline(ABC):
 
     def _get_character_masks(self, ctx: PipelineContext) -> Dict[str, Any]:
         """获取当前章节的角色面具（供策略验证使用）"""
-        return {}
+        context_builder = getattr(ctx, "context_builder", None)
+        allocator = getattr(context_builder, "budget_allocator", None)
+        kernel = (
+            getattr(allocator, "character_narrative_kernel", None)
+            or getattr(context_builder, "character_narrative_kernel", None)
+        )
+        if kernel is None:
+            return {}
+
+        try:
+            from engine.core.value_objects.character_mask import CharacterMask
+
+            slots = list(
+                kernel.get_cast_slots(ctx.novel_id, ctx.chapter_number) or []
+            )
+            if not slots:
+                plan = kernel.plan_cast(
+                    ctx.novel_id,
+                    ctx.chapter_number,
+                    ctx.outline or "",
+                )
+                slots = list(getattr(plan, "slots", []) or [])
+
+            bible = kernel._get_bible(ctx.novel_id)
+            characters = list(getattr(bible, "characters", []) or []) if bible else []
+
+            def _character_id(character: Any) -> str:
+                try:
+                    value = kernel._char_id(character)
+                except Exception:
+                    raw = getattr(character, "character_id", None)
+                    value = getattr(raw, "value", raw)
+                    value = value or getattr(character, "id", "")
+                return str(getattr(value, "value", value) or "")
+
+            by_id = {
+                character_id: character
+                for character in characters
+                if (character_id := _character_id(character))
+            }
+            by_name = {
+                str(getattr(character, "name", "") or ""): character
+                for character in characters
+                if str(getattr(character, "name", "") or "")
+            }
+
+            masks: Dict[str, CharacterMask] = {}
+            for slot in slots:
+                raw_id = getattr(slot, "character_id", "")
+                character_id = str(getattr(raw_id, "value", raw_id) or "")
+                character = by_id.get(character_id)
+                if character is None:
+                    character = by_name.get(str(getattr(slot, "name", "") or ""))
+                if character is None or not callable(getattr(character, "compute_mask", None)):
+                    continue
+
+                mask_data = character.compute_mask(up_to_chapter=ctx.chapter_number)
+                if not isinstance(mask_data, dict):
+                    continue
+                mask_data = dict(mask_data)
+                mask_data.setdefault("character_id", character_id or _character_id(character))
+                mask_data.setdefault("name", getattr(slot, "name", "") or getattr(character, "name", ""))
+                mask = CharacterMask.from_character_dict(
+                    mask_data,
+                    chapter_number=int(ctx.chapter_number or 0),
+                )
+                key = str(mask.character_id or mask.name or character_id)
+                if key:
+                    masks[key] = mask
+            return masks
+        except Exception as exc:
+            logger.debug(
+                "[%s] 当前章节角色面具构建失败，跳过角色一致性投影: %s",
+                ctx.novel_id,
+                exc,
+            )
+            return {}
 
     def _get_character_names(self, ctx: PipelineContext) -> List[str]:
         """获取角色名列表（供策略验证使用）"""
-        return []
+        return [
+            mask.name
+            for mask in self._get_character_masks(ctx).values()
+            if getattr(mask, "name", "")
+        ]
 
     def _push_persistence_command(self, ctx: PipelineContext) -> bool:
         """推送持久化命令到 CQRS 队列"""
@@ -1660,7 +1854,11 @@ class BaseStoryPipeline(ABC):
             drift_alert=ctx.drift_alert,
             similarity_score=ctx.similarity_score,
             validation_score=ctx.validation_score,
+            validation_status=ctx.validation_status,
             validation_passed=ctx.validation_passed,
+            validation_violations=list(ctx.validation_violations),
+            validation_suggestions=list(ctx.validation_suggestions),
+            validation_dimensions=dict(ctx.validation_dimensions),
             narrative_sync_ok=ctx.narrative_sync_ok,
             error=error,
             audit_snapshot=getattr(ctx, 'audit_snapshot', {}),

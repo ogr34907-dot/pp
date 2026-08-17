@@ -43,6 +43,8 @@ from application.engine.dag.plan.schema import (
     render_chapter_rhythm_block,
     serialize_chapter_rhythm,
 )
+from application.evolution.services.gate_service import EvolutionGateUnavailableError
+from application.core.taxonomy.opening_profiles import resolve_opening_profile
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +425,59 @@ class AutoNovelGenerationWorkflow:
             logger.warning(f"Theme 集成器初始化失败: {e}")
             self._theme_integrator = None
 
+    def _generation_contract_variables(
+        self,
+        novel_id: str,
+        *,
+        style_summary: str = "",
+        voice_anchors: str = "",
+    ) -> Dict[str, Any]:
+        """Resolve the shared workbench prose contract from the novel and taxonomy."""
+        novel_title = str(novel_id or "")
+        genre = str(self._genre or "")
+        writing_style = str(style_summary or "")
+        style_guide = str(style_summary or "")
+        try:
+            novel = self.context_builder.novel_repository.get_by_id(NovelId(novel_id))
+            if novel is not None:
+                novel_title = str(getattr(novel, "title", "") or novel_title)
+                genre = str(
+                    getattr(novel, "locked_genre", None)
+                    or getattr(novel, "genre_label", None)
+                    or getattr(novel, "genre", None)
+                    or genre
+                )
+                writing_style = str(
+                    getattr(novel, "writing_style", None)
+                    or getattr(novel, "style_guide", None)
+                    or writing_style
+                )
+                style_guide = str(getattr(novel, "style_guide", None) or writing_style)
+        except Exception as exc:
+            logger.debug("generation contract metadata unavailable novel=%s: %s", novel_id, exc)
+
+        variables: Dict[str, Any] = {
+            "novel_title": novel_title,
+            "genre": genre,
+            "writing_style": writing_style,
+            "style_guide": style_guide,
+            "voice_anchors": str(voice_anchors or ""),
+        }
+        try:
+            profile = resolve_opening_profile(genre, strict=False) if genre else None
+        except Exception as exc:
+            logger.debug("opening profile unavailable genre=%s: %s", genre, exc)
+            profile = None
+        if profile is not None:
+            variables.update(profile.as_variables())
+        else:
+            variables.update({
+                "genre_opening_profile": {},
+                "genre_reader_contract": {},
+                "genre_rhythm_constraints": {},
+            })
+        return variables
+
     def prepare_chapter_generation(
         self,
         novel_id: str,
@@ -441,33 +496,38 @@ class AutoNovelGenerationWorkflow:
         storyline_context = self._get_storyline_context(novel_id, chapter_number)
         plot_tension = self._get_plot_tension(novel_id, chapter_number)
         evolution_gate_report = None
-        try:
-            if self.evolution_gate_service:
+        if self.evolution_gate_service:
+            try:
                 evolution_gate_report = self.evolution_gate_service.check(
                     novel_id=novel_id,
                     chapter_number=chapter_number,
                     outline_content=outline,
                     branch_id="main",
                 ).to_dict()
-                if (
-                    not allow_evolution_gate_bypass
-                    and any(
-                        v.get("level") == "blocking"
+            except Exception as e:
+                logger.error(
+                    "EvolutionGate 写前检查无法确认 novel=%s ch=%s: %s",
+                    novel_id,
+                    chapter_number,
+                    e,
+                )
+                raise EvolutionGateUnavailableError(novel_id, chapter_number, e) from e
+
+            if (
+                not allow_evolution_gate_bypass
+                and any(
+                    v.get("level") == "blocking"
+                    for v in evolution_gate_report.get("violations", [])
+                )
+            ):
+                raise RuntimeError(
+                    "evolution_gate_blocked:"
+                    + "; ".join(
+                        str(v.get("message") or "")
                         for v in evolution_gate_report.get("violations", [])
+                        if v.get("level") == "blocking"
                     )
-                ):
-                    raise RuntimeError(
-                        "evolution_gate_blocked:"
-                        + "; ".join(
-                            str(v.get("message") or "")
-                            for v in evolution_gate_report.get("violations", [])
-                            if v.get("level") == "blocking"
-                        )
-                    )
-        except Exception as e:
-            if str(e).startswith("evolution_gate_blocked:"):
-                raise
-            logger.warning("EvolutionGate 写前检查跳过 novel=%s ch=%s: %s", novel_id, chapter_number, e)
+                )
         payload = self.context_builder.build_structured_context(
             novel_id=novel_id,
             chapter_number=chapter_number,
@@ -496,6 +556,11 @@ class AutoNovelGenerationWorkflow:
             voice_anchors = self.context_builder.build_voice_anchor_system_section(novel_id)
         except Exception as e:
             logger.warning("voice_anchor section skipped: %s", e)
+        contract = self._generation_contract_variables(
+            novel_id,
+            style_summary=style_summary,
+            voice_anchors=voice_anchors,
+        )
         return {
             "storyline_context": storyline_context,
             "plot_tension": plot_tension,
@@ -504,6 +569,7 @@ class AutoNovelGenerationWorkflow:
             "context_budget_tokens": max_tokens,
             "style_summary": style_summary,
             "voice_anchors": voice_anchors,
+            **contract,
             "evolution_gate": evolution_gate_report,
             "evolution_gate_blocked": bool(
                 evolution_gate_report
@@ -588,6 +654,12 @@ class AutoNovelGenerationWorkflow:
         except Exception as e:
             logger.warning("fallback voice_anchors skipped: %s", e)
 
+        contract = self._generation_contract_variables(
+            novel_id,
+            style_summary=style_summary,
+            voice_anchors=voice_anchors,
+        )
+
         return {
             "storyline_context": storyline_context,
             "plot_tension": plot_tension,
@@ -596,6 +668,7 @@ class AutoNovelGenerationWorkflow:
             "context_budget_tokens": max_tokens,
             "style_summary": style_summary,
             "voice_anchors": voice_anchors,
+            **contract,
         }
 
     async def post_process_generated_chapter(
@@ -1240,6 +1313,10 @@ class AutoNovelGenerationWorkflow:
         storyline_context: str = "",
         plot_tension: str = "",
         style_summary: str = "",
+        novel_title: str = "",
+        genre: str = "",
+        writing_style: str = "",
+        style_guide: str = "",
         genre_opening_profile: Optional[Dict[str, Any]] = None,
         genre_reader_contract: Optional[Dict[str, Any]] = None,
         genre_rhythm_constraints: Optional[Dict[str, Any]] = None,
@@ -1257,6 +1334,10 @@ class AutoNovelGenerationWorkflow:
             storyline_context=storyline_context,
             plot_tension=plot_tension,
             style_summary=style_summary,
+            novel_title=novel_title,
+            genre=genre,
+            writing_style=writing_style,
+            style_guide=style_guide,
             genre_opening_profile=genre_opening_profile,
             genre_reader_contract=genre_reader_contract,
             genre_rhythm_constraints=genre_rhythm_constraints,
@@ -1276,6 +1357,10 @@ class AutoNovelGenerationWorkflow:
         storyline_context: str = "",
         plot_tension: str = "",
         style_summary: str = "",
+        novel_title: str = "",
+        genre: str = "",
+        writing_style: str = "",
+        style_guide: str = "",
         genre_opening_profile: Optional[Dict[str, Any]] = None,
         genre_reader_contract: Optional[Dict[str, Any]] = None,
         genre_rhythm_constraints: Optional[Dict[str, Any]] = None,
@@ -1313,6 +1398,10 @@ class AutoNovelGenerationWorkflow:
         pt = (plot_tension or "").strip()
         ss = (style_summary or "").strip()
         va = (voice_anchors or "").strip()
+        novel_title = (novel_title or "").strip()
+        genre = (genre or "").strip()
+        writing_style = (writing_style or ss).strip()
+        style_guide = (style_guide or ss).strip()
         genre_profile_payload = {
             "genre_opening_profile": genre_opening_profile or {},
             "genre_reader_contract": genre_reader_contract or {},
@@ -1452,6 +1541,14 @@ class AutoNovelGenerationWorkflow:
         # SafeDict: 用户在提示词广场编辑模板时可能引入未知变量，
         # 需要安全降级——未匹配的变量保留为 {name} 占位符，而非抛出 KeyError
         system_vars = {
+            "novel_title": novel_title,
+            "genre": genre,
+            "writing_style": writing_style,
+            "style_guide": style_guide,
+            "voice_anchors": va,
+            "genre_opening_profile": genre_opening_profile or {},
+            "genre_reader_contract": genre_reader_contract or {},
+            "genre_rhythm_constraints": genre_rhythm_constraints or {},
             "theme_persona": theme_persona,
             "theme_rules": theme_rules,
             "planning_section": planning_section,
@@ -1481,7 +1578,21 @@ class AutoNovelGenerationWorkflow:
                 "正文必须以 Bible 为准统一使用 Bible 姓名，不得继续使用大纲里的占位名。\n"
             )
 
-        user_message = _safe_format(user_template, {"outline": outline, "beat_section": ""})
+        user_message = _safe_format(
+            user_template,
+            {
+                "outline": outline,
+                "beat_section": "",
+                "novel_title": novel_title,
+                "genre": genre,
+                "writing_style": writing_style,
+                "style_guide": style_guide,
+                "voice_anchors": va,
+                "genre_opening_profile": genre_opening_profile or {},
+                "genre_reader_contract": genre_reader_contract or {},
+                "genre_rhythm_constraints": genre_rhythm_constraints or {},
+            },
+        )
 
         if beat_mode and prior_in_chapter:
             # V2：基于锚点的动态连贯性要求

@@ -61,7 +61,12 @@ class CandidateChapterWorkflowService:
         self.semantic_reviewer = semantic_reviewer
         self.max_candidate_revisions = max(0, int(max_candidate_revisions))
 
-    async def generate_next(self, novel_id: str) -> ChapterCandidate | None:
+    async def generate_next(
+        self,
+        novel_id: str,
+        *,
+        expected_generation_epoch: int | None = None,
+    ) -> ChapterCandidate | None:
         """Generate and audit only the next formal chapter slot.
 
         In review mode this ends in ``awaiting_review``.  In continuous mode
@@ -70,6 +75,11 @@ class CandidateChapterWorkflowService:
         """
 
         run = self.repository.get_run(novel_id)
+        if (
+            expected_generation_epoch is not None
+            and run.generation_epoch != int(expected_generation_epoch)
+        ):
+            raise CandidateGateError("generation run belongs to a newer generation epoch")
         if run.state != GenerationRunState.RUNNING:
             raise CandidateGateError(f"generation run is {run.state.value}; cannot generate next candidate")
         if run.current_candidate_id:
@@ -197,18 +207,38 @@ class CandidateChapterWorkflowService:
         candidate = self.repository.begin_sync_retry(candidate_id)
         return await self._sync_formal_candidate(candidate)
 
-    async def run_continuously(self, novel_id: str) -> list[ChapterCandidate]:
+    async def run_continuously(
+        self,
+        novel_id: str,
+        *,
+        expected_generation_epoch: int | None = None,
+    ) -> list[ChapterCandidate]:
         """Advance until target, a hard gate, author review, or a recoverable error."""
 
         completed: list[ChapterCandidate] = []
         while True:
             run = self.repository.get_run(novel_id)
+            if (
+                expected_generation_epoch is not None
+                and run.generation_epoch != int(expected_generation_epoch)
+            ):
+                break
             if run.state != GenerationRunState.RUNNING:
+                break
+            if expected_generation_epoch is not None and (
+                run.canonical_sync_status != "ready"
+                or run.next_action != "generate_candidate"
+                or run.current_candidate_id is not None
+                or run.current_candidate_chapter is not None
+            ):
                 break
             if run.current_formal_chapter >= run.target_chapters:
                 self.repository.complete_run(novel_id)
                 break
-            candidate = await self.generate_next(novel_id)
+            candidate = await self.generate_next(
+                novel_id,
+                expected_generation_epoch=expected_generation_epoch,
+            )
             if candidate is None:
                 break
             completed.append(candidate)

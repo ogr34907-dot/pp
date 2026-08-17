@@ -46,6 +46,26 @@ describe('getCandidateGenerationProgress', () => {
     ])
   })
 
+  it('marks outline exhaustion as a warning without an active generation step', () => {
+    const progress = getCandidateGenerationProgress({
+      state: 'waiting_planning',
+      run_mode: 'continuous',
+      current_formal_chapter: 8,
+      target_chapters: 20,
+      canonical_sync_status: 'ready',
+      next_action: 'expand_outline_cohort',
+    })
+
+    expect(progress).toMatchObject({
+      label: '等待扩展五级大纲',
+      tone: 'warning',
+      isActive: false,
+    })
+    expect(progress.steps.map(step => step.state)).toEqual([
+      'pending', 'pending', 'pending', 'pending', 'pending',
+    ])
+  })
+
   it('shows a failed canonical sync after formal writing has completed', () => {
     const progress = getCandidateGenerationProgress({
       state: 'paused',

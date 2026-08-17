@@ -93,6 +93,43 @@ async def test_legacy_required_memory_failure_pauses_without_fallback_context():
 
 
 @pytest.mark.asyncio
+async def test_legacy_evolution_gate_unavailable_pauses_without_fallback_or_llm():
+    reason = "evolution_gate_unavailable:novel-1:chapter=2:backend down"
+    host, chapter_workflow, llm_service = _legacy_host_with_required_memory_failure(
+        reason
+    )
+    novel = SimpleNamespace(
+        novel_id=SimpleNamespace(value="novel-1"),
+        current_stage=NovelStage.WRITING,
+        autopilot_status=AutopilotStatus.RUNNING,
+        target_chapters=20,
+        max_auto_chapters=100,
+        current_auto_chapters=1,
+        last_chapter_tension=0,
+        target_words_per_chapter=2500,
+    )
+
+    await run_legacy_writing(host, novel)
+
+    chapter_workflow.build_fallback_chapter_bundle.assert_not_called()
+    assert llm_service.calls == 0
+    assert novel.current_stage == NovelStage.PAUSED_FOR_REVIEW
+    assert novel.autopilot_status == AutopilotStatus.STOPPED
+    host._update_shared_state.assert_any_call(
+        "novel-1",
+        current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+        autopilot_status=AutopilotStatus.STOPPED.value,
+        paused_for_review=True,
+        writing_substep="evolution_gate_unavailable",
+        writing_substep_label="Evolution Gate unavailable; paused",
+        autopilot_pause_reason=reason,
+        evolution_gate_error=reason,
+        evolution_gate_message="novel-1:chapter=2:backend down",
+    )
+    host._flush_novel.assert_called_once_with(novel)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("target_chapters", [None, 0, True, 1.5, "invalid"])
 async def test_legacy_writing_refuses_invalid_persisted_target_chapters(target_chapters):
     host = SimpleNamespace(

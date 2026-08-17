@@ -39,6 +39,18 @@ class EvolutionGateBlockedError(RuntimeError):
         self.report = report
 
 
+class EvolutionGateUnavailableError(RuntimeError):
+    """The configured gate could not establish a continuity result."""
+
+    def __init__(self, novel_id: str, chapter_number: int, cause: BaseException):
+        self.novel_id = novel_id
+        self.chapter_number = chapter_number
+        self.cause = cause
+        super().__init__(
+            f"evolution_gate_unavailable:{novel_id}:chapter={chapter_number}:{cause}"
+        )
+
+
 class EvolutionGateService:
     def __init__(self, snapshot_repository: Any = None, character_repository: Any = None):
         self.snapshot_repository = snapshot_repository

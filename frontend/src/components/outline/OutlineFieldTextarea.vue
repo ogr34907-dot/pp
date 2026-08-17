@@ -5,6 +5,7 @@
       type="textarea"
       :rows="3"
       :placeholder="placeholder"
+      :disabled="disabled"
       @update:value="$emit('update:modelValue', $event)"
     />
   </n-form-item>
@@ -15,6 +16,7 @@ defineProps<{
   modelValue: string
   label: string
   placeholder?: string
+  disabled?: boolean
 }>()
 
 defineEmits<{ 'update:modelValue': [value: string] }>()

@@ -70,6 +70,12 @@ class OutlineContractService:
         payload = node.to_dict()
         active = slot.active if slot else None
         draft = slot.draft if slot else None
+        # Legacy trees still expose both identities.  Consumers may use the
+        # physical StoryNode id only for physical endpoints; planning actions
+        # must use the contract identity when one is bound.
+        payload["story_node_id"] = node.id
+        payload["logical_node_id"] = slot.id if slot else None
+        payload["tree_mode"] = "LEGACY_ACTIVE"
         payload["outline_contract"] = {
             "contract_id": slot.id if slot else None,
             "level": slot.level.value if slot else None,
@@ -199,6 +205,7 @@ class OutlineContractService:
                     "id": str(physical_id or row["logical_node_id"]),
                     "logical_node_id": str(row["logical_node_id"]),
                     "story_node_id": physical_id,
+                    "tree_mode": "MANIFEST_ACTIVE",
                     "novel_id": novel_id,
                     "node_type": str(row["level"]),
                     "number": int(row.get("sibling_index") or 0) + 1,
@@ -246,6 +253,9 @@ class OutlineContractService:
         draft = getattr(root, "draft", None)
         return {
             "id": root.id,
+            "logical_node_id": root.id,
+            "story_node_id": None,
+            "tree_mode": "LEGACY_ACTIVE",
             "novel_id": novel_id,
             "node_type": OutlineLevel.OUTLINE.value,
             "number": 1,
@@ -267,7 +277,12 @@ class OutlineContractService:
     def working_tree(self, novel_id: str) -> Optional[dict[str, Any]]:
         """Return the current Manifest draft tree, never the prose-active tree."""
 
-        rows = self.contract_repository.working_plan_items_with_payload(novel_id)
+        try:
+            rows = self.contract_repository.working_plan_items_with_payload(novel_id)
+        except KeyError as exc:
+            if "outline planning head not found" in str(exc):
+                return None
+            raise
         if not rows:
             return None
         by_parent: dict[Optional[str], list[dict[str, Any]]] = {}
@@ -295,6 +310,7 @@ class OutlineContractService:
                     "id",
                     "logical_node_id",
                     "story_node_id",
+                    "tree_mode",
                     "parent_logical_node_id",
                     "parent_story_node_id",
                     "novel_id",

@@ -135,6 +135,50 @@ class ChapterCandidateRepository:
             raise KeyError(f"generation run not found: {novel_id}")
         return self._run_from_row(row)
 
+    def list_resumable_generation_runs(self) -> list[GenerationRun]:
+        """Return only runs that are safe for an automatic post-startup claim."""
+
+        rows = self._connection().execute(
+            """
+            SELECT * FROM novel_generation_runs
+            WHERE state = 'running'
+              AND canonical_sync_status = 'ready'
+              AND next_action = 'generate_candidate'
+              AND current_candidate_id IS NULL
+              AND current_candidate_chapter IS NULL
+              AND current_formal_chapter < target_chapters
+            ORDER BY novel_id
+            """
+        ).fetchall()
+        return [self._run_from_row(row) for row in rows]
+
+    def record_runner_error(
+        self,
+        novel_id: str,
+        *,
+        expected_generation_epoch: int,
+        reason: str,
+    ) -> GenerationRun:
+        """Persist a runner failure without overwriting a newer worldline."""
+
+        conn = self._connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'error', next_action = 'resolve_generation_error',
+                    last_error = ?, updated_at = ?
+                WHERE novel_id = ? AND generation_epoch = ? AND state = 'running'
+                """,
+                (reason, self._now(), novel_id, int(expected_generation_epoch)),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return self.get_run(novel_id)
+
     def formal_chapter_head(self, novel_id: str) -> int:
         """Return the continuous baseline plus Candidate-first Canonical head."""
 
@@ -2719,9 +2763,22 @@ class ChapterCandidateRepository:
                     """,
                     (interruption, now, novel_id),
                 )
+            elif (
+                run.state == GenerationRunState.RUNNING
+                and run.canonical_sync_status == "ready"
+                and run.next_action == "generate_candidate"
+                and run.current_candidate_id is None
+                and run.current_candidate_chapter is None
+                and run.current_formal_chapter < run.target_chapters
+                and candidate_row is None
+            ):
+                # This exact state is the only automatically resumable point.
+                conn.commit()
+                return self.get_run(novel_id)
             else:
                 # A run can be marked running just before its candidate row is
-                # created.  Stop that orphaned run without retiring an epoch.
+                # created, or can contain a stale cursor/action. Stop it
+                # without allowing startup to infer a new Candidate.
                 conn.execute(
                     """
                     UPDATE novel_generation_runs
@@ -2852,6 +2909,60 @@ class ChapterCandidateRepository:
             conn.rollback()
             raise
         return self.get_candidate(candidate_id)
+
+    def pause_for_governance(self, novel_id: str, reason: str) -> GenerationRun:
+        """Pause the durable Candidate run at a governance review boundary."""
+
+        expected_run = self.get_run(novel_id)
+        if expected_run.current_candidate_id is not None:
+            raise CandidateGateError(
+                "governance pause requires no active Candidate; stop or finish it first"
+            )
+        now = self._now()
+        conn = self._connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            run = self._locked_run_transition(
+                conn,
+                novel_id=novel_id,
+                expected_run=expected_run,
+                allowed_states=(GenerationRunState.RUNNING,),
+            )
+            updated = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET state = 'paused', next_action = 'review_governance',
+                    last_error = ?, updated_at = ?
+                WHERE novel_id = ? AND run_mode = ? AND state = ?
+                  AND generation_epoch = ? AND target_chapters = ?
+                  AND current_formal_chapter = ? AND current_candidate_id IS NULL
+                  AND current_candidate_chapter IS NULL AND canonical_sync_status = ?
+                  AND next_action = ? AND last_error = ?
+                  AND max_pending_candidates = ? AND prefetch = ?
+                """,
+                (
+                    reason,
+                    now,
+                    novel_id,
+                    run.run_mode.value,
+                    run.state.value,
+                    run.generation_epoch,
+                    run.target_chapters,
+                    run.current_formal_chapter,
+                    run.canonical_sync_status,
+                    run.next_action,
+                    run.last_error,
+                    run.max_pending_candidates,
+                    run.prefetch,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError("generation run changed before governance pause")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return self.get_run(novel_id)
 
     def fail_run(self, novel_id: str, reason: str) -> GenerationRun:
         """Record a pre-candidate plan/context failure without inferring writing."""

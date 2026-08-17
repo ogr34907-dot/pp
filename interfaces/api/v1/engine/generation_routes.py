@@ -66,19 +66,11 @@ def get_candidate_repository() -> ChapterCandidateRepository:
 
 
 def get_candidate_workflow_service() -> CandidateChapterWorkflowService:
-    db = api_dependencies.get_database()
-    return CandidateChapterWorkflowService(
-        ChapterCandidateRepository(db),
-        OutlineContractService(
-            contract_repository=OutlineContractRepository(db),
-            story_node_repository=api_dependencies.get_story_node_repository(),
-        ),
-        api_dependencies.get_auto_workflow(),
-        api_dependencies.get_chapter_aftermath_pipeline(),
-        dag_engine=DAGEngine(),
-        dag_factory=get_default_dag,
-        semantic_reviewer=api_dependencies.get_chapter_ai_review_service(),
-    )
+    return api_dependencies.get_candidate_workflow_service()
+
+
+def get_generation_run_coordinator():
+    return api_dependencies.get_generation_run_coordinator()
 
 
 def get_generation_start_preflight(
@@ -154,12 +146,39 @@ def _raise_candidate_error(exc: Exception) -> None:
     raise exc
 
 
+def _claim_continuous_runner_or_fail(
+    repository: ChapterCandidateRepository,
+    coordinator: Any,
+    novel_id: str,
+) -> bool:
+    """Keep ``running`` durable state coupled to an actual in-process runner."""
+
+    run = repository.get_run(novel_id)
+    if run.run_mode != RunMode.CONTINUOUS:
+        return False
+    claimed = bool(coordinator.claim(novel_id))
+    if claimed:
+        return True
+    current = repository.get_run(novel_id)
+    if current.state.value == "running" and current.generation_epoch == run.generation_epoch:
+        repository.record_runner_error(
+            novel_id,
+            expected_generation_epoch=run.generation_epoch,
+            reason="generation_runner_claim_failed",
+        )
+        raise CandidateWorkflowError(
+            "generation runner claim failed; the durable run was moved to error"
+        )
+    return False
+
+
 @router.post("/novels/{novel_id}/start")
-def start_generation_run(
+async def start_generation_run(
     novel_id: str,
     body: StartGenerationRequest,
     repository: ChapterCandidateRepository = Depends(get_candidate_repository),
     preflight: GenerationStartPreflight = Depends(get_generation_start_preflight),
+    coordinator=Depends(get_generation_run_coordinator),
 ):
     try:
         try:
@@ -168,6 +187,8 @@ def start_generation_run(
             raise HTTPException(status_code=422, detail="run_mode must be continuous or chapter_review") from exc
         preflight.ensure_startable(novel_id)
         run = repository.start_run(novel_id, run_mode=mode)
+        if mode == RunMode.CONTINUOUS:
+            _claim_continuous_runner_or_fail(repository, coordinator, novel_id)
         return {"success": True, "data": _run_to_dict(run)}
     except HTTPException:
         raise
@@ -374,17 +395,20 @@ async def generate_next_candidate(
 @router.post("/novels/{novel_id}/run-continuous")
 async def run_continuous_generation(
     novel_id: str,
-    service: CandidateChapterWorkflowService = Depends(get_candidate_workflow_service),
+    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
+    coordinator=Depends(get_generation_run_coordinator),
 ):
-    """Advance until target or the first authoritative pause/error/review gate."""
+    """Claim the durable runner and return immediately with authoritative state."""
 
     try:
-        candidates = await service.run_continuously(novel_id)
+        claimed = _claim_continuous_runner_or_fail(repository, coordinator, novel_id)
+        run = repository.get_run(novel_id)
         return {
             "success": True,
             "data": {
-                "candidates": [_candidate_to_dict(candidate) for candidate in candidates],
-                "state": _run_to_dict(service.repository.get_run(novel_id)),
+                "candidates": [],
+                "claimed": claimed,
+                "state": _run_to_dict(run),
             },
         }
     except Exception as exc:
@@ -396,17 +420,23 @@ async def approve_and_commit_candidate(
     candidate_id: str,
     body: ApprovalRequest,
     service: CandidateChapterWorkflowService = Depends(get_candidate_workflow_service),
+    repository: ChapterCandidateRepository = Depends(get_candidate_repository),
 ):
     """The only public approval path that also runs canonical aftermath sync."""
 
     try:
+        candidate = await service.accept_candidate(
+            candidate_id, continue_after_commit=body.continue_after_commit
+        )
+        if body.continue_after_commit:
+            _claim_continuous_runner_or_fail(
+                repository,
+                api_dependencies.get_generation_run_coordinator(),
+                candidate.novel_id,
+            )
         return {
             "success": True,
-            "data": _candidate_to_dict(
-                await service.accept_candidate(
-                    candidate_id, continue_after_commit=body.continue_after_commit
-                )
-            ),
+            "data": _candidate_to_dict(candidate),
         }
     except Exception as exc:
         _raise_candidate_error(exc)
@@ -451,9 +481,11 @@ async def retry_candidate_canonical_sync(
     service: CandidateChapterWorkflowService = Depends(get_candidate_workflow_service),
 ):
     try:
+        candidate = await service.retry_canonical_sync(candidate_id)
+        api_dependencies.get_generation_run_coordinator().claim(candidate.novel_id)
         return {
             "success": True,
-            "data": _candidate_to_dict(await service.retry_canonical_sync(candidate_id)),
+            "data": _candidate_to_dict(candidate),
         }
     except Exception as exc:
         _raise_candidate_error(exc)

@@ -8,6 +8,7 @@ from application.workflows.auto_novel_generation_workflow import (
     CHAPTER_CONTEXT_LAYER3_HEADER,
     assemble_chapter_bundle_context_text,
 )
+from application.evolution.services.gate_service import EvolutionGateUnavailableError
 from infrastructure.ai.prompt_utils import PromptTemplateUnavailable
 from application.engine.dtos.generation_result import GenerationResult
 from application.engine.dtos.scene_director_dto import SceneDirectorAnalysis
@@ -171,6 +172,17 @@ def test_prepare_chapter_generation_reports_originating_context_budget(workflow)
     )
 
     assert bundle["context_budget_tokens"] == 12345
+
+
+def test_prepare_chapter_generation_surfaces_evolution_gate_unavailable(workflow):
+    workflow.evolution_gate_service = Mock(
+        check=Mock(side_effect=RuntimeError("backend down"))
+    )
+
+    with pytest.raises(EvolutionGateUnavailableError, match="evolution_gate_unavailable"):
+        workflow.prepare_chapter_generation("novel-1", 4, "本章大纲")
+
+    workflow.context_builder.build_structured_context.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -70,8 +70,9 @@ class PipelineContext:
     generation_interrupted: bool = False         # stop/restart 导致本步骤中断
 
     # ═══ 步骤5产出：策略验证 ═══
-    validation_passed: bool = True
-    validation_score: float = 0.0
+    validation_passed: bool = False
+    validation_score: Optional[float] = None
+    validation_status: str = "UNEVALUATED"
     validation_violations: List[Dict[str, Any]] = field(default_factory=list)
     validation_suggestions: List[str] = field(default_factory=list)
     validation_dimensions: Dict[str, float] = field(default_factory=dict)  # 各维度分数
@@ -187,8 +188,12 @@ class PipelineResult:
     tension: int = 0                            # 0-100
     drift_alert: bool = False
     similarity_score: Optional[float] = None
-    validation_score: float = 0.0
-    validation_passed: bool = True
+    validation_score: Optional[float] = None
+    validation_status: str = "UNEVALUATED"
+    validation_passed: bool = False
+    validation_violations: List[Dict[str, Any]] = field(default_factory=list)
+    validation_suggestions: List[str] = field(default_factory=list)
+    validation_dimensions: Dict[str, float] = field(default_factory=dict)
     narrative_sync_ok: bool = False
     error: Optional[str] = None
 
@@ -206,9 +211,14 @@ class PipelineResult:
             "tension": self.tension,
             "drift_alert": self.drift_alert,
             "similarity_score": self.similarity_score,
-            "validation_score": round(self.validation_score, 3),
+            "validation_score": round(self.validation_score, 3) if self.validation_score is not None else None,
+            "validation_status": self.validation_status,
             "validation_passed": self.validation_passed,
+            "validation_violations": self.validation_violations,
+            "validation_suggestions": self.validation_suggestions,
+            "validation_dimensions": self.validation_dimensions,
             "narrative_sync_ok": self.narrative_sync_ok,
             "error": self.error,
+            "audit_snapshot": self.audit_snapshot,
             "step_status": self.step_status,
         }

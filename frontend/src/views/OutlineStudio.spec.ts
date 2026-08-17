@@ -471,4 +471,45 @@ describe('OutlineStudio request and payload isolation', () => {
     }))
     expect(mocks.saveDraft).not.toHaveBeenCalled()
   })
+
+  it('keeps Manifest Active nodes read-only while allowing the next cohort action', async () => {
+    const active = {
+      ...node('manifest-part', 'contract-part'),
+      node_type: 'part',
+      logical_node_id: 'logical-part',
+      story_node_id: 'story-part',
+      tree_mode: 'MANIFEST_ACTIVE',
+      status: 'synced',
+      outline_contract: { contract_id: 'contract-part', status: 'synced' },
+    }
+    const current = {
+      ...contract('contract-part', { title: '第一部' }),
+      active: {
+        revision: 1,
+        status: 'synced',
+        source: 'author',
+        digest: 'part-v1',
+        payload: { title: '第一部' },
+      },
+      draft: null,
+    }
+    const root = node('root')
+    root.tree_mode = 'MANIFEST_ACTIVE'
+    root.children = [active]
+    mocks.getTree.mockResolvedValue(root)
+    mocks.getWorkingTree.mockResolvedValue(null)
+    mocks.getContract.mockResolvedValue(current)
+    mocks.expandCohort.mockResolvedValue({ attempt: { id: 'attempt-1', status: 'completed' } })
+
+    const state = await setupStudio()
+    await state.loadTree()
+    await state.selectNode(active)
+
+    expect(state.canEditSelectedNode).toBe(false)
+    expect(state.canGenerateNextCohort).toBe(true)
+    await state.saveDraft()
+    await state.runDraftStream()
+    expect(mocks.saveDraft).not.toHaveBeenCalled()
+    expect(mocks.consumeOutlineDraftStream).not.toHaveBeenCalled()
+  })
 })

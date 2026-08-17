@@ -24,6 +24,10 @@ def _audit_pause_gate(
 ) -> bool:
     if not canonical_ready:
         return True
+    if auto and (hard_fail or anti_ai_severe):
+        return True
+    if auto:
+        return False
     return (not auto) and (
         bool(getattr(prefs, "pause_after_each_chapter_audit", False))
         or (

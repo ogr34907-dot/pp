@@ -79,6 +79,64 @@ def test_story_pipeline_runner_marks_writing_context_as_requiring_narrative_memo
     assert context.metadata["requires_narrative_memory"] is True
 
 
+def test_story_pipeline_runner_marks_memory_orchestrator_ready(monkeypatch):
+    class _MemoryOrchestrator:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        "engine.infrastructure.memory.memory_orchestrator_impl.MemoryOrchestratorImpl",
+        _MemoryOrchestrator,
+    )
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_connection_pool",
+        lambda: object(),
+    )
+    runner = StoryPipelineRunner(
+        novel_repository=object(),
+        llm_service=object(),
+        context_builder=None,
+        background_task_service=None,
+        planning_service=None,
+        story_node_repo=None,
+        chapter_repository=None,
+        use_story_pipeline_for_writing=True,
+    )
+
+    context = runner._make_context("novel-1", chapter_number=1)
+
+    assert context.metadata["memory_orchestrator_status"] == "READY"
+
+
+def test_story_pipeline_runner_marks_memory_orchestrator_degraded(monkeypatch):
+    def _raise(**_kwargs):
+        raise RuntimeError("memory backend unavailable")
+
+    monkeypatch.setattr(
+        "engine.infrastructure.memory.memory_orchestrator_impl.MemoryOrchestratorImpl",
+        _raise,
+    )
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.connection.get_connection_pool",
+        lambda: object(),
+    )
+    runner = StoryPipelineRunner(
+        novel_repository=object(),
+        llm_service=object(),
+        context_builder=None,
+        background_task_service=None,
+        planning_service=None,
+        story_node_repo=None,
+        chapter_repository=None,
+        use_story_pipeline_for_writing=True,
+    )
+
+    context = runner._make_context("novel-1", chapter_number=1)
+
+    assert context.metadata["memory_orchestrator_status"] == "DEGRADED"
+    assert context.metadata["memory_orchestrator_error"] == "memory backend unavailable"
+
+
 def test_parent_volume_selection_does_not_overflow_last_full_volume():
     volumes = [
         SimpleNamespace(id="volume-1", number=1),
@@ -329,4 +387,3 @@ async def test_summary_trigger_skips_completed_part_with_current_runtime_summary
     await host._maybe_generate_summaries(novel, completed_count=1)
 
     assert summary_service.generated_part_numbers == []
-

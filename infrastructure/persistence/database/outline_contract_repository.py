@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import logging
 import sqlite3
 from typing import Any, Callable, Mapping, Optional, Sequence, Union
 from uuid import uuid4
@@ -39,6 +40,9 @@ from infrastructure.persistence.database.planning_authority_guard import (
 
 class OutlineGateError(ValueError):
     """Raised when an operation would bypass the published plan gate."""
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -825,6 +829,7 @@ class OutlineContractRepository:
                     "id": story_node_id or str(row["logical_node_id"]),
                     "item_id": str(row["item_id"]),
                     "logical_node_id": str(row["logical_node_id"]),
+                    "tree_mode": "MANIFEST_WORKING",
                     "novel_id": str(row["novel_id"]),
                     "story_node_id": story_node_id,
                     "parent_story_node_id": row["parent_story_node_id"],
@@ -3493,6 +3498,197 @@ class OutlineContractRepository:
 
     def cancel_manifest_cohort_attempt(self, attempt_id: str) -> dict[str, Any]:
         return self._finish_manifest_cohort_attempt(attempt_id, status="cancelled")
+
+    def _manifest_cohort_attempt_completion_error(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> Optional[str]:
+        """Return a blocker when a restarted attempt has no complete Working Plan."""
+
+        plan_revision_id = str(row["plan_revision_id"])
+        parent_logical_node_id = str(row["parent_logical_node_id"])
+        level = OutlineLevel(str(row["level"]))
+        plan = self.get_plan_revision(plan_revision_id, _connection=conn)
+        head = self.get_planning_head(plan.novel_id)
+        if head.authority_mode != PlanningAuthorityMode.MANIFEST:
+            return "manifest planning authority is unavailable"
+        if head.working_plan_revision_id != plan.id:
+            return "Working Plan is no longer the manifest working revision"
+        if plan.sealed_at or plan.status not in {
+            PlanRevisionStatus.DRAFT,
+            PlanRevisionStatus.GENERATING,
+            PlanRevisionStatus.VALIDATING,
+        }:
+            return "Working Plan is no longer editable"
+
+        scope = json.loads(row["scope_json"] or "{}")
+        if not isinstance(scope, dict):
+            return "cohort attempt scope is invalid"
+        if str(scope.get("parent_logical_node_id") or "") != parent_logical_node_id:
+            return "cohort attempt parent scope changed"
+
+        parent = next(
+            (item for item in plan.items if item.logical_node_id == parent_logical_node_id),
+            None,
+        )
+        if parent is None:
+            return "cohort attempt parent is missing from Working Plan"
+        if parent.level.child_level != level:
+            return "cohort attempt level no longer belongs to its parent"
+        if str(scope.get("parent_version_digest") or "") != parent.version_digest:
+            return "Working Plan parent digest does not match attempt scope"
+
+        children = tuple(
+            item
+            for item in plan.items
+            if item.parent_logical_node_id == parent_logical_node_id
+            and item.level == level
+        )
+        if not children:
+            return "Working Plan cohort children are incomplete"
+
+        # The cohort write itself changes the Working Plan digest.  The
+        # attempt scope pins the pre-call digest; once direct children exist,
+        # the new digest is expected and the structural validators below are
+        # the authority for deciding whether the write is complete.
+
+        normalized = self._validate_plan_items(plan.novel_id, plan.items, conn=conn)
+        self._validate_plan_cohorts(conn, normalized)
+        self._validate_plan_projection_bindings(conn, plan, allow_unmaterialized=True)
+        return None
+
+    def recover_manifest_cohort_attempt_after_service_restart(
+        self,
+        attempt_id: str,
+        *,
+        reason: str = "service_restart_interrupted",
+    ) -> dict[str, Any]:
+        """Close one orphaned Cohort attempt without creating outline children.
+
+        A process may die after the Working Plan transaction commits but before
+        the attempt row is marked complete.  Recovery treats the durable plan as
+        authoritative and only changes the attempt status.
+        """
+
+        conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("manifest cohort recovery requires a clean connection")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM outline_plan_cohort_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"outline cohort attempt not found: {attempt_id}")
+            old_status = str(row["status"])
+            if old_status != "running":
+                conn.commit()
+                return self.get_manifest_cohort_attempt(attempt_id)
+
+            try:
+                blocker = self._manifest_cohort_attempt_completion_error(conn, row)
+            except Exception as exc:
+                blocker = str(exc)
+            new_status = "completed" if blocker is None else "failed"
+            error = "" if blocker is None else reason
+            now = self._now()
+            updated = conn.execute(
+                """
+                UPDATE outline_plan_cohort_attempts
+                SET status = ?, error = ?, completed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (new_status, error, now, now, attempt_id),
+            )
+            if updated.rowcount != 1:
+                raise OutlineGateError("manifest cohort attempt changed during recovery")
+            event = {
+                "type": "recovered",
+                "reason": reason,
+                "old_status": old_status,
+                "new_status": new_status,
+            }
+            if blocker:
+                event["blocker"] = blocker
+            self._append_manifest_cohort_attempt_event(conn, attempt_id, event)
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        return self.get_manifest_cohort_attempt(attempt_id)
+
+    def recover_manifest_cohort_attempts_after_service_restart(
+        self,
+        *,
+        reason: str = "service_restart_interrupted",
+    ) -> list[dict[str, Any]]:
+        """Recover every running Cohort attempt exactly once, per novel."""
+
+        conn = self._connection()
+        rows = conn.execute(
+            """
+            SELECT attempt.id, attempt.plan_revision_id,
+                   attempt.parent_logical_node_id, attempt.level,
+                   revision.novel_id
+            FROM outline_plan_cohort_attempts AS attempt
+            JOIN outline_plan_revisions AS revision
+              ON revision.id = attempt.plan_revision_id
+            WHERE attempt.status = 'running'
+            ORDER BY revision.novel_id, attempt.created_at, attempt.id
+            """
+        ).fetchall()
+        recovered: list[dict[str, Any]] = []
+        by_novel: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            by_novel.setdefault(str(row["novel_id"]), []).append(row)
+        for novel_id, novel_rows in by_novel.items():
+            try:
+                for row in novel_rows:
+                    attempt = self.recover_manifest_cohort_attempt_after_service_restart(
+                        str(row["id"]), reason=reason
+                    )
+                    result = {
+                        "attempt_id": str(attempt["id"]),
+                        "novel_id": novel_id,
+                        "plan_revision_id": str(attempt["plan_revision_id"]),
+                        "parent_logical_node_id": str(attempt["parent_logical_node_id"]),
+                        "level": str(attempt["level"]),
+                        "old_status": "running",
+                        "new_status": str(attempt["status"]),
+                        "reason": reason,
+                        "attempt": attempt,
+                    }
+                    recovered.append(result)
+                    logger.info(
+                        "Startup: recovered cohort attempt=%s novel=%s plan=%s parent=%s "
+                        "level=%s old_status=%s new_status=%s reason=%s",
+                        result["attempt_id"],
+                        result["novel_id"],
+                        result["plan_revision_id"],
+                        result["parent_logical_node_id"],
+                        result["level"],
+                        result["old_status"],
+                        result["new_status"],
+                        result["reason"],
+                    )
+            except Exception:
+                logger.exception(
+                    "Startup: cohort recovery isolated failure novel=%s reason=%s",
+                    novel_id,
+                    reason,
+                )
+        return recovered
+
+    # Short alias used by startup orchestration and compatible with the other
+    # persistence recovery entry points in this repository.
+    def recover_all_manifest_cohort_attempts_after_service_restart(
+        self,
+        *,
+        reason: str = "service_restart_interrupted",
+    ) -> list[dict[str, Any]]:
+        return self.recover_manifest_cohort_attempts_after_service_restart(reason=reason)
 
     def get_manifest_cohort_attempt(
         self,

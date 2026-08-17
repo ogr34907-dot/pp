@@ -10,6 +10,13 @@
       </span>
     </header>
     <p class="generation-launcher__description">{{ presentation?.detail || '发布并同步总纲、部纲、卷纲、幕纲和章纲后，再选择运行方式。' }}</p>
+    <RouterLink
+      v-if="presentation?.cta?.target === 'outline'"
+      class="generation-launcher__cta"
+      :to="`/book/${novelId}/outline`"
+    >
+      {{ presentation?.cta?.label }}
+    </RouterLink>
     <n-alert v-if="error" type="error" :show-icon="true" role="alert">{{ error }}</n-alert>
     <div class="generation-launcher__modes" role="radiogroup" aria-label="自动驾驶模式">
       <button type="button" class="generation-mode" :class="{ 'is-selected': mode === 'continuous' }" role="radio" :aria-checked="mode === 'continuous'" @click="mode = 'continuous'">

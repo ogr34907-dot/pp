@@ -71,11 +71,38 @@ class ChapterProseInvocationComposer:
             header="ADDITIONAL CONTINUITY",
             total_budget=context_budget,
         )
-        return {
+        variables: dict[str, Any] = {
+            "novel_title": request.novel_title,
+            "genre": request.genre or metadata.get("genre") or metadata.get("genre_label") or "",
+            "writing_style": metadata.get("writing_style") or metadata.get("style_summary") or request.style_guide,
+            "style_guide": metadata.get("style_guide") or request.style_guide,
+            "voice_anchors": metadata.get("voice_anchors") or request.style_guide,
+            "genre_opening_profile": {},
+            "genre_reader_contract": {},
+            "genre_rhythm_constraints": {},
             "target_words": int(request.target_words or 2500),
             "chapter_outline": request.outline,
             "continuity_context": continuity_context,
         }
+        genre = str(variables["genre"] or "").strip()
+        profile = None
+        if genre:
+            try:
+                from application.core.taxonomy.opening_profiles import resolve_opening_profile
+
+                profile = resolve_opening_profile(genre, strict=False)
+            except Exception:
+                profile = None
+        if profile is not None:
+            variables.update(profile.as_variables())
+        for key in (
+            "genre_opening_profile",
+            "genre_reader_contract",
+            "genre_rhythm_constraints",
+        ):
+            if key in metadata:
+                variables[key] = metadata[key] or {}
+        return variables
 
     @staticmethod
     def _max_output_tokens(request: ProseCompositionRequest) -> int:

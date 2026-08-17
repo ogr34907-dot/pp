@@ -82,4 +82,5 @@ class WuxiaPipeline(ThemedStoryPipeline):
                     "suggestion": "替换为古白话表达",
                 })
 
+        self._refresh_validation_status(ctx)
         return result

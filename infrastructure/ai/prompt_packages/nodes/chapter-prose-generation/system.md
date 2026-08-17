@@ -18,6 +18,16 @@
 2. 段落拆分均匀舒适，全程无大段堆积文本，贴合网文排版逻辑。
 3. 严格依照细纲结尾收束剧情，不续写后续、不额外留白、不私自新增伏笔。
 
+【作品与类型约束】
+作品标题：{novel_title}
+题材：{genre}
+写作风格：{writing_style}
+风格指南：{style_guide}
+声线锚点：{voice_anchors}
+类型开篇画像：{genre_opening_profile}
+读者契约：{genre_reader_contract}
+节奏约束：{genre_rhythm_constraints}
+
 四、绝对禁止条例
 1. 禁止脱离细纲自创核心剧情、人物决策、主线伏笔。
 2. 禁止篡改细纲事件顺序、对话核心、爽点设计与人物状态。

@@ -17,6 +17,7 @@ export interface GenerationPresentation {
   detail: string
   tone: GenerationPresentationTone
   isActive: boolean
+  cta?: { label: string; target: 'outline' }
 }
 
 function clean(value?: string | null): string {
@@ -67,6 +68,16 @@ export function getGenerationPresentation(input: GenerationPresentationInput | n
       detail: '未通过前不会生成下一章，也不会消耗下一章 Token。',
       tone: 'warning',
       isActive: false,
+    }
+  }
+  if (state === 'waiting_planning') {
+    return {
+      key: 'waiting_planning',
+      label: '等待扩展五级大纲',
+      detail: '当前规划已用完，需要生成并发布下一批大纲。',
+      tone: 'warning',
+      isActive: false,
+      cta: { label: '大纲扩展', target: 'outline' },
     }
   }
   if (state === 'running') {

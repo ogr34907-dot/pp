@@ -3,7 +3,7 @@ import { fetchJson, fetchUrl, HttpError } from './http'
 
 export type RunMode = 'continuous' | 'chapter_review'
 export type GenerationRunState =
-  | 'idle' | 'running' | 'waiting_review' | 'paused' | 'stopped' | 'completed' | 'error'
+  | 'idle' | 'running' | 'waiting_planning' | 'waiting_review' | 'paused' | 'stopped' | 'completed' | 'error'
 export type CandidateStatus =
   | 'streaming' | 'auditing' | 'awaiting_review' | 'committing' | 'syncing' | 'committed'
   | 'stale' | 'regenerating' | 'rejected' | 'failed' | 'cancelled'
@@ -54,8 +54,9 @@ export interface OutlineContract {
 
 export interface OutlineTreeNode {
   id: string
-  logical_node_id?: string
+  logical_node_id?: string | null
   story_node_id?: string | null
+  tree_mode?: 'LEGACY_ACTIVE' | 'MANIFEST_ACTIVE' | 'MANIFEST_WORKING' | string
   novel_id: string
   node_type: 'outline' | 'part' | 'volume' | 'act' | 'chapter' | string
   number?: number
@@ -214,7 +215,7 @@ export const generationApi = {
   generateNext: (novelId: string) =>
     unwrap<ChapterCandidate | null>(apiRoutes.generation.generateNext(novelId), { method: 'POST' }),
   runContinuous: (novelId: string) =>
-    unwrap<{ candidates: ChapterCandidate[]; state: GenerationRun }>(
+    unwrap<{ candidates: ChapterCandidate[]; claimed: boolean; state: GenerationRun }>(
       apiRoutes.generation.runContinuous(novelId), { method: 'POST' },
     ),
   stop: (novelId: string) => unwrap<GenerationRun>(apiRoutes.generation.stop(novelId), { method: 'POST' }),
@@ -275,11 +276,11 @@ export const outlineApi = {
   }),
   expandCohort: (
     novelId: string,
-    request: { logical_node_id?: string; id?: string; level: 'part' | 'volume' | 'act' | 'chapter'; author_payloads?: OutlinePayload[] },
+    request: { logical_node_id: string; id?: string; level: 'part' | 'volume' | 'act' | 'chapter'; author_payloads?: OutlinePayload[] },
   ) => unwrap<Record<string, unknown>>(apiRoutes.outline.cohortExpand(novelId), {
     method: 'POST',
     body: {
-      parent_logical_node_id: request.logical_node_id || '',
+      parent_logical_node_id: request.logical_node_id,
       level: request.level,
       author_payloads: request.author_payloads || [],
     },

@@ -19,6 +19,13 @@ CONTINUATION_HANDLER_KEY = "chapter_generate_prose_commit"
 def chapter_prose_input_bindings() -> list[VariableBinding]:
     return [
         VariableBinding("novel_title", "novel.setup.title", False, "", scope="novel", stage="setup", display_name="小说标题"),
+        VariableBinding("genre", "novel.setup.genre", False, "", scope="novel", stage="setup", display_name="题材"),
+        VariableBinding("writing_style", "novel.generation.writing_style", False, "", scope="novel", stage="writing", display_name="写作风格"),
+        VariableBinding("style_guide", "novel.generation.style_guide", False, "", scope="novel", stage="writing", display_name="风格指南"),
+        VariableBinding("voice_anchors", "novel.generation.voice_anchors", False, "", scope="novel", stage="writing", display_name="声线锚点"),
+        VariableBinding("genre_opening_profile", "novel.taxonomy.opening_profile", False, {}, scope="novel", stage="planning", value_type="object", display_name="类型开篇画像"),
+        VariableBinding("genre_reader_contract", "novel.taxonomy.reader_contract", False, {}, scope="novel", stage="planning", value_type="object", display_name="读者契约"),
+        VariableBinding("genre_rhythm_constraints", "novel.taxonomy.rhythm_constraints", False, {}, scope="novel", stage="planning", value_type="object", display_name="节奏约束"),
         VariableBinding("target_words", "chapter.target_words", False, 2500, scope="chapter", stage="writing", value_type="integer", display_name="文章目标字数"),
         VariableBinding("chapter_outline", "chapter.outline", False, "", scope="chapter", stage="writing", display_name="正文细纲"),
         VariableBinding("continuity_context", "chapter.continuity_context", False, "", scope="chapter", stage="writing", display_name="连续性上下文"),

@@ -124,8 +124,10 @@ class StoryPipelineRunner(DaemonHostMixin, BaseStoryPipeline):
                 db_pool=get_connection_pool(),
                 llm_service=self.llm_service,
             )
-        except Exception:
-            pass
+            ctx.metadata["memory_orchestrator_status"] = "READY"
+        except Exception as exc:
+            ctx.metadata["memory_orchestrator_status"] = "DEGRADED"
+            ctx.metadata["memory_orchestrator_error"] = str(exc)
 
         return ctx
 

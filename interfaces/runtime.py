@@ -169,6 +169,7 @@ class BackendLifecycle:
         """Run graceful shutdown hooks shared by uvicorn and desktop shutdown."""
         if self._start_force_exit_watchdog is not None:
             self._start_force_exit_watchdog()
+        self._stop_generation_runner()
         self._stop_daemon()
         self.stop_background_tasks()
         self.stop_persistence_consumer()
@@ -326,7 +327,9 @@ class BackendLifecycle:
                     self._logger.info("Startup: novels table is not present; skipping running-novel reset")
                     return
 
+                self._recover_manifest_cohort_attempts(db)
                 self._recover_candidate_generation_runs(db)
+                self._start_generation_runner()
 
                 cnt_row = db.fetch_one(
                     "SELECT COUNT(*) AS c FROM novels WHERE autopilot_status = 'running'"
@@ -398,6 +401,44 @@ class BackendLifecycle:
                     exc_info=True,
                 )
                 return
+
+    def _recover_manifest_cohort_attempts(self, db: Any) -> None:
+        """Close orphaned Manifest cohort attempts before Candidate recovery."""
+
+        try:
+            from infrastructure.persistence.database.outline_contract_repository import (
+                OutlineContractRepository,
+            )
+
+            recovered = OutlineContractRepository(db).recover_all_manifest_cohort_attempts_after_service_restart()
+            if recovered:
+                self._logger.info(
+                    "Startup: reconciled %s manifest cohort attempts after service restart",
+                    len(recovered),
+                )
+        except Exception as exc:
+            self._logger.warning(
+                "Startup: manifest cohort recovery skipped: %s",
+                exc,
+            )
+
+    def _start_generation_runner(self) -> None:
+        try:
+            from interfaces.api.dependencies import get_generation_run_coordinator
+
+            get_generation_run_coordinator().start_resumable()
+        except Exception as exc:
+            self._logger.warning("Startup: generation runner claim skipped: %s", exc)
+
+    def _stop_generation_runner(self) -> None:
+        try:
+            from interfaces.api.dependencies import (
+                shutdown_generation_run_coordinator_if_initialized,
+            )
+
+            shutdown_generation_run_coordinator_if_initialized()
+        except Exception as exc:
+            self._logger.warning("Shutdown: generation runner cleanup skipped: %s", exc)
 
     def recover_drafts(self) -> None:
         try:

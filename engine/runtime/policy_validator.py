@@ -9,7 +9,23 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from engine.validation_status import (
+    ADVISORY_FAIL,
+    HARD_FAIL,
+    PASS,
+    UNEVALUATED,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _is_hard_violation(violation: Any) -> bool:
+    severity = violation.get("severity") if isinstance(violation, dict) else violation
+    if isinstance(severity, (int, float)):
+        return float(severity) >= 0.75
+    return str(severity or "").strip().lower() in {
+        "critical", "error", "hard", "high", "严重", "致命"
+    }
 
 
 class PolicyReport:
@@ -17,10 +33,12 @@ class PolicyReport:
 
     def __init__(
         self,
-        overall_score: float = 0.0,
+        overall_score: Optional[float] = None,
         dimensions: Optional[Dict[str, float]] = None,
         violations: Optional[List[Dict[str, Any]]] = None,
         passed: bool = False,
+        status: Optional[str] = None,
+        suggestions: Optional[List[str]] = None,
     ):
         self.overall_score = overall_score
         self.language_style_score = (dimensions or {}).get("language_style", 0.0)
@@ -30,11 +48,22 @@ class PolicyReport:
         self.viewpoint_score = (dimensions or {}).get("viewpoint", 0.0)
         self.rhythm_score = (dimensions or {}).get("rhythm", 0.0)
         self.all_violations = violations or []
-        self.passed = passed
+        self.suggestions = suggestions or []
+        self.status = status or (
+            PASS
+            if passed
+            else (
+                HARD_FAIL
+                if (overall_score is not None and overall_score < 0.4)
+                or any(_is_hard_violation(v) for v in self.all_violations)
+                else ADVISORY_FAIL
+            )
+        )
+        self.passed = self.status == PASS
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "overall_score": round(self.overall_score, 3),
+            "overall_score": round(self.overall_score, 3) if self.overall_score is not None else None,
             "scores": {
                 "language_style": round(self.language_style_score, 3),
                 "character_consistency": round(self.character_consistency_score, 3),
@@ -46,16 +75,19 @@ class PolicyReport:
             "violation_count": len(self.all_violations),
             "violations": self.all_violations,
             "passed": self.passed,
+            "status": self.status,
+            "suggestions": self.suggestions,
         }
 
 
 class PolicyViolationError(Exception):
     """策略违规异常（对应 QualityViolationError）"""
 
-    def __init__(self, violations: List[Dict[str, Any]], overall_score: float):
+    def __init__(self, violations: List[Dict[str, Any]], overall_score: Optional[float]):
         self.violations = violations
         self.overall_score = overall_score
-        message = f"策略验证不通过(评分{overall_score:.2f})，共{len(violations)}项违规"
+        score = f"{overall_score:.2f}" if overall_score is not None else "unavailable"
+        message = f"策略验证不通过(评分{score})，共{len(violations)}项违规"
         super().__init__(message)
 
 
@@ -141,20 +173,23 @@ class PolicyValidator:
                 )
             except Exception as e:
                 logger.warning(f"QualityGuardrail.check 失败: {e}")
+                return PolicyReport(
+                    overall_score=None,
+                    dimensions={},
+                    violations=[
+                        {"type": "validator_unavailable", "description": str(e)}
+                    ],
+                    status=UNEVALUATED,
+                )
 
-        # 降级：返回默认通过
+        # 护栏不可用时只记录未评估，绝不伪造分数或通过状态。
         return PolicyReport(
-            overall_score=0.85,
-            dimensions={
-                "language_style": 0.85,
-                "character_consistency": 0.9,
-                "plot_density": 0.8,
-                "naming": 0.95,
-                "viewpoint": 0.85,
-                "rhythm": 0.8,
-            },
-            violations=[],
-            passed=True,
+            overall_score=None,
+            dimensions={},
+            violations=[
+                {"type": "validator_unavailable", "description": "QualityGuardrail 不可用"}
+            ],
+            status=UNEVALUATED,
         )
 
     def enforce(
@@ -191,7 +226,11 @@ class PolicyValidator:
         )
 
         threshold = min_score or self._min_pass_score
-        if report.overall_score < threshold:
+        if (
+            report.status != PASS
+            or report.overall_score is None
+            or report.overall_score < threshold
+        ):
             raise PolicyViolationError(
                 violations=report.all_violations,
                 overall_score=report.overall_score,

@@ -149,9 +149,18 @@ class DaemonHostMixin:
 
     def _get_active_novels(self) -> List[Novel]:
         """获取所有活跃小说（DB + 共享内存，避免 DB 与前端状态短暂不一致时漏捞）"""
+        candidate_novel_ids = self._candidate_run_novel_ids()
+        if candidate_novel_ids is None:
+            logger.error("Candidate Run authority lookup failed; daemon will fail closed")
+            return []
         running = self.novel_repository.find_by_autopilot_status(
             AutopilotStatus.RUNNING.value
         )
+        running = [
+            novel
+            for novel in running
+            if novel.novel_id.value not in candidate_novel_ids
+        ]
         seen = {n.novel_id.value for n in running}
 
         try:
@@ -162,6 +171,8 @@ class DaemonHostMixin:
             shared_repo = get_shared_state_repository()
             for nid in shared_repo.get_all_novel_ids():
                 if nid in seen:
+                    continue
+                if nid in candidate_novel_ids:
                     continue
                 state = shared_repo.get_novel_state(nid)
                 if not state or state.autopilot_status != AutopilotStatus.RUNNING.value:
@@ -180,6 +191,49 @@ class DaemonHostMixin:
             logger.debug("合并共享内存 running 小说失败（可忽略）: %s", e)
 
         return running
+
+    def _candidate_run_novel_ids(self) -> Optional[set[str]]:
+        """Return Candidate-owned novels, or ``None`` when authority is unreadable.
+
+        An old database without the Candidate migration returns an empty set so
+        the legacy status remains the compatibility fallback.  Any other read
+        failure fails closed and must never be treated as an old database.
+        """
+
+        db = getattr(getattr(self, "chapter_repository", None), "db", None)
+        if db is None:
+            try:
+                from application.paths import get_db_path
+                from infrastructure.persistence.database.connection import get_database
+
+                db = get_database(get_db_path())
+            except Exception as exc:
+                logger.error("Candidate Run authority database unavailable: %s", exc)
+                return None
+        try:
+            table = db.fetch_one(
+                "SELECT 1 AS present FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'novel_generation_runs' LIMIT 1"
+            )
+        except Exception as exc:
+            logger.error("Candidate Run authority table check failed: %s", exc)
+            return None
+        if table is None:
+            return set()
+        try:
+            rows = db.fetch_all("SELECT novel_id FROM novel_generation_runs")
+            return {str(row["novel_id"]) for row in rows if row.get("novel_id")}
+        except Exception as exc:
+            logger.error("Candidate Run authority read failed: %s", exc)
+            return None
+
+    def _candidate_run_exists(self, novel_id: NovelId) -> Optional[bool]:
+        """Return whether Candidate owns a novel; ``None`` means read failure."""
+
+        candidate_novel_ids = self._candidate_run_novel_ids()
+        if candidate_novel_ids is None:
+            return None
+        return novel_id.value in candidate_novel_ids
 
 
     def _write_daemon_heartbeat(self) -> None:
@@ -511,6 +565,11 @@ class DaemonHostMixin:
         except Exception:
             pass  # 模块未初始化时静默降级
 
+        candidate_owned = self._candidate_run_exists(novel.novel_id)
+        if candidate_owned is None or candidate_owned:
+            novel.autopilot_status = AutopilotStatus.STOPPED
+            return False
+
         # 通道 2：DB 降级（守护进程重启后冷启动时仍需要）
         self._merge_autopilot_status_from_db(novel)
         return novel.autopilot_status == AutopilotStatus.RUNNING
@@ -562,6 +621,9 @@ class DaemonHostMixin:
 
     def _novel_is_running_in_db(self, novel_id: NovelId) -> bool:
         """DB 降级路径：独立连接读是否仍为 RUNNING（仅当 mp.Event 未初始化时使用）。"""
+        candidate_owned = self._candidate_run_exists(novel_id)
+        if candidate_owned is None or candidate_owned:
+            return False
         status = self._read_autopilot_status_ephemeral(novel_id)
         return status == AutopilotStatus.RUNNING
 

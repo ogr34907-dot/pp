@@ -76,43 +76,45 @@
 
         <form v-else class="outline-editor" @submit.prevent="saveDraft">
           <div class="outline-editor__summary">
-            <n-input v-model:value="form.title" placeholder="本层标题" aria-label="大纲标题" />
-            <n-input v-model:value="form.creative_goal" placeholder="创作目标：这一层需要完成什么？" aria-label="创作目标" />
+            <n-input v-model:value="form.title" :disabled="!canEditSelectedNode" placeholder="本层标题" aria-label="大纲标题" />
+            <n-input v-model:value="form.creative_goal" :disabled="!canEditSelectedNode" placeholder="创作目标：这一层需要完成什么？" aria-label="创作目标" />
           </div>
           <n-input
             v-model:value="form.narrative_text"
             type="textarea"
             :rows="5"
+            :disabled="!canEditSelectedNode"
             placeholder="叙述性计划：给作者和下一层 AI 的清晰说明。"
             aria-label="叙述性计划"
           />
           <div class="outline-editor__grid">
-            <FieldTextarea v-model="form.entry_state" label="进入状态" placeholder="人物、关系、地点与世界从何处开始" />
-            <FieldTextarea v-model="form.exit_state" label="结束状态" placeholder="这一层结束时必须抵达的状态" />
-            <FieldTextarea v-model="form.requiredEventsText" label="必须发生" placeholder="每行一条事件" />
-            <FieldTextarea v-model="form.forbiddenEventsText" label="禁止发生" placeholder="每行一条禁止项" />
-            <FieldTextarea v-model="form.handoffText" label="向下交接" placeholder="每行一条必须留给下层的条件" />
-            <FieldTextarea v-model="form.foreshadowText" label="伏笔要求" placeholder="每行一条：设置 / 推进 / 兑现" />
+            <FieldTextarea v-model="form.entry_state" :disabled="!canEditSelectedNode" label="进入状态" placeholder="人物、关系、地点与世界从何处开始" />
+            <FieldTextarea v-model="form.exit_state" :disabled="!canEditSelectedNode" label="结束状态" placeholder="这一层结束时必须抵达的状态" />
+            <FieldTextarea v-model="form.requiredEventsText" :disabled="!canEditSelectedNode" label="必须发生" placeholder="每行一条事件" />
+            <FieldTextarea v-model="form.forbiddenEventsText" :disabled="!canEditSelectedNode" label="禁止发生" placeholder="每行一条禁止项" />
+            <FieldTextarea v-model="form.handoffText" :disabled="!canEditSelectedNode" label="向下交接" placeholder="每行一条必须留给下层的条件" />
+            <FieldTextarea v-model="form.foreshadowText" :disabled="!canEditSelectedNode" label="伏笔要求" placeholder="每行一条：设置 / 推进 / 兑现" />
           </div>
           <div class="outline-editor__grid outline-editor__grid--numbers">
-            <n-form-item label="起始章节"><n-input-number v-model:value="form.chapter_start" :min="1" clearable /></n-form-item>
-            <n-form-item label="结束章节"><n-input-number v-model:value="form.chapter_end" :min="1" clearable /></n-form-item>
-            <n-form-item label="篇幅预算（字）"><n-input-number v-model:value="form.word_budget" :min="0" :step="1000" clearable /></n-form-item>
+            <n-form-item label="起始章节"><n-input-number v-model:value="form.chapter_start" :disabled="!canEditSelectedNode" :min="1" clearable /></n-form-item>
+            <n-form-item label="结束章节"><n-input-number v-model:value="form.chapter_end" :disabled="!canEditSelectedNode" :min="1" clearable /></n-form-item>
+            <n-form-item label="篇幅预算（字）"><n-input-number v-model:value="form.word_budget" :disabled="!canEditSelectedNode" :min="0" :step="1000" clearable /></n-form-item>
           </div>
           <div v-if="selectedContract.level === 'chapter'" class="outline-editor__chapter-fields">
-            <n-input v-model:value="form.pov" placeholder="POV / 叙事视角" aria-label="POV" />
-            <FieldTextarea v-model="form.scenesText" label="场景" placeholder="每行一个场景" />
-            <FieldTextarea v-model="form.beatsText" label="节拍" placeholder="每行一个节拍" />
-            <FieldTextarea v-model="form.conflictsText" label="冲突" placeholder="每行一个冲突" />
-            <n-input v-model:value="form.ending_hook" placeholder="结尾钩子" aria-label="结尾钩子" />
+            <n-input v-model:value="form.pov" :disabled="!canEditSelectedNode" placeholder="POV / 叙事视角" aria-label="POV" />
+            <FieldTextarea v-model="form.scenesText" :disabled="!canEditSelectedNode" label="场景" placeholder="每行一个场景" />
+            <FieldTextarea v-model="form.beatsText" :disabled="!canEditSelectedNode" label="节拍" placeholder="每行一个节拍" />
+            <FieldTextarea v-model="form.conflictsText" :disabled="!canEditSelectedNode" label="冲突" placeholder="每行一个冲突" />
+            <n-input v-model:value="form.ending_hook" :disabled="!canEditSelectedNode" placeholder="结尾钩子" aria-label="结尾钩子" />
           </div>
           <div class="outline-editor__actions">
-            <n-button type="primary" attr-type="submit" :loading="saving">{{ isWorkingNode(selectedNode) ? '保存 Working 草稿' : '保存草稿' }}</n-button>
-            <n-button secondary :loading="streaming" @click.prevent="generateDraftStream">
+            <n-button v-if="canEditSelectedNode" type="primary" attr-type="submit" :loading="saving">{{ isWorkingNode(selectedNode) ? '保存 Working 草稿' : '保存草稿' }}</n-button>
+            <n-button v-if="canEditSelectedNode" secondary :loading="streaming" @click.prevent="generateDraftStream">
               <template #icon><n-icon :component="SparklesOutline" /></template>
               {{ draftButtonLabel }}
             </n-button>
             <n-button
+              v-if="canEditSelectedNode"
               :disabled="isWorkingNode(selectedNode) ? !cohortAttemptId : !selectedContract.draft"
               :loading="publishing"
               @click.prevent="publishAndSync"
@@ -218,6 +220,7 @@ const message = useMessage()
 const novelId = computed(() => String(route.params.slug || ''))
 const tree = ref<OutlineTreeNode | null>(null)
 const workingTree = ref<OutlineTreeNode | null>(null)
+const workingTreeLoadFailed = ref(false)
 const selectedNode = ref<OutlineTreeNode | null>(null)
 const selectedParent = ref<OutlineTreeNode | undefined>()
 const selectedContract = ref<OutlineContract | null>(null)
@@ -254,6 +257,7 @@ const flattenedTree = computed<FlattenedNode[]>(() => {
 })
 
 const displayTree = computed(() => workingTree.value || tree.value)
+const canEditSelectedNode = computed(() => Boolean(selectedNode.value && !isManifestActiveNode(selectedNode.value) && !workingTreeLoadFailed.value))
 
 const nextLevel = computed<CohortLevel | null>(() => {
   const node = selectedNode.value
@@ -293,9 +297,32 @@ function levelLabel(level?: string) {
   return ({ outline: '总纲', part: '部纲', volume: '卷纲', act: '幕纲', chapter: '章纲' } as Record<string, string>)[String(level)] || '计划'
 }
 function defaultTitle(level?: string) { return `${levelLabel(level)}（未命名）` }
-function nodeKey(node: OutlineTreeNode) { return String(node.logical_node_id || node.id) }
+function nodeKey(node: OutlineTreeNode) {
+  if (node.logical_node_id) return String(node.logical_node_id)
+  if (node.story_node_id) return `story:${node.story_node_id}`
+  return String(node.id)
+}
+function treeMode(node?: OutlineTreeNode | null) {
+  if (node?.tree_mode) return node.tree_mode
+  return node?.status === 'draft' && node.plan_revision_id && node.logical_node_id
+    ? 'MANIFEST_WORKING'
+    : 'LEGACY_ACTIVE'
+}
+function isManifestActiveNode(node?: OutlineTreeNode | null) {
+  return treeMode(node) === 'MANIFEST_ACTIVE'
+}
 function isWorkingNode(node?: OutlineTreeNode | null) {
-  return Boolean(node && node.status === 'draft' && node.plan_revision_id && node.logical_node_id)
+  return Boolean(node && treeMode(node) === 'MANIFEST_WORKING' && node.status === 'draft' && node.plan_revision_id && node.logical_node_id)
+}
+function requireLogicalNodeId(node: OutlineTreeNode): string {
+  const logicalNodeId = String(node.logical_node_id || '').trim()
+  if (!logicalNodeId) throw new Error('当前节点缺少 logical_node_id，已阻止生成 Cohort')
+  return logicalNodeId
+}
+function ensureWorkingTreeReadable(): boolean {
+  if (!workingTreeLoadFailed.value) return true
+  error.value = 'Working Tree 读取失败，已阻止规划写操作；请刷新并确认后端状态。'
+  return false
 }
 function findFirstChild(
   root: OutlineTreeNode | null,
@@ -402,12 +429,15 @@ async function loadTree() {
   if (!novelId.value) return
   loading.value = true
   error.value = ''
+  workingTreeLoadFailed.value = false
   try {
     tree.value = await outlineApi.getTree(novelId.value)
     try {
       workingTree.value = await outlineApi.getWorkingTree(novelId.value)
-    } catch {
+    } catch (cause) {
       workingTree.value = null
+      workingTreeLoadFailed.value = true
+      throw cause
     }
     if (!selectedNode.value && displayTree.value) await selectNode(displayTree.value)
     else if (selectedNode.value) {
@@ -465,6 +495,7 @@ async function selectNode(node: OutlineTreeNode) {
 }
 
 async function bindSelectedNode() {
+  if (!ensureWorkingTreeReadable()) return
   const node = selectedNode.value
   const requestEpoch = selectionEpoch
   if (!node || node.node_type === 'outline') return
@@ -485,6 +516,12 @@ async function bindSelectedNode() {
 }
 
 async function saveDraft() {
+  if (!ensureWorkingTreeReadable() || !canEditSelectedNode.value) {
+    if (!canEditSelectedNode.value && !workingTreeLoadFailed.value) {
+      error.value = 'Active Manifest 只读，不能保存 Legacy 草稿。'
+    }
+    return
+  }
   const contract = selectedContract.value
   if (!contract) return
   const context = captureContractContext(contract)
@@ -522,6 +559,12 @@ async function saveDraft() {
 }
 
 async function publishAndSync() {
+  if (!ensureWorkingTreeReadable() || !canEditSelectedNode.value) {
+    if (!canEditSelectedNode.value && !workingTreeLoadFailed.value) {
+      error.value = 'Active Manifest 只读，不能使用 Legacy 发布。'
+    }
+    return
+  }
   const contract = selectedContract.value
   const node = selectedNode.value
   const draft = contract?.draft
@@ -555,6 +598,7 @@ async function publishAndSync() {
 }
 
 async function generateNextCohort() {
+  if (!ensureWorkingTreeReadable()) return
   const node = selectedNode.value
   const level = nextLevel.value
   if (!node || !level || !canGenerateNextCohort.value) return
@@ -564,7 +608,7 @@ async function generateNextCohort() {
   error.value = ''
   try {
     const result = await outlineApi.expandCohort(novelId.value, {
-      logical_node_id: node.logical_node_id || node.id,
+      logical_node_id: requireLogicalNodeId(node),
       level,
       author_payloads: [],
     })
@@ -590,6 +634,12 @@ async function generateNextCohort() {
 }
 
 async function runDraftStream(retryAttemptId?: string) {
+  if (!ensureWorkingTreeReadable() || !canEditSelectedNode.value) {
+    if (!canEditSelectedNode.value && !workingTreeLoadFailed.value) {
+      error.value = 'Active Manifest 只读，不能重生成当前层草稿。'
+    }
+    return
+  }
   const contract = selectedContract.value
   if (!contract || streaming.value) return
   const context = captureContractContext(contract)
