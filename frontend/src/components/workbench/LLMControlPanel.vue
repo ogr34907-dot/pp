@@ -113,7 +113,9 @@
                 >
                   删除
                 </n-button>
-                <n-button size="small" secondary :loading="testing" @click="testSelected">测试连接</n-button>
+                <n-button size="small" secondary :loading="testing" @click="testSelected">
+                  {{ testing ? '等待模型返回' : '测试连接' }}
+                </n-button>
                 <n-button size="small" type="primary" ghost :loading="saving" @click="activateSelected">设为启用</n-button>
               </n-space>
             </div>
@@ -195,8 +197,9 @@
             </div>
 
             <div class="llm-field">
-              <label class="llm-label">超时（秒）</label>
-              <n-input-number v-model:value="selectedProfile.timeout_seconds" :min="1" :step="10" style="width: 100%" />
+              <label class="llm-label">历史兼容值（秒）</label>
+              <n-input-number v-model:value="selectedProfile.timeout_seconds" disabled style="width: 100%" />
+              <n-text depth="3" style="font-size: 12px">仅为兼容旧配置保留；模型思考或流式停顿不会因该值中断，可随时主动取消。</n-text>
             </div>
 
             <div v-if="selectedProfile.protocol === 'openai'" class="llm-field span-2">

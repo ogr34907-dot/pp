@@ -26,15 +26,12 @@
         />
       </label>
       <label class="em-infer-field">
-        <span>超时（秒）</span>
+        <span>历史兼容值（秒）</span>
         <n-input-number
           class="em-infer-input"
           :value="timeoutSeconds"
-          :min="30"
-          :max="3600"
-          :step="10"
+          disabled
           size="small"
-          @update:value="onTimeout"
         />
       </label>
     </div>
@@ -64,9 +61,6 @@ function onMaxTokens(v: number | null) {
   emit('update:maxTokens', Math.max(1, Math.floor(v ?? DEFAULT_MAX_OUTPUT_TOKENS)))
 }
 
-function onTimeout(v: number | null) {
-  emit('update:timeoutSeconds', Math.max(30, Math.floor(v ?? props.timeoutSeconds)))
-}
 </script>
 
 <style scoped>

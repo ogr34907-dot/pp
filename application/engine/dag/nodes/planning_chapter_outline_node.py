@@ -73,6 +73,7 @@ class PlanningOutlinePartitionNode(AbstractPlanningNode):
         is_configurable=True,
         can_disable=True,
         default_timeout_seconds=90,
+        llm_backed=True,
         cpms_node_key=OUTLINE_BEAT_PARTITION,
         prompt_mode=PromptMode.CPMS_FIRST,
         description="抽象规划节点 · 章纲 → atoms；LLM 提示词取自 CPMS",

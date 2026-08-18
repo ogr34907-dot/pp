@@ -20,6 +20,8 @@ class PlanningRuntimeSettings:
     macro_act_node_delay_seconds: float = 0.04
     macro_watch_poll_seconds: float = 0.32
     macro_watch_node_delay_seconds: float = 0.028
+    # Kept for config/backward compatibility; the SSE watcher no longer
+    # terminates a live LLM run based on elapsed wall-clock time.
     macro_watch_max_seconds: float = 3600.0
     macro_watch_heartbeat_every_ticks: int = 10
     act_generation_poll_seconds: float = 0.4

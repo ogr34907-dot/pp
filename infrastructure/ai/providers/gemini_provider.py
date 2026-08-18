@@ -11,7 +11,7 @@ from domain.ai.services.llm_service import GenerationConfig, GenerationResult
 from domain.ai.value_objects.prompt import Prompt
 from domain.ai.value_objects.token_usage import TokenUsage
 from infrastructure.ai.config.settings import Settings
-from infrastructure.ai.http_timeout import build_httpx_timeout
+from infrastructure.ai.http_timeout import build_llm_httpx_timeout
 from .base import BaseProvider
 from .model_resolution import require_resolved_model_id
 
@@ -27,8 +27,9 @@ class GeminiProvider(BaseProvider):
             raise ValueError('API key is required for GeminiProvider')
         self.base_url = (settings.base_url or DEFAULT_BASE_URL).rstrip('/')
         # 长生命周期 httpx client（跨请求复用连接池）
+        self._llm_timeout = build_llm_httpx_timeout(settings.http_timeout_settings)
         self._http_client = httpx.AsyncClient(
-            timeout=build_httpx_timeout(settings.http_timeout_settings),
+            timeout=self._llm_timeout,
             trust_env=False,
         )
 
@@ -47,7 +48,7 @@ class GeminiProvider(BaseProvider):
             params=query,
             headers=self._build_headers(stream=False),
             json=payload,
-            timeout=config.timeout_seconds or self.settings.timeout_seconds,
+            timeout=self._llm_timeout,
         )
         response.raise_for_status()
         data = response.json()
@@ -84,7 +85,7 @@ class GeminiProvider(BaseProvider):
             params=query,
             headers=self._build_headers(stream=True),
             json=payload,
-            timeout=config.timeout_seconds or self.settings.timeout_seconds,
+            timeout=self._llm_timeout,
         ) as response:
             response.raise_for_status()
             buffer = ''

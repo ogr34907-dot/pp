@@ -623,7 +623,7 @@ export const planningApi = {
     apiClient.post<MacroPlanGenerateResponse>(
       `/planning/novels/${novelId}/macro/generate`,
       data,
-      { timeout: runtimePerformance.network.planningTaskTimeoutMs }
+      { timeout: runtimePerformance.network.llmTaskTimeoutMs }
     ) as unknown as Promise<MacroPlanGenerateResponse>,
 
   getMacroProgress: (novelId: string) =>

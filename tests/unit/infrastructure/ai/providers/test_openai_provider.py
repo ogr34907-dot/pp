@@ -60,7 +60,7 @@ class TestOpenAIProviderLegacy:
 
         timeout = provider._http_client.timeout
         assert timeout.connect == 4
-        assert timeout.read == 40
+        assert timeout.read is None
         assert timeout.write == 8
         assert timeout.pool == 2
 

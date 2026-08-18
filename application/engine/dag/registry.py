@@ -190,6 +190,10 @@ class BaseNode(ABC):
             return self._config.timeout_seconds
         return base
 
+    def allows_long_llm_wait(self) -> bool:
+        """Whether remote-model wait time is part of this node's work."""
+        return bool(self.meta and self.meta.llm_backed)
+
     def get_max_retries(self) -> int:
         """获取最大重试次数，支持配置覆盖"""
         base = self.meta.default_max_retries if self.meta else 1
@@ -320,16 +324,21 @@ class NodeRegistry:
             }
             context.update(dict(state.get("_runtime_context") or {}))
 
-            # 执行：统一在节点 executor 边界应用现有 timeout 配置。
+            # LLM 节点不设置自动总时限：远程模型可能长时间思考，或在
+            # 流式输出间暂停。任务仍由请求取消、服务关闭和上游取消信号
+            # 正常终止；纯本地节点继续使用原有 deadline 保护。
             timeout_seconds = instance.get_timeout()
             execution_task = asyncio.create_task(
                 instance.execute(resolved_inputs, context)
             )
             try:
-                result = await asyncio.wait_for(
-                    execution_task,
-                    timeout=timeout_seconds,
-                )
+                if instance.allows_long_llm_wait():
+                    result = await execution_task
+                else:
+                    result = await asyncio.wait_for(
+                        execution_task,
+                        timeout=timeout_seconds,
+                    )
             except asyncio.TimeoutError:
                 # asyncio.TimeoutError 与内层主动抛出的 TimeoutError 使用同一
                 # 标准异常类型；task.cancelled() 可区分 deadline 取消和内层异常。

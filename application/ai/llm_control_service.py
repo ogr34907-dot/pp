@@ -44,7 +44,11 @@ class LLMProfile(BaseModel):
     model: str = ''
     temperature: float = 0.7
     max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
-    timeout_seconds: int = 300
+    timeout_seconds: int = Field(
+        default=300,
+        ge=1,
+        description="历史兼容字段；LLM 生成等待不会因该值被硬截断",
+    )
     extra_headers: Dict[str, str] = Field(default_factory=dict)
     extra_query: Dict[str, Any] = Field(default_factory=dict)
     extra_body: Dict[str, Any] = Field(default_factory=dict)
@@ -473,7 +477,7 @@ class LLMControlService:
                     latency_ms=latency_ms,
                     error=(
                         "模型返回了空内容。请核对：API Key 是否有效、模型名与协议是否匹配、"
-                        "base_url 是否正确；若使用代理或网关，也可能是超时截断或限流。"
+                        "base_url 是否正确；若使用代理或网关，也可能是响应尚未返回或被限流。"
                     ),
                 )
             preview = body.replace('\r', ' ').replace('\n', ' ')

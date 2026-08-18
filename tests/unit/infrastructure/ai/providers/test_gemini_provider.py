@@ -33,12 +33,12 @@ def test_gemini_provider_http_timeout_uses_settings():
 
     timeout = provider._http_client.timeout
     assert timeout.connect == 4
-    assert timeout.read == 40
+    assert timeout.read is None
     assert timeout.write == 8
     assert timeout.pool == 2
 
 
-async def test_gemini_provider_passes_task_timeout_to_request():
+async def test_gemini_provider_uses_unbounded_read_timeout_for_request():
     provider = GeminiProvider(Settings(api_key="test-api-key", default_model="gemini-test"))
     captured = {}
 
@@ -49,7 +49,8 @@ async def test_gemini_provider_passes_task_timeout_to_request():
     provider._http_client.post = _post
     await provider.generate(Prompt(system="s", user="u"), GenerationConfig(timeout_seconds=19))
 
-    assert captured["timeout"] == 19
+    assert captured["timeout"].read is None
+    assert captured["timeout"].connect == provider.settings.connect_timeout
 
 
 async def test_gemini_provider_preserves_cache_and_thinking_usage_details():
@@ -77,7 +78,7 @@ async def test_gemini_provider_preserves_cache_and_thinking_usage_details():
     assert result.token_usage.reasoning_tokens == 3
 
 
-async def test_gemini_provider_passes_task_timeout_to_stream_request():
+async def test_gemini_provider_uses_unbounded_read_timeout_for_stream_request():
     provider = GeminiProvider(Settings(api_key="test-api-key", default_model="gemini-test"))
     captured = {}
 
@@ -95,4 +96,5 @@ async def test_gemini_provider_passes_task_timeout_to_stream_request():
     ]
 
     assert chunks == ["ok"]
-    assert captured["timeout"] == 23
+    assert captured["timeout"].read is None
+    assert captured["timeout"].write == provider.settings.write_timeout

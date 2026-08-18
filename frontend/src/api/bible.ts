@@ -1,6 +1,5 @@
 import type { AxiosRequestConfig } from 'axios'
 
-import { WIZARD_STEP_TIMEOUT_MS } from '@/constants/wizard'
 import { runtimePerformance } from '@/config/performance'
 import { apiClient, resolveHttpUrl } from './config'
 
@@ -242,7 +241,7 @@ export const bibleApi = {
     apiClient.post<{ message: string; novel_id: string; status_url: string }>(
       `/bible/novels/${novelId}/generate?stage=${stage}`,
       {},
-      { timeout: WIZARD_STEP_TIMEOUT_MS }
+      { timeout: runtimePerformance.network.llmTaskTimeoutMs }
     ) as Promise<{ message: string; novel_id: string; status_url: string }>,
 
   /**
@@ -252,7 +251,7 @@ export const bibleApi = {
   getBibleStatus: (novelId: string) =>
     apiClient.get<{ exists: boolean; ready: boolean; novel_id: string }>(
       `/bible/novels/${novelId}/bible/status`,
-      { timeout: WIZARD_STEP_TIMEOUT_MS }
+      { timeout: runtimePerformance.network.shortTaskTimeoutMs }
     ) as Promise<{ exists: boolean; ready: boolean; novel_id: string }>,
 
   /**

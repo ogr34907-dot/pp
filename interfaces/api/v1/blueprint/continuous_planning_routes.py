@@ -7,7 +7,6 @@
 import asyncio
 import json as _json
 import logging
-import time as _time
 
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Query
 
@@ -366,7 +365,7 @@ async def watch_macro_plan_progress_sse(novel_id: str):
       event: node      data: 部/卷/幕 节点（running 时随增量解析推送；completed 时补齐剩余）
       event: done       data: {success}  # 节点序列结束，随后仍会发 terminal
       event: heartbeat data: {tick}
-      event: terminal   data: {status, message}  # status 为 completed | failed | timeout
+      event: terminal   data: {status, message}  # status 为 completed | failed
     """
 
     def _sse(event: str, data: dict) -> str:
@@ -374,22 +373,15 @@ async def watch_macro_plan_progress_sse(novel_id: str):
 
     async def _watch():
         runtime_settings = get_planning_runtime_settings()
-        t0 = _time.monotonic()
         last_len = 0
         last_sig: tuple[str, str] | None = None
         tick = 0
-        max_seconds = runtime_settings.macro_watch_max_seconds
         chunk_events = 0
         emitted_macro_nodes = 0
 
         logger.info("[MacroSSEWatch] novel=%s client subscribed macro/progress/stream", novel_id)
 
         while True:
-            if _time.monotonic() - t0 > max_seconds:
-                logger.warning("[MacroSSEWatch] novel=%s stream timeout after %.0fs", novel_id, max_seconds)
-                yield _sse("terminal", {"status": "timeout", "message": "宏观规划观摩流超时"})
-                break
-
             await asyncio.sleep(runtime_settings.macro_watch_poll_seconds)
             prog = get_macro_plan_progress(novel_id)
             stream_full = prog.get("llm_stream_text") or ""
@@ -410,7 +402,13 @@ async def watch_macro_plan_progress_sse(novel_id: str):
                     {
                         "phase": st if st != "idle" else "watch",
                         "status": st,
-                        "message": msg or ("已连接宏观规划输出流，等待模型生成…" if st == "idle" else ""),
+                        "message": msg or (
+                            "已连接宏观规划输出流，等待模型生成…"
+                            if st == "idle"
+                            else "模型正在思考，等待首段输出…"
+                            if st == "running" and not stream_full
+                            else ""
+                        ),
                         "current": prog.get("current", 0),
                         "total": prog.get("total", 0),
                         "percent": prog.get("percent", 0),

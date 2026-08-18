@@ -154,6 +154,39 @@ class TestNodeRegistry:
 
         assert node.get_timeout() == 120
 
+    @pytest.mark.asyncio
+    async def test_llm_backed_executor_waits_past_automatic_node_deadline(self):
+        import asyncio
+        from application.engine.dag.models import NodeResult
+
+        @NodeRegistry.register("test_llm_wait_node")
+        class LLMWaitNode(BaseNode):
+            meta = NodeMeta(
+                node_type="test_llm_wait_node",
+                display_name="llm wait node",
+                category=NodeCategory.EXECUTION,
+                llm_backed=True,
+                default_timeout_seconds=60,
+            )
+
+            def get_timeout(self):
+                # Keep the test short; the executor must ignore this automatic
+                # deadline because the node represents a remote LLM request.
+                return 0.01
+
+            async def execute(self, inputs, context):
+                await asyncio.sleep(0.05)
+                return NodeResult(outputs={"result": "model response"})
+
+            def validate_inputs(self, inputs):
+                return True
+
+        executor = NodeRegistry.create_executor("test_llm_wait_node", "llm_wait")
+
+        result = await executor({})
+
+        assert result["result"] == "model response"
+
     def test_omitted_retry_override_uses_node_metadata(self):
         class RetryDefaultNode(BaseNode):
             meta = NodeMeta(

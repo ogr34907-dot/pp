@@ -101,6 +101,6 @@ export const knowledgeApi = {
     request.post<{ success: boolean; message: string; facts_count: number; premise_lock: string }>(
       `/novels/${novelId}/knowledge/generate`,
       {},
-      { timeout: runtimePerformance.network.longTaskTimeoutMs }
+      { timeout: runtimePerformance.network.llmTaskTimeoutMs }
     ) as unknown as Promise<{ success: boolean; message: string; facts_count: number; premise_lock: string }>,
 }

@@ -466,7 +466,11 @@ function isCurrentContract(context: ContractContext) {
 function idempotencyKey(prefix: string) { return `${prefix}-${crypto.randomUUID()}` }
 const streamStatus = computed(() => {
   const attempt = streamAttempt.value
-  if (streaming.value) return attempt ? `正在接收流式草稿（尝试 ${attempt.id.slice(-8)}）…` : '正在建立流式草稿尝试…'
+  if (streaming.value) {
+    if (!attempt) return '正在建立流式草稿尝试…'
+    if (!streamText.value) return `模型正在思考，等待首段输出（尝试 ${attempt.id.slice(-8)}）…`
+    return `正在接收流式草稿（尝试 ${attempt.id.slice(-8)}）…`
+  }
   if (attempt?.status === 'completed') return '草稿已通过结构校验并写入当前节点的草稿版本。'
   if (attempt?.status === 'cancelled') return '本次流式草稿已取消；可复用原上下文重试。'
   if (attempt?.status === 'failed') return attempt.error || '本次流式草稿失败；可复用原上下文重试。'

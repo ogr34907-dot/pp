@@ -1,6 +1,7 @@
 """DaemonHostMixin Phase 7/8/9 测试"""
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+import asyncio
 
 import pytest
 
@@ -26,6 +27,45 @@ def test_daemon_host_mixin_provides_infrastructure_methods():
     assert hasattr(DaemonHostMixin, "_call_with_timeout")
     assert hasattr(DaemonHostMixin, "_find_next_unwritten_chapter_async")
     assert hasattr(DaemonHostMixin, "_flush_novel")
+
+
+@pytest.mark.asyncio
+async def test_llm_wait_ignores_legacy_wall_clock_timeout():
+    host = DaemonHostMixin.__new__(DaemonHostMixin)
+
+    async def delayed_result():
+        await asyncio.sleep(0.05)
+        return "完整结果"
+
+    result = await host._call_with_timeout(
+        delayed_result(),
+        timeout=0.001,
+        label="delayed-test",
+        timeout_default="错误默认值",
+    )
+
+    assert result == "完整结果"
+
+
+@pytest.mark.asyncio
+async def test_stream_wait_ignores_legacy_total_and_idle_limits():
+    class DelayedLLM:
+        async def stream_generate(self, _prompt, _config):
+            yield "首段"
+            await asyncio.sleep(0.08)
+            yield "后段"
+
+    host = DaemonHostMixin.__new__(DaemonHostMixin)
+    host.llm_service = DelayedLLM()
+
+    result = await host._stream_llm_with_stop_watch(
+        SimpleNamespace(system="", user="test"),
+        SimpleNamespace(),
+        total_timeout=0.01,
+        idle_timeout=0.01,
+    )
+
+    assert result == "首段后段"
 
 
 def test_autopilot_daemon_keeps_entrypoint_methods():

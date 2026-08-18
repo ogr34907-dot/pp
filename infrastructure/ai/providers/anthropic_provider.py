@@ -10,7 +10,7 @@ from domain.ai.services.llm_service import GenerationConfig, GenerationResult
 from domain.ai.value_objects.prompt import Prompt
 from domain.ai.value_objects.token_usage import TokenUsage
 from infrastructure.ai.config.settings import Settings
-from infrastructure.ai.http_timeout import build_httpx_timeout
+from infrastructure.ai.http_timeout import build_llm_httpx_timeout
 from .base import BaseProvider
 from .model_resolution import require_resolved_model_id
 
@@ -110,9 +110,11 @@ class AnthropicProvider(BaseProvider):
         if self._messages_base_url.endswith("/v1"):
             self._messages_base_url = self._messages_base_url[:-3]
 
+        _sdk_timeout = build_llm_httpx_timeout(settings.http_timeout_settings)
+        self._llm_timeout = _sdk_timeout
         official_client_kw = {
             "api_key": settings.api_key,
-            "timeout": settings.timeout_seconds,
+            "timeout": _sdk_timeout,
             "max_retries": 2,
             "default_headers": {
                 "User-Agent": "claude-cli/2.1.87 (external, cli)",
@@ -124,7 +126,6 @@ class AnthropicProvider(BaseProvider):
             official_client_kw["base_url"] = base
 
         # SDK 内置 httpx 默认 trust_env=True，会走系统 HTTP(S)_PROXY，本机代理 TLS 常导致 ConnectError。
-        _sdk_timeout = build_httpx_timeout(settings.http_timeout_settings)
         self._http_client_sync = httpx.Client(timeout=_sdk_timeout, trust_env=False)
         self._http_client_async = httpx.AsyncClient(timeout=_sdk_timeout, trust_env=False)
         self.client = Anthropic(**official_client_kw, http_client=self._http_client_sync)
@@ -132,7 +133,7 @@ class AnthropicProvider(BaseProvider):
 
         # 流式端点专用 httpx client（长生命周期，跨请求复用连接池）
         self._stream_http_client = httpx.AsyncClient(
-            timeout=build_httpx_timeout(self.settings.http_timeout_settings),
+            timeout=self._llm_timeout,
             trust_env=False,
         )
 
@@ -224,8 +225,9 @@ class AnthropicProvider(BaseProvider):
                 payload["system"] += instruction
         return model_id, payload
 
-    def _request_timeout(self, config: GenerationConfig) -> float:
-        return float(config.timeout_seconds or self.settings.timeout_seconds)
+    def _request_timeout(self, config: GenerationConfig) -> httpx.Timeout:
+        """Return phase limits without a total/read generation deadline."""
+        return self._llm_timeout
 
     @staticmethod
     def _format_stream_error(exc: BaseException) -> str:

@@ -300,6 +300,7 @@ class ChapterAuditNode(BaseNode):
         is_configurable=True,
         can_disable=True,
         default_timeout_seconds=60,
+        llm_backed=True,
         cpms_node_key=ANTI_AI_CHAPTER_AUDIT,
         prompt_mode=PromptMode.CPMS_FIRST,
         description="L7 章后审计：35+增强模式扫描，涵盖8大类AI味检测",

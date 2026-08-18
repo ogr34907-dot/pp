@@ -1,7 +1,7 @@
 /**
  * 工作流 / 长任务 / 一致性 / 故事线
  */
-import { WIZARD_STEP_TIMEOUT_MS } from '@/constants/wizard'
+import { runtimePerformance } from '@/config/performance'
 import { apiClient, resolveHttpUrl } from './config'
 import type { JobStatusResponse } from '../types/api'
 
@@ -784,7 +784,7 @@ export const workflowApi = {
     apiClient.post<SuggestMainPlotOptionsResponse>(
       `/novels/${novelId}/setup/suggest-main-plot-options`,
       {},
-      { timeout: WIZARD_STEP_TIMEOUT_MS }
+      { timeout: runtimePerformance.network.llmTaskTimeoutMs }
     ) as unknown as Promise<SuggestMainPlotOptionsResponse>,
 
   getPlotOutline: (novelId: string) =>
@@ -802,7 +802,7 @@ export const workflowApi = {
     apiClient.post<GeneratePlotOutlineResponse>(
       `/novels/${novelId}/setup/generate-plot-outline`,
       {},
-      { timeout: WIZARD_STEP_TIMEOUT_MS },
+      { timeout: runtimePerformance.network.llmTaskTimeoutMs },
     ) as unknown as Promise<GeneratePlotOutlineResponse>,
 
   /** POST /api/v1/novels/{novel_id}/storylines */

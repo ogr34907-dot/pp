@@ -1281,20 +1281,21 @@ class DaemonHostMixin:
     async def _call_with_timeout(
         self,
         coro,
-        timeout: float,
+        timeout: float | None = None,
         novel_id: str = "",
         label: str = "",
         timeout_default=None,
     ):
-        """为 LLM 调用加超时保护 + 停止信号响应，避免 API 卡住或用户停止后仍在等待。
+        """等待 LLM 完成，同时保留显式停止和取消能力。
 
-        双重保护：
-        1. asyncio.wait_for 超时保护——防止 LLM API 无限等待
-        2. 停止信号监听——用户点击停止后，5 秒内终止当前 LLM 调用
+        ``timeout`` 保留为旧调用方的兼容参数，但不再作为模型生成的
+        墙钟截止时间。远程模型可能在首 token 前深度思考，也可能在流式
+        输出之间长时间停顿；这两种情况都不应被应用层丢弃。用户停止、
+        请求取消和进程关闭仍会取消正在等待的协程。
 
         Args:
             coro: awaitable 协程对象
-            timeout: 超时秒数
+            timeout: 旧版兼容参数（不再用于硬截断）
             novel_id: 小说 ID（用于写共享状态和检查停止信号）
             label: 调用标签（用于日志）
             timeout_default: 超时/停止时的显式默认返回值
@@ -1322,11 +1323,26 @@ class DaemonHostMixin:
                     pass
 
         watch_task = None
+        call_task = asyncio.ensure_future(coro)
         if novel_id:
             watch_task = asyncio.create_task(_watch_stop())
 
         try:
-            result = await asyncio.wait_for(coro, timeout=timeout)
+            pending = {call_task}
+            if watch_task is not None:
+                pending.add(watch_task)
+            done, _ = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if call_task not in done:
+                call_task.cancel()
+                await asyncio.gather(call_task, return_exceptions=True)
+                logger.info(f"[{novel_id}] {label} 收到停止信号，取消等待中的 LLM 调用")
+                return timeout_default
+
+            result = await call_task
 
             # LLM 调用正常完成，但检查是否在等待期间收到了停止信号
             if stop_detected.is_set():
@@ -1335,17 +1351,10 @@ class DaemonHostMixin:
 
             return result
 
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[{novel_id}] ⏱️ {label} 超时（{timeout}s），使用显式默认值: {timeout_default}"
-            )
-            if novel_id:
-                self._update_shared_state(
-                    novel_id,
-                    _last_timeout_label=label,
-                    _last_timeout_at=time.time(),
-                )
-            return timeout_default
+        except asyncio.CancelledError:
+            call_task.cancel()
+            await asyncio.gather(call_task, return_exceptions=True)
+            raise
         except Exception as e:
             logger.warning(f"[{novel_id}] {label} 异常: {e}，使用显式默认值")
             return timeout_default
@@ -1819,8 +1828,8 @@ class DaemonHostMixin:
         config: GenerationConfig,
         novel=None,
         chapter_draft_so_far: str = "",
-        total_timeout: float = 600.0,
-        idle_timeout: float = 120.0,
+        total_timeout: float | None = None,
+        idle_timeout: float | None = None,
     ) -> str:
         """与 workflow 共用同一套 Prompt + LLM；novel 传入时并行轮询 DB 是否已停止。
 
@@ -1828,14 +1837,14 @@ class DaemonHostMixin:
         1. 快速响应停止信号（0.3s 轮询间隔）
         2. 批量推送 chunks，减少跨进程通信开销
         3. 使用共享状态缓存，减少 DB 访问
-        4. 超时保护：总时间上限 + 空闲超时（防止 LLM 挂起）
+        4. LLM 等待不设总时限或流间隔时限；停止信号仍会终止任务
 
         Args:
             prompt: LLM 提示词
             config: 生成配置
             novel: 小说对象
-            total_timeout: 总时间上限（秒），默认 10 分钟
-            idle_timeout: 空闲超时（秒），默认 2 分钟无数据则终止
+            total_timeout: 旧版兼容参数，不再用于硬截断
+            idle_timeout: 旧版兼容参数，不再用于硬截断
         """
         if novel is not None:
             try:
@@ -1856,16 +1865,13 @@ class DaemonHostMixin:
         content = ""
         stop_detected = asyncio.Event()
         watch_task = None
-        idle_watch_task = None
         nid = getattr(novel.novel_id, "value", novel.novel_id) if novel else None
 
         # 批量推送缓冲（当前节拍内的 LLM 增量）
         chunk_buffer: List[str] = []
         last_push_time = time.time()
-        last_chunk_time = time.time()  # 追踪最后一次收到数据的时间
         # 🔥 高频推送整章累积快照，避免前端对多节拍增量做 += 时出现衔接重复/乱序
         CHUNK_PUSH_INTERVAL = 0.15
-        start_time = time.time()
 
         def _live_chapter_snapshot() -> str:
             prior = (chapter_draft_so_far or "").rstrip()
@@ -1920,40 +1926,15 @@ class DaemonHostMixin:
                         stop_detected.set()
                         return
 
-        async def _watch_idle_timeout() -> None:
-            """空闲超时检测：长时间无数据则终止"""
-            while not stop_detected.is_set():
-                await asyncio.sleep(5.0)  # 每 5 秒检查一次
-                elapsed_since_chunk = time.time() - last_chunk_time
-                if elapsed_since_chunk >= idle_timeout:
-                    logger.warning(
-                        f"[{nid}] ⚠️ 流式生成空闲超时（{idle_timeout}s 无数据），强制终止"
-                    )
-                    stop_detected.set()
-                    return
-
-                # 检查总时间
-                total_elapsed = time.time() - start_time
-                if total_elapsed >= total_timeout:
-                    logger.warning(
-                        f"[{nid}] ⚠️ 流式生成总时间超限（{total_timeout}s），强制终止"
-                    )
-                    stop_detected.set()
-                    return
-
         if novel is not None:
             novel_id_ref = novel.novel_id
             watch_task = asyncio.create_task(_watch_stop_signal())
-
-        # 启动空闲超时检测
-        idle_watch_task = asyncio.create_task(_watch_idle_timeout())
 
         try:
             async for chunk in self.llm_service.stream_generate(prompt, config):
                 if stop_detected.is_set():
                     break
                 content += chunk
-                last_chunk_time = time.time()  # 更新最后收到数据的时间
 
                 # 🔧 优化：高频小批量推送，实现流式打字机效果
                 if novel is not None and chunk:
@@ -1988,12 +1969,6 @@ class DaemonHostMixin:
                 watch_task.cancel()
                 try:
                     await watch_task
-                except asyncio.CancelledError:
-                    pass
-            if idle_watch_task is not None:
-                idle_watch_task.cancel()
-                try:
-                    await idle_watch_task
                 except asyncio.CancelledError:
                     pass
 

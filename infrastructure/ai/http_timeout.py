@@ -29,3 +29,22 @@ def build_httpx_timeout(settings: HttpTimeoutSettings) -> httpx.Timeout:
         write=settings.write_timeout,
         pool=settings.pool_timeout,
     )
+
+
+def build_llm_httpx_timeout(settings: HttpTimeoutSettings) -> httpx.Timeout:
+    """Build an LLM timeout without a response/read deadline.
+
+    ``timeout_seconds`` historically acted like a total generation deadline,
+    but httpx timeouts are phase-based and an SDK request timeout can replace
+    the client-level timeout.  LLMs may spend minutes thinking before the first
+    token, or pause between streamed chunks, so neither case should be treated
+    as a failed request.  Connection, write, and pool waits remain bounded so
+    an unreachable endpoint does not consume a worker forever.
+    """
+    return httpx.Timeout(
+        timeout=None,
+        connect=settings.connect_timeout,
+        read=None,
+        write=settings.write_timeout,
+        pool=settings.pool_timeout,
+    )

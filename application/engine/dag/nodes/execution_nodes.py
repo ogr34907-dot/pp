@@ -73,6 +73,7 @@ class PlanningNode(BaseNode):
         is_configurable=True,
         can_disable=False,
         default_timeout_seconds=120,
+        llm_backed=True,
         cpms_node_key=MACRO_PLANNING,
         description="PlanningService.generate_macro_plan",
         default_edges=["exec_beat"],
@@ -151,6 +152,7 @@ class WriterNode(BaseNode):
         is_configurable=True,
         can_disable=False,
         default_timeout_seconds=300,
+        llm_backed=True,
         cpms_node_key=_WORKFLOW_CHAPTER_GEN_NODE_KEY,
         # CPMS 子提示词自动注入（Anti-AI 层）
         cpms_sub_keys=[
@@ -331,6 +333,7 @@ class BeatNode(BaseNode):
         is_configurable=True,
         can_disable=True,
         default_timeout_seconds=60,
+        llm_backed=True,
         cpms_node_key=_WORKFLOW_BEAT_NODE_KEY,
         description="承接 plan_outline 的 chapter_plan_json；缺失时构建 ChapterExecutionPlan，再统一投影为 beats",
         default_edges=["exec_writer"],
@@ -551,6 +554,7 @@ class SceneNode(BaseNode):
         is_configurable=True,
         can_disable=True,
         default_timeout_seconds=60,
+        llm_backed=True,
         cpms_node_key=SCENE_DIRECTOR,
         description="SceneDirectorService 场景分析",
         default_edges=["exec_beat"],

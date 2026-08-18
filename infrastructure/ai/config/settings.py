@@ -19,6 +19,7 @@ class Settings:
     api_key: Optional[str] = None
     #: 兼容自建/转发网关，与官方 provider base_url 一致；未设则走官方默认
     base_url: Optional[str] = None
+    #: 历史兼容字段；LLM 生成不会按它设置总等待截止时间
     timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SETTINGS.timeout_seconds
     #: 连接超时（秒）：建立 TCP 连接的最大等待时间。设短可快速发现网络不可达
     connect_timeout: float = DEFAULT_HTTP_TIMEOUT_SETTINGS.connect_timeout

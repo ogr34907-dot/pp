@@ -587,7 +587,8 @@ class AutoBibleGenerator:
             if not chars_payload:
                 raise ValueError(
                     "角色生成未得到任何人物：多为模型输出非 JSON、截断或解析失败。"
-                    "请确认 AI 控制台模型可用并适当增大超时；也可查看服务端日志中的 LLM 原始片段。"
+                    "模型等待不会按历史超时字段硬截断；请确认 AI 控制台模型、代理连接，"
+                    "也可查看服务端日志中的 LLM 原始片段。"
                 )
             # 保存人物
             character_ids = []
@@ -657,7 +658,8 @@ class AutoBibleGenerator:
             if not locs_payload:
                 raise ValueError(
                     "地点生成未得到任何地点：多为模型输出非 JSON、截断或解析失败。"
-                    "请确认 AI 控制台模型可用并适当增大超时；也可查看服务端日志中的 LLM 原始片段。"
+                    "模型等待不会按历史超时字段硬截断；请确认 AI 控制台模型、代理连接，"
+                    "也可查看服务端日志中的 LLM 原始片段。"
                 )
             # 保存地点
             location_ids = []

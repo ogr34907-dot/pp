@@ -172,15 +172,13 @@ class OutlineCohortGenerationService:
                 parent_payload=parent_payload,
                 siblings=payloads,
             )
-            chapter_range_blockers = tuple(
-                blocker
-                for blocker in validation.blockers
-                if blocker.startswith("chapter_range:")
-            )
-            if chapter_range_blockers:
+            if validation.blockers:
+                # A completed attempt is eligible for author publication. Do
+                # not persist a cohort that can only be rejected later by the
+                # publication gate (especially handoff boundary mismatches).
                 raise OutlineCohortGenerationError(
-                    "cohort generation violated parent chapter range: "
-                    + ", ".join(chapter_range_blockers)
+                    "cohort generation failed deterministic validation: "
+                    + ", ".join(validation.blockers)
                 )
             completed, updated = self.repository.complete_manifest_cohort_attempt_with_payloads(
                 attempt_id=attempt["id"],

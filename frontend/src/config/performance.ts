@@ -15,6 +15,9 @@ export const runtimePerformance = {
     mediumTaskTimeoutMs: numberFromEnv('VITE_API_MEDIUM_TASK_TIMEOUT_MS', 60000),
     longTaskTimeoutMs: numberFromEnv('VITE_API_LONG_TASK_TIMEOUT_MS', 120000),
     planningTaskTimeoutMs: numberFromEnv('VITE_PLANNING_TASK_TIMEOUT_MS', 300000),
+    // LLM results can legitimately take much longer than a browser request
+    // budget. Individual UI flows retain AbortController cancellation instead.
+    llmTaskTimeoutMs: 0,
   },
   dagSse: {
     messageThrottleMs: numberFromEnv('VITE_DAG_SSE_MESSAGE_THROTTLE_MS', 100),

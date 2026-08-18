@@ -106,7 +106,7 @@ class TestAnthropicProvider:
         assert call_kwargs['max_tokens'] == 2048
 
     @pytest.mark.asyncio
-    async def test_generate_uses_single_request_builder_with_task_timeout(self, provider):
+    async def test_generate_uses_single_request_builder_without_read_deadline(self, provider):
         prompt = Prompt(system="You are helpful", user="Hello")
         config = GenerationConfig(max_tokens=128, timeout_seconds=12)
         provider.async_client.messages.create = AsyncMock(return_value=Mock(
@@ -117,7 +117,8 @@ class TestAnthropicProvider:
         await provider.generate(prompt, config)
 
         call_kwargs = provider.async_client.messages.create.call_args[1]
-        assert call_kwargs["timeout"] == 12
+        assert call_kwargs["timeout"].read is None
+        assert call_kwargs["timeout"].connect == provider.settings.connect_timeout
 
     @pytest.mark.asyncio
     async def test_generate_preserves_cache_and_thinking_usage_details(self, provider):

@@ -90,7 +90,7 @@ export const llmControlApi = {
     apiClient.put<LLMControlPanelData>('/llm-control', config) as Promise<LLMControlPanelData>,
   testProfile: (profile: LLMProfile) =>
     apiClient.post<LLMTestResult>('/llm-control/test', profile, {
-      timeout: runtimePerformance.network.longTaskTimeoutMs,
+      timeout: runtimePerformance.network.llmTaskTimeoutMs,
     }) as Promise<LLMTestResult>,
   fetchModels: (payload: FetchModelsPayload) =>
     apiClient.post<ModelListResponse>('/llm-control/models', payload, {

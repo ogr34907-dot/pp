@@ -48,7 +48,8 @@ class GenerationConfig:
             raise ValueError("max_tokens must be greater than 0")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than 0")
-        # The default belongs to the constructor; an explicit operation limit is a cap.
+        # Kept for API/storage compatibility. Providers intentionally do not
+        # use this value as a wall-clock generation deadline.
         self.max_tokens = int(self.max_tokens)
 
     def is_explicit(self, name: str) -> bool:

@@ -1635,7 +1635,7 @@ async function loadPlotOutline(opts?: { forceNew?: boolean }) {
     } catch (directError: unknown) {
       let msg = formatApiError(directError) || formatApiError(e) || '生成失败，请重试'
       if (isLikelyTimeoutError(directError) || isLikelyTimeoutError(e)) {
-        msg = `请求超时：LLM 响应时间过长。请换更快模型后重试。`
+        msg = `LLM 响应尚未返回：请检查模型与代理连接，稍后再查看或重试。`
       }
       plotOutlineError.value = msg
     }

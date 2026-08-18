@@ -240,7 +240,7 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
     )
     drift_result = await host._call_with_timeout(
         host._score_voice_only(novel.novel_id.value, chapter_num, content),
-        timeout=180.0,  # 文风预检最多 3 分钟
+        timeout=None,
         novel_id=novel.novel_id.value,
         label="voice_check",
         timeout_default={"drift_alert": False, "similarity_score": None},
@@ -465,7 +465,7 @@ async def run_chapter_audit(host: Any, novel: Novel) -> None:
                     expected_content_sha256=expected_content_sha256 or None,
                     expected_content_revision=expected_content_revision,
                 ),
-                timeout=300.0,  # 章后管线最多 5 分钟（含多次 LLM）
+                timeout=None,
                 novel_id=novel.novel_id.value,
                 label="aftermath_pipeline",
                 timeout_default={"drift_alert": False, "similarity_score": None, "narrative_sync_ok": False, "vector_stored": False, "foreshadow_stored": False, "triples_extracted": False},

@@ -165,6 +165,10 @@ class NodeMeta(BaseModel):
     prompt_variables: List[str] = Field(default_factory=list)
     is_configurable: bool = True
     can_disable: bool = True
+    # LLM-backed nodes must remain awaitable while a remote model is thinking
+    # or pausing between stream chunks. User cancellation and process shutdown
+    # still cancel the task; this only disables the automatic node deadline.
+    llm_backed: bool = False
     default_timeout_seconds: int = 60
     default_max_retries: int = 1
     # CPMS 主关联字段

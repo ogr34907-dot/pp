@@ -13,7 +13,7 @@ from domain.ai.value_objects.prompt import Prompt
 from domain.ai.value_objects.token_usage import TokenUsage
 from application.ai.llm_retry_policy import LLM_MAX_TOTAL_ATTEMPTS, is_retryable_llm_error
 from infrastructure.ai.config.settings import Settings
-from infrastructure.ai.http_timeout import build_httpx_timeout
+from infrastructure.ai.http_timeout import build_llm_httpx_timeout
 from infrastructure.ai.url_utils import normalize_openai_base_url
 from .base import BaseProvider
 from .model_resolution import require_resolved_model_id
@@ -46,9 +46,10 @@ class OpenAIProvider(BaseProvider):
 
         self._use_legacy = settings.use_legacy_chat_completions
 
+        self._llm_timeout = build_llm_httpx_timeout(self.settings.http_timeout_settings)
         client_kwargs = {
             "api_key": settings.api_key,
-            "timeout": self.settings.timeout_seconds,
+            "timeout": self._llm_timeout,
             "default_headers": self.settings.extra_headers or None,
             "default_query": self.settings.extra_query or None,
         }
@@ -56,7 +57,7 @@ class OpenAIProvider(BaseProvider):
             client_kwargs["base_url"] = self.settings.base_url
 
         self._http_client = httpx.AsyncClient(
-            timeout=build_httpx_timeout(self.settings.http_timeout_settings),
+            timeout=self._llm_timeout,
             trust_env=False,
         )
         client_kwargs["http_client"] = self._http_client
@@ -291,8 +292,13 @@ class OpenAIProvider(BaseProvider):
             result["strict"] = bool(schema_config["strict"])
         return result
 
-    def _request_timeout(self, config: GenerationConfig) -> float:
-        return float(config.timeout_seconds or self.settings.timeout_seconds)
+    def _request_timeout(self, config: GenerationConfig) -> httpx.Timeout:
+        """Return phase limits while leaving model response reads unbounded.
+
+        ``GenerationConfig.timeout_seconds`` is retained for API/storage
+        compatibility, but is no longer used as a hard generation deadline.
+        """
+        return self._llm_timeout
 
     def _is_deepseek_model(self, model_id: str) -> bool:
         return "deepseek" in model_id.lower() or "deepseek" in (self.settings.base_url or "").lower()

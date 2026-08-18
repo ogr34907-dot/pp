@@ -4,14 +4,29 @@ export class HttpError extends Error {
   status: number
   statusText: string
   body: unknown
+  detail: string
 
   constructor(response: Response, body: unknown) {
-    super(`HTTP ${response.status} ${response.statusText}`.trim())
+    const detail = extractErrorDetail(body)
+    super([`HTTP ${response.status} ${response.statusText}`.trim(), detail].filter(Boolean).join(': '))
     this.name = 'HttpError'
     this.status = response.status
     this.statusText = response.statusText
     this.body = body
+    this.detail = detail
   }
+}
+
+function extractErrorDetail(body: unknown): string {
+  if (typeof body === 'string') return body.trim()
+  if (!body || typeof body !== 'object') return ''
+  const detail = (body as { detail?: unknown }).detail
+  if (typeof detail === 'string') return detail.trim()
+  if (detail !== undefined) {
+    try { return JSON.stringify(detail) }
+    catch { return String(detail) }
+  }
+  return ''
 }
 
 export interface FetchJsonOptions extends Omit<RequestInit, 'body'> {
