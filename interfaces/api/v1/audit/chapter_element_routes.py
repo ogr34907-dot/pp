@@ -255,5 +255,7 @@ async def get_element_chapters(
                 "chapters": chapters
             }
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"不支持的元素类型: {element_type}") from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询元素章节失败: {str(e)}")

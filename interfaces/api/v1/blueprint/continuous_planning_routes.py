@@ -842,6 +842,8 @@ async def get_act_detail(
             "success": True,
             "data": act.to_dict()
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取幕详情失败: {str(e)}")
 

@@ -22,7 +22,7 @@ function errorText(err: unknown): string {
 
 export const useAIInvocationStore = defineStore('aiInvocation', () => {
   const sessionListeners = new Map<string, Array<(payload: InvocationResponseDTO) => void>>()
-  const sessionPollTimer = new Map<string, ReturnType<typeof setTimeout>>()
+  const sessionPollTimer = new Map<string, number>()
   const activeGenerationPollSessions = new Set<string>()
   const sessionPollInFlight = new Set<string>()
   const headlessAdvancingSessions = new Set<string>()

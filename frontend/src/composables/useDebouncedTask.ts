@@ -26,7 +26,7 @@ export function useDebouncedTask(
 ): UseDebouncedTaskResult {
   const isScheduled = ref(false)
   const isExecuting = ref(false)
-  let timer: ReturnType<typeof setTimeout> | null = null
+  let timer: number | null = null
   let rerunAfterCurrent = false
   let disposed = false
 

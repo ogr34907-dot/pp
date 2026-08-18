@@ -89,6 +89,15 @@ class OutlineContractRepository:
             self._connection(), novel_id, operation=operation
         )
 
+    def novel_exists(self, novel_id: str) -> bool:
+        """Return whether a novel row exists before legacy tree initialization."""
+
+        row = self._connection().execute(
+            "SELECT 1 FROM novels WHERE id = ? LIMIT 1",
+            (novel_id,),
+        ).fetchone()
+        return row is not None
+
     def _begin_legacy_mutation_transaction(
         self,
         conn: sqlite3.Connection,

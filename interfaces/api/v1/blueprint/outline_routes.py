@@ -185,7 +185,10 @@ def get_outline_tree(
 ):
     """Logical total-outline root plus the existing physical structure tree."""
 
-    return {"success": True, "data": service.logical_tree(novel_id)}
+    try:
+        return {"success": True, "data": service.logical_tree(novel_id)}
+    except Exception as exc:
+        _raise_contract_error(exc)
 
 
 @router.get("/novels/{novel_id}/working-tree")

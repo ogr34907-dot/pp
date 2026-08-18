@@ -16,6 +16,7 @@ from interfaces.api.dependencies import (
 )
 from interfaces.api.urls import bible_generation_status_url
 from domain.shared.exceptions import EntityNotFoundError
+from infrastructure.persistence.database.write_dispatch import sqlite_writes_bypass_queue
 
 logger = logging.getLogger(__name__)
 
@@ -267,7 +268,8 @@ async def delete_novel(
         novel_id: 小说 ID
         service: Novel 服务
     """
-    service.delete_novel(novel_id)
+    with sqlite_writes_bypass_queue():
+        service.delete_novel(novel_id)
 
 
 @router.post("/{novel_id}/bible/generate", status_code=202)

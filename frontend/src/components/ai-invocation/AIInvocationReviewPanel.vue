@@ -9,7 +9,7 @@ const store = useAIInvocationStore()
 const message = useMessage()
 const promptDraftSystem = ref('')
 const promptDraftUser = ref('')
-let previewTimer: ReturnType<typeof setTimeout> | null = null
+let previewTimer: number | null = null
 
 const statusType = computed(() => {
   const status = store.session?.status

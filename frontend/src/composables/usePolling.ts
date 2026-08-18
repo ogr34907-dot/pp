@@ -24,7 +24,7 @@ export function usePolling(
 ): UsePollingResult {
   const isPolling = ref(false)
   const isExecuting = ref(false)
-  let timer: ReturnType<typeof setTimeout> | null = null
+  let timer: number | null = null
   let disposed = false
 
   function clearTimer() {

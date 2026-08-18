@@ -176,6 +176,33 @@ async def test_mock_provider_plot_outline_returns_contract_shape():
 
 
 @pytest.mark.asyncio
+async def test_mock_provider_outline_cohort_returns_non_empty_payload_array():
+    content = await _generate(
+        'Return a JSON array of complete sibling plans. Each item must include '
+        'title, narrative_text, creative_goal, entry_state, exit_state, conflicts, '
+        'state_changes, handoff_conditions, chapter_start, and chapter_end.'
+    )
+
+    payloads = json.loads(content)
+    assert isinstance(payloads, list)
+    assert payloads
+    assert {
+        "title",
+        "narrative_text",
+        "creative_goal",
+        "entry_state",
+        "exit_state",
+        "conflicts",
+        "state_changes",
+        "handoff_conditions",
+        "chapter_start",
+        "chapter_end",
+    } <= set(payloads[0])
+    for previous, current in zip(payloads, payloads[1:]):
+        assert current["entry_state"] == previous["exit_state"]
+
+
+@pytest.mark.asyncio
 async def test_mock_provider_chapter_review_returns_review_contract():
     data = _loads(await _generate('章节 AI 审阅，请输出 "score" 和 "issues"。'))
 

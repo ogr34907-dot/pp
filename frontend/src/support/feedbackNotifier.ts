@@ -27,7 +27,7 @@ const ringBuffer: FeedbackIncidentPayload[] = []
 
 /** @internal 供测试或可观测性挂接（勿在业务中依赖） */
 const _axiosAggBuffer: FeedbackIncidentPayload[] = []
-let _axiosAggTimer: ReturnType<typeof setTimeout> | null = null
+let _axiosAggTimer: number | null = null
 
 const { notification } = createDiscreteApi(['notification'], {
   notificationProviderProps: {

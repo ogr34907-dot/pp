@@ -233,6 +233,9 @@ class OutlineContractService:
 
             return render_manifest(root_rows[0])
 
+        novel_exists = getattr(self.contract_repository, "novel_exists", None)
+        if callable(novel_exists) and not novel_exists(novel_id):
+            raise KeyError(f"novel not found: {novel_id}")
         root = self.contract_repository.ensure_root(novel_id)
         nodes = self.story_node_repository.get_by_novel_sync(novel_id)
         nodes_by_parent: dict[Optional[str], list[StoryNode]] = {}

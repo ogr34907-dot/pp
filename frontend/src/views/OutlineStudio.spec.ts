@@ -474,6 +474,80 @@ describe('OutlineStudio request and payload isolation', () => {
     }))
   })
 
+  it('does not offer author publication while the Working cohort is still running', async () => {
+    const workingRoot = {
+      ...node('manifest-root', 'contract-root'),
+      node_type: 'outline',
+      logical_node_id: 'logical-root',
+      tree_mode: 'MANIFEST_WORKING',
+      status: 'draft',
+      plan_revision_id: 'plan-1',
+      plan_digest: 'plan-v1',
+      version_digest: 'root-v1',
+      cohort_attempt_id: null,
+      latest_cohort_attempt: {
+        id: 'running-attempt',
+        status: 'running',
+        level: 'part',
+      },
+      payload: { title: '总纲' },
+      children: [],
+    }
+    mocks.getTree.mockResolvedValue(node('root'))
+    mocks.getWorkingTree.mockResolvedValue(workingRoot)
+    mocks.getContract.mockResolvedValue(contract('contract-root', { title: '总纲' }))
+
+    const state = await setupStudio()
+    await state.loadTree()
+    await state.selectNode(workingRoot)
+
+    expect(state.canAuthorPublishCohort).toBe(false)
+    expect(state.cohortStatusLabel).toBe('部纲生成中')
+    await state.publishAndSync()
+
+    expect(mocks.authorPublishCohort).not.toHaveBeenCalled()
+    expect(state.error).toContain('部纲仍在生成中')
+  })
+
+  it('keeps a retry action for a failed Working cohort after re-entering the page', async () => {
+    const workingRoot = {
+      ...node('manifest-root', 'contract-root'),
+      node_type: 'outline',
+      logical_node_id: 'logical-root',
+      tree_mode: 'MANIFEST_WORKING',
+      status: 'draft',
+      plan_revision_id: 'plan-1',
+      plan_digest: 'plan-v1',
+      version_digest: 'root-v1',
+      latest_cohort_attempt: {
+        id: 'failed-attempt',
+        status: 'failed',
+        error: 'provider unavailable',
+        level: 'part',
+      },
+      payload: { title: '总纲' },
+      children: [],
+    }
+    mocks.getTree.mockResolvedValue(node('root'))
+    mocks.getWorkingTree.mockResolvedValue(workingRoot)
+    mocks.getContract.mockResolvedValue(contract('contract-root', { title: '总纲' }))
+    mocks.expandCohort.mockResolvedValue({ attempt: { id: 'retry-attempt', status: 'completed' } })
+
+    const state = await setupStudio()
+    await state.loadTree()
+    await state.selectNode(workingRoot)
+
+    expect(state.canGenerateNextCohort).toBe(true)
+    expect(state.cohortButtonLabel).toBe('重试生成')
+    await state.generateNextCohort()
+
+    expect(mocks.expandCohort).toHaveBeenCalledWith('novel-1', expect.objectContaining({
+      logical_node_id: 'logical-root',
+      level: 'part',
+      retry_attempt_id: 'failed-attempt',
+    }))
+  })
+
   it('saves a Working node through the Manifest item endpoint and never legacy saveDraft', async () => {
     const working = {
       ...node('manifest-node-part', 'contract-part'),

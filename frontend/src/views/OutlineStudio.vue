@@ -115,12 +115,12 @@
             </n-button>
             <n-button
               v-if="canEditSelectedNode"
-              :disabled="isWorkingNode(selectedNode) ? !cohortAttemptId : !selectedContract.draft"
+              :disabled="isWorkingNode(selectedNode) ? !canAuthorPublishCohort : !selectedContract.draft"
               :loading="publishing"
               @click.prevent="publishAndSync"
             >
               <template #icon><n-icon :component="CloudUploadOutline" /></template>
-              {{ isWorkingNode(selectedNode) ? '作者发布规划' : '发布并同步' }}
+              {{ isWorkingNode(selectedNode) ? workingPublishButtonLabel : '发布并同步' }}
             </n-button>
             <n-button
               v-if="nextLevel && canGenerateNextCohort"
@@ -261,13 +261,16 @@ const canEditSelectedNode = computed(() => Boolean(selectedNode.value && !isMani
 
 const nextLevel = computed<CohortLevel | null>(() => {
   const node = selectedNode.value
-  if (!node || nodeStatus(node) !== 'synced') return null
-  return ({
+  if (!node) return null
+  const level = ({
     outline: 'part',
     part: 'volume',
     volume: 'act',
     act: 'chapter',
   } as Partial<Record<OutlineLevel, CohortLevel>>)[String(node.node_type) as OutlineLevel] || null
+  if (!level) return null
+  if (nodeStatus(node) === 'synced') return level
+  return isWorkingNode(node) && retryableCohortAttempt.value ? level : null
 })
 
 const retryableCohortAttempt = computed(() => {
@@ -276,6 +279,30 @@ const retryableCohortAttempt = computed(() => {
     ? attempt
     : null
 })
+
+const cohortAttemptStatus = computed(() => {
+  const node = selectedNode.value
+  const attempt = node?.latest_cohort_attempt
+  if (attempt?.status) return String(attempt.status)
+  return node?.cohort_attempt_id ? 'completed' : null
+})
+
+const cohortStatusLabel = computed(() => ({
+  running: '部纲生成中',
+  completed: '规划已生成，等待作者发布',
+  failed: '部纲生成失败',
+  cancelled: '部纲生成已取消',
+} as Record<string, string>)[cohortAttemptStatus.value || ''] || '')
+
+const canAuthorPublishCohort = computed(() => Boolean(
+  isWorkingNode(selectedNode.value)
+  && cohortAttemptId.value
+  && cohortAttemptStatus.value === 'completed',
+))
+
+const workingPublishButtonLabel = computed(() => canAuthorPublishCohort.value
+  ? '作者发布规划'
+  : (cohortStatusLabel.value || '等待部纲生成'))
 
 const cohortButtonLabel = computed(() => retryableCohortAttempt.value
   ? '重试生成'
@@ -295,11 +322,23 @@ const draftButtonLabel = computed(() => (
 const canGenerateNextCohort = computed(() => Boolean(
   selectedNode.value
   && nextLevel.value
-  && !isWorkingNode(selectedNode.value)
-  && (retryableCohortAttempt.value || !flattenedTree.value.some(item => (
-    item.parent && nodeKey(item.parent) === nodeKey(selectedNode.value as OutlineTreeNode)
-    && String(item.node.node_type) === nextLevel.value
-  ))),
+  && (
+    (
+      isWorkingNode(selectedNode.value)
+      && Boolean(retryableCohortAttempt.value)
+      && !flattenedTree.value.some(item => (
+        item.parent && nodeKey(item.parent) === nodeKey(selectedNode.value as OutlineTreeNode)
+        && String(item.node.node_type) === nextLevel.value
+      ))
+    )
+    || (
+      !isWorkingNode(selectedNode.value)
+      && (retryableCohortAttempt.value || !flattenedTree.value.some(item => (
+        item.parent && nodeKey(item.parent) === nodeKey(selectedNode.value as OutlineTreeNode)
+        && String(item.node.node_type) === nextLevel.value
+      )))
+    )
+  ),
 ))
 
 function levelLabel(level?: string) {
@@ -585,6 +624,12 @@ async function publishAndSync() {
   try {
     if (node && isWorkingNode(node)) {
       if (!cohortAttemptId.value) throw new Error('当前 Working 草稿没有可发布的 Cohort Attempt')
+      if (!canAuthorPublishCohort.value) {
+        if (cohortAttemptStatus.value === 'running') {
+          throw new Error('部纲仍在生成中，请刷新状态后再发布')
+        }
+        throw new Error('部纲尚未生成完成，暂不能作者发布规划')
+      }
       await outlineApi.authorPublishCohort(cohortAttemptId.value)
       if (!isCurrentContract(context)) return
       workingTree.value = null

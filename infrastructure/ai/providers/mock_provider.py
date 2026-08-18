@@ -29,6 +29,8 @@ class MockResponseFactory:
 
     def build(self, prompt: Prompt) -> str:
         intent = self._detect_intent(prompt)
+        if intent == "outline_cohort":
+            return self._outline_cohort()
         if intent == "act_plan":
             return self._act_plan(prompt)
         if intent == "chapter_preplan":
@@ -55,6 +57,18 @@ class MockResponseFactory:
     def _detect_intent(self, prompt: Prompt) -> str:
         text = f"{prompt.system}\n{prompt.user}".lower()
 
+        if (
+            "narrative_text" in text
+            and "creative_goal" in text
+            and "entry_state" in text
+            and "exit_state" in text
+            and "conflicts" in text
+            and "state_changes" in text
+            and "handoff_conditions" in text
+            and "chapter_start" in text
+            and "chapter_end" in text
+        ):
+            return "outline_cohort"
         if (
             "natural_language_suggestion" in text
             and "suggested_mutations" in text
@@ -467,6 +481,34 @@ class MockResponseFactory:
                 "suggestions": ["配置真实模型后重新执行 AI 审阅。"],
             }
         )
+
+    def _outline_cohort(self) -> str:
+        """Return a valid generic sibling cohort for no-key/local runs."""
+
+        payloads = []
+        previous_exit = ""
+        for index in range(1, 4):
+            exit_state = f"阶段 {index} 的目标已完成，并留下下一阶段的明确入口。"
+            payloads.append(
+                {
+                    "title": f"阶段 {index}",
+                    "narrative_text": "围绕当前父级目标推进一轮可验证的压力、选择与代价。",
+                    "creative_goal": "完成本阶段的核心推进并明确下一阶段入口。",
+                    "entry_state": "本阶段开始时，核心目标尚未完成。"
+                    if index == 1
+                    else previous_exit,
+                    "exit_state": exit_state,
+                    "conflicts": ["目标推进与新增代价之间的冲突"],
+                    "state_changes": {
+                        "story": [{"change": f"阶段 {index} 的目标、阻力与代价发生可见变化。"}]
+                    },
+                    "handoff_conditions": ["下一阶段必须承接本阶段的结果与新增代价。"],
+                    "chapter_start": index,
+                    "chapter_end": index,
+                }
+            )
+            previous_exit = exit_state
+        return json.dumps(payloads, ensure_ascii=False, separators=(",", ":"))
 
     def _act_plan(self, prompt: Prompt) -> str:
         match = re.search(r"请为这一幕规划\s*(\d+)\s*个章节", prompt.user)
