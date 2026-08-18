@@ -69,6 +69,13 @@ export interface OutlineTreeNode {
   version_id?: string
   version_digest?: string
   cohort_attempt_id?: string | null
+  latest_cohort_attempt?: {
+    id: string
+    status: 'running' | 'completed' | 'failed' | 'cancelled' | string
+    error?: string
+    retry_of_attempt_id?: string | null
+    level?: string
+  } | null
   payload?: OutlinePayload
   status?: string
   outline_contract?: {
@@ -106,6 +113,11 @@ export interface ChapterCandidate {
   failure_reason: string
   continue_after_commit: boolean
   formal_chapter_id?: string | null
+}
+
+export interface CandidateCommitResult extends ChapterCandidate {
+  continuation_started?: boolean
+  continuation_error?: string | null
 }
 
 export interface CandidateVersion {
@@ -237,7 +249,7 @@ export const generationApi = {
       method: 'POST', body: { feedback },
     }),
   approveAndCommit: (candidateId: string, continueAfterCommit: boolean) =>
-    unwrap<ChapterCandidate>(apiRoutes.generation.candidateApprove(candidateId), {
+    unwrap<CandidateCommitResult>(apiRoutes.generation.candidateApprove(candidateId), {
       method: 'POST', body: { continue_after_commit: continueAfterCommit },
     }),
   retrySync: (candidateId: string) =>
@@ -276,13 +288,14 @@ export const outlineApi = {
   }),
   expandCohort: (
     novelId: string,
-    request: { logical_node_id: string; id?: string; level: 'part' | 'volume' | 'act' | 'chapter'; author_payloads?: OutlinePayload[] },
+    request: { logical_node_id: string; id?: string; level: 'part' | 'volume' | 'act' | 'chapter'; author_payloads?: OutlinePayload[]; retry_attempt_id?: string | null },
   ) => unwrap<Record<string, unknown>>(apiRoutes.outline.cohortExpand(novelId), {
     method: 'POST',
     body: {
       parent_logical_node_id: request.logical_node_id,
       level: request.level,
       author_payloads: request.author_payloads || [],
+      ...(request.retry_attempt_id ? { retry_attempt_id: request.retry_attempt_id } : {}),
     },
   }),
   authorPublishCohort: (attemptId: string) =>

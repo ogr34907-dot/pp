@@ -25,6 +25,37 @@ def _is_novel_deleted(host: Any, novel: Novel) -> bool:
         return False
 
 
+def _record_processing_failure(host: Any, novel: Novel, error: str = "") -> None:
+    """Record one failed stage; the lifecycle owns the error counter."""
+    if _is_novel_deleted(host, novel):
+        logger.warning("[%s] 小说已被删除，放弃本轮处理（不累计错误）", novel.novel_id)
+        return
+
+    host._merge_autopilot_status_from_db(novel)
+    if novel.autopilot_status != AutopilotStatus.RUNNING:
+        logger.info("[%s] 处理失败但用户已停止，不累计熔断/失败次数", novel.novel_id)
+        host._save_novel_state(novel)
+        return
+
+    if error:
+        novel.autopilot_recovery_reason = str(error)
+        host._update_shared_state(
+            novel.novel_id.value,
+            autopilot_recovery_reason=str(error),
+        )
+
+    if host.circuit_breaker:
+        host.circuit_breaker.record_failure()
+    novel.consecutive_error_count = (novel.consecutive_error_count or 0) + 1
+
+    if novel.consecutive_error_count >= 3:
+        logger.error("[%s] 连续失败 %s 次，挂起等待急救", novel.novel_id, novel.consecutive_error_count)
+        novel.autopilot_status = AutopilotStatus.ERROR
+    else:
+        logger.warning("[%s] 连续失败 %s/3 次", novel.novel_id, novel.consecutive_error_count)
+    host._save_novel_state(novel)
+
+
 async def process_novel(host: Any, novel: Novel) -> None:
     """处理单个小说（全流程状态机路由）"""
     try:
@@ -84,6 +115,7 @@ async def process_novel(host: Any, novel: Novel) -> None:
 
         stage_name = novel.current_stage.value
         logger.debug("[%s] 当前阶段: %s", novel.novel_id, stage_name)
+        stage_result = None
 
         if novel.current_stage in (NovelStage.PLANNING, NovelStage.MACRO_PLANNING):
             if novel.current_stage == NovelStage.PLANNING:
@@ -102,7 +134,7 @@ async def process_novel(host: Any, novel: Novel) -> None:
             logger.info("[%s] 开始写作 (第 %s 幕)", novel.novel_id, novel.current_act + 1)
             from engine.runtime.writing_delegate import run_writing
 
-            await run_writing(host, novel)
+            stage_result = await run_writing(host, novel)
         elif novel.current_stage == NovelStage.AUDITING:
             logger.info("[%s] 开始审计", novel.novel_id)
             await run_chapter_audit(host, novel)
@@ -170,6 +202,19 @@ async def process_novel(host: Any, novel: Novel) -> None:
             logger.debug("[%s] 等待人工审阅", novel.novel_id)
             return
 
+        if stage_result is not None:
+            result_status = getattr(stage_result, "status", "")
+            if result_status == "failed":
+                _record_processing_failure(
+                    host,
+                    novel,
+                    str(getattr(stage_result, "error", "") or "writing stage failed"),
+                )
+                return
+            if result_status in {"paused", "interrupted"}:
+                host._save_novel_state(novel)
+                return
+
         host._merge_autopilot_status_from_db(novel)
         if novel.autopilot_status == AutopilotStatus.RUNNING:
             if host.circuit_breaker:
@@ -183,23 +228,4 @@ async def process_novel(host: Any, novel: Novel) -> None:
     except Exception as e:
         logger.error("[%s] 处理失败: %s", novel.novel_id, e, exc_info=True)
 
-        if _is_novel_deleted(host, novel):
-            logger.warning("[%s] 小说已被删除，放弃本轮处理（不累计错误）", novel.novel_id)
-            return
-
-        host._merge_autopilot_status_from_db(novel)
-        if novel.autopilot_status != AutopilotStatus.RUNNING:
-            logger.info("[%s] 处理异常但用户已停止，不累计熔断/失败次数", novel.novel_id)
-            host._save_novel_state(novel)
-            return
-
-        if host.circuit_breaker:
-            host.circuit_breaker.record_failure()
-        novel.consecutive_error_count = (novel.consecutive_error_count or 0) + 1
-
-        if novel.consecutive_error_count >= 3:
-            logger.error("[%s] 连续失败 %s 次，挂起等待急救", novel.novel_id, novel.consecutive_error_count)
-            novel.autopilot_status = AutopilotStatus.ERROR
-        else:
-            logger.warning("[%s] 连续失败 %s/3 次", novel.novel_id, novel.consecutive_error_count)
-        host._save_novel_state(novel)
+        _record_processing_failure(host, novel)

@@ -397,7 +397,12 @@ class NarrativeGovernanceService:
             chapter_number,
             {"content_length": len(content or ""), "metadata": metadata or {}},
         )
-        return self.evaluate_after_chapter(novel_id, chapter_number, content)
+        return self.evaluate_after_chapter(
+            novel_id,
+            chapter_number,
+            content,
+            sync_flags=metadata,
+        )
 
     def evaluate_after_chapter(
         self,
@@ -656,38 +661,52 @@ class NarrativeGovernanceService:
     def _pause_autopilot(self, novel_id: str) -> None:
         if not self.db:
             return
-        try:
-            from infrastructure.persistence.database.chapter_candidate_repository import (
-                ChapterCandidateRepository,
-            )
+        from infrastructure.persistence.database.chapter_candidate_repository import (
+            CandidateGateError,
+            ChapterCandidateRepository,
+        )
 
+        candidate_repository = ChapterCandidateRepository(self.db)
+        try:
+            run = candidate_repository.get_run(novel_id)
+        except KeyError:
+            # A missing Candidate run is the only condition that permits the
+            # legacy novels mirror. Database or CAS failures must propagate.
             run = None
-            try:
-                run = ChapterCandidateRepository(self.db).pause_for_governance(
+
+        if run is not None:
+            if (
+                run.current_candidate_id is not None
+                and run.canonical_sync_status == "syncing"
+                and run.next_action == "sync_candidate"
+            ):
+                candidate_repository.request_governance_pause_after_sync(
                     novel_id,
                     "narrative_governance_block",
                 )
-            except Exception:
-                # Legacy novels may not have a Candidate run yet. Preserve the
-                # compatibility mirror below while never claiming a run pause.
-                run = None
-
-            conn = self.db.get_connection()
-            conn.execute(
-                """
-                UPDATE novels
-                SET autopilot_status = 'stopped',
-                    current_stage = 'paused_for_review',
-                    audit_progress = ?
-                WHERE id = ?
-                """,
-                ("叙事治理发现严重结构风险，已暂停自动驾驶。", novel_id),
-            )
-            conn.commit()
-            if run is not None:
                 return
-        except Exception:
-            return
+            if run.current_candidate_id is None:
+                candidate_repository.pause_for_governance(
+                    novel_id,
+                    "narrative_governance_block",
+                )
+                return
+            raise CandidateGateError(
+                "governance pause cannot safely transition the active Candidate run"
+            )
+
+        conn = self.db.get_connection()
+        conn.execute(
+            """
+            UPDATE novels
+            SET autopilot_status = 'stopped',
+                current_stage = 'paused_for_review',
+                audit_progress = ?
+            WHERE id = ?
+            """,
+            ("叙事治理发现严重结构风险，已暂停自动驾驶。", novel_id),
+        )
+        conn.commit()
 
     def _emit(
         self,

@@ -181,7 +181,7 @@ def create_app(app_settings: BackendSettings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            _get_lifecycle().shutdown()
+            await _get_lifecycle().shutdown()
 
     created = FastAPI(
         title="PlotPilot API",

@@ -1,6 +1,7 @@
 """Prose composition strategies for StoryPipeline."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
@@ -11,6 +12,9 @@ from application.ai_invocation.contracts.autopilot_writing import (
 from application.ai_invocation.dtos import InvocationSessionStatus
 from infrastructure.ai.prompt_keys import CHAPTER_PROSE_GENERATION
 from engine.runtime.generation_token_policy import CHAPTER_PROSE_MAX_TOKENS
+
+
+logger = logging.getLogger(__name__)
 
 
 StreamSink = Callable[[str], None]
@@ -48,6 +52,10 @@ class ProseCompositionResult:
 class ProseComposer(Protocol):
     async def compose(self, request: ProseCompositionRequest) -> ProseCompositionResult:
         ...
+
+
+class CommittedContentLookupError(RuntimeError):
+    """The committed-content read failed; it is not a missing row."""
 
 
 class ChapterProseInvocationComposer:
@@ -115,7 +123,9 @@ class ChapterProseInvocationComposer:
         return GenerationConfig(max_tokens=ChapterProseInvocationComposer._max_output_tokens(request), temperature=0.85)
 
     @staticmethod
-    def _load_committed_story_pipeline_content(request: ProseCompositionRequest) -> str:
+    def _load_committed_story_pipeline_content(
+        request: ProseCompositionRequest,
+    ) -> str | None:
         """Return accepted prose already committed for this StoryPipeline step.
 
         StoryPipeline owns the formal chapter save, so its continuation stores
@@ -147,9 +157,18 @@ class ChapterProseInvocationComposer:
                     int(request.chapter_number or 0),
                 ),
             )
-        except Exception:
-            return ""
-        return str((row or {}).get("accepted_content") or "").strip()
+        except Exception as exc:
+            logger.exception(
+                "读取已提交 StoryPipeline 正文失败 novel=%s chapter=%s",
+                request.novel_id,
+                request.chapter_number,
+            )
+            raise CommittedContentLookupError(
+                "committed story pipeline content lookup failed"
+            ) from exc
+        if row is None:
+            return None
+        return str(row.get("accepted_content") or "").strip()
 
     async def compose(self, request: ProseCompositionRequest) -> ProseCompositionResult:
         from application.ai_invocation.autopilot.factory import get_or_create_autopilot_orchestrator
@@ -159,7 +178,7 @@ class ChapterProseInvocationComposer:
         from infrastructure.persistence.database.connection import get_database
 
         committed_content = self._load_committed_story_pipeline_content(request)
-        if committed_content:
+        if committed_content is not None:
             if request.stream_sink:
                 request.stream_sink(committed_content)
             return ProseCompositionResult(

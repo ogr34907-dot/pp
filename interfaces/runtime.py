@@ -164,12 +164,13 @@ class BackendLifecycle:
         self.recover_drafts()
         self._start_daemon()
         self.init_dag_node_registry()
+        self._start_generation_runner()
 
-    def shutdown(self) -> None:
+    async def shutdown(self) -> None:
         """Run graceful shutdown hooks shared by uvicorn and desktop shutdown."""
         if self._start_force_exit_watchdog is not None:
             self._start_force_exit_watchdog()
-        self._stop_generation_runner()
+        await self._stop_generation_runner()
         self._stop_daemon()
         self.stop_background_tasks()
         self.stop_persistence_consumer()
@@ -181,6 +182,7 @@ class BackendLifecycle:
         self.log_stopped("PlotPilot service stopped")
 
     def windows_forced_shutdown(self) -> None:
+        self._cancel_generation_runner_forced()
         self._stop_daemon()
         self.stop_background_tasks()
         self.stop_persistence_consumer()
@@ -329,7 +331,6 @@ class BackendLifecycle:
 
                 self._recover_manifest_cohort_attempts(db)
                 self._recover_candidate_generation_runs(db)
-                self._start_generation_runner()
 
                 cnt_row = db.fetch_one(
                     "SELECT COUNT(*) AS c FROM novels WHERE autopilot_status = 'running'"
@@ -430,15 +431,25 @@ class BackendLifecycle:
         except Exception as exc:
             self._logger.warning("Startup: generation runner claim skipped: %s", exc)
 
-    def _stop_generation_runner(self) -> None:
+    async def _stop_generation_runner(self) -> None:
         try:
             from interfaces.api.dependencies import (
                 shutdown_generation_run_coordinator_if_initialized,
             )
 
-            shutdown_generation_run_coordinator_if_initialized()
+            await shutdown_generation_run_coordinator_if_initialized()
         except Exception as exc:
             self._logger.warning("Shutdown: generation runner cleanup skipped: %s", exc)
+
+    def _cancel_generation_runner_forced(self) -> None:
+        try:
+            from interfaces.api.dependencies import (
+                cancel_generation_run_coordinator_if_initialized,
+            )
+
+            cancel_generation_run_coordinator_if_initialized()
+        except Exception as exc:
+            self._logger.warning("Forced shutdown: generation runner cleanup skipped: %s", exc)
 
     def recover_drafts(self) -> None:
         try:

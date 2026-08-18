@@ -172,6 +172,47 @@ def _claim_continuous_runner_or_fail(
     return False
 
 
+def _claim_continuation(
+    repository: ChapterCandidateRepository,
+    coordinator: Any,
+    novel_id: str,
+) -> dict[str, Any]:
+    """Report continuation failure without undoing an already durable commit."""
+
+    run = repository.get_run(novel_id)
+    if run.run_mode != RunMode.CONTINUOUS:
+        return {"continuation_started": False, "continuation_error": None}
+    try:
+        if coordinator.claim(novel_id):
+            return {"continuation_started": True, "continuation_error": None}
+    except Exception as exc:
+        return {
+            "continuation_started": False,
+            "continuation_error": f"generation_runner_claim_failed:{exc}",
+        }
+
+    current = repository.get_run(novel_id)
+    if current.state.value == "running" and current.generation_epoch == run.generation_epoch:
+        try:
+            repository.record_runner_error(
+                novel_id,
+                expected_generation_epoch=run.generation_epoch,
+                reason="generation_runner_claim_failed",
+            )
+        except Exception as exc:
+            return {
+                "continuation_started": False,
+                "continuation_error": (
+                    "generation_runner_claim_failed; "
+                    f"error state persistence failed: {exc}"
+                ),
+            }
+    return {
+        "continuation_started": False,
+        "continuation_error": "generation_runner_claim_failed",
+    }
+
+
 @router.post("/novels/{novel_id}/start")
 async def start_generation_run(
     novel_id: str,
@@ -428,15 +469,19 @@ async def approve_and_commit_candidate(
         candidate = await service.accept_candidate(
             candidate_id, continue_after_commit=body.continue_after_commit
         )
+        continuation = {
+            "continuation_started": False,
+            "continuation_error": None,
+        }
         if body.continue_after_commit:
-            _claim_continuous_runner_or_fail(
+            continuation = _claim_continuation(
                 repository,
                 api_dependencies.get_generation_run_coordinator(),
                 candidate.novel_id,
             )
         return {
             "success": True,
-            "data": _candidate_to_dict(candidate),
+            "data": {**_candidate_to_dict(candidate), **continuation},
         }
     except Exception as exc:
         _raise_candidate_error(exc)

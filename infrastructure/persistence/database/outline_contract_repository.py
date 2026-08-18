@@ -785,14 +785,79 @@ class OutlineContractRepository:
                    version.revision AS version_revision, version.digest AS version_digest,
                    version.payload_json, version.source AS version_source,
                    version.status AS version_status,
-                   (SELECT attempt.id
-                    FROM outline_plan_cohort_attempts AS attempt
-                    WHERE attempt.plan_revision_id = item.plan_revision_id
-                      AND attempt.parent_logical_node_id = item.parent_logical_node_id
-                      AND attempt.level = item.level
-                      AND attempt.status = 'completed'
-                    ORDER BY attempt.created_at DESC, attempt.id DESC
-                    LIMIT 1) AS cohort_attempt_id
+                    (SELECT attempt.id
+                     FROM outline_plan_cohort_attempts AS attempt
+                     WHERE attempt.plan_revision_id = item.plan_revision_id
+                       AND attempt.parent_logical_node_id = item.parent_logical_node_id
+                       AND attempt.level = item.level
+                       AND attempt.status = 'completed'
+                     ORDER BY attempt.created_at DESC, attempt.id DESC
+                     LIMIT 1) AS cohort_attempt_id,
+                    (SELECT attempt.id
+                     FROM outline_plan_cohort_attempts AS attempt
+                     WHERE attempt.plan_revision_id = item.plan_revision_id
+                       AND attempt.parent_logical_node_id = item.logical_node_id
+                       AND attempt.level = CASE item.level
+                           WHEN 'outline' THEN 'part'
+                           WHEN 'part' THEN 'volume'
+                           WHEN 'volume' THEN 'act'
+                           WHEN 'act' THEN 'chapter'
+                           ELSE ''
+                       END
+                     ORDER BY attempt.created_at DESC, attempt.id DESC
+                     LIMIT 1) AS latest_cohort_attempt_id,
+                    (SELECT attempt.status
+                     FROM outline_plan_cohort_attempts AS attempt
+                     WHERE attempt.plan_revision_id = item.plan_revision_id
+                       AND attempt.parent_logical_node_id = item.logical_node_id
+                       AND attempt.level = CASE item.level
+                           WHEN 'outline' THEN 'part'
+                           WHEN 'part' THEN 'volume'
+                           WHEN 'volume' THEN 'act'
+                           WHEN 'act' THEN 'chapter'
+                           ELSE ''
+                       END
+                     ORDER BY attempt.created_at DESC, attempt.id DESC
+                     LIMIT 1) AS latest_cohort_attempt_status,
+                    (SELECT attempt.error
+                     FROM outline_plan_cohort_attempts AS attempt
+                     WHERE attempt.plan_revision_id = item.plan_revision_id
+                       AND attempt.parent_logical_node_id = item.logical_node_id
+                       AND attempt.level = CASE item.level
+                           WHEN 'outline' THEN 'part'
+                           WHEN 'part' THEN 'volume'
+                           WHEN 'volume' THEN 'act'
+                           WHEN 'act' THEN 'chapter'
+                           ELSE ''
+                       END
+                     ORDER BY attempt.created_at DESC, attempt.id DESC
+                     LIMIT 1) AS latest_cohort_attempt_error,
+                    (SELECT attempt.retry_of_attempt_id
+                     FROM outline_plan_cohort_attempts AS attempt
+                     WHERE attempt.plan_revision_id = item.plan_revision_id
+                       AND attempt.parent_logical_node_id = item.logical_node_id
+                       AND attempt.level = CASE item.level
+                           WHEN 'outline' THEN 'part'
+                           WHEN 'part' THEN 'volume'
+                           WHEN 'volume' THEN 'act'
+                           WHEN 'act' THEN 'chapter'
+                           ELSE ''
+                       END
+                     ORDER BY attempt.created_at DESC, attempt.id DESC
+                     LIMIT 1) AS latest_cohort_attempt_retry_of_id,
+                    (SELECT attempt.level
+                     FROM outline_plan_cohort_attempts AS attempt
+                     WHERE attempt.plan_revision_id = item.plan_revision_id
+                       AND attempt.parent_logical_node_id = item.logical_node_id
+                       AND attempt.level = CASE item.level
+                           WHEN 'outline' THEN 'part'
+                           WHEN 'part' THEN 'volume'
+                           WHEN 'volume' THEN 'act'
+                           WHEN 'act' THEN 'chapter'
+                           ELSE ''
+                       END
+                     ORDER BY attempt.created_at DESC, attempt.id DESC
+                     LIMIT 1) AS latest_cohort_attempt_level
             FROM outline_plan_revision_items AS item
             JOIN outline_contracts AS contract
               ON contract.id = item.logical_node_id AND contract.novel_id = ?
@@ -824,6 +889,15 @@ class OutlineContractRepository:
                 if row["story_node_id"] is not None
                 else None
             )
+            latest_cohort_attempt = None
+            if row["latest_cohort_attempt_id"] is not None:
+                latest_cohort_attempt = {
+                    "id": str(row["latest_cohort_attempt_id"]),
+                    "status": str(row["latest_cohort_attempt_status"] or ""),
+                    "error": str(row["latest_cohort_attempt_error"] or ""),
+                    "retry_of_attempt_id": row["latest_cohort_attempt_retry_of_id"],
+                    "level": str(row["latest_cohort_attempt_level"] or ""),
+                }
             result.append(
                 {
                     "id": story_node_id or str(row["logical_node_id"]),
@@ -856,6 +930,7 @@ class OutlineContractRepository:
                     "version_digest": str(row["version_digest"] or ""),
                     "version_source": str(row["version_source"] or "ai"),
                     "cohort_attempt_id": row["cohort_attempt_id"],
+                    "latest_cohort_attempt": latest_cohort_attempt,
                     "payload": payload.canonical_dict(),
                     "status": "draft",
                     "outline_contract": {

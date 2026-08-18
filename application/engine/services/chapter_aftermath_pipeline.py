@@ -651,6 +651,31 @@ class ChapterAftermathPipeline:
         if not out["narrative_sync_ok"]:
             return out
 
+        # Governance's blocking decision is part of the N -> N+1 barrier.
+        # Non-blocking enrichment remains in the serialized auxiliary queue.
+        try:
+            await self._run_blocking_governance(
+                novel_id,
+                chapter_number,
+                content,
+                out,
+            )
+        except Exception as exc:
+            out.update(
+                {
+                    "narrative_sync_ok": False,
+                    "failure_reason": "governance_blocking_decision_failed",
+                    "governance_error": str(exc),
+                }
+            )
+            logger.warning(
+                "阻断治理决策失败，关闭下一章推进 novel=%s ch=%s: %s",
+                novel_id,
+                chapter_number,
+                exc,
+            )
+            return out
+
         # 0) 章间衔接锚点。只有 canonical 与 durable Memory 都 ready 后，
         # 才允许写入下一章会读取的前章桥段资产。
         try:
@@ -736,6 +761,42 @@ class ChapterAftermathPipeline:
         )
 
         return out
+
+    async def _run_blocking_governance(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        content: str,
+        evidence: Dict[str, Any],
+    ) -> None:
+        """Persist the one governance decision that controls next-chapter entry."""
+        from application.governance.service import NarrativeGovernanceService
+        from infrastructure.persistence.database.connection import get_database
+        from infrastructure.persistence.database.sqlite_governance_repository import (
+            SqliteGovernanceRepository,
+        )
+        from infrastructure.persistence.database.sqlite_storyline_repository import (
+            SqliteStorylineRepository,
+        )
+        from interfaces.api.dependencies import get_novel_repository
+
+        db = getattr(self._chapter_repository, "db", None) or get_database()
+        governance = NarrativeGovernanceService(
+            SqliteGovernanceRepository(db),
+            get_novel_repository(),
+            SqliteStorylineRepository(db),
+            db,
+        )
+        report = await asyncio.to_thread(
+            governance.commit_chapter,
+            novel_id,
+            chapter_number,
+            content,
+            dict(evidence),
+        )
+        evidence["governance_report"] = report.to_dict()
+        evidence["governance_severity"] = report.severity
+        evidence["governance_should_pause"] = report.should_pause_autopilot
 
     async def ensure_prior_chapters_committed(
         self,
@@ -1132,40 +1193,7 @@ class ChapterAftermathPipeline:
         except Exception as e:
             logger.warning("自动护栏/溯源失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
 
-        # 5) 叙事治理层：结构治理报告与严重问题暂停闸门（质量护栏之外的整书治理）
-        try:
-            from application.governance.service import NarrativeGovernanceService
-            from infrastructure.persistence.database.connection import get_database
-            from infrastructure.persistence.database.sqlite_governance_repository import (
-                SqliteGovernanceRepository,
-            )
-            from infrastructure.persistence.database.sqlite_storyline_repository import (
-                SqliteStorylineRepository,
-            )
-            from interfaces.api.dependencies import get_novel_repository
-
-            db = get_database()
-            governance = NarrativeGovernanceService(
-                SqliteGovernanceRepository(db),
-                get_novel_repository(),
-                SqliteStorylineRepository(db),
-                db,
-            )
-            report = await asyncio.to_thread(
-                governance.commit_chapter,
-                novel_id,
-                chapter_number,
-                content,
-                dict(evidence),
-            )
-            evidence["governance_report"] = report.to_dict()
-            evidence["governance_severity"] = report.severity
-            evidence["governance_should_pause"] = report.should_pause_autopilot
-        except Exception as e:
-            logger.warning("叙事治理评估失败 novel=%s ch=%s: %s", novel_id, chapter_number, e)
-            raise
-
-        # 6) 故事演进硬状态快照 — 只消费 evidence，不把 read model 当真源
+        # 5) 故事演进硬状态快照 — 只消费 evidence，不把 read model 当真源
         try:
             if self._evolution_snapshot_service:
                 snapshot = await asyncio.to_thread(
@@ -1189,7 +1217,7 @@ class ChapterAftermathPipeline:
             logger.warning("[Evolution] 快照创建失败（非致命）novel=%s ch=%s: %s", novel_id, chapter_number, e)
             raise
 
-        # 7) 世界线快照 — 章节完成后自动打 CHAPTER checkpoint
+        # 6) 世界线快照 — 章节完成后自动打 CHAPTER checkpoint
         try:
             if self._unified_checkpoint:
                 cp_id = await asyncio.to_thread(
@@ -1207,7 +1235,7 @@ class ChapterAftermathPipeline:
         except Exception as e:
             logger.warning("[Worldline] 自动 checkpoint 失败（非致命）novel=%s ch=%s: %s", novel_id, chapter_number, e)
 
-        # 8) 道具生命周期同步 — 事件提取、状态机转换、知识库三元组
+        # 7) 道具生命周期同步 — 事件提取、状态机转换、知识库三元组
         try:
             if self._prop_syncer:
                 sync_result = await self._prop_syncer.sync(novel_id, chapter_number, content)

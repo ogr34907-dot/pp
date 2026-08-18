@@ -68,6 +68,7 @@ def test_backend_lifecycle_startup_orchestrates_runtime_steps(monkeypatch):
     monkeypatch.setattr(lifecycle, "bootstrap_persistence_consumer", lambda: calls.append("persistence"))
     monkeypatch.setattr(lifecycle, "recover_drafts", lambda: calls.append("recover_drafts"))
     monkeypatch.setattr(lifecycle, "init_dag_node_registry", lambda: calls.append("dag_registry"))
+    monkeypatch.setattr(lifecycle, "_start_generation_runner", lambda: calls.append("start_generation_runner"))
 
     lifecycle.startup(registered_route_count=3)
 
@@ -78,6 +79,7 @@ def test_backend_lifecycle_startup_orchestrates_runtime_steps(monkeypatch):
         "recover_drafts",
         "start_daemon",
         "dag_registry",
+        "start_generation_runner",
     ]
 
 
@@ -98,6 +100,7 @@ def test_backend_lifecycle_skips_orphan_cleanup_when_disabled_by_environment(mon
     monkeypatch.setattr(lifecycle, "bootstrap_persistence_consumer", lambda: calls.append("persistence"))
     monkeypatch.setattr(lifecycle, "recover_drafts", lambda: calls.append("recover_drafts"))
     monkeypatch.setattr(lifecycle, "init_dag_node_registry", lambda: calls.append("dag_registry"))
+    monkeypatch.setattr(lifecycle, "_start_generation_runner", lambda: calls.append("start_generation_runner"))
 
     lifecycle.startup(registered_route_count=3)
 
@@ -107,6 +110,7 @@ def test_backend_lifecycle_skips_orphan_cleanup_when_disabled_by_environment(mon
         "recover_drafts",
         "start_daemon",
         "dag_registry",
+        "start_generation_runner",
     ]
 
 
@@ -203,7 +207,8 @@ def test_startup_reset_reconciles_candidate_state_with_real_sqlite(tmp_path, mon
     database.close_all(skip_checkpoint=True)
 
 
-def test_backend_lifecycle_shutdown_orchestrates_cleanup(monkeypatch):
+@pytest.mark.asyncio
+async def test_backend_lifecycle_shutdown_orchestrates_cleanup(monkeypatch):
     calls = []
     lifecycle = BackendLifecycle(
         start_daemon=lambda: calls.append("start_daemon"),
@@ -218,11 +223,15 @@ def test_backend_lifecycle_shutdown_orchestrates_cleanup(monkeypatch):
     monkeypatch.setattr(lifecycle, "checkpoint_sqlite_wal_safe", lambda: calls.append("wal"))
     monkeypatch.setattr(lifecycle, "close_llm_service", lambda: calls.append("llm"))
     monkeypatch.setattr(lifecycle, "log_stopped", lambda title: calls.append(title))
+    async def stop_generation_runner():
+        calls.append("generation_runner")
+    monkeypatch.setattr(lifecycle, "_stop_generation_runner", stop_generation_runner)
 
-    lifecycle.shutdown()
+    await lifecycle.shutdown()
 
     assert calls == [
         "watchdog",
+        "generation_runner",
         "stop_daemon",
         "background_tasks",
         "persistence_consumer",

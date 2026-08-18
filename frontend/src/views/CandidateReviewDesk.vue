@@ -20,6 +20,9 @@
       <n-button v-if="run?.canonical_sync_status === 'failed' && candidate" size="small" type="error" secondary :loading="actionLoading" @click="retrySync">
         重试当前章同步
       </n-button>
+      <n-button v-if="continuationError" size="small" secondary :loading="actionLoading" @click="retryContinuation">
+        重试自动继续
+      </n-button>
     </section>
 
     <nav class="review-mobile-tabs" aria-label="审稿台面板">
@@ -159,6 +162,7 @@ const softWarnings = computed<unknown[]>(() => Array.isArray(candidate.value?.au
 const auditSummary = computed(() => candidate.value?.audit?.status === 'blocked' ? '存在硬性阻断；请修改正文或创建大纲修订草稿。' : '已完成无正式副作用的机器审校，等待作者确认。')
 const wordCount = computed(() => editorContent.value.replace(/\s/g, '').length)
 const canCommit = computed(() => Boolean(candidate.value?.audit_is_current && candidate.value?.commit_plan_is_current && candidate.value?.status === 'awaiting_review'))
+const continuationError = ref('')
 const commitPlan = reactive({ chapter_summary: '', eventsText: '', handoffText: '' })
 const savedDraft = ref<ReviewDraft>({
   content: '', feedback: '', chapterSummary: '', eventsText: '', handoffText: '',
@@ -218,6 +222,9 @@ async function refresh(options: { force?: boolean; preserveFeedback?: boolean } 
       : []
     if (requestEpoch !== refreshEpoch) return
     run.value = refreshedRun
+    if (refreshedRun?.last_error?.includes('generation_runner_claim_failed')) {
+      continuationError.value = refreshedRun.last_error
+    }
     versions.value = refreshedVersions
     syncEditorFromCandidate(refreshedCandidate, options)
   } catch (cause) {
@@ -275,18 +282,35 @@ async function approve(continueAfterCommit: boolean) {
   if (!candidate.value) return
   const current = candidate.value
   await applyAction(async () => {
-    await generationApi.approveAndCommit(current.id, continueAfterCommit)
+    const result = await generationApi.approveAndCommit(current.id, continueAfterCommit)
+    continuationError.value = result.continuation_error || ''
     if (!continueAfterCommit) return
-    // This remains deliberately one-at-a-time: review mode triggers only the
-    // next candidate after the formal sync succeeds; continuous keeps running.
-    try {
-      if (run.value?.run_mode === 'continuous') await generationApi.runContinuous(novelId.value)
-      else await generationApi.generateNext(novelId.value)
-    } catch (cause) {
+    if (result.continuation_error) {
       await refresh({ force: true })
-      throw cause
+      return
+    }
+    // Continuous owns its runner on the server. Review mode still needs one
+    // explicit next-candidate request, but a failure cannot undo the commit.
+    if (run.value?.run_mode !== 'continuous') {
+      try {
+        await generationApi.generateNext(novelId.value)
+      } catch (cause) {
+        continuationError.value = cause instanceof Error ? cause.message : '自动继续失败'
+        await refresh({ force: true })
+      }
     }
   }, continueAfterCommit ? '已正式提交；正在按所选模式推进。' : '已正式提交并暂停。')
+}
+async function retryContinuation() {
+  if (!continuationError.value) return
+  await applyAction(async () => {
+    if (run.value?.run_mode === 'continuous') {
+      await generationApi.runContinuous(novelId.value)
+    } else {
+      await generationApi.generateNext(novelId.value)
+    }
+    continuationError.value = ''
+  }, '自动继续已重新启动。')
 }
 async function reject() {
   if (!candidate.value) return

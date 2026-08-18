@@ -1792,9 +1792,10 @@ class BaseStoryPipeline(ABC):
 
     async def _apply_voice_rewrite_loop(self, ctx: PipelineContext) -> None:
         """声线漂移定向改写循环"""
-        ctx.rewrite_applied = True
-        ctx.rewrite_attempts = min(self.VOICE_REWRITE_MAX_ATTEMPTS, 1)
-        # 具体改写逻辑委托给 voice_drift_service
+        # The base pipeline does not rewrite content.  Only a concrete rewrite
+        # owner may mark the result after persisting a changed content hash.
+        ctx.rewrite_applied = False
+        ctx.rewrite_attempts = 0
 
     async def _score_tension_via_llm(self, ctx: PipelineContext) -> Optional[int]:
         """通过 AI Invocation 评分。

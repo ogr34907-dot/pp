@@ -102,6 +102,7 @@ class OutlineCohortGenerationService:
         parent_logical_node_id: str,
         level: OutlineLevel,
         author_payloads: Sequence[OutlinePayload] = (),
+        retry_of_attempt_id: str | None = None,
     ) -> dict[str, Any]:
         plan = self.repository.get_plan_revision(plan_revision_id)
         parent = next(
@@ -118,6 +119,7 @@ class OutlineCohortGenerationService:
             scope=scope,
             context_digest=context_digest,
             prompt_snapshot={"system": prompt.system, "user": prompt.user},
+            retry_of_attempt_id=retry_of_attempt_id,
         )
         try:
             response = await self.llm_service.generate(

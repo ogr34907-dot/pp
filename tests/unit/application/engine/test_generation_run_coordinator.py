@@ -66,6 +66,41 @@ async def test_duplicate_claims_share_one_runner_and_normal_exit_is_terminal():
 
 
 @pytest.mark.asyncio
+async def test_duplicate_claim_after_candidate_cursor_advanced_keeps_existing_runner():
+    repository = _Repository()
+    release = asyncio.Event()
+
+    class _Workflow:
+        async def run_continuously(self, _novel_id, *, expected_generation_epoch):
+            assert expected_generation_epoch == 4
+            await release.wait()
+
+    coordinator = GenerationRunCoordinator(lambda: repository, _Workflow)
+
+    assert coordinator.claim("novel-1") is True
+    repository.run = GenerationRun(
+        novel_id="novel-1",
+        run_mode=RunMode.CONTINUOUS,
+        state=GenerationRunState.RUNNING,
+        generation_epoch=4,
+        target_chapters=10,
+        current_formal_chapter=1,
+        current_candidate_id="candidate-1",
+        current_candidate_chapter=2,
+        canonical_sync_status="ready",
+        next_action="await_review",
+    )
+
+    assert coordinator.claim("novel-1") is True
+    assert coordinator.active_novel_ids == ("novel-1",)
+    assert repository.runner_errors == []
+
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_runner_normal_exit_converts_orphaned_running_state_to_error():
     repository = _Repository()
 

@@ -10,7 +10,7 @@ from engine.runtime.audit_delegate import _audit_pause_gate
 from engine.runtime.legacy_writing_delegate import _legacy_chapter_is_continuation_ready
 from engine.runtime.macro_planning_delegate import run_macro_planning
 from engine.runtime.novel_lifecycle import process_novel
-from engine.runtime.writing_delegate import run_writing
+from engine.runtime.writing_delegate import WritingStageResult, run_writing
 
 
 def test_audit_pause_gate_always_blocks_canonical_failure():
@@ -420,6 +420,32 @@ async def test_process_novel_routes_writing_via_run_writing():
     ) as mock_writing:
         await process_novel(host, novel)
         mock_writing.assert_awaited_once_with(host, novel)
+
+
+@pytest.mark.asyncio
+async def test_story_pipeline_failure_is_not_recorded_as_success():
+    host = MagicMock()
+    host._is_still_running.return_value = True
+    host.circuit_breaker = MagicMock()
+    novel = SimpleNamespace(
+        novel_id=SimpleNamespace(value="failed-novel"),
+        current_stage=NovelStage.WRITING,
+        current_act=0,
+        autopilot_status=AutopilotStatus.RUNNING,
+        consecutive_error_count=0,
+        autopilot_recovery_reason="",
+    )
+
+    with patch(
+        "engine.runtime.writing_delegate.run_writing",
+        new=AsyncMock(return_value=WritingStageResult.failed("story pipeline failed")),
+    ):
+        await process_novel(host, novel)
+
+    host.circuit_breaker.record_failure.assert_called_once_with()
+    host.circuit_breaker.record_success.assert_not_called()
+    assert novel.consecutive_error_count == 1
+    assert novel.autopilot_recovery_reason == "story pipeline failed"
 
 
 @pytest.mark.asyncio

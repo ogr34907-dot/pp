@@ -71,13 +71,11 @@ async function start() {
   error.value = ''
   try {
     run.value = await generationApi.start(props.novelId, mode.value)
-    // Keep the browser responsive while the server persists authority states.
-    const advance = mode.value === 'continuous'
-      ? generationApi.runContinuous(props.novelId)
-      : generationApi.generateNext(props.novelId)
-    void advance.catch(cause => {
-      error.value = cause instanceof Error ? cause.message : '启动候选章节失败'
-    }).finally(refresh)
+    if (mode.value === 'chapter_review') {
+      void generationApi.generateNext(props.novelId).catch(cause => {
+        error.value = cause instanceof Error ? cause.message : '启动候选章节失败'
+      }).finally(refresh)
+    }
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : '启动候选自动驾驶失败'
   } finally { starting.value = false; emit('status-change', run.value) }

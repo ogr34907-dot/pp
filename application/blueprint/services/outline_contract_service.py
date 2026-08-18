@@ -331,6 +331,7 @@ class OutlineContractService:
                     "version_digest",
                     "version_source",
                     "cohort_attempt_id",
+                    "latest_cohort_attempt",
                     "payload",
                     "status",
                     "outline_contract",

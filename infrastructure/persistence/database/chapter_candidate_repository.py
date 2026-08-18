@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
+import logging
 import sqlite3
 from typing import Any, Optional, Union
 from uuid import uuid4
@@ -21,6 +22,9 @@ from domain.novel.candidate_chapter import (
 
 class CandidateGateError(ValueError):
     """Raised when a candidate transition would bypass author/commit gates."""
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -2812,8 +2816,15 @@ class ChapterCandidateRepository:
             return 0
         recovered = 0
         for row in rows:
-            self.recover_after_service_restart(str(row["novel_id"]))
-            recovered += 1
+            novel_id = str(row["novel_id"])
+            try:
+                self.recover_after_service_restart(novel_id)
+                recovered += 1
+            except Exception:
+                logger.exception(
+                    "Candidate startup recovery failed novel=%s",
+                    novel_id,
+                )
         return recovered
 
     def fail_candidate(self, candidate_id: str, reason: str) -> ChapterCandidate:
@@ -2958,6 +2969,76 @@ class ChapterCandidateRepository:
             )
             if updated.rowcount != 1:
                 raise CandidateGateError("generation run changed before governance pause")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return self.get_run(novel_id)
+
+    def request_governance_pause_after_sync(
+        self,
+        novel_id: str,
+        reason: str,
+    ) -> GenerationRun:
+        """Arm a governance pause while the current Candidate is syncing.
+
+        The final pause is published by ``mark_sync_succeeded`` in the same
+        transaction that publishes the formal Candidate commit.
+        """
+
+        expected_run = self.get_run(novel_id)
+        if expected_run.state != GenerationRunState.RUNNING:
+            raise CandidateGateError("governance pause requires a running Candidate run")
+        if expected_run.current_candidate_id is None:
+            raise CandidateGateError("governance pause-after-sync requires an active Candidate")
+        if expected_run.canonical_sync_status != "syncing":
+            raise CandidateGateError("governance pause-after-sync requires canonical sync")
+        if expected_run.next_action != "sync_candidate":
+            raise CandidateGateError("governance pause-after-sync requires sync_candidate action")
+
+        now = self._now()
+        conn = self._connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            run = self._locked_run_transition(
+                conn,
+                novel_id=novel_id,
+                expected_run=expected_run,
+                allowed_states=(GenerationRunState.RUNNING,),
+            )
+            if run.current_candidate_id is None or run.canonical_sync_status != "syncing":
+                raise CandidateGateError("generation run changed before governance pause request")
+            updated = conn.execute(
+                """
+                UPDATE novel_generation_runs
+                SET next_action = 'finish_sync_then_pause', last_error = ?, updated_at = ?
+                WHERE novel_id = ? AND run_mode = ? AND state = ?
+                  AND generation_epoch = ? AND target_chapters = ?
+                  AND current_formal_chapter = ? AND current_candidate_id = ?
+                  AND current_candidate_chapter = ? AND canonical_sync_status = 'syncing'
+                  AND next_action = 'sync_candidate' AND last_error = ?
+                  AND max_pending_candidates = ? AND prefetch = ?
+                """,
+                (
+                    str(reason),
+                    now,
+                    novel_id,
+                    run.run_mode.value,
+                    run.state.value,
+                    run.generation_epoch,
+                    run.target_chapters,
+                    run.current_formal_chapter,
+                    run.current_candidate_id,
+                    run.current_candidate_chapter,
+                    run.last_error,
+                    run.max_pending_candidates,
+                    run.prefetch,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CandidateGateError(
+                    "generation run changed before governance pause request"
+                )
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -3474,7 +3555,8 @@ class ChapterCandidateRepository:
                        candidate.generation_epoch AS candidate_generation_epoch,
                        run.generation_epoch AS active_generation_epoch,
                        run.current_formal_chapter, run.current_candidate_id,
-                       run.canonical_sync_status, run.next_action AS run_next_action
+                       run.canonical_sync_status, run.next_action AS run_next_action,
+                       run.last_error AS run_last_error
                 FROM chapter_candidates AS candidate
                 JOIN chapter_candidate_formal_commits AS formal
                   ON formal.candidate_id = candidate.id
@@ -3531,9 +3613,16 @@ class ChapterCandidateRepository:
                 else GenerationRunState.RUNNING
             )
             next_action = (
-                "resume_generation"
+                "review_governance"
+                if pause_after_sync
+                else "resume_generation"
                 if next_state == GenerationRunState.PAUSED
                 else "generate_candidate"
+            )
+            next_error = (
+                str(version["run_last_error"] or "narrative_governance_block")
+                if pause_after_sync
+                else ""
             )
             updated = conn.execute(
                 """
@@ -3564,7 +3653,7 @@ class ChapterCandidateRepository:
                 UPDATE novel_generation_runs
                 SET state = ?, current_formal_chapter = ?, current_candidate_id = NULL,
                     current_candidate_chapter = NULL, canonical_sync_status = 'ready',
-                    next_action = ?, last_error = '', updated_at = ?
+                    next_action = ?, last_error = ?, updated_at = ?
                 WHERE novel_id = ? AND generation_epoch = ?
                   AND current_candidate_id = ? AND current_formal_chapter = ?
                   AND canonical_sync_status = 'syncing'
@@ -3573,6 +3662,7 @@ class ChapterCandidateRepository:
                     next_state.value,
                     candidate.chapter_number,
                     next_action,
+                    next_error,
                     now,
                     candidate.novel_id,
                     int(version["active_generation_epoch"]),

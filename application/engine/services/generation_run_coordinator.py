@@ -26,6 +26,7 @@ class GenerationRunCoordinator:
         self._logger = logger or logging.getLogger(__name__)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._epochs: dict[str, int] = {}
+        self._accepting_claims = True
 
     @property
     def active_novel_ids(self) -> tuple[str, ...]:
@@ -38,18 +39,24 @@ class GenerationRunCoordinator:
     def claim(self, novel_id: str) -> bool:
         """Claim a durable run if it is in the exact auto-runnable state."""
 
+        if not self._accepting_claims:
+            return False
+
         repository = self._repository_factory()
         try:
             run = repository.get_run(novel_id)
         except KeyError:
-            return False
-        if not self._is_claimable(run):
             return False
 
         existing = self._tasks.get(novel_id)
         if existing is not None and not existing.done():
             if self._epochs.get(novel_id) == run.generation_epoch:
                 return True
+
+        if not self._is_claimable(run):
+            return False
+
+        if existing is not None and not existing.done():
             existing.cancel()
 
         try:
@@ -76,6 +83,9 @@ class GenerationRunCoordinator:
     def start_resumable(self) -> int:
         """Claim all continuous runs left at the precise startup resume point."""
 
+        if not self._accepting_claims:
+            return 0
+
         repository = self._repository_factory()
         claimed = 0
         for run in repository.list_resumable_generation_runs():
@@ -85,17 +95,31 @@ class GenerationRunCoordinator:
             self._logger.info("Generation runner startup claimed novels=%s", claimed)
         return claimed
 
-    def shutdown(self) -> None:
-        """Cancel all in-process tasks and release their ownership map."""
+    async def shutdown(self) -> None:
+        """Stop new claims, cancel tasks, and await their actual exit."""
 
+        self._accepting_claims = False
         tasks = tuple(self._tasks.values())
-        self._tasks.clear()
-        self._epochs.clear()
         for task in tasks:
             if not task.done():
                 task.cancel()
         if tasks:
-            self._logger.info("Generation runner shutdown cancelled tasks=%s", len(tasks))
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._epochs.clear()
+        if tasks:
+            self._logger.info("Generation runner shutdown awaited tasks=%s", len(tasks))
+
+    def cancel_forced_shutdown(self) -> None:
+        """Best-effort cancellation for process-forced Windows exit."""
+
+        self._accepting_claims = False
+        tasks = tuple(self._tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
+        self._epochs.clear()
 
     async def _run(self, novel_id: str, generation_epoch: int) -> None:
         try:

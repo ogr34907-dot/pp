@@ -10,7 +10,12 @@ import pytest
 from engine.pipeline.base import BaseStoryPipeline
 from engine.pipeline.context import PipelineContext
 from engine.pipeline.steps import StepResult
-from engine.pipeline.prose_composer import ChapterProseInvocationComposer, ProseCompositionRequest, ProseCompositionResult
+from engine.pipeline.prose_composer import (
+    ChapterProseInvocationComposer,
+    CommittedContentLookupError,
+    ProseCompositionRequest,
+    ProseCompositionResult,
+)
 from application.engine.services.context_budget_allocator import ContextBudgetAllocator
 from application.engine.services.context_budget_models import FactLockUnavailableError
 from domain.novel.entities.chapter import ChapterStatus
@@ -558,6 +563,42 @@ async def test_chapter_prose_composer_reuses_committed_story_pipeline_content(mo
     assert result.content == "已采纳正文"
     assert result.status == "committed_story_pipeline_content"
     assert chunks == ["已采纳正文"]
+
+
+def test_committed_content_lookup_distinguishes_missing_row(monkeypatch):
+    import infrastructure.persistence.database.connection
+
+    monkeypatch.setattr(
+        infrastructure.persistence.database.connection,
+        "get_database",
+        lambda *_args, **_kwargs: SimpleNamespace(fetch_one=lambda *_args, **_kwargs: None),
+    )
+
+    result = ChapterProseInvocationComposer._load_committed_story_pipeline_content(
+        ProseCompositionRequest(novel_id="novel-1", chapter_number=2)
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_committed_content_query_error_does_not_regenerate(monkeypatch):
+    class _FailingDb:
+        def fetch_one(self, *_args, **_kwargs):
+            raise RuntimeError("database unavailable")
+
+    import infrastructure.persistence.database.connection
+
+    monkeypatch.setattr(
+        infrastructure.persistence.database.connection,
+        "get_database",
+        lambda *_args, **_kwargs: _FailingDb(),
+    )
+
+    with pytest.raises(CommittedContentLookupError):
+        await ChapterProseInvocationComposer().compose(
+            ProseCompositionRequest(novel_id="novel-1", chapter_number=2)
+        )
 
 
 @pytest.mark.asyncio

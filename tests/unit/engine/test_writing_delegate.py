@@ -16,6 +16,14 @@ import engine.runtime.writing_delegate as writing_delegate
 from engine.pipeline.context import PipelineResult
 
 
+def _test_runner():
+    runner = MagicMock()
+    runner.DEFAULT_TARGET_WORDS = 2500
+    runner._make_context.return_value = MagicMock(chapter_number=64)
+    runner._get_novel_phase.return_value = "development"
+    return runner
+
+
 def test_is_story_pipeline_writing_enabled_default_writing(monkeypatch):
     monkeypatch.delenv("PLOTPILOT_USE_STORY_PIPELINE", raising=False)
     assert is_story_pipeline_writing_enabled() is True
@@ -231,6 +239,88 @@ async def test_run_story_pipeline_writing_pauses_on_canonical_history_failure():
         autopilot_pause_reason="canonical_history_checkpoint_required",
     )
     daemon._flush_novel.assert_called_once_with(novel)
+
+
+@pytest.mark.asyncio
+async def test_hard_fail_does_not_reset_consecutive_error_count(monkeypatch):
+    novel = SimpleNamespace(
+        novel_id=SimpleNamespace(value="hard-fail-novel"),
+        genre="",
+        target_words_per_chapter=2500,
+        auto_approve_mode=True,
+        era="ancient",
+        consecutive_error_count=2,
+        current_stage=NovelStage.WRITING,
+    )
+    daemon = MagicMock()
+    runner = _test_runner()
+    commit_repository = MagicMock()
+    commit_repository.recover_pending_story_pipeline_advances.return_value = []
+    monkeypatch.setattr(
+        writing_delegate,
+        "_get_story_pipeline_commit_repository",
+        lambda _runner: commit_repository,
+    )
+    pipeline = MagicMock()
+    pipeline.run_chapter = AsyncMock(
+        return_value=PipelineResult(
+            success=False,
+            error="content validation hard fail (score=0.31)",
+            validation_status="HARD_FAIL",
+            chapter_number=64,
+        )
+    )
+
+    with patch("engine.runtime.writing_delegate._build_runner", return_value=runner), patch(
+        "engine.pipelines.registry.get_pipeline_registry"
+    ) as registry:
+        registry.return_value.create_pipeline.return_value = pipeline
+        result = await writing_delegate.run_story_pipeline_writing(daemon, novel)
+
+    assert result.status == "paused"
+    assert novel.current_stage == NovelStage.PAUSED_FOR_REVIEW
+    assert novel.consecutive_error_count == 2
+    commit_repository.advance_story_pipeline_once.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hard_fail_does_not_immediately_regenerate_same_chapter(monkeypatch):
+    novel = SimpleNamespace(
+        novel_id=SimpleNamespace(value="hard-fail-no-loop"),
+        genre="",
+        target_words_per_chapter=2500,
+        auto_approve_mode=True,
+        era="ancient",
+        consecutive_error_count=0,
+        current_stage=NovelStage.WRITING,
+    )
+    daemon = MagicMock()
+    runner = _test_runner()
+    commit_repository = MagicMock()
+    commit_repository.recover_pending_story_pipeline_advances.return_value = []
+    monkeypatch.setattr(
+        writing_delegate,
+        "_get_story_pipeline_commit_repository",
+        lambda _runner: commit_repository,
+    )
+    pipeline = MagicMock()
+    pipeline.run_chapter = AsyncMock(
+        return_value=PipelineResult(
+            success=False,
+            error="content validation hard fail (score=0.31)",
+            validation_status="HARD_FAIL",
+            chapter_number=64,
+        )
+    )
+
+    with patch("engine.runtime.writing_delegate._build_runner", return_value=runner), patch(
+        "engine.pipelines.registry.get_pipeline_registry"
+    ) as registry:
+        registry.return_value.create_pipeline.return_value = pipeline
+        await writing_delegate.run_story_pipeline_writing(daemon, novel)
+
+    pipeline.run_chapter.assert_awaited_once()
+    commit_repository.advance_story_pipeline_once.assert_not_called()
 
 
 @pytest.mark.asyncio

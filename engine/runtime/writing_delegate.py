@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 import hashlib
+from dataclasses import dataclass
 from typing import Any, Dict, Literal
 
 from infrastructure.engine.story_pipeline_environment import (
@@ -26,6 +27,31 @@ from engine.runtime.daemon_host import (
 logger = logging.getLogger(__name__)
 
 PipelineMode = Literal["off", "writing", "full"]
+WritingStageStatus = Literal["succeeded", "failed", "paused", "interrupted"]
+
+
+@dataclass(frozen=True)
+class WritingStageResult:
+    """Local result passed from the writing delegate to the lifecycle owner."""
+
+    status: WritingStageStatus
+    error: str = ""
+
+    @classmethod
+    def succeeded(cls) -> "WritingStageResult":
+        return cls("succeeded")
+
+    @classmethod
+    def failed(cls, error: str) -> "WritingStageResult":
+        return cls("failed", str(error or "unknown"))
+
+    @classmethod
+    def paused(cls, reason: str) -> "WritingStageResult":
+        return cls("paused", str(reason or "paused"))
+
+    @classmethod
+    def interrupted(cls, reason: str = "interrupted") -> "WritingStageResult":
+        return cls("interrupted", str(reason or "interrupted"))
 
 
 def get_story_pipeline_mode() -> PipelineMode:
@@ -210,21 +236,21 @@ def _candidate_first_authority_exists(host: Any, novel_id: str) -> bool:
     return _candidate_first_authority_blocks_completed_write(database, novel_id)
 
 
-async def run_writing(host: Any, novel: Any) -> None:
+async def run_writing(host: Any, novel: Any) -> WritingStageResult:
     """写作阶段统一入口 — 按 host 配置或环境变量选择新/旧管线"""
     novel_id = str(getattr(getattr(novel, "novel_id", ""), "value", novel.novel_id))
     if _candidate_first_authority_exists(host, novel_id):
         _pause_for_candidate_first_authority(host, novel, novel_id)
-        return
+        return WritingStageResult.paused("candidate_first_required")
     if getattr(host, "use_story_pipeline_for_writing", False):
-        await run_story_pipeline_writing(host, novel)
-        return
+        return await run_story_pipeline_writing(host, novel)
     from engine.runtime.legacy_writing_delegate import run_legacy_writing
 
     await run_legacy_writing(host, novel)
+    return WritingStageResult.succeeded()
 
 
-async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
+async def run_story_pipeline_writing(daemon: Any, novel: Any) -> WritingStageResult:
     """执行单章写作（新管线），并同步 novel 状态到 daemon 模型"""
     from domain.novel.entities.novel import NovelStage
     from engine.pipelines.registry import get_pipeline_registry
@@ -247,7 +273,9 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
             novel_id,
             "required_narrative_memory_unavailable:canonical_commit_repository",
         )
-        return
+        return WritingStageResult.paused(
+            "required_narrative_memory_unavailable:canonical_commit_repository"
+        )
 
     try:
         recovered_advances = commit_repository.recover_pending_story_pipeline_advances(
@@ -262,7 +290,7 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
             novel_id,
             f"story_pipeline_advance_recovery_failed:{exc}",
         )
-        return
+        return WritingStageResult.paused(f"story_pipeline_advance_recovery_failed:{exc}")
 
     if recovered_advances:
         recovery = recovered_advances[-1]
@@ -274,7 +302,10 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
                 "story_pipeline_advance_recovery_failed:"
                 f"{recovery.disposition}:{recovery.failure_reason}",
             )
-            return
+            return WritingStageResult.paused(
+                "story_pipeline_advance_recovery_failed:"
+                f"{recovery.disposition}:{recovery.failure_reason}"
+            )
         _apply_story_pipeline_advance(novel, recovery)
         daemon._update_shared_state(
             novel_id,
@@ -295,7 +326,7 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
             novel_id,
             recovery.chapter_number,
         )
-        return
+        return WritingStageResult.succeeded()
 
     def _writing_sink(substep: str, label: str, extra: Dict[str, Any]) -> None:
         merged = dict(extra)
@@ -368,13 +399,13 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
     if not result.success and result.error == "candidate_first_required":
         _pause_for_candidate_first_authority(daemon, novel, novel_id)
         logger.info("[%s] StoryPipeline formal write blocked by Candidate-first", novel_id)
-        return
+        return WritingStageResult.paused("candidate_first_required")
 
     if not result.success and result.error == "awaiting_ai_review":
         novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
         daemon._flush_novel(novel)
         logger.info("[%s] StoryPipeline 等待 AI Invocation 审阅", novel_id)
-        return
+        return WritingStageResult.paused("awaiting_ai_review")
 
     if not result.success and result.error == "interrupted":
         try:
@@ -394,9 +425,9 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
         )
         if daemon._is_still_running(novel):
             novel.current_stage = NovelStage.WRITING
-            daemon._flush_novel(novel)
+        daemon._flush_novel(novel)
         logger.info("[%s] StoryPipeline 正文生成中断，未提交正式章节", novel_id)
-        return
+        return WritingStageResult.interrupted()
 
     error = result.error or "unknown"
     if not result.success and (
@@ -428,7 +459,22 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
         )
         daemon._flush_novel(novel)
         logger.warning("[%s] StoryPipeline 因规范记忆未提交而暂停: %s", novel_id, error)
-        return
+        return WritingStageResult.paused(error)
+
+    is_hard_fail = str(getattr(result, "validation_status", "")).upper() == "HARD_FAIL"
+    is_hard_fail = is_hard_fail or "content validation hard fail" in error.lower()
+    if not result.success and is_hard_fail:
+        novel.current_stage = NovelStage.PAUSED_FOR_REVIEW
+        novel.last_audit_narrative_ok = False
+        daemon._update_shared_state(
+            novel_id,
+            current_stage=NovelStage.PAUSED_FOR_REVIEW.value,
+            last_audit_narrative_ok=False,
+            autopilot_pause_reason=error,
+        )
+        daemon._flush_novel(novel)
+        logger.warning("[%s] StoryPipeline 硬失败，暂停自动推进: %s", novel_id, error)
+        return WritingStageResult.paused(error)
 
     if result.success:
         chapter_num = result.chapter_number or ctx.chapter_number
@@ -446,7 +492,10 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
                 "story_pipeline_advance_failed:"
                 f"{advance.disposition}:{advance.failure_reason}",
             )
-            return
+            return WritingStageResult.paused(
+                "story_pipeline_advance_failed:"
+                f"{advance.disposition}:{advance.failure_reason}"
+            )
         if getattr(result, "audit_snapshot", None):
             pending = getattr(daemon, "_pending_story_pipeline_aftermath", None)
             if pending is not None:
@@ -485,7 +534,7 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
             result.word_count,
             result.tension,
         )
-        return
+        return WritingStageResult.succeeded()
 
     if "所有章节已写完" in error:
         logger.info("[%s] StoryPipeline：当前幕章节已全部写完", novel_id)
@@ -512,8 +561,7 @@ async def run_story_pipeline_writing(daemon: Any, novel: Any) -> None:
                 writing_substep_label="幕级规划",
             )
         daemon._flush_novel(novel)
-        return
+        return WritingStageResult.succeeded()
 
-    novel.consecutive_error_count = (getattr(novel, "consecutive_error_count", 0) or 0) + 1
-    daemon._flush_novel(novel)
     logger.error("[%s] StoryPipeline 写作失败: %s", novel_id, error)
+    return WritingStageResult.failed(error)

@@ -904,13 +904,23 @@ def get_generation_run_coordinator():
     return _generation_run_coordinator
 
 
-def shutdown_generation_run_coordinator_if_initialized() -> None:
-    """Cancel runner tasks without constructing the coordinator during shutdown."""
+async def shutdown_generation_run_coordinator_if_initialized() -> None:
+    """Await runner task shutdown without constructing the coordinator."""
 
     global _generation_run_coordinator
     if _generation_run_coordinator is None:
         return
-    _generation_run_coordinator.shutdown()
+    await _generation_run_coordinator.shutdown()
+    _generation_run_coordinator = None
+
+
+def cancel_generation_run_coordinator_if_initialized() -> None:
+    """Cancel runner tasks for a process-forced shutdown path."""
+
+    global _generation_run_coordinator
+    if _generation_run_coordinator is None:
+        return
+    _generation_run_coordinator.cancel_forced_shutdown()
     _generation_run_coordinator = None
 
 

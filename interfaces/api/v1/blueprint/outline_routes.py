@@ -77,6 +77,7 @@ class CohortExpandRequest(BaseModel):
     parent_logical_node_id: str = Field(..., min_length=1)
     level: OutlineLevel
     author_payloads: list[OutlinePayloadDTO] = Field(default_factory=list)
+    retry_attempt_id: Optional[str] = None
 
 
 class WorkingItemRequest(BaseModel):
@@ -349,14 +350,19 @@ async def expand_manifest_cohort(
 
     try:
         draft = service.open_or_clone_cohort_draft(novel_id)
-        result = await service.generate_cohort(
-            plan_revision_id=draft.id,
-            parent_logical_node_id=body.parent_logical_node_id,
-            level=body.level,
-            author_payloads=tuple(
+        generate_kwargs = {
+            "plan_revision_id": draft.id,
+            "parent_logical_node_id": body.parent_logical_node_id,
+            "level": body.level,
+            "author_payloads": tuple(
                 OutlinePayload.from_dict(payload.model_dump())
                 for payload in body.author_payloads
             ),
+        }
+        if body.retry_attempt_id:
+            generate_kwargs["retry_of_attempt_id"] = body.retry_attempt_id
+        result = await service.generate_cohort(
+            **generate_kwargs,
         )
         return {"success": True, "data": result}
     except Exception as exc:
@@ -382,23 +388,45 @@ async def publish_manifest_cohort(
                 raise OutlineCohortGenerationError(
                     "runtime cohort publication returned an invalid generation run"
                 )
-            claimed = api_dependencies.get_generation_run_coordinator().claim(novel_id)
-            if not claimed:
-                reason = "runtime_publish_runner_claim_failed"
-                try:
-                    ChapterCandidateRepository(api_dependencies.get_database()).record_runner_error(
-                        novel_id,
-                        expected_generation_epoch=int(generation_epoch),
-                        reason=reason,
-                    )
-                except Exception as persist_exc:
-                    raise OutlineCohortGenerationError(
-                        "runtime cohort published but runner claim failed and the error state "
-                        "could not be persisted"
-                    ) from persist_exc
-                raise OutlineCohortGenerationError(
-                    "runtime cohort published but generation runner claim failed; run paused as error"
+            repository = ChapterCandidateRepository(api_dependencies.get_database())
+            try:
+                claimed = bool(
+                    api_dependencies.get_generation_run_coordinator().claim(novel_id)
                 )
+            except Exception as exc:
+                claimed = False
+                reason = f"runtime_publish_runner_claim_failed:{exc}"
+            else:
+                reason = "runtime_publish_runner_claim_failed"
+            continuation_error = None
+            if not claimed:
+                try:
+                    current = repository.get_run(novel_id)
+                    if (
+                        current.state.value == "running"
+                        and current.generation_epoch == int(generation_epoch)
+                    ):
+                        repository.record_runner_error(
+                            novel_id,
+                            expected_generation_epoch=int(generation_epoch),
+                            reason=reason,
+                        )
+                    continuation_error = reason
+                except Exception as persist_exc:
+                    continuation_error = (
+                        f"{reason}; error state persistence failed: {persist_exc}"
+                    )
+            result = {
+                **result,
+                "continuation_started": claimed,
+                "continuation_error": continuation_error,
+            }
+        elif isinstance(result, dict):
+            result = {
+                **result,
+                "continuation_started": False,
+                "continuation_error": None,
+            }
         return {
             "success": True,
             "data": result,
