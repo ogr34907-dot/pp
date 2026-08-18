@@ -1,4 +1,5 @@
 """StoryPipeline generation prompt helper tests."""
+from pathlib import Path
 from types import SimpleNamespace
 
 from engine.pipeline.context import PipelineContext
@@ -7,6 +8,21 @@ from engine.pipeline.generation_prompt_builder import (
     build_generation_prompt,
     make_prompt,
 )
+
+
+def test_chapter_prose_prompt_balances_fact_locks_with_literary_freedom():
+    root = Path(__file__).resolve().parents[3]
+    system = (root / "infrastructure/ai/prompt_packages/nodes/chapter-prose-generation/system.md").read_text(encoding="utf-8")
+    user = (root / "infrastructure/ai/prompt_packages/nodes/chapter-prose-generation/user.md").read_text(encoding="utf-8")
+
+    assert "连续性与长期记忆上下文" in user
+    assert "Canonical Hard Facts" in system
+    assert "微动作" in system
+    assert "潜台词" in system
+    assert "无名环境人物" in system
+    assert "章尾必须完成本章约定 Delta" in system
+    assert "近3章承接摘要" not in user
+    assert "主角发生重大变化" not in user
 
 
 def test_build_generation_prompt_puts_beat_task_before_context():

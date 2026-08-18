@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from application.blueprint.services.outline_contract_service import OutlineContractService
+from application.engine.services.candidate_chapter_workflow import CandidateChapterWorkflowService
 from application.engine.services.generation_start_preflight import (
     GenerationStartPreflight,
     GenerationStartPreflightError,
@@ -2695,6 +2696,51 @@ def test_stopping_during_canonical_sync_finishes_sync_then_pauses(candidates):
     assert resumed.current_candidate_id is None
 
 
+@pytest.mark.asyncio
+async def test_governance_block_prevents_next_candidate_generation(candidates):
+    repo, db = candidates
+    candidate = repo.create_streaming_candidate(
+        novel_id="novel-1",
+        chapter_number=1,
+        title="第一章",
+        outline_chain=_chain(),
+        llm_content="候选",
+    )
+    repo.mark_auditing(candidate.id)
+    repo.finish_audit(candidate.id, audit={}, commit_plan={})
+    repo.approve_for_commit(candidate.id, continue_after_commit=True)
+    formal = repo.commit_formal(candidate.id)
+    _persist_durable_aftermath(db, formal)
+
+    armed = repo.request_governance_pause_after_sync(
+        "novel-1", "narrative_governance_block"
+    )
+    assert armed.next_action == "finish_sync_then_pause"
+
+    committed = repo.mark_sync_succeeded(formal.id)
+    assert committed.status == CandidateStatus.COMMITTED
+    paused = repo.get_run("novel-1")
+    assert paused.state == GenerationRunState.PAUSED
+    assert paused.next_action == "review_governance"
+
+    generated = []
+
+    class _DraftGenerator:
+        async def generate_candidate_draft(self, **kwargs):
+            generated.append(kwargs)
+            return {}
+
+    workflow = CandidateChapterWorkflowService(
+        repo,
+        outline_service=None,
+        draft_generator=_DraftGenerator(),
+        aftermath_pipeline=None,
+    )
+
+    assert await workflow.run_continuously("novel-1") == []
+    assert generated == []
+
+
 def test_stop_preserves_failed_formal_candidate_for_sync_retry(candidates):
     repo, _db = candidates
     candidate = repo.create_streaming_candidate(
@@ -2821,6 +2867,49 @@ def test_service_restart_cancels_active_candidate_and_dag_trace(candidates):
 
     with pytest.raises(CandidateGateError, match="retired generation epoch"):
         repo.set_generated_content(candidate.id, "迟到正文")
+
+
+def test_candidate_restart_recovery_isolated_per_novel(monkeypatch, tmp_path):
+    db = DatabaseConnection(str(tmp_path / "recovery-isolation.db"))
+    repo = ChapterCandidateRepository(db)
+    calls = []
+
+    db.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-a", "A", "a", 3),
+    )
+    db.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-b", "B", "b", 3),
+    )
+    db.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("novel-c", "C", "c", 3),
+    )
+    db.execute(
+        "INSERT INTO novel_generation_runs (novel_id, run_mode, state, generation_epoch, target_chapters) VALUES (?, 'continuous', 'running', 1, 3)",
+        ("novel-a",),
+    )
+    db.execute(
+        "INSERT INTO novel_generation_runs (novel_id, run_mode, state, generation_epoch, target_chapters) VALUES (?, 'continuous', 'running', 1, 3)",
+        ("novel-b",),
+    )
+    db.execute(
+        "INSERT INTO novel_generation_runs (novel_id, run_mode, state, generation_epoch, target_chapters) VALUES (?, 'continuous', 'running', 1, 3)",
+        ("novel-c",),
+    )
+    db.get_connection().commit()
+
+    def recover(novel_id):
+        calls.append(novel_id)
+        if novel_id == "novel-b":
+            raise RuntimeError("broken novel")
+        return repo.get_run(novel_id)
+
+    monkeypatch.setattr(repo, "recover_after_service_restart", recover)
+
+    assert repo.recover_all_after_service_restart() == 2
+    assert calls == ["novel-a", "novel-b", "novel-c"]
 
 
 def test_service_restart_preserves_candidate_waiting_for_author_review(candidates):

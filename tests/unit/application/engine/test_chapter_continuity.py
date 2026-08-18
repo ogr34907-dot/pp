@@ -236,3 +236,40 @@ async def test_aftermath_preserves_failed_canonical_sync_status(monkeypatch):
     assert result["commit_status"] == "failed"
     assert result["failure_reason"] == "empty_summary"
     await pipeline.drain_auxiliary_stages()
+
+
+@pytest.mark.asyncio
+async def test_blocking_governance_is_not_repeated_in_auxiliary(monkeypatch):
+    calls = {"blocking": 0, "auxiliary": 0}
+
+    async def fake_bridge(self, novel_id, chapter_number, content):
+        return None
+
+    async def fake_sync(*args, **kwargs):
+        return {"narrative_sync_ok": True}
+
+    async def fake_blocking(self, novel_id, chapter_number, content, evidence):
+        calls["blocking"] += 1
+        evidence["governance_should_pause"] = False
+
+    async def fake_auxiliary(self, novel_id, chapter_number, content, evidence):
+        calls["auxiliary"] += 1
+
+    monkeypatch.setattr(ChapterAftermathPipeline, "_extract_chapter_bridge", fake_bridge)
+    monkeypatch.setattr(
+        "application.world.services.chapter_narrative_sync.sync_chapter_narrative_after_save",
+        fake_sync,
+    )
+    monkeypatch.setattr(ChapterAftermathPipeline, "_run_blocking_governance", fake_blocking)
+    monkeypatch.setattr(ChapterAftermathPipeline, "_run_auxiliary_stages", fake_auxiliary)
+
+    pipeline = ChapterAftermathPipeline(
+        knowledge_service=None,
+        chapter_indexing_service=None,
+        llm_service=object(),
+    )
+    result = await pipeline.run_after_chapter_saved("novel-1", 10, "正文内容")
+    await pipeline.drain_auxiliary_stages()
+
+    assert result["narrative_sync_ok"] is True
+    assert calls == {"blocking": 1, "auxiliary": 1}

@@ -270,12 +270,21 @@ const nextLevel = computed<CohortLevel | null>(() => {
   } as Partial<Record<OutlineLevel, CohortLevel>>)[String(node.node_type) as OutlineLevel] || null
 })
 
-const cohortButtonLabel = computed(() => ({
-  part: 'AI 一键生成全部部纲',
-  volume: 'AI 一键生成该部全部卷纲',
-  act: 'AI 一键生成该卷全部幕纲',
-  chapter: 'AI 一键生成该幕全部章纲',
-} as Record<string, string>)[nextLevel.value || ''] || '')
+const retryableCohortAttempt = computed(() => {
+  const attempt = selectedNode.value?.latest_cohort_attempt
+  return attempt && (attempt.status === 'failed' || attempt.status === 'cancelled')
+    ? attempt
+    : null
+})
+
+const cohortButtonLabel = computed(() => retryableCohortAttempt.value
+  ? '重试生成'
+  : ({
+      part: 'AI 一键生成全部部纲',
+      volume: 'AI 一键生成该部全部卷纲',
+      act: 'AI 一键生成该卷全部幕纲',
+      chapter: 'AI 一键生成该幕全部章纲',
+    } as Record<string, string>)[nextLevel.value || ''] || '')
 
 const draftButtonLabel = computed(() => (
   String(selectedNode.value?.node_type || '') === 'outline'
@@ -287,10 +296,10 @@ const canGenerateNextCohort = computed(() => Boolean(
   selectedNode.value
   && nextLevel.value
   && !isWorkingNode(selectedNode.value)
-  && !flattenedTree.value.some(item => (
+  && (retryableCohortAttempt.value || !flattenedTree.value.some(item => (
     item.parent && nodeKey(item.parent) === nodeKey(selectedNode.value as OutlineTreeNode)
     && String(item.node.node_type) === nextLevel.value
-  )),
+  ))),
 ))
 
 function levelLabel(level?: string) {
@@ -465,7 +474,7 @@ async function selectNode(node: OutlineTreeNode) {
   publishing.value = false
   binding.value = false
   cohortLoading.value = false
-  cohortAttemptId.value = node.cohort_attempt_id || null
+  cohortAttemptId.value = node.cohort_attempt_id || node.latest_cohort_attempt?.id || null
   error.value = ''
   payloadToForm(null)
   const contractId = node.outline_contract?.contract_id
@@ -611,6 +620,7 @@ async function generateNextCohort() {
       logical_node_id: requireLogicalNodeId(node),
       level,
       author_payloads: [],
+      retry_attempt_id: retryableCohortAttempt.value?.id || null,
     })
     if (!isCurrentNode(requestEpoch, selectedKey)) return
     const attemptId = String((result as any)?.attempt?.id || '') || null

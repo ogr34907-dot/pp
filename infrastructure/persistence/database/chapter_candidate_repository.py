@@ -2995,18 +2995,37 @@ class ChapterCandidateRepository:
             raise CandidateGateError("governance pause-after-sync requires canonical sync")
         if expected_run.next_action != "sync_candidate":
             raise CandidateGateError("governance pause-after-sync requires sync_candidate action")
+        expected_candidate = self.get_candidate(expected_run.current_candidate_id)
+        formal_attempt_row = self._connection().execute(
+            "SELECT sync_attempt FROM chapter_candidate_formal_commits WHERE candidate_id = ?",
+            (expected_candidate.id,),
+        ).fetchone()
+        if formal_attempt_row is None:
+            raise CandidateGateError("candidate formal version is missing")
+        expected_sync_attempt = int(formal_attempt_row["sync_attempt"] or 0)
 
         now = self._now()
         conn = self._connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            run = self._locked_run_transition(
+            _candidate, run, formal = self._locked_candidate_transition(
                 conn,
-                novel_id=novel_id,
+                candidate_id=expected_candidate.id,
+                expected_candidate=expected_candidate,
                 expected_run=expected_run,
-                allowed_states=(GenerationRunState.RUNNING,),
+                allowed_statuses=(CandidateStatus.SYNCING,),
+                allowed_run_states=(GenerationRunState.RUNNING,),
+                allowed_canonical_sync_statuses=("syncing",),
+                require_formal=True,
+                allowed_formal_sync_statuses=("syncing",),
+                expected_formal_sync_attempt=expected_sync_attempt,
+                require_current_plan_pin=False,
             )
-            if run.current_candidate_id is None or run.canonical_sync_status != "syncing":
+            if (
+                formal is None
+                or run.current_candidate_id is None
+                or run.canonical_sync_status != "syncing"
+            ):
                 raise CandidateGateError("generation run changed before governance pause request")
             updated = conn.execute(
                 """

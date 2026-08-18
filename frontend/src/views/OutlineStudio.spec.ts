@@ -441,6 +441,39 @@ describe('OutlineStudio request and payload isolation', () => {
     expect(mocks.expandCohort).not.toHaveBeenCalled()
   })
 
+  it('retries a failed cohort in the same scope instead of starting an unrelated expansion', async () => {
+    const root = node('root')
+    const selected = {
+      ...node('story-part', 'contract-part'),
+      node_type: 'part',
+      logical_node_id: 'logical-part',
+      outline_contract: { contract_id: 'contract-part', status: 'synced' },
+      latest_cohort_attempt: {
+        id: 'failed-attempt',
+        status: 'failed',
+        error: 'provider unavailable',
+        level: 'volume',
+      },
+      children: [],
+    }
+    root.children = [selected]
+    mocks.getTree.mockResolvedValue(root)
+    mocks.getContract.mockResolvedValue(contract('contract-part', { title: '第一部' }))
+    mocks.expandCohort.mockResolvedValue({ attempt: { id: 'retry-attempt', status: 'completed' } })
+
+    const state = await setupStudio()
+    await state.loadTree()
+    await state.selectNode(selected)
+    await state.generateNextCohort()
+
+    expect(state.cohortButtonLabel).toBe('重试生成')
+    expect(mocks.expandCohort).toHaveBeenCalledWith('novel-1', expect.objectContaining({
+      logical_node_id: 'logical-part',
+      level: 'volume',
+      retry_attempt_id: 'failed-attempt',
+    }))
+  })
+
   it('saves a Working node through the Manifest item endpoint and never legacy saveDraft', async () => {
     const working = {
       ...node('manifest-node-part', 'contract-part'),

@@ -787,8 +787,9 @@ class ChapterAftermathPipeline:
             SqliteStorylineRepository(db),
             db,
         )
-        report = await asyncio.to_thread(
-            governance.commit_chapter,
+        # Keep the blocking decision inside the replay critical section; the
+        # auxiliary queue remains deferred and version-guarded below.
+        report = governance.commit_chapter(
             novel_id,
             chapter_number,
             content,

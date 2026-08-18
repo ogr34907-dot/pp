@@ -1,12 +1,6 @@
-import { readFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
-const componentSource = readFileSync(
-  resolve(dirname(fileURLToPath(import.meta.url)), 'GenerationModeLauncher.vue'),
-  'utf8',
-)
+import componentSource from './GenerationModeLauncher.vue?raw'
 
 describe('GenerationModeLauncher start contract', () => {
   it('keeps Continuous on the single start request', () => {

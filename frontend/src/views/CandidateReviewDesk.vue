@@ -283,11 +283,11 @@ async function approve(continueAfterCommit: boolean) {
   const current = candidate.value
   await applyAction(async () => {
     const result = await generationApi.approveAndCommit(current.id, continueAfterCommit)
-    continuationError.value = result.continuation_error || ''
+    continuationError.value = result?.continuation_error || ''
     if (!continueAfterCommit) return
-    if (result.continuation_error) {
+    if (result?.continuation_error) {
       await refresh({ force: true })
-      return
+      throw new Error(result.continuation_error)
     }
     // Continuous owns its runner on the server. Review mode still needs one
     // explicit next-candidate request, but a failure cannot undo the commit.
@@ -297,6 +297,7 @@ async function approve(continueAfterCommit: boolean) {
       } catch (cause) {
         continuationError.value = cause instanceof Error ? cause.message : '自动继续失败'
         await refresh({ force: true })
+        throw cause
       }
     }
   }, continueAfterCommit ? '已正式提交；正在按所选模式推进。' : '已正式提交并暂停。')

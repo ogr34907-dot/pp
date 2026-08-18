@@ -110,6 +110,19 @@ class ChapterProseInvocationComposer:
         ):
             if key in metadata:
                 variables[key] = metadata[key] or {}
+        if int(request.chapter_number or 0) > 3:
+            # Opening mechanics are a launch aid, not a recurring chapter template.
+            variables["genre_opening_profile"] = {}
+            variables["genre_reader_contract"] = {
+                key: value
+                for key, value in dict(variables["genre_reader_contract"] or {}).items()
+                if key not in {"first_screen_hook", "chapter_1_payoff", "chapter_3_lock"}
+            }
+            variables["genre_rhythm_constraints"] = {
+                key: value
+                for key, value in dict(variables["genre_rhythm_constraints"] or {}).items()
+                if key != "first_screen_hook"
+            }
         return variables
 
     @staticmethod

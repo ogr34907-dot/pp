@@ -127,6 +127,7 @@ class ContextBudgetAllocator:
     # 各槽位的默认上限
     MAX_FORESHADOWING_TOKENS = 2000
     MAX_CHARACTER_ANCHORS_TOKENS = 1500
+    CHARACTER_ANCHORS_MIN_TOKENS = 64
     MAX_GRAPH_SUBNETWORK_TOKENS = 1500
     MAX_ACT_SUMMARIES_TOKENS = 1500
     MAX_RECENT_CHAPTERS_TOKENS = 8000   # 扩容：N-1 完整 + N-2 半量 + N-3~5 预览
@@ -807,6 +808,10 @@ class ContextBudgetAllocator:
             content=character_anchors,
             tokens=self.estimate_tokens(character_anchors),
             max_tokens=self.MAX_CHARACTER_ANCHORS_TOKENS,
+            min_tokens=min(
+                self.CHARACTER_ANCHORS_MIN_TOKENS,
+                self.estimate_tokens(character_anchors),
+            ),
             priority=110,
         )
 

@@ -98,6 +98,40 @@ def test_allocator_uses_persisted_target_for_lifecycle_progress():
     assert allocator._estimate_total_chapters("novel-1") == 120
 
 
+def test_character_anchor_slot_has_a_nonzero_safe_minimum_floor(monkeypatch):
+    allocator = ContextBudgetAllocator()
+    for name in (
+        "_build_lifecycle_directive",
+        "_build_narrative_promise_slot",
+        "_build_narrative_contract_slot",
+        "_build_context_brief",
+        "_build_evolution_presenter_slot",
+        "_get_current_act_summary",
+        "_build_character_state_lock_block",
+        "_get_pending_foreshadowings",
+        "_get_graph_subnetwork",
+        "_get_recent_act_summaries",
+        "_get_recent_chapters",
+        "_get_vector_recall",
+        "_build_worldbuilding_core_slot",
+        "_build_immersion_details_slot",
+        "_build_key_props_slot",
+        "_get_deferred_foreshadowings",
+        "_build_storyline_slot",
+    ):
+        monkeypatch.setattr(allocator, name, lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(
+        allocator,
+        "_get_character_anchors",
+        lambda *_args, **_kwargs: "【角色状态锚点】\n身份：守门人；不可逆状态：失明。",
+    )
+
+    slots = allocator._collect_all_slots("novel-1", 4, "outline")
+
+    assert slots["character_anchors"].tier == PriorityTier.T0_CRITICAL
+    assert slots["character_anchors"].min_tokens > 0
+
+
 def test_t3_reservation_reduces_t2_content_not_only_statistics(monkeypatch):
     slots = {
         "recent": _slot("recent", PriorityTier.T2_DYNAMIC, "r" * 396, 99),

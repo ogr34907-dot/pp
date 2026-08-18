@@ -496,6 +496,36 @@ def test_chapter_prose_composer_drops_additional_continuity_when_main_context_fi
     assert allocator.estimate_tokens(variables["continuity_context"]) == 100
 
 
+@pytest.mark.parametrize("chapter_number", [1, 3])
+def test_chapter_prose_composer_keeps_opening_profile_during_opening_phase(chapter_number):
+    variables = ChapterProseInvocationComposer()._build_variables(
+        ProseCompositionRequest(
+            novel_id="novel-1",
+            chapter_number=chapter_number,
+            genre="仙侠",
+        )
+    )
+
+    assert variables["genre_opening_profile"]["opening_mechanism"]
+    assert variables["genre_reader_contract"]["first_screen_hook"]
+
+
+def test_chapter_prose_composer_filters_opening_profile_after_chapter_three():
+    variables = ChapterProseInvocationComposer()._build_variables(
+        ProseCompositionRequest(
+            novel_id="novel-1",
+            chapter_number=4,
+            genre="仙侠",
+        )
+    )
+
+    assert variables["genre_opening_profile"] == {}
+    assert "first_screen_hook" not in variables["genre_reader_contract"]
+    assert variables["genre_reader_contract"]["reader_promise"]
+    assert "first_screen_hook" not in variables["genre_rhythm_constraints"]
+    assert variables["genre_rhythm_constraints"]["conflict_density"]
+
+
 @pytest.mark.asyncio
 async def test_chapter_prose_composer_reuses_committed_story_pipeline_content(monkeypatch):
     conn = sqlite3.connect(":memory:")

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
+
+import pytest
 
 from application.governance.models import CanonicalStoryline
 from application.governance.service import NarrativeGovernanceService
@@ -135,3 +138,40 @@ def test_storyline_registry_merges_aliases_into_canonical_line():
     assert "地下交易故事线" in merged.aliases
     assert "地下交易追查" in merged.aliases
     assert repo.get_storyline(sid2) is None
+
+
+def test_governance_pause_failure_on_candidate_owned_run_fails_closed(monkeypatch):
+    legacy_updates = []
+
+    class _Connection:
+        def execute(self, *args, **kwargs):
+            legacy_updates.append((args, kwargs))
+
+        def commit(self):
+            legacy_updates.append(("commit",))
+
+    class _Database:
+        def get_connection(self):
+            return _Connection()
+
+    class _CandidateRepository:
+        def __init__(self, _db):
+            pass
+
+        def get_run(self, novel_id):
+            assert novel_id == "novel-1"
+            return SimpleNamespace(current_candidate_id=None)
+
+        def pause_for_governance(self, novel_id, reason):
+            raise RuntimeError(f"pause CAS failed: {novel_id}:{reason}")
+
+    monkeypatch.setattr(
+        "infrastructure.persistence.database.chapter_candidate_repository.ChapterCandidateRepository",
+        _CandidateRepository,
+    )
+    service = NarrativeGovernanceService(object(), db=_Database())
+
+    with pytest.raises(RuntimeError, match="pause CAS failed"):
+        service._pause_autopilot("novel-1")
+
+    assert legacy_updates == []

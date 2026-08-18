@@ -64,3 +64,19 @@ async def test_story_pipeline_uses_shared_rewrite_coordinator_for_existing_prose
     assert coordinator.calls == [(existing, "新正文", "safe_snapshot")]
     assert context.metadata["rewrite_requires_rebuild"] is True
     assert repository.saved == []
+
+
+@pytest.mark.asyncio
+async def test_base_voice_rewrite_does_not_claim_an_unchanged_content_rewrite():
+    context = PipelineContext(
+        novel_id="novel-1",
+        chapter_number=1,
+        chapter_content="正文保持不变",
+    )
+    context.rewrite_applied = True
+    context.rewrite_attempts = 2
+
+    await BaseStoryPipeline()._apply_voice_rewrite_loop(context)
+
+    assert context.rewrite_applied is False
+    assert context.rewrite_attempts == 0

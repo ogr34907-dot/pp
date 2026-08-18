@@ -2,9 +2,12 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from application.blueprint.services.outline_cohort_generation_service import (
     OutlineCohortGenerationError,
 )
+from domain.novel.candidate_chapter import GenerationRunState, RunMode
 from infrastructure.persistence.database.outline_contract_repository import OutlineContractRepository
 from infrastructure.persistence.database.planning_authority_guard import (
     PlanningAuthorityError,
@@ -204,6 +207,7 @@ def test_manifest_cohort_expand_reuses_the_open_draft_after_a_failed_attempt(
                 "parent_logical_node_id": "root",
                 "level": "part",
                 "author_payloads": [],
+                "retry_attempt_id": "failed-attempt",
             },
         )
 
@@ -279,6 +283,66 @@ def test_manifest_cohort_publish_maps_planning_authority_conflict_to_conflict(
             outline_routes.get_outline_cohort_generation_service, None
         )
         app.dependency_overrides.pop(outline_routes.get_outline_service, None)
+
+
+@pytest.mark.asyncio
+async def test_manifest_publish_success_not_hidden_by_continuation_claim_failure(monkeypatch):
+    from interfaces.main import app
+
+    class _Service:
+        async def publish_completed_cohort(self, *, attempt_id: str):
+            assert attempt_id == "attempt-1"
+            return {
+                "attempt": {"id": attempt_id, "status": "published"},
+                "run": SimpleNamespace(novel_id="novel-1", generation_epoch=7),
+            }
+
+    class _Coordinator:
+        def claim(self, novel_id):
+            assert novel_id == "novel-1"
+            raise RuntimeError("runner unavailable")
+
+    class _Repository:
+        def __init__(self, _db):
+            pass
+
+        def get_run(self, novel_id):
+            assert novel_id == "novel-1"
+            return SimpleNamespace(
+                state=GenerationRunState.RUNNING,
+                generation_epoch=7,
+            )
+
+        def record_runner_error(self, novel_id, *, expected_generation_epoch, reason):
+            assert (novel_id, expected_generation_epoch, reason) == (
+                "novel-1",
+                7,
+                "runtime_publish_runner_claim_failed:runner unavailable",
+            )
+
+    app.dependency_overrides[outline_routes.get_outline_cohort_generation_service] = (
+        lambda: _Service()
+    )
+    monkeypatch.setattr(
+        outline_routes.api_dependencies,
+        "get_generation_run_coordinator",
+        lambda: _Coordinator(),
+    )
+    monkeypatch.setattr(outline_routes.api_dependencies, "get_database", lambda: object())
+    monkeypatch.setattr(outline_routes, "ChapterCandidateRepository", _Repository)
+    try:
+        result = await outline_routes.publish_manifest_cohort("attempt-1", _Service())
+
+        assert result["success"] is True
+        assert result["data"]["attempt"]["id"] == "attempt-1"
+        assert result["data"]["continuation_started"] is False
+        assert result["data"]["continuation_error"] == (
+            "runtime_publish_runner_claim_failed:runner unavailable"
+        )
+    finally:
+        app.dependency_overrides.pop(
+            outline_routes.get_outline_cohort_generation_service, None
+        )
 
 
 def test_manifest_cohort_publish_maps_service_state_conflict_to_conflict(client):
