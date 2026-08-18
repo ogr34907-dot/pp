@@ -435,9 +435,9 @@ export const traceApi = {
       `/novels/${novelId}/ai-traces/stages`,
     ) as unknown as Promise<AiStageListResponse>,
 
-  /** GET /ai-traces/stages/taxonomy */
+  /** GET /novels/ai-traces/stages/taxonomy */
   stageTaxonomy: () =>
     apiClient.get<StageTaxonomyResponse>(
-      '/ai-traces/stages/taxonomy',
+      '/novels/ai-traces/stages/taxonomy',
     ) as unknown as Promise<StageTaxonomyResponse>,
 }

@@ -175,7 +175,7 @@ class StoryStructureService:
         if number is not None:
             node.number = number
 
-        saved_node = await self.repository.save(node)
+        saved_node = await self.repository.update(node)
         return saved_node.to_dict()
 
     def _collect_descendant_chapter_numbers(self, novel_id: str, root_id: str) -> List[int]:

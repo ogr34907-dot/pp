@@ -329,6 +329,9 @@ async def test_generate_manifest_cohort_persists_attempt_then_replaces_draft(tmp
     assert "世界规则" in llm.prompts[0].user
     assert "让主角选择承担代价" in llm.prompts[0].user
     assert "canonical_boundary" in llm.prompts[0].user
+    assert '"parent_chapter_start_exact": 1' in llm.prompts[0].user
+    assert '"parent_chapter_end_exact": 10' in llm.prompts[0].user
+    assert "不得用小说总章节数 target_chapters 替代当前父级范围" in llm.prompts[0].user
 
 
 @pytest.mark.asyncio
@@ -363,6 +366,52 @@ async def test_invalid_manifest_cohort_response_marks_attempt_failed_without_pla
     ).fetchone()
     attempt = repository.get_manifest_cohort_attempt(str(row["id"]))
     assert attempt["status"] == "failed"
+    assert repository.get_plan_revision(draft.id).items == draft.items
+    assert repository.get_planning_head("novel-1").active_plan_revision_id == active.id
+
+
+@pytest.mark.asyncio
+async def test_manifest_cohort_rejects_child_ranges_outside_the_parent_before_persisting(
+    tmp_path,
+):
+    database = DatabaseConnection(str(tmp_path / "cohort-service-parent-range.db"))
+    database.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES "
+        "('novel-1', 'Novel', 'cohort-service-parent-range', 10)"
+    )
+    database.get_connection().commit()
+    repository = OutlineContractRepository(database)
+    active, draft, root_item = _root_item(database, repository)
+    service = OutlineCohortGenerationService(
+        repository,
+        OutlineContractService(
+            contract_repository=repository,
+            story_node_repository=StoryNodeRepository(database),
+        ),
+        _LLM(
+            '[{"title":"Invalid part","narrative_text":"The range is wrong.",'
+            '"creative_goal":"Test the guard", "entry_state":"旧秩序仍然完整",'
+            '"exit_state":"新秩序建立但付出代价", "conflicts":["Range conflict"],'
+            '"state_changes":{"hero":[{"change":"moves"}]},'
+            '"handoff_conditions":["continue"], "chapter_start":1,"chapter_end":11}]'
+        ),
+        database,
+    )
+
+    with pytest.raises(
+        OutlineCohortGenerationError,
+        match="chapter_range:last_end_mismatch:expected=10:actual=11",
+    ):
+        await service.generate_cohort(
+            plan_revision_id=draft.id,
+            parent_logical_node_id=root_item.logical_node_id,
+            level=OutlineLevel.PART,
+        )
+
+    row = database.get_connection().execute(
+        "SELECT id FROM outline_plan_cohort_attempts ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    assert repository.get_manifest_cohort_attempt(str(row["id"]))["status"] == "failed"
     assert repository.get_plan_revision(draft.id).items == draft.items
     assert repository.get_planning_head("novel-1").active_plan_revision_id == active.id
 

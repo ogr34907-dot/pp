@@ -380,6 +380,9 @@ class ChapterService:
         Returns:
             ChapterDTO
         """
+        if self.novel_repository.get_by_id(NovelId(novel_id)) is None:
+            raise EntityNotFoundError("Novel", novel_id)
+
         existing = self.get_chapter_by_novel_and_number(novel_id, chapter_number)
         if existing:
             return existing

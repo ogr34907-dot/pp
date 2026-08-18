@@ -16,7 +16,10 @@ from domain.structure.outline_plan import (
     PlanRevisionStatus,
     PlanningAuthorityMode,
 )
-from domain.structure.outline_plan_validation import merge_author_locked_payload
+from domain.structure.outline_plan_validation import (
+    merge_author_locked_payload,
+    validate_sibling_cohort,
+)
 from infrastructure.persistence.database.chapter_candidate_repository import (
     ChapterCandidateRepository,
     CandidateGateError,
@@ -95,6 +98,37 @@ class OutlineCohortGenerationService:
                 raise
             raise OutlineCohortGenerationError(str(exc)) from exc
 
+    def validate_cohort_scope(
+        self,
+        novel_id: str,
+        parent_logical_node_id: str,
+        level: OutlineLevel,
+    ) -> None:
+        """Reject an impossible expansion before creating a Working Plan clone."""
+
+        ManifestPlanningService(self.db).ensure_manifest_planning_authority(novel_id)
+        head = self.repository.get_planning_head(novel_id)
+        plan_revision_id = (
+            head.working_plan_revision_id or head.active_plan_revision_id
+        )
+        if not plan_revision_id:
+            raise OutlineCohortGenerationError(
+                "manifest planning authority has no active plan"
+            )
+        plan = self.repository.get_plan_revision(plan_revision_id)
+        parent = next(
+            (
+                item
+                for item in plan.items
+                if item.logical_node_id == parent_logical_node_id
+            ),
+            None,
+        )
+        if parent is None or parent.level.child_level != level:
+            raise OutlineCohortGenerationError(
+                "parent does not own the requested cohort level"
+            )
+
     async def generate_cohort(
         self,
         *,
@@ -111,7 +145,9 @@ class OutlineCohortGenerationService:
         )
         if parent is None or parent.level.child_level != level:
             raise OutlineCohortGenerationError("parent does not own the requested cohort level")
-        prompt, scope, context_digest = self._build_prompt(plan, parent, level)
+        prompt, scope, context_digest, parent_payload = self._build_prompt(
+            plan, parent, level
+        )
         attempt = self.repository.start_manifest_cohort_attempt(
             plan_revision_id=plan.id,
             parent_logical_node_id=parent.logical_node_id,
@@ -131,6 +167,21 @@ class OutlineCohortGenerationService:
             payloads, author_conflicts = self._merge_author_payloads(
                 payloads, author_payloads
             )
+            validation = validate_sibling_cohort(
+                level=level,
+                parent_payload=parent_payload,
+                siblings=payloads,
+            )
+            chapter_range_blockers = tuple(
+                blocker
+                for blocker in validation.blockers
+                if blocker.startswith("chapter_range:")
+            )
+            if chapter_range_blockers:
+                raise OutlineCohortGenerationError(
+                    "cohort generation violated parent chapter range: "
+                    + ", ".join(chapter_range_blockers)
+                )
             completed, updated = self.repository.complete_manifest_cohort_attempt_with_payloads(
                 attempt_id=attempt["id"],
                 payloads=payloads,
@@ -712,7 +763,7 @@ class OutlineCohortGenerationService:
         level: OutlineLevel,
         *,
         connection: Any = None,
-    ) -> tuple[Prompt, dict[str, Any], str]:
+    ) -> tuple[Prompt, dict[str, Any], str, OutlinePayload]:
         conn = connection if connection is not None else self.db.get_connection()
         novel = conn.execute(
             "SELECT title, premise, target_chapters FROM novels WHERE id = ?",
@@ -751,6 +802,29 @@ class OutlineCohortGenerationService:
             "target_ending": self._payload_value(rows, OutlineLevel.OUTLINE, "exit_state"),
         }
         encoded_context = json.dumps(context, ensure_ascii=False, sort_keys=True)
+        parent_payload = OutlinePayload.from_dict(
+            json.loads(str(parent_row.get("payload_json") or "{}"))
+        )
+        boundary_contract = json.dumps(
+            {
+                "parent_entry_state_exact": parent_payload.entry_state,
+                "parent_exit_state_exact": parent_payload.exit_state,
+                "first_child_entry_state_exact": parent_payload.entry_state,
+                "last_child_exit_state_exact": parent_payload.exit_state,
+                "between_siblings": "child[i].entry_state must exactly equal child[i-1].exit_state",
+                "parent_chapter_start_exact": parent_payload.chapter_start,
+                "parent_chapter_end_exact": parent_payload.chapter_end,
+                "first_child_chapter_start_exact": parent_payload.chapter_start,
+                "last_child_chapter_end_exact": parent_payload.chapter_end,
+                "child_chapter_ranges": (
+                    "Each child must stay within the exact parent chapter range; "
+                    "siblings must form one contiguous, gap-free, non-overlapping partition."
+                ),
+                "never_use_novel_target_chapters_as_parent_range": True,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         import hashlib
 
         context_digest = hashlib.sha256(encoded_context.encode("utf-8")).hexdigest()
@@ -769,9 +843,15 @@ class OutlineCohortGenerationService:
                 f"小说：{novel['title']}\n创意：{novel['premise'] or ''}\n"
                 f"现在整体生成：{label}\n"
                 f"规划上下文：{encoded_context}\n"
+                f"连续性硬约束（以下边界值必须逐字复制，不得同义改写）：{boundary_contract}\n"
                 "每项必须包含 title、narrative_text、creative_goal、entry_state、"
                 "exit_state、conflicts、state_changes、handoff_conditions、"
-                "chapter_start、chapter_end。相邻项必须首尾连续，最后一项到达父级 exit_state。"
+                "chapter_start、chapter_end。第一项 entry_state 必须逐字等于父级 entry_state；"
+                "每个后续 entry_state 必须逐字等于前一项 exit_state；最后一项 exit_state 必须逐字等于父级 exit_state。"
+                "chapter_start/chapter_end 必须严格、连续、无重叠、无缺口地覆盖上方 JSON 中父级的精确章节范围："
+                "第一项 chapter_start 必须等于 first_child_chapter_start_exact，最后一项 chapter_end 必须等于 "
+                "last_child_chapter_end_exact，任何子项不得超出 parent_chapter_start_exact 到 parent_chapter_end_exact。"
+                "绝对不得用小说总章节数 target_chapters 替代当前父级范围，handoff_conditions 必须是非空 JSON 数组。"
             ),
         )
         context_digest = hashlib.sha256(
@@ -782,7 +862,7 @@ class OutlineCohortGenerationService:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-        return prompt, scope, context_digest
+        return prompt, scope, context_digest, parent_payload
 
     def _bible_context(
         self, novel_id: str, *, connection: Any = None

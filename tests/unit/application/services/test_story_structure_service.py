@@ -25,6 +25,7 @@ class _FakeStoryRepo:
     def __init__(self, nodes):
         self._nodes = {node.id: node for node in nodes}
         self.deleted_ids = []
+        self.updated_ids = []
 
     async def get_by_id(self, node_id):
         return self._nodes.get(node_id)
@@ -56,6 +57,13 @@ class _FakeStoryRepo:
             self.deleted_ids.append(node_id)
             del self._nodes[node_id]
         return existed
+
+    async def update(self, node):
+        if node.id not in self._nodes:
+            raise ValueError(f"Node not found: {node.id}")
+        self.updated_ids.append(node.id)
+        self._nodes[node.id] = node
+        return node
 
 
 class _FakeChapterRepo:
@@ -90,7 +98,7 @@ class _FakeCoordinator:
 
 
 def _node(node_id: str, node_type: NodeType, number: int, parent_id: Optional[str] = None):
-    return SimpleNamespace(
+    node = SimpleNamespace(
         id=node_id,
         novel_id="novel-1",
         parent_id=parent_id,
@@ -98,6 +106,16 @@ def _node(node_id: str, node_type: NodeType, number: int, parent_id: Optional[st
         number=number,
         is_chapter=lambda: node_type == NodeType.CHAPTER,
     )
+    node.to_dict = lambda: {
+        "id": node.id,
+        "novel_id": node.novel_id,
+        "parent_id": node.parent_id,
+        "node_type": node.node_type.value,
+        "number": node.number,
+        "title": getattr(node, "title", None),
+        "description": getattr(node, "description", None),
+    }
+    return node
 
 
 def _chapter(number: int):
@@ -179,6 +197,21 @@ def test_delete_node_removes_descendant_chapters_before_deleting_structure_node(
         ("novel-1", 1),
     ]
     assert repo.deleted_ids == ["act-1"]
+
+
+def test_update_node_updates_existing_node_instead_of_inserting_duplicate_id():
+    repo = _FakeStoryRepo([_node("act-1", NodeType.ACT, 1)])
+    service = StoryStructureService(repo)
+
+    result = asyncio.run(
+        service.update_node("act-1", title="Renamed", description="Updated", number=2)
+    )
+
+    assert result["id"] == "act-1"
+    assert result["title"] == "Renamed"
+    assert result["description"] == "Updated"
+    assert result["number"] == 2
+    assert repo.updated_ids == ["act-1"]
 
 
 def test_delete_node_returns_true_when_direct_chapter_delete_removes_story_node():

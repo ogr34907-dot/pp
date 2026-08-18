@@ -1,4 +1,4 @@
-/** 与 application/ai/ai_call_stage.py AI_CALL_STAGES 保持一致（单源在后端 /ai-traces/stages/taxonomy） */
+/** 与 application/ai/ai_call_stage.py AI_CALL_STAGES 保持一致（单源在后端 /novels/ai-traces/stages/taxonomy） */
 export interface StageDef {
   key: string
   label: string

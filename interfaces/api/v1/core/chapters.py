@@ -260,7 +260,10 @@ async def ensure_chapter(
 
     适用于结构树手动添加章节节点后、用户点击想直接开始写作的场景。
     """
-    return service.ensure_chapter(novel_id, chapter_number, request.title)
+    try:
+        return service.ensure_chapter(novel_id, chapter_number, request.title)
+    except EntityNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.put("/{novel_id}/chapters/{chapter_number}/micro-beats")

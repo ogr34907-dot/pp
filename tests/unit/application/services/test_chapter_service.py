@@ -155,6 +155,29 @@ class TestChapterService:
 
         assert chapter_dto is None
 
+    def test_ensure_chapter_requires_existing_novel(
+        self, service, mock_chapter_repository, mock_novel_repository
+    ):
+        mock_novel_repository.get_by_id.return_value = None
+
+        with pytest.raises(EntityNotFoundError, match="Novel"):
+            service.ensure_chapter("missing-novel", 1, "第一章")
+
+        mock_chapter_repository.save.assert_not_called()
+
+    def test_ensure_chapter_creates_once_for_existing_novel(
+        self, service, mock_chapter_repository, mock_novel_repository
+    ):
+        mock_novel_repository.get_by_id.return_value = object()
+        mock_chapter_repository.list_by_novel.return_value = []
+
+        result = service.ensure_chapter("novel-1", 1, "第一章")
+
+        assert result.novel_id == "novel-1"
+        assert result.number == 1
+        assert result.title == "第一章"
+        mock_chapter_repository.save.assert_called_once()
+
     def test_delete_chapter(self, service, mock_chapter_repository):
         """测试删除章节"""
         chapter = Chapter(

@@ -130,6 +130,13 @@ def test_manifest_cohort_routes_generate_then_publish_without_legacy_node_publis
         def __init__(self):
             self.calls: list[tuple] = []
 
+        def validate_cohort_scope(self, novel_id: str, parent_logical_node_id: str, level):
+            assert (novel_id, parent_logical_node_id, level.value) == (
+                test_novel_id,
+                "root",
+                "part",
+            )
+
         def open_or_clone_cohort_draft(self, novel_id: str):
             assert novel_id == test_novel_id
             return SimpleNamespace(id="draft-plan-1")
@@ -189,6 +196,13 @@ def test_manifest_cohort_expand_reuses_the_open_draft_after_a_failed_attempt(
     from interfaces.main import app
 
     class _Service:
+        def validate_cohort_scope(self, novel_id: str, parent_logical_node_id: str, level):
+            assert (novel_id, parent_logical_node_id, level.value) == (
+                test_novel_id,
+                "root",
+                "part",
+            )
+
         def open_or_clone_cohort_draft(self, novel_id: str):
             assert novel_id == test_novel_id
             return SimpleNamespace(id="open-draft-1")
@@ -213,6 +227,80 @@ def test_manifest_cohort_expand_reuses_the_open_draft_after_a_failed_attempt(
 
         assert response.status_code == 200
         assert response.json()["data"]["attempt"]["id"] == "retry-attempt"
+    finally:
+        app.dependency_overrides.pop(
+            outline_routes.get_outline_cohort_generation_service, None
+        )
+
+
+def test_invalid_manifest_cohort_expand_does_not_open_a_working_draft(
+    client, db, test_novel_id
+):
+    from application.blueprint.services.outline_cohort_generation_service import (
+        OutlineCohortGenerationService,
+    )
+    from application.blueprint.services.outline_contract_service import OutlineContractService
+    from domain.structure.outline_contract import OutlinePayload, OutlineSource
+    from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+    from interfaces.main import app
+
+    repository = OutlineContractRepository(db)
+    root = repository.ensure_root(test_novel_id)
+    draft = repository.save_draft(
+        root.id,
+        OutlinePayload(
+            title="总纲",
+            narrative_text="主线",
+            creative_goal="完成目标",
+            entry_state="开始",
+            exit_state="结束",
+        ),
+        source=OutlineSource.AUTHOR,
+    )
+    repository.publish_and_sync(
+        root.id,
+        expected_revision=draft.draft.revision,
+        idempotency_key="preflight-root",
+    )
+    plan = repository.backfill_initial_plan(test_novel_id).plan
+    assert plan is not None
+    conn = db.get_connection()
+    conn.execute(
+        "UPDATE outline_planning_heads SET authority_mode='manifest', "
+        "authority_generation=1, projection_generation=1 WHERE novel_id=?",
+        (test_novel_id,),
+    )
+    conn.commit()
+    before = repository.get_planning_head(test_novel_id)
+    assert before.working_plan_revision_id is None
+
+    service = OutlineCohortGenerationService(
+        repository,
+        OutlineContractService(
+            contract_repository=repository,
+            story_node_repository=StoryNodeRepository(db),
+        ),
+        llm_service=object(),
+        db=db,
+    )
+    app.dependency_overrides[outline_routes.get_outline_cohort_generation_service] = (
+        lambda: service
+    )
+    try:
+        response = client.post(
+            f"/api/v1/outline/novels/{test_novel_id}/cohorts/expand",
+            json={
+                "parent_logical_node_id": root.id,
+                "level": "chapter",
+                "author_payloads": [],
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "parent does not own the requested cohort level"
+        after = repository.get_planning_head(test_novel_id)
+        assert after.working_plan_revision_id is None
+        assert after.active_plan_revision_id == before.active_plan_revision_id
     finally:
         app.dependency_overrides.pop(
             outline_routes.get_outline_cohort_generation_service, None

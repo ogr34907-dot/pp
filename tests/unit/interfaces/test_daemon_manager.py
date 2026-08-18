@@ -11,6 +11,7 @@ from interfaces.daemon_manager import (
     AutopilotDaemonManager,
     DaemonLifecycleSettings,
     DaemonStatus,
+    _project_root,
     cleanup_orphan_python_processes,
     is_expected_daemon_shutdown_exception,
     run_autopilot_daemon_process,
@@ -439,7 +440,9 @@ def test_orphan_cleanup_terminates_only_a_registered_stale_daemon(monkeypatch, t
     """DAEMON-001: a Python spawn child survives a killed launcher only when its local PID record is ignored."""
     registry_path = tmp_path / "autopilot-daemon.json"
     registry_path.write_text(
-        json.dumps({"pid": 202, "parent_pid": 999, "workspace_root": "W:/novel/test"}),
+        json.dumps(
+            {"pid": 202, "parent_pid": 999, "workspace_root": str(_project_root())}
+        ),
         encoding="utf-8",
     )
     local_executable = sys.executable

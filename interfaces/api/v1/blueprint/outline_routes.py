@@ -352,6 +352,11 @@ async def expand_manifest_cohort(
     """Open (or recover) the Manifest draft, then generate one sibling cohort."""
 
     try:
+        service.validate_cohort_scope(
+            novel_id,
+            body.parent_logical_node_id,
+            body.level,
+        )
         draft = service.open_or_clone_cohort_draft(novel_id)
         generate_kwargs = {
             "plan_revision_id": draft.id,
