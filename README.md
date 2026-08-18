@@ -90,7 +90,7 @@ ARK_MODEL=your-model
 
 ### 4. 启动工作台
 
-日常本机写小说时，双击 `tools\start-local.vbs`。它会隐藏命令行窗口和后台服务进程，等待 FastAPI 就绪后打开浏览器。
+日常本机写小说时，双击 `tools\start-local.vbs`。它会隐藏命令行窗口和后台服务进程，等待 FastAPI 与 Vite 前端都就绪后打开浏览器。
 
 需要从终端观察真实启动错误时，运行诊断入口 `tools\start-dev.bat`：
 
@@ -98,26 +98,27 @@ ARK_MODEL=your-model
 .\tools\start-dev.bat
 ```
 
-日常启动只拉起 `8005` 上的 FastAPI；FastAPI 直接托管已构建的 `frontend\dist`，不会默认启动 Vite 或 `3000`。
+日常启动会同时拉起 `8005` 上的 FastAPI 和 `3000` 上的 Vite 前端，浏览器默认打开前端端口。Vite 的 `/api` 代理指向 `8005`，所以页面请求仍由本地 FastAPI 处理。
 
 服务地址如下：
 
 | 地址 | 用途 |
 | --- | --- |
-| [http://127.0.0.1:8005/](http://127.0.0.1:8005/) | PlotPilot 作者工作台 |
+| [http://127.0.0.1:3000/](http://127.0.0.1:3000/) | PlotPilot 作者工作台（默认入口） |
+| [http://127.0.0.1:8005/](http://127.0.0.1:8005/) | FastAPI 直接托管的构建版工作台 |
 | [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs) | FastAPI OpenAPI 文档 |
 
-结束日常服务时双击 `tools\stop-local.vbs`，或从终端运行 `tools\stop-dev.bat`。两者只处理 `8005`，不会误杀 `3000` 上的其他项目。
+结束日常服务时双击 `tools\stop-local.vbs`，或从终端运行 `tools\stop-dev.bat`。两者会处理 PlotPilot 的 `8005` 和 `3000`，不会误杀其他端口上的项目。
 
 ### 启动器说明
 
 | 文件 | 适用场景 |
 | --- | --- |
-| `tools\start-local.vbs` | 日常本机写作入口；无终端启动 `8005`，并打开 `http://127.0.0.1:8005/`。 |
-| `tools\stop-local.vbs` | 日常本机写作的无终端停止入口；只处理 `8005`。 |
+| `tools\start-local.vbs` | 日常本机写作入口；无终端启动 `8005` 与 `3000`，并打开 `http://127.0.0.1:3000/`。 |
+| `tools\stop-local.vbs` | 日常本机写作的无终端停止入口；处理 `8005` 与 `3000`。 |
 | `tools\start-dev.bat` | 从终端运行的诊断入口；行为与日常启动相同，但保留真实失败退出码。 |
-| `tools\stop-dev.bat` | 从终端停止日常服务；只处理 `8005`。 |
-| `tools\start-frontend-dev.bat` | 显式启动 Vue/Vite 源码开发服务器 `3000`，不会替代日常启动。 |
+| `tools\stop-dev.bat` | 从终端停止日常服务；处理 `8005` 与 `3000`。 |
+| `tools\start-frontend-dev.bat` | 只启动 Vue/Vite 源码开发服务器 `3000`；适合后端已单独运行的场景。 |
 | `tools\stop-frontend-dev.bat` | 停止显式启动的 Vite `3000` 开发服务器。 |
 | `tools\plotpilot.bat` | 便携式 GUI 启动器。它要求 Python `3.14.x`，并在没有系统 Python 时查找 `tools\python-3.14.5-embed-amd64.zip`；适合准备好该运行时的分发环境，不是源码开发的推荐入口。 |
 
@@ -176,24 +177,24 @@ AI 流式大纲生成会保存为可恢复的尝试：页面刷新后会恢复�
 
 ## 手动启动与本地部署
 
-不使用 Windows 启动器时，日常本机模式只需启动 FastAPI。运行前请确认已经在 `frontend` 目录执行过 `npm run build`，因为 `8005` 会直接托管构建产物：
+不使用 Windows 启动器、只需要后端构建版工作台时，可以单独启动 FastAPI。运行前请确认已经在 `frontend` 目录执行过 `npm run build`，因为 `8005` 会直接托管构建产物：
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn interfaces.main:app --host 127.0.0.1 --port 8005
 ```
 
-然后访问 [http://127.0.0.1:8005/](http://127.0.0.1:8005/)；OpenAPI 文档仍在 [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs)。
+然后访问 [http://127.0.0.1:8005/](http://127.0.0.1:8005/)；OpenAPI 文档仍在 [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs)。日常一键入口会额外启动 `3000` 并优先打开它。
 
 ### Vue 源码开发（可选）
 
-只有需要修改 Vue 源码时才使用 `3000`。先让 `8005` 后端保持运行，再双击 `tools\start-frontend-dev.bat`，或在 `frontend` 目录执行：
+如果只想单独启动或重启 Vue 源码服务，可先让 `8005` 后端保持运行，再双击 `tools\start-frontend-dev.bat`，或在 `frontend` 目录执行：
 
 ```powershell
 Set-Location frontend
 npm run dev -- --host 127.0.0.1 --port 3000
 ```
 
-此时工作台地址才是 [http://127.0.0.1:3000/](http://127.0.0.1:3000/)。Vite 的 API 代理仍指向已运行的 `8005`；停止时使用 `tools\stop-frontend-dev.bat`，不要用日常的 `stop-dev.bat` 代替。
+此时工作台地址是 [http://127.0.0.1:3000/](http://127.0.0.1:3000/)。Vite 的 API 代理仍指向已运行的 `8005`；只停止前端时使用 `tools\stop-frontend-dev.bat`，不要用日常的 `stop-dev.bat` 代替。
 
 Linux 或 macOS 可以使用同样的后端命令流程，将 Windows 虚拟环境路径替换为 `.venv/bin/python`，并使用 `source .venv/bin/activate`。生产构建、Tauri 桌面安装包与维护者打包说明见 [docs/BUILD_INSTALLER.md](docs/BUILD_INSTALLER.md)。
 
@@ -205,7 +206,7 @@ Linux 或 macOS 可以使用同样的后端命令流程，将 Windows 虚拟环�
 
 ### 启动器打开后无法访问工作台
 
-先检查 [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs)。如果后端未就绪，检查 `.env` 中的配置和 `8005` 端口占用；日常模式不启动 `3000`。只有 Vue 源码开发时才需要检查 `3000`，此时在 `frontend` 目录确认已执行 `npm install`。
+先检查 [http://127.0.0.1:8005/docs](http://127.0.0.1:8005/docs) 和 [http://127.0.0.1:3000/](http://127.0.0.1:3000/)。如果后端未就绪，检查 `.env` 中的配置和 `8005` 端口占用；如果前端未就绪，确认在 `frontend` 目录执行过 `npm install` 并检查 `3000` 端口占用。
 
 ### 生成时报 API Key 或模型错误
 

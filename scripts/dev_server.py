@@ -118,7 +118,7 @@ def start_local_workbench(
     wait_for_ready: Callable[..., None] = wait_for_http_ready,
     browser_opener: Callable[[str], object] = webbrowser.open,
 ) -> None:
-    """Start the local FastAPI workbench that serves the built frontend."""
+    """Start the local API and Vite workbench, then open the frontend."""
 
     project_root = Path(project_root).resolve()
     python_executable = python_executable or _default_python_executable(project_root)
@@ -142,7 +142,25 @@ def start_local_workbench(
             )
         wait_for_ready(WORKBENCH_URL, timeout_seconds=60, poll_interval=0.25)
 
-    browser_opener(WORKBENCH_URL)
+    if not is_ready(FRONTEND_HEALTH_URL):
+        if not port_in_use(FRONTEND_PORT):
+            _start_process(
+                [
+                    npm_command,
+                    "run",
+                    "dev",
+                    "--",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(FRONTEND_PORT),
+                ],
+                cwd=project_root / "frontend",
+                popen=popen,
+            )
+        wait_for_ready(FRONTEND_HEALTH_URL, timeout_seconds=60, poll_interval=0.25)
+
+    browser_opener(FRONTEND_HEALTH_URL)
 
 
 def start_frontend_development_server(
@@ -235,10 +253,10 @@ def stop_local_workbench(
     listening_pids: Callable[[int], list[int]] = _listening_pids,
     terminate_process_tree: Callable[[int], object] = _terminate_process_tree,
 ) -> list[int]:
-    """Stop only the local FastAPI workbench process tree."""
+    """Stop the default local API and Vite process trees."""
 
     return _stop_servers_on_ports(
-        (BACKEND_PORT,),
+        (BACKEND_PORT, FRONTEND_PORT),
         listening_pids=listening_pids,
         terminate_process_tree=terminate_process_tree,
     )
@@ -259,13 +277,13 @@ def stop_frontend_development_server(
 
 
 def start_development_servers(*args, **kwargs) -> None:
-    """Backward-compatible alias for the 8005-only local workbench launcher."""
+    """Backward-compatible alias for the default API + frontend launcher."""
 
     return start_local_workbench(*args, **kwargs)
 
 
 def stop_development_servers(*args, **kwargs) -> list[int]:
-    """Backward-compatible alias for stopping the 8005-only local workbench."""
+    """Backward-compatible alias for stopping the default API + frontend."""
 
     return stop_local_workbench(*args, **kwargs)
 
@@ -281,7 +299,7 @@ def main() -> int:
 
     if arguments.command == "start":
         start_local_workbench(_project_root())
-        print(f"PlotPilot local workbench is ready at {WORKBENCH_URL}")
+        print(f"PlotPilot local frontend is ready at {FRONTEND_HEALTH_URL}")
         return 0
 
     if arguments.command == "frontend":
