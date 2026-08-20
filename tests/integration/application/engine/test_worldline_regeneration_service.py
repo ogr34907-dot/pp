@@ -19,9 +19,21 @@ from infrastructure.persistence.database.plan_projection_writer import (
     PlanProjectionWriter,
 )
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
+from application.blueprint.services.outline_continuity_review_service import (
+    OutlineContinuityReviewService,
+)
 from application.engine.services.worldline_regeneration_service import (
     WorldlineRegenerationError,
     WorldlineRegenerationService,
+)
+from domain.structure.outline_continuity import (
+    ContinuityDecision,
+    ContinuityReviewReport,
+    ContinuityReviewScope,
+    ContinuityReviewState,
+)
+from infrastructure.persistence.database.outline_continuity_review_repository import (
+    OutlineContinuityReviewRepository,
 )
 from application.world.services.chapter_narrative_sync import (
     CHAPTER_NARRATIVE_PIPELINE_VERSION,
@@ -377,6 +389,7 @@ def _materialize_manifest_worldline(
                 ),
             ),
         )
+    _install_required_pass_receipt(db, contracts, expanded)
     conn = db.get_connection()
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -407,6 +420,69 @@ def _materialize_manifest_worldline(
         conn.rollback()
         raise
     return target
+
+
+def _install_required_pass_receipt(db, contracts, plan) -> None:
+    reviews = OutlineContinuityReviewRepository(db)
+    service = OutlineContinuityReviewService(contracts, reviews, object(), db)
+    review_ids = []
+    scope_fingerprints = []
+    for parent_logical_node_id in contracts.required_narrative_review_scope_parents(
+        plan.id
+    ):
+        parent = next(
+            item
+            for item in plan.items
+            if item.logical_node_id == parent_logical_node_id
+        )
+        children = tuple(
+            item
+            for item in plan.items
+            if item.parent_logical_node_id == parent.logical_node_id
+        )
+        scope = ContinuityReviewScope(
+            parent_logical_node_id=parent.logical_node_id,
+            level=parent.level.child_level.value,
+            parent_version_id=parent.version_id,
+            parent_version_digest=parent.version_digest,
+            children=tuple(
+                {
+                    "logical_node_id": item.logical_node_id,
+                    "version_id": item.version_id,
+                    "version_digest": item.version_digest,
+                    "sibling_index": item.sibling_index,
+                }
+                for item in children
+            ),
+        )
+        scope_fingerprint = service.current_scope_fingerprint(
+            plan.id, parent.logical_node_id, plan.digest
+        )
+        run = reviews.begin(
+            novel_id=plan.novel_id,
+            plan_revision_id=plan.id,
+            scope=scope,
+            plan_digest=plan.digest,
+            scope_fingerprint=scope_fingerprint,
+        )
+        completed = reviews.complete(
+            run["id"],
+            report=ContinuityReviewReport(
+                decision=ContinuityDecision.PASS,
+                confidence=1.0,
+                scope_fingerprint=scope_fingerprint,
+            ),
+        )
+        review_ids.append(completed["id"])
+        scope_fingerprints.append(completed["scope_fingerprint"])
+    contracts.set_narrative_review_receipt(
+        plan_revision_id=plan.id,
+        expected_plan_digest=plan.digest,
+        state=ContinuityReviewState.PASS,
+        receipt={"action": "pass", "actor": "test"},
+        review_ids=tuple(review_ids),
+        scope_fingerprints=tuple(scope_fingerprints),
+    )
 
 
 def _seed_canonical_tail(db):

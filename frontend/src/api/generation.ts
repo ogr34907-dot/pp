@@ -52,6 +52,36 @@ export interface OutlineContract {
   draft?: OutlineRevision | null
 }
 
+export interface OutlineContinuityRun {
+  id: string
+  plan_revision_id: string
+  scope_parent_logical_node_id: string
+  scope_fingerprint: string
+  state: string
+  decision: 'pass' | 'review' | 'conflict' | 'unavailable' | string
+  confidence?: number | null
+  report?: Record<string, unknown>
+  error?: string
+}
+
+export interface OutlineContinuityStatus {
+  plan_revision_id: string
+  plan_digest: string
+  state: 'not_required' | 'pending' | 'pass' | 'acknowledged' | string
+  receipt: Record<string, unknown>
+  latest?: OutlineContinuityRun | null
+  current?: OutlineContinuityRun | null
+  run?: OutlineContinuityRun | null
+  technical_blockers?: string[]
+}
+
+export interface OutlineContinuitySuggestionApplyResult {
+  plan_revision_id: string
+  plan_digest: string
+  logical_node_id: string
+  version_digest: string
+}
+
 export interface OutlineTreeNode {
   id: string
   logical_node_id?: string | null
@@ -298,8 +328,21 @@ export const outlineApi = {
       ...(request.retry_attempt_id ? { retry_attempt_id: request.retry_attempt_id } : {}),
     },
   }),
-  authorPublishCohort: (attemptId: string) =>
-    unwrap<Record<string, unknown>>(apiRoutes.outline.authorPublishCohort(attemptId), { method: 'POST' }),
+  authorPublishCohort: (
+    attemptId: string,
+    confirmation?: {
+      expected_plan_digest: string
+      confirm_narrative_risk: boolean
+      override_reason?: string
+      review_ids: string[]
+      scope_fingerprints: string[]
+      actor?: string
+      idempotency_key?: string
+    },
+  ) => unwrap<Record<string, unknown>>(apiRoutes.outline.authorPublishCohort(attemptId), {
+    method: 'POST',
+    ...(confirmation ? { body: confirmation } : {}),
+  }),
   getContract: (contractId: string) => unwrap<OutlineContract>(apiRoutes.outline.contract(contractId)),
   saveDraft: (contractId: string, payload: OutlinePayload, source: 'author' | 'ai' | 'imported' = 'author') =>
     unwrap<OutlineContract>(apiRoutes.outline.draft(contractId), { method: 'POST', body: { payload, source } }),
@@ -325,6 +368,41 @@ export const outlineApi = {
     })),
   cancelGenerationAttempt: (contractId: string, attemptId: string) =>
     unwrap<OutlineGenerationAttempt>(apiRoutes.outline.generationAttemptCancel(contractId, attemptId), { method: 'POST' }),
+  getContinuityReview: (planRevisionId: string, parentLogicalNodeId?: string) =>
+    unwrap<OutlineContinuityStatus>(apiRoutes.outline.continuityReview(planRevisionId, parentLogicalNodeId)),
+  requestContinuityReview: (
+    planRevisionId: string,
+    request: { parent_logical_node_id: string; expected_plan_digest: string; force?: boolean },
+  ) => unwrap<OutlineContinuityStatus>(apiRoutes.outline.continuityReview(planRevisionId), {
+    method: 'POST', body: request,
+  }),
+  applyContinuityReceipt: (
+    planRevisionId: string,
+    request: {
+      expected_plan_digest: string
+      state: 'pass' | 'acknowledged'
+      review_ids?: string[]
+      scope_fingerprints?: string[]
+      actor?: string
+      reason?: string
+      idempotency_key?: string
+    },
+  ) => unwrap<OutlineContinuityStatus>(apiRoutes.outline.continuityReviewApply(planRevisionId), {
+    method: 'POST', body: request,
+  }),
+  applyContinuitySuggestion: (
+    reviewId: string,
+    suggestionId: string,
+    request: {
+      logical_node_id: string
+      expected_plan_digest: string
+      expected_version_digest: string
+      scope_fingerprint: string
+    },
+  ) => unwrap<OutlineContinuitySuggestionApplyResult>(
+    apiRoutes.outline.continuitySuggestionApply(reviewId, suggestionId),
+    { method: 'POST', body: request },
+  ),
 }
 
 export interface OutlineGenerationAttemptEvent {

@@ -42,7 +42,8 @@ async def http_exception_handler(request: Request, exc) -> JSONResponse:
         JSONResponse with unified error format
     """
     status_code = exc.status_code
-    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    raw_detail = exc.detail
+    detail = raw_detail if isinstance(raw_detail, str) else str(raw_detail)
 
     # Map status code to error code, use generic if not found
     error_code = STATUS_CODE_MAP.get(status_code, "HTTP_ERROR")
@@ -62,7 +63,7 @@ async def http_exception_handler(request: Request, exc) -> JSONResponse:
 
     content = error_response.model_dump()
     # Keep FastAPI's traditional HTTPException shape available for legacy clients.
-    content["detail"] = detail
+    content["detail"] = raw_detail
 
     return JSONResponse(
         status_code=status_code,

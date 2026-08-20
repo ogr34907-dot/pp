@@ -9,6 +9,7 @@ import json
 from typing import Any, Iterable, Mapping, Optional
 
 from domain.structure.outline_contract import OutlineLevel
+from domain.structure.outline_continuity import ContinuityReviewState
 
 
 class PlanningAuthorityMode(str, Enum):
@@ -138,6 +139,8 @@ class OutlinePlanRevision:
     author_intent: str = ""
     created_by: str = "system"
     publish_idempotency_key: str = ""
+    narrative_review_state: ContinuityReviewState = ContinuityReviewState.NOT_REQUIRED
+    narrative_review_receipt: Mapping[str, Any] | None = None
     created_at: str = ""
     updated_at: str = ""
     sealed_at: Optional[str] = None
@@ -151,12 +154,23 @@ class OutlinePlanRevision:
                 "reconciliation_status",
                 PlanReconciliationStatus(self.reconciliation_status),
             )
+        if isinstance(self.narrative_review_state, str):
+            object.__setattr__(
+                self,
+                "narrative_review_state",
+                ContinuityReviewState(self.narrative_review_state),
+            )
         object.__setattr__(self, "items", tuple(self.items))
         object.__setattr__(self, "canonical_boundary", dict(self.canonical_boundary or {}))
         object.__setattr__(
             self,
             "reconciliation_report",
             dict(self.reconciliation_report or {}),
+        )
+        object.__setattr__(
+            self,
+            "narrative_review_receipt",
+            dict(self.narrative_review_receipt or {}),
         )
 
 

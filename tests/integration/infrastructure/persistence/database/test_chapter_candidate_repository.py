@@ -60,6 +60,8 @@ def _activate_manifest_five_level_chain(
     *,
     novel_id: str,
     chapter_number: int = 1,
+    required_events: list[str] | None = None,
+    creative_goal: str = "推进冲突和人物变化",
 ):
     """Use the production backfill path to create one active sealed chain."""
 
@@ -89,10 +91,12 @@ def _activate_manifest_five_level_chain(
     payload = OutlinePayload(
         title="已发布文学大纲",
         narrative_text="主角承担不可逆代价，并将当前冲突交接给下一阶段。",
-        creative_goal="推进冲突和人物变化",
+        creative_goal=creative_goal,
         entry_state="承接前一阶段结局",
         exit_state="留下下一阶段必须回应的变化",
-        required_events=["发生不可逆选择"],
+        required_events=(
+            ["发生不可逆选择"] if required_events is None else required_events
+        ),
         state_changes={"characters": [{"name": "主角", "change": "承担代价"}]},
         handoff_conditions=["下一阶段承接本阶段结局"],
         chapter_start=chapter_number,
@@ -592,6 +596,91 @@ def test_manifest_candidate_persists_full_five_level_plan_pin_at_creation(tmp_pa
         "chapter",
     }
     assert all(candidate.outline_chain[level]["version_id"] for level in candidate.outline_chain)
+
+
+def test_manifest_candidate_rejects_chapter_without_usable_prose_input(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "manifest-prose-input.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("manifest-prose-input", "Manifest Prose Input", "manifest-prose-input", 20),
+    )
+    conn.commit()
+    service, chapter_node, _plan = _activate_manifest_five_level_chain(
+        db,
+        novel_id="manifest-prose-input",
+        required_events=[],
+        creative_goal="",
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run(
+        "manifest-prose-input", run_mode=RunMode.CHAPTER_REVIEW, target_chapters=20
+    )
+
+    with pytest.raises(
+        CandidateGateError,
+        match="candidate prose input is not ready: prose_input:missing_required_events_or_creative_goal",
+    ):
+        repo.create_streaming_candidate(
+            novel_id="manifest-prose-input",
+            chapter_number=1,
+            title="第一章",
+            outline_chain=service.published_context_for_chapter(
+                "manifest-prose-input", chapter_node.id
+            ),
+        )
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM chapter_candidates WHERE novel_id = ?",
+        ("manifest-prose-input",),
+    ).fetchone()[0] == 0
+
+
+def test_manifest_candidate_authority_recheck_rejects_exact_blank_prose_input(tmp_path):
+    """An existing Candidate cannot continue when its exact active chapter loses prose input."""
+
+    db, repo, candidate = _manifest_candidate_for_pin_boundary(
+        tmp_path, boundary="revalidation"
+    )
+    conn = db.get_connection()
+    chapter_version_id = candidate.outline_chain["chapter"]["version_id"]
+    version = conn.execute(
+        "SELECT payload_json FROM outline_contract_versions WHERE id = ?",
+        (chapter_version_id,),
+    ).fetchone()
+    assert version is not None
+    payload_values = json.loads(str(version["payload_json"]))
+    payload_values["required_events"] = [" ", ""]
+    payload_values["creative_goal"] = "  "
+    blank_payload = OutlinePayload.from_dict(payload_values)
+    blank_payload_json = json.dumps(
+        blank_payload.canonical_dict(), ensure_ascii=False, sort_keys=True
+    )
+    conn.execute("DROP TRIGGER IF EXISTS trg_outline_contract_versions_manifest_sealed_update")
+    conn.execute("DROP TRIGGER IF EXISTS trg_outline_contract_versions_sealed_global_update")
+    conn.execute("DROP TRIGGER IF EXISTS trg_outline_contract_versions_sealed_global_update_v2")
+    conn.execute(
+        "UPDATE outline_contract_versions SET payload_json = ?, digest = ? WHERE id = ?",
+        (blank_payload_json, blank_payload.digest, chapter_version_id),
+    )
+    _tamper_manifest_candidate_chain(
+        conn,
+        candidate_id=candidate.id,
+        mutate=lambda chain: chain["chapter"].update(
+            payload=blank_payload.canonical_dict(), digest=blank_payload.digest
+        ),
+    )
+    conn.execute(
+        "UPDATE chapter_candidates SET chapter_outline_digest = ? WHERE id = ?",
+        (blank_payload.digest, candidate.id),
+    )
+    conn.commit()
+
+    with pytest.raises(
+        CandidateGateError,
+        match=r"^candidate prose input is not ready: prose_input:missing_required_events_or_creative_goal",
+    ):
+        repo.revalidate_candidate_generation_authority(candidate.id)
 
 
 def test_manifest_context_and_candidate_ignore_mutable_contract_story_node_cache(tmp_path):
@@ -2367,6 +2456,96 @@ def test_manifest_publication_resumes_only_the_exact_waiting_planning_run(tmp_pa
     assert resumed.state == GenerationRunState.RUNNING
     assert resumed.next_action == "generate_candidate"
     assert resumed.generation_epoch == paused.generation_epoch
+
+
+def test_manifest_publication_keeps_waiting_for_missing_next_chapter_prose_input(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "resume-prose-input.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("resume-prose-input", "Resume Prose Input", "resume-prose-input", 20),
+    )
+    conn.commit()
+    _, _, plan = _activate_manifest_five_level_chain(
+        db,
+        novel_id="resume-prose-input",
+        required_events=[],
+        creative_goal="",
+    )
+    repo = ChapterCandidateRepository(db)
+    repo.start_run("resume-prose-input", run_mode=RunMode.CONTINUOUS, target_chapters=20)
+    paused = repo.wait_for_outline_expansion("resume-prose-input")
+
+    conn.execute("BEGIN IMMEDIATE")
+    resumed = repo.resume_after_outline_publication(
+        conn,
+        novel_id="resume-prose-input",
+        expected_generation_epoch=paused.generation_epoch,
+        expected_current_formal_chapter=paused.current_formal_chapter,
+        expected_active_plan_revision_id=plan.id,
+        expected_active_plan_digest=plan.digest,
+        expected_authority_generation=1,
+        expected_projection_generation=1,
+    )
+    conn.commit()
+
+    assert resumed.state == GenerationRunState.WAITING_PLANNING
+    assert resumed.next_action == "expand_outline_cohort"
+
+
+def test_manifest_publication_keeps_waiting_when_next_chapter_is_not_expanded(tmp_path):
+    db = DatabaseConnection(str(tmp_path / "resume-unexpanded-outline.db"))
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO novels (id, title, slug, target_chapters) VALUES (?, ?, ?, ?)",
+        ("resume-unexpanded", "Resume Unexpanded", "resume-unexpanded", 20),
+    )
+    conn.commit()
+    contracts = OutlineContractRepository(db)
+    root = contracts.ensure_root("resume-unexpanded")
+    draft = contracts.save_draft(
+        root.id,
+        OutlinePayload(
+            title="总纲",
+            narrative_text="先完成宏观规划。",
+            creative_goal="展开下一层规划",
+            chapter_start=1,
+            chapter_end=20,
+        ),
+        source=OutlineSource.AUTHOR,
+    )
+    contracts.publish_and_sync(root.id, expected_revision=draft.draft.revision)
+    plan = contracts.backfill_initial_plan("resume-unexpanded").plan
+    assert plan is not None
+    conn.execute(
+        """
+        UPDATE outline_planning_heads
+        SET authority_mode = 'manifest', authority_generation = 1,
+            projection_generation = 1
+        WHERE novel_id = ?
+        """,
+        ("resume-unexpanded",),
+    )
+    conn.commit()
+    repo = ChapterCandidateRepository(db)
+    repo.start_run("resume-unexpanded", run_mode=RunMode.CONTINUOUS, target_chapters=20)
+    paused = repo.wait_for_outline_expansion("resume-unexpanded")
+
+    conn.execute("BEGIN IMMEDIATE")
+    resumed = repo.resume_after_outline_publication(
+        conn,
+        novel_id="resume-unexpanded",
+        expected_generation_epoch=paused.generation_epoch,
+        expected_current_formal_chapter=paused.current_formal_chapter,
+        expected_active_plan_revision_id=plan.id,
+        expected_active_plan_digest=plan.digest,
+        expected_authority_generation=1,
+        expected_projection_generation=1,
+    )
+    conn.commit()
+
+    assert resumed.state == GenerationRunState.WAITING_PLANNING
+    assert resumed.next_action == "expand_outline_cohort"
 
 
 def test_start_run_uses_persisted_novel_target_chapters(tmp_path):

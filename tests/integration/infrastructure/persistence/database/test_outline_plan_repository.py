@@ -1,10 +1,17 @@
 """Persistence behavior for immutable book-level outline manifests."""
 
+import json
 import sqlite3
 
 import pytest
 
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
+from domain.structure.outline_continuity import (
+    ContinuityDecision,
+    ContinuityReviewReport,
+    ContinuityReviewScope,
+    ContinuityReviewState,
+)
 from domain.structure.outline_plan import (
     BackfillStatus,
     OutlinePlanItem,
@@ -14,8 +21,12 @@ from domain.structure.outline_plan import (
 )
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.outline_contract_repository import (
+    NarrativeConfirmationRequired,
     OutlineGateError,
     OutlineContractRepository,
+)
+from infrastructure.persistence.database.outline_continuity_review_repository import (
+    OutlineContinuityReviewRepository,
 )
 from infrastructure.persistence.database.planning_authority_guard import (
     PlanningAuthorityError,
@@ -986,6 +997,7 @@ def test_manifest_draft_seals_declared_bindings_before_projection_materializes(p
     )
     part = next(item for item in expanded.items if item.level == OutlineLevel.PART)
 
+    _install_current_pass_receipt(database, repository, expanded)
     sealed = repository.seal_plan_revision(expanded.id)
     binding = database.get_connection().execute(
         """
@@ -1003,6 +1015,180 @@ def test_manifest_draft_seals_declared_bindings_before_projection_materializes(p
     assert database.get_connection().execute(
         "SELECT COUNT(*) FROM story_nodes WHERE id = ?", (binding[0],)
     ).fetchone()[0] == 0
+
+
+def test_pending_review_plan_requires_current_receipt_before_sealing(plan_repo):
+    database, repository, _, draft = _manifest_working_draft(plan_repo)
+
+    with pytest.raises(OutlineGateError, match="outline_narrative_confirmation_required"):
+        repository.seal_plan_revision(draft.id)
+
+    _install_current_pass_receipt(database, repository, draft)
+
+    sealed = repository.seal_plan_revision(draft.id)
+
+    assert sealed.sealed_at is not None
+
+
+def test_pending_review_receipt_must_cover_each_changed_cohort_scope(plan_repo):
+    database, repository, _, draft = _manifest_working_draft(plan_repo)
+    root = next(item for item in draft.items if item.level == OutlineLevel.OUTLINE)
+    part = next(item for item in draft.items if item.level == OutlineLevel.PART)
+    reviews = OutlineContinuityReviewRepository(database)
+
+    unrelated = reviews.begin(
+        novel_id=draft.novel_id,
+        plan_revision_id=draft.id,
+        scope=ContinuityReviewScope(
+            parent_logical_node_id=part.logical_node_id,
+            level=OutlineLevel.VOLUME.value,
+            parent_version_id=part.version_id,
+            parent_version_digest=part.version_digest,
+        ),
+        plan_digest=draft.digest,
+        scope_fingerprint="unrelated-part-scope",
+    )
+    unrelated = reviews.complete(
+        unrelated["id"],
+        report=ContinuityReviewReport(
+            decision=ContinuityDecision.PASS,
+            confidence=1.0,
+            scope_fingerprint=unrelated["scope_fingerprint"],
+        ),
+    )
+
+    with pytest.raises(NarrativeConfirmationRequired):
+        repository.set_narrative_review_receipt(
+            plan_revision_id=draft.id,
+            expected_plan_digest=draft.digest,
+            state=ContinuityReviewState.PASS,
+            receipt={"action": "pass", "actor": "test"},
+            review_ids=(unrelated["id"],),
+            scope_fingerprints=(unrelated["scope_fingerprint"],),
+        )
+
+    current = _complete_passing_review(database, draft, root.logical_node_id)
+    updated = repository.set_narrative_review_receipt(
+        plan_revision_id=draft.id,
+        expected_plan_digest=draft.digest,
+        state=ContinuityReviewState.PASS,
+        receipt={"action": "pass", "actor": "test"},
+        review_ids=(current["id"],),
+        scope_fingerprints=(current["scope_fingerprint"],),
+    )
+
+    assert updated.narrative_review_state is ContinuityReviewState.PASS
+
+
+def test_pending_review_receipt_requires_child_scope_after_nested_expansion(plan_repo):
+    database, repository, _, draft = _manifest_working_draft(plan_repo)
+    part = next(item for item in draft.items if item.level == OutlineLevel.PART)
+    expanded = repository.replace_draft_cohort_payloads(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=part.logical_node_id,
+        payloads=(
+            OutlinePayload(
+                title="第一卷",
+                narrative_text="主角踏入新的秩序。",
+                creative_goal="扩大核心冲突",
+                chapter_start=1,
+                chapter_end=10,
+            ),
+        ),
+    )
+    root = next(item for item in expanded.items if item.level == OutlineLevel.OUTLINE)
+    root_review = _complete_passing_review(
+        database, expanded, root.logical_node_id
+    )
+
+    with pytest.raises(NarrativeConfirmationRequired):
+        repository.set_narrative_review_receipt(
+            plan_revision_id=expanded.id,
+            expected_plan_digest=expanded.digest,
+            state=ContinuityReviewState.PASS,
+            receipt={"action": "pass", "actor": "test"},
+            review_ids=(root_review["id"],),
+            scope_fingerprints=(root_review["scope_fingerprint"],),
+        )
+
+    part_review = _complete_passing_review(
+        database, expanded, part.logical_node_id
+    )
+    updated = repository.set_narrative_review_receipt(
+        plan_revision_id=expanded.id,
+        expected_plan_digest=expanded.digest,
+        state=ContinuityReviewState.PASS,
+        receipt={"action": "pass", "actor": "test"},
+        review_ids=(root_review["id"], part_review["id"]),
+        scope_fingerprints=(
+            root_review["scope_fingerprint"],
+            part_review["scope_fingerprint"],
+        ),
+    )
+
+    assert updated.narrative_review_state is ContinuityReviewState.PASS
+
+
+def test_acknowledged_receipt_rejects_a_forged_override_id(plan_repo):
+    database, repository, _, draft = _manifest_working_draft(plan_repo)
+    reviews = OutlineContinuityReviewRepository(database)
+    scope = ContinuityReviewScope(
+        parent_logical_node_id=draft.items[0].logical_node_id,
+        level="part",
+        parent_version_id=draft.items[0].version_id,
+        parent_version_digest=draft.items[0].version_digest,
+    )
+    run = reviews.begin(
+        novel_id=draft.novel_id,
+        plan_revision_id=draft.id,
+        scope=scope,
+        plan_digest=draft.digest,
+        scope_fingerprint="current-scope",
+    )
+    reviews.complete(
+        run["id"],
+        report=ContinuityReviewReport(
+            decision=ContinuityDecision.REVIEW,
+            scope_fingerprint="current-scope",
+        ),
+    )
+
+    with pytest.raises(OutlineGateError, match="narrative"):
+        repository.set_narrative_review_receipt(
+            plan_revision_id=draft.id,
+            expected_plan_digest=draft.digest,
+            state=ContinuityReviewState.ACKNOWLEDGED,
+            receipt={"override_id": "forged-override-id"},
+            review_ids=(run["id"],),
+            scope_fingerprints=("current-scope",),
+        )
+
+    database.get_connection().execute(
+        """
+        UPDATE outline_plan_revisions
+        SET narrative_review_state = 'acknowledged',
+            narrative_review_receipt_json = ?
+        WHERE id = ?
+        """,
+        (
+            json.dumps(
+                {
+                    "plan_revision_id": draft.id,
+                    "plan_digest": draft.digest,
+                    "state": "acknowledged",
+                    "review_ids": [run["id"]],
+                    "scope_fingerprints": ["current-scope"],
+                    "override_id": "forged-override-id",
+                },
+                sort_keys=True,
+            ),
+            draft.id,
+        ),
+    )
+    database.get_connection().commit()
+
+    with pytest.raises(OutlineGateError, match="narrative"):
+        repository.seal_plan_revision(draft.id)
 
 
 def test_manifest_cohort_attempt_rejects_sealed_or_nonworking_plan(plan_repo):
@@ -1649,6 +1835,61 @@ def _manifest_working_draft(plan_repo, *, count: int = 1):
     return database, repository, active, draft
 
 
+def _complete_passing_review(database, plan, parent_logical_node_id):
+    parent = next(
+        item for item in plan.items if item.logical_node_id == parent_logical_node_id
+    )
+    children = tuple(
+        item
+        for item in plan.items
+        if item.parent_logical_node_id == parent.logical_node_id
+    )
+    reviews = OutlineContinuityReviewRepository(database)
+    scope = ContinuityReviewScope(
+        parent_logical_node_id=parent.logical_node_id,
+        level=parent.level.child_level.value,
+        parent_version_id=parent.version_id,
+        parent_version_digest=parent.version_digest,
+        children=tuple(
+            {
+                "logical_node_id": item.logical_node_id,
+                "version_id": item.version_id,
+                "version_digest": item.version_digest,
+                "sibling_index": item.sibling_index,
+            }
+            for item in children
+        ),
+    )
+    run = reviews.begin(
+        novel_id=plan.novel_id,
+        plan_revision_id=plan.id,
+        scope=scope,
+        plan_digest=plan.digest,
+        scope_fingerprint=f"synthetic-pass:{parent.logical_node_id}:{plan.digest}",
+    )
+    return reviews.complete(
+        run["id"],
+        report=ContinuityReviewReport(
+            decision=ContinuityDecision.PASS,
+            confidence=1.0,
+            scope_fingerprint=run["scope_fingerprint"],
+        ),
+    )
+
+
+def _install_current_pass_receipt(database, repository, plan):
+    parent = next(item for item in plan.items if item.level == OutlineLevel.OUTLINE)
+    completed = _complete_passing_review(database, plan, parent.logical_node_id)
+    return repository.set_narrative_review_receipt(
+        plan_revision_id=plan.id,
+        expected_plan_digest=plan.digest,
+        state=ContinuityReviewState.PASS,
+        receipt={"action": "pass", "actor": "test"},
+        review_ids=(completed["id"],),
+        scope_fingerprints=(completed["scope_fingerprint"],),
+    )
+
+
 def test_working_tree_reads_the_open_draft_without_changing_active_manifest(plan_repo):
     database, repository, active, draft = _manifest_working_draft(plan_repo)
 
@@ -1701,16 +1942,38 @@ def test_working_item_edit_creates_a_new_version_and_rechecks_digests(plan_repo)
     assert changed["version_digest"] == edited.digest
     assert changed["payload"]["foreshadowing"]["payoff"] == ["broken seal"]
     assert changed["payload"]["extra"]["future"] == {"v": 2}
-    with pytest.raises(OutlineGateError, match="has direct children"):
-        repository.update_working_plan_item(
-            plan_revision_id=draft.id,
-            logical_node_id=next(item for item in draft.items if item.level == OutlineLevel.OUTLINE).logical_node_id,
-            payload=edited,
-            expected_plan_digest=updated.digest,
-            expected_version_digest=next(
-                item for item in updated.items if item.level == OutlineLevel.OUTLINE
-            ).version_digest,
-        )
+
+
+def test_working_nonleaf_edit_preserves_children_and_rebinds_them(plan_repo):
+    _, repository, _, draft = _manifest_working_draft(plan_repo)
+    root = next(item for item in draft.items if item.level == OutlineLevel.OUTLINE)
+    child = next(item for item in draft.items if item.parent_logical_node_id == root.logical_node_id)
+    original_child_version_id = child.version_id
+    original_child_digest = child.version_digest
+    edited = OutlinePayload(
+        title="总纲（作者修订）",
+        narrative_text="主角在更明确的代价中重建秩序。",
+        creative_goal="完成核心选择",
+        entry_state="旧秩序仍然完整",
+        exit_state="新秩序建立但付出代价",
+        chapter_start=1,
+        chapter_end=10,
+    )
+
+    updated = repository.update_working_plan_item(
+        plan_revision_id=draft.id,
+        logical_node_id=root.logical_node_id,
+        payload=edited,
+        expected_plan_digest=draft.digest,
+        expected_version_digest=root.version_digest,
+    )
+
+    refreshed_root = next(item for item in updated.items if item.logical_node_id == root.logical_node_id)
+    refreshed_child = next(item for item in updated.items if item.logical_node_id == child.logical_node_id)
+    assert refreshed_root.version_digest == edited.digest
+    assert refreshed_child.version_id == original_child_version_id
+    assert refreshed_child.version_digest == original_child_digest
+    assert refreshed_child.validated_parent_digest == edited.digest
 
 
 def test_working_item_edit_rejects_a_stale_version_digest(plan_repo):

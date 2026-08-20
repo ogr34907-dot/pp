@@ -10,15 +10,27 @@ from application.blueprint.services.outline_cohort_generation_service import (
     OutlineCohortGenerationError,
     OutlineCohortGenerationService,
 )
+from application.blueprint.services.outline_continuity_review_service import (
+    OutlineContinuityReviewService,
+)
 from application.blueprint.services.outline_contract_service import OutlineContractService
 from domain.novel.candidate_chapter import GenerationRunState, RunMode
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload, OutlineSource
+from domain.structure.outline_continuity import (
+    ContinuityDecision,
+    ContinuityReviewReport,
+    ContinuityReviewScope,
+    ContinuityReviewState,
+)
 from infrastructure.persistence.database.chapter_candidate_repository import (
     ChapterCandidateRepository,
 )
 from infrastructure.persistence.database.connection import DatabaseConnection
 from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
+)
+from infrastructure.persistence.database.outline_continuity_review_repository import (
+    OutlineContinuityReviewRepository,
 )
 from infrastructure.persistence.database.story_node_repository import StoryNodeRepository
 
@@ -96,6 +108,59 @@ def _root_item(database, repository):
     return active, draft_plan, draft_plan.items[0]
 
 
+def _install_current_pass_receipt(database, repository, plan):
+    parent = next(item for item in plan.items if item.level == OutlineLevel.OUTLINE)
+    children = tuple(
+        item
+        for item in plan.items
+        if item.parent_logical_node_id == parent.logical_node_id
+    )
+    reviews = OutlineContinuityReviewRepository(database)
+    scope = ContinuityReviewScope(
+        parent_logical_node_id=parent.logical_node_id,
+        level=parent.level.child_level.value,
+        parent_version_id=parent.version_id,
+        parent_version_digest=parent.version_digest,
+        children=tuple(
+            {
+                "logical_node_id": item.logical_node_id,
+                "version_id": item.version_id,
+                "version_digest": item.version_digest,
+                "sibling_index": item.sibling_index,
+            }
+            for item in children
+        ),
+    )
+    scope_fingerprint = OutlineContinuityReviewService(
+        repository, reviews, object(), database
+    ).current_scope_fingerprint(
+        plan.id, parent.logical_node_id, plan.digest
+    )
+    run = reviews.begin(
+        novel_id=plan.novel_id,
+        plan_revision_id=plan.id,
+        scope=scope,
+        plan_digest=plan.digest,
+        scope_fingerprint=scope_fingerprint,
+    )
+    completed = reviews.complete(
+        run["id"],
+        report=ContinuityReviewReport(
+            decision=ContinuityDecision.PASS,
+            confidence=1.0,
+            scope_fingerprint=run["scope_fingerprint"],
+        ),
+    )
+    return repository.set_narrative_review_receipt(
+        plan_revision_id=plan.id,
+        expected_plan_digest=plan.digest,
+        state=ContinuityReviewState.PASS,
+        receipt={"action": "pass", "actor": "test"},
+        review_ids=(completed["id"],),
+        scope_fingerprints=(completed["scope_fingerprint"],),
+    )
+
+
 async def _published_manifest_cohort(tmp_path, *, slug: str):
     database = DatabaseConnection(str(tmp_path / f"{slug}.db"))
     database.execute(
@@ -127,6 +192,7 @@ async def _published_manifest_cohort(tmp_path, *, slug: str):
         parent_logical_node_id=root_item.logical_node_id,
         level=OutlineLevel.PART,
     )
+    _install_current_pass_receipt(database, repository, generated["plan"])
     published = await service.publish_completed_cohort(
         attempt_id=generated["attempt"]["id"]
     )
@@ -417,7 +483,7 @@ async def test_manifest_cohort_rejects_child_ranges_outside_the_parent_before_pe
 
 
 @pytest.mark.asyncio
-async def test_manifest_cohort_rejects_handoff_boundary_before_persisting(tmp_path):
+async def test_manifest_cohort_accepts_semantically_equivalent_handoff_wording(tmp_path):
     database = DatabaseConnection(str(tmp_path / "cohort-service-handoff-boundary.db"))
     database.execute(
         "INSERT INTO novels (id, title, slug, target_chapters) VALUES "
@@ -426,38 +492,33 @@ async def test_manifest_cohort_rejects_handoff_boundary_before_persisting(tmp_pa
     database.get_connection().commit()
     repository = OutlineContractRepository(database)
     active, draft, root_item = _root_item(database, repository)
+    llm = _LLM(
+        '[{"title":"Equivalent handoff","narrative_text":"The range is valid.",'
+        '"creative_goal":"Test the narrative review",'
+        '"entry_state":"旧秩序尚未改变","exit_state":"主角付出代价后建立新秩序",'
+        '"conflicts":["Boundary conflict"],'
+        '"state_changes":{"hero":[{"change":"moves"}]},'
+        '"handoff_conditions":["continue"],"chapter_start":1,"chapter_end":10}]'
+    )
     service = OutlineCohortGenerationService(
         repository,
         OutlineContractService(
             contract_repository=repository,
             story_node_repository=StoryNodeRepository(database),
         ),
-        _LLM(
-            '[{"title":"Invalid part","narrative_text":"The range is valid.",'
-            '"creative_goal":"Test the handoff guard",'
-            '"entry_state":"旧秩序仍然完整","exit_state":"错误终点",'
-            '"conflicts":["Boundary conflict"],'
-            '"state_changes":{"hero":[{"change":"moves"}]},'
-            '"handoff_conditions":["continue"],"chapter_start":1,"chapter_end":10}]'
-        ),
+        llm,
         database,
     )
 
-    with pytest.raises(
-        OutlineCohortGenerationError,
-        match="handoff:last_exit_state_mismatch",
-    ):
-        await service.generate_cohort(
-            plan_revision_id=draft.id,
-            parent_logical_node_id=root_item.logical_node_id,
-            level=OutlineLevel.PART,
-        )
+    result = await service.generate_cohort(
+        plan_revision_id=draft.id,
+        parent_logical_node_id=root_item.logical_node_id,
+        level=OutlineLevel.PART,
+    )
 
-    row = database.get_connection().execute(
-        "SELECT id FROM outline_plan_cohort_attempts ORDER BY created_at DESC LIMIT 1"
-    ).fetchone()
-    assert repository.get_manifest_cohort_attempt(str(row["id"]))["status"] == "failed"
-    assert repository.get_plan_revision(draft.id).items == draft.items
+    assert result["attempt"]["status"] == "completed"
+    assert "逐字复制" not in llm.prompts[0].user
+    assert "同义" in llm.prompts[0].user
     assert repository.get_planning_head("novel-1").active_plan_revision_id == active.id
 
 
@@ -697,6 +758,7 @@ async def test_publish_completed_cohort_seals_projects_and_activates_the_draft(t
         parent_logical_node_id=root_item.logical_node_id,
         level=OutlineLevel.PART,
     )
+    _install_current_pass_receipt(database, repository, generated["plan"])
     published = await service.publish_completed_cohort(
         attempt_id=generated["attempt"]["id"]
     )
@@ -710,11 +772,11 @@ async def test_publish_completed_cohort_seals_projects_and_activates_the_draft(t
     assert head.active_plan_digest == published["plan"].digest
     assert head.working_plan_revision_id is None
     assert published["run"] is not None
-    assert published["run"].state == GenerationRunState.RUNNING
+    assert published["run"].state == GenerationRunState.WAITING_PLANNING
     assert replayed["plan"].id == published["plan"].id
     assert replayed["reconciliation"].status == published["reconciliation"].status
     assert replayed["run"] is not None
-    assert replayed["run"].state == GenerationRunState.RUNNING
+    assert replayed["run"].state == GenerationRunState.WAITING_PLANNING
     assert len(llm.prompts) == 1
     part = next(item for item in published["plan"].items if item.level == OutlineLevel.PART)
     binding = next(
@@ -724,6 +786,18 @@ async def test_publish_completed_cohort_seals_projects_and_activates_the_draft(t
     )
     node = await nodes.get_by_id(binding["story_node_id"])
     assert node is not None and node.title == "第一部"
+
+
+def test_publish_technical_preflight_reports_blockers_before_narrative_confirmation():
+    service = OutlineCohortGenerationService.__new__(OutlineCohortGenerationService)
+    service.repository = SimpleNamespace(
+        technical_blockers_for_plan=lambda plan_id, _connection=None: (
+            "chapter range has a gap",
+        )
+    )
+
+    with pytest.raises(OutlineCohortGenerationError, match="chapter range has a gap"):
+        service._assert_technical_plan_ready("plan-1", object())
 
 
 @pytest.mark.asyncio
@@ -758,6 +832,7 @@ async def test_publish_completed_cohort_replay_rejects_a_moved_manifest_head(tmp
         parent_logical_node_id=root_item.logical_node_id,
         level=OutlineLevel.PART,
     )
+    _install_current_pass_receipt(database, repository, generated["plan"])
     await service.publish_completed_cohort(attempt_id=generated["attempt"]["id"])
 
     database.execute(

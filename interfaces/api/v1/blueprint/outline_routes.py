@@ -22,6 +22,7 @@ from infrastructure.persistence.database.outline_contract_repository import (
     OutlineContractRepository,
     OutlineContractSlot,
     OutlineGateError,
+    NarrativeConfirmationRequired,
 )
 from infrastructure.persistence.database.chapter_candidate_repository import (
     ChapterCandidateRepository,
@@ -78,6 +79,37 @@ class CohortExpandRequest(BaseModel):
     level: OutlineLevel
     author_payloads: list[OutlinePayloadDTO] = Field(default_factory=list)
     retry_attempt_id: Optional[str] = None
+
+
+class CohortPublishRequest(BaseModel):
+    expected_plan_digest: Optional[str] = None
+    idempotency_key: str = Field(default="", max_length=200)
+    confirm_narrative_risk: bool = False
+    override_reason: str = ""
+    review_ids: list[str] = Field(default_factory=list)
+    scope_fingerprints: list[str] = Field(default_factory=list)
+    actor: str = "author"
+
+
+def _narrative_confirmation(
+    body: Optional[CohortPublishRequest],
+) -> Optional[dict[str, Any]]:
+    if body is None or not (
+        body.confirm_narrative_risk
+        or body.expected_plan_digest
+        or body.review_ids
+        or body.scope_fingerprints
+    ):
+        return None
+    return {
+        "expected_plan_digest": body.expected_plan_digest or "",
+        "idempotency_key": body.idempotency_key,
+        "confirm_narrative_risk": body.confirm_narrative_risk,
+        "override_reason": body.override_reason,
+        "review_ids": list(body.review_ids),
+        "scope_fingerprints": list(body.scope_fingerprints),
+        "actor": body.actor,
+    }
 
 
 class WorkingItemRequest(BaseModel):
@@ -150,6 +182,8 @@ def _raise_contract_error(exc: Exception) -> None:
         raise HTTPException(status_code=410, detail=_MANIFEST_AUTHORITY_DETAIL) from exc
     if isinstance(exc, KeyError):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if isinstance(exc, NarrativeConfirmationRequired):
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     if isinstance(exc, OutlineGateError):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if isinstance(exc, ValueError):
@@ -158,6 +192,8 @@ def _raise_contract_error(exc: Exception) -> None:
 
 
 def _raise_manifest_cohort_error(exc: Exception) -> None:
+    if isinstance(exc, NarrativeConfirmationRequired):
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     if isinstance(
         exc,
         (PlanningAuthorityError, OutlineGateError, OutlineCohortGenerationError),
@@ -383,11 +419,16 @@ async def publish_manifest_cohort(
     service: OutlineCohortGenerationService = Depends(
         get_outline_cohort_generation_service
     ),
+    body: Optional[CohortPublishRequest] = None,
 ):
     """Publish a completed Manifest cohort without legacy node publication."""
 
     try:
-        result = await service.publish_completed_cohort(attempt_id=attempt_id)
+        confirmation = _narrative_confirmation(body)
+        kwargs: dict[str, Any] = {"attempt_id": attempt_id}
+        if confirmation is not None:
+            kwargs["narrative_confirmation"] = confirmation
+        result = await service.publish_completed_cohort(**kwargs)
         run = result.get("run") if isinstance(result, dict) else None
         if run is not None:
             novel_id = str(getattr(run, "novel_id", "") or "")
@@ -449,13 +490,18 @@ async def publish_manifest_cohort_for_author(
     service: OutlineCohortGenerationService = Depends(
         get_outline_cohort_generation_service
     ),
+    body: Optional[CohortPublishRequest] = None,
 ):
     """Publish a completed author planning cohort without resuming a run."""
 
     try:
+        confirmation = _narrative_confirmation(body)
+        kwargs: dict[str, Any] = {"attempt_id": attempt_id}
+        if confirmation is not None:
+            kwargs["narrative_confirmation"] = confirmation
         return {
             "success": True,
-            "data": await service.publish_author_planning_cohort(attempt_id=attempt_id),
+            "data": await service.publish_author_planning_cohort(**kwargs),
         }
     except Exception as exc:
         _raise_manifest_cohort_error(exc)

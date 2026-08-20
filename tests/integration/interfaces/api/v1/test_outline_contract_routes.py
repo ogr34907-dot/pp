@@ -7,12 +7,80 @@ import pytest
 from application.blueprint.services.outline_cohort_generation_service import (
     OutlineCohortGenerationError,
 )
+from application.blueprint.services.outline_continuity_review_service import (
+    OutlineContinuityReviewService,
+)
 from domain.novel.candidate_chapter import GenerationRunState, RunMode
-from infrastructure.persistence.database.outline_contract_repository import OutlineContractRepository
+from domain.structure.outline_continuity import (
+    ContinuityDecision,
+    ContinuityReviewReport,
+    ContinuityReviewScope,
+    ContinuityReviewState,
+)
+from infrastructure.persistence.database.outline_contract_repository import (
+    NarrativeConfirmationRequired,
+    OutlineContractRepository,
+)
+from infrastructure.persistence.database.outline_continuity_review_repository import (
+    OutlineContinuityReviewRepository,
+)
 from infrastructure.persistence.database.planning_authority_guard import (
     PlanningAuthorityError,
 )
 from interfaces.api.v1.blueprint import outline_routes
+
+
+def _install_current_pass_receipt(db, repository, plan):
+    parent = next(item for item in plan.items if item.level.value == "outline")
+    children = tuple(
+        item
+        for item in plan.items
+        if item.parent_logical_node_id == parent.logical_node_id
+    )
+    reviews = OutlineContinuityReviewRepository(db)
+    scope = ContinuityReviewScope(
+        parent_logical_node_id=parent.logical_node_id,
+        level=parent.level.child_level.value,
+        parent_version_id=parent.version_id,
+        parent_version_digest=parent.version_digest,
+        children=tuple(
+            {
+                "logical_node_id": item.logical_node_id,
+                "version_id": item.version_id,
+                "version_digest": item.version_digest,
+                "sibling_index": item.sibling_index,
+            }
+            for item in children
+        ),
+    )
+    scope_fingerprint = OutlineContinuityReviewService(
+        repository, reviews, object(), db
+    ).current_scope_fingerprint(
+        plan.id, parent.logical_node_id, plan.digest
+    )
+    run = reviews.begin(
+        novel_id=plan.novel_id,
+        plan_revision_id=plan.id,
+        scope=scope,
+        plan_digest=plan.digest,
+        scope_fingerprint=scope_fingerprint,
+    )
+    completed = reviews.complete(
+        run["id"],
+        report=ContinuityReviewReport(
+            decision=ContinuityDecision.PASS,
+            confidence=1.0,
+            scope_fingerprint=run["scope_fingerprint"],
+        ),
+    )
+    return repository.set_narrative_review_receipt(
+        plan_revision_id=plan.id,
+        expected_plan_digest=plan.digest,
+        state=ContinuityReviewState.PASS,
+        receipt={"action": "pass", "actor": "test"},
+        review_ids=(completed["id"],),
+        scope_fingerprints=(completed["scope_fingerprint"],),
+    )
 
 
 def test_outline_root_can_be_drafted_then_published_and_synced(client, test_novel_id):
@@ -548,6 +616,113 @@ def test_author_publish_route_is_separate_from_runtime_publish(client, test_nove
         )
 
 
+def test_author_publish_forwards_current_narrative_confirmation(client):
+    from interfaces.main import app
+
+    class _Service:
+        async def publish_author_planning_cohort(
+            self, *, attempt_id: str, narrative_confirmation=None
+        ):
+            assert attempt_id == "attempt-author"
+            assert narrative_confirmation == {
+                "expected_plan_digest": "plan-digest",
+                "confirm_narrative_risk": True,
+                "override_reason": "The planned break is intentional.",
+                "review_ids": ["review-1"],
+                "scope_fingerprints": ["scope-1"],
+                "actor": "author",
+                "idempotency_key": "publish-confirmation",
+            }
+            return {"attempt": {"id": attempt_id}, "run": None}
+
+    app.dependency_overrides[outline_routes.get_outline_cohort_generation_service] = (
+        _Service
+    )
+    try:
+        response = client.post(
+            "/api/v1/outline/cohort-attempts/attempt-author/author-publish",
+            json={
+                "expected_plan_digest": "plan-digest",
+                "confirm_narrative_risk": True,
+                "override_reason": "The planned break is intentional.",
+                "review_ids": ["review-1"],
+                "scope_fingerprints": ["scope-1"],
+                "actor": "author",
+                "idempotency_key": "publish-confirmation",
+            },
+        )
+
+        assert response.status_code == 200
+    finally:
+        app.dependency_overrides.pop(
+            outline_routes.get_outline_cohort_generation_service, None
+        )
+
+
+def test_author_publish_returns_structured_narrative_confirmation_conflict(client):
+    from interfaces.main import app
+
+    class _Service:
+        async def publish_author_planning_cohort(self, *, attempt_id: str, narrative_confirmation=None):
+            raise NarrativeConfirmationRequired(
+                plan_digest="plan-digest",
+                decisions=("conflict",),
+                reviews=({"id": "review-1"},),
+                reason_required=True,
+            )
+
+    app.dependency_overrides[outline_routes.get_outline_cohort_generation_service] = (
+        _Service
+    )
+    try:
+        response = client.post(
+            "/api/v1/outline/cohort-attempts/attempt-author/author-publish"
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "code": "outline_narrative_confirmation_required",
+            "plan_digest": "plan-digest",
+            "decisions": ["conflict"],
+            "reviews": [{"id": "review-1"}],
+            "reason_required": True,
+        }
+    finally:
+        app.dependency_overrides.pop(
+            outline_routes.get_outline_cohort_generation_service, None
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_publish_forwards_pass_receipt_without_author_override():
+    class _Service:
+        async def publish_completed_cohort(self, *, attempt_id: str, narrative_confirmation=None):
+            assert attempt_id == "attempt-runtime"
+            assert narrative_confirmation == {
+                "expected_plan_digest": "plan-digest",
+                "confirm_narrative_risk": False,
+                "override_reason": "",
+                "review_ids": ["review-pass"],
+                "scope_fingerprints": ["scope-pass"],
+                "actor": "author",
+                "idempotency_key": "runtime-pass",
+            }
+            return {"attempt": {"id": attempt_id}, "run": None}
+
+    result = await outline_routes.publish_manifest_cohort(
+        "attempt-runtime",
+        _Service(),
+        outline_routes.CohortPublishRequest(
+            expected_plan_digest="plan-digest",
+            review_ids=["review-pass"],
+            scope_fingerprints=["scope-pass"],
+            idempotency_key="runtime-pass",
+        ),
+    )
+
+    assert result["success"] is True
+
+
 def test_author_publish_actual_service_does_not_require_a_generation_run(
     client, db, test_novel_id
 ):
@@ -617,6 +792,9 @@ def test_author_publish_actual_service_does_not_require_a_generation_run(
         expected_plan_digest=working.digest,
         expected_parent_digest=parent_digest,
         expected_context_digest="author-context",
+    )
+    _install_current_pass_receipt(
+        db, repository, repository.get_plan_revision(working.id)
     )
     service = OutlineCohortGenerationService(
         repository,

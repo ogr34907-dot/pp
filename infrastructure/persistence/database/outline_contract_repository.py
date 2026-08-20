@@ -17,6 +17,7 @@ from domain.structure.outline_contract import (
     OutlineSource,
     OutlineStatus,
 )
+from domain.structure.outline_continuity import ContinuityReviewState
 from domain.structure.outline_plan import (
     BackfillResult,
     BackfillStatus,
@@ -40,6 +41,37 @@ from infrastructure.persistence.database.planning_authority_guard import (
 
 class OutlineGateError(ValueError):
     """Raised when an operation would bypass the published plan gate."""
+
+
+class NarrativeConfirmationRequired(OutlineGateError):
+    """Raised when narrative risk has not been confirmed for this exact draft."""
+
+    code = "outline_narrative_confirmation_required"
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        plan_digest: str = "",
+        decisions: Sequence[str] = (),
+        reviews: Sequence[Mapping[str, Any]] = (),
+        reason_required: bool = False,
+    ) -> None:
+        super().__init__(message or self.code)
+        self.plan_digest = plan_digest
+        self.decisions = tuple(str(value) for value in decisions)
+        self.reviews = tuple(dict(value) for value in reviews)
+        self.reason_required = bool(reason_required)
+
+    @property
+    def detail(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "plan_digest": self.plan_digest,
+            "decisions": list(self.decisions),
+            "reviews": [dict(review) for review in self.reviews],
+            "reason_required": self.reason_required,
+        }
 
 
 logger = logging.getLogger(__name__)
@@ -632,11 +664,154 @@ class OutlineContractRepository:
             publish_idempotency_key=str(
                 values["publish_idempotency_key"] or ""
             ),
+            narrative_review_state=str(
+                values.get("narrative_review_state") or "not_required"
+            ),
+            narrative_review_receipt=json.loads(
+                values.get("narrative_review_receipt_json") or "{}"
+            ),
             created_at=str(values["created_at"] or ""),
             updated_at=str(values["updated_at"] or ""),
             sealed_at=values.get("sealed_at"),
             items=self._plan_items_from_rows(item_rows),
         )
+
+    def set_narrative_review_receipt(
+        self,
+        *,
+        plan_revision_id: str,
+        expected_plan_digest: str,
+        state: ContinuityReviewState,
+        receipt: Mapping[str, Any],
+        review_ids: Sequence[str],
+        scope_fingerprints: Sequence[str],
+        _connection: Optional[sqlite3.Connection] = None,
+    ) -> OutlinePlanRevision:
+        """Attach a receipt only when every referenced review is current.
+
+        The receipt is deliberately written with the plan digest CAS.  Reports
+        remain current by semantic scope fingerprint, so an unrelated Working
+        edit can reuse them; the receipt itself is always attached to the
+        current plan digest in this transaction.
+        """
+
+        if isinstance(state, str):
+            state = ContinuityReviewState(state)
+        if state not in {ContinuityReviewState.PASS, ContinuityReviewState.ACKNOWLEDGED}:
+            raise ValueError("narrative review receipt state must be pass or acknowledged")
+        review_ids = tuple(str(value) for value in review_ids if str(value).strip())
+        scope_fingerprints = tuple(
+            str(value) for value in scope_fingerprints if str(value).strip()
+        )
+        if not review_ids or not scope_fingerprints:
+            raise NarrativeConfirmationRequired(
+                "outline narrative confirmation requires current review evidence"
+            )
+
+        def operation(conn: sqlite3.Connection) -> OutlinePlanRevision:
+            plan = self.get_plan_revision(plan_revision_id, _connection=conn)
+            if plan.digest != expected_plan_digest:
+                raise OutlineGateError("outline plan digest changed before narrative confirmation")
+            if plan.sealed_at:
+                raise OutlineGateError("sealed outline plan cannot receive a narrative receipt")
+            if plan.status not in {
+                PlanRevisionStatus.DRAFT,
+                PlanRevisionStatus.GENERATING,
+                PlanRevisionStatus.VALIDATING,
+            }:
+                raise OutlineGateError("only an editable outline plan can receive a narrative receipt")
+
+            decisions: list[str] = []
+            review_parent_ids: set[str] = set()
+            for review_id in review_ids:
+                row = conn.execute(
+                    """
+                    SELECT plan_revision_id, scope_parent_logical_node_id,
+                           scope_fingerprint, state, decision
+                    FROM outline_continuity_review_runs
+                    WHERE id = ?
+                    """,
+                    (review_id,),
+                ).fetchone()
+                if row is None:
+                    raise NarrativeConfirmationRequired(
+                        "outline narrative confirmation references a missing review"
+                    )
+                if (
+                    str(row["plan_revision_id"]) != plan.id
+                    or str(row["scope_fingerprint"]) not in scope_fingerprints
+                    or str(row["state"]) != "succeeded"
+                ):
+                    raise NarrativeConfirmationRequired(
+                        "outline narrative confirmation references a stale review"
+                    )
+                decisions.append(str(row["decision"]))
+                review_parent_ids.add(str(row["scope_parent_logical_node_id"]))
+
+            required_scope_parents = self._required_narrative_scope_parents(
+                conn, plan
+            )
+            if not required_scope_parents.issubset(review_parent_ids):
+                raise NarrativeConfirmationRequired(
+                    "outline narrative confirmation does not cover every changed cohort"
+                )
+
+            if state is ContinuityReviewState.PASS and any(
+                decision != "pass" for decision in decisions
+            ):
+                raise NarrativeConfirmationRequired(
+                    "only pass continuity reviews can create a pass receipt"
+                )
+            if state is ContinuityReviewState.ACKNOWLEDGED:
+                self._validate_narrative_override(
+                    conn,
+                    plan,
+                    receipt,
+                    review_ids=review_ids,
+                    scope_fingerprints=scope_fingerprints,
+                )
+
+            stored = {
+                **dict(receipt),
+                "plan_revision_id": plan.id,
+                "plan_digest": plan.digest,
+                "state": state.value,
+                "review_ids": list(review_ids),
+                "scope_fingerprints": list(scope_fingerprints),
+            }
+            now = self._now()
+            updated = conn.execute(
+                """
+                UPDATE outline_plan_revisions
+                SET narrative_review_state = ?, narrative_review_receipt_json = ?, updated_at = ?
+                WHERE id = ? AND sealed_at IS NULL AND digest = ?
+                """,
+                (
+                    state.value,
+                    json.dumps(stored, ensure_ascii=False, sort_keys=True),
+                    now,
+                    plan.id,
+                    plan.digest,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise OutlineGateError("outline plan changed during narrative confirmation")
+            return self.get_plan_revision(plan.id, _connection=conn)
+
+        if _connection is not None:
+            return operation(_connection)
+        conn = self._connection()
+        if conn.in_transaction:
+            raise OutlineGateError("narrative receipt requires a clean connection")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = operation(conn)
+            conn.commit()
+            return result
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
 
     def _require_active_manifest_plan(
         self,
@@ -953,6 +1128,37 @@ class OutlineContractRepository:
             )
         return result
 
+    def technical_blockers_for_plan(
+        self, plan_revision_id: str, *, _connection: Optional[sqlite3.Connection] = None
+    ) -> tuple[str, ...]:
+        """Return deterministic plan blockers without evaluating narrative risk."""
+
+        conn = _connection or self._connection()
+        try:
+            plan = self.get_plan_revision(plan_revision_id, _connection=conn)
+            normalized = self._validate_plan_items(plan.novel_id, plan.items, conn=conn)
+            self._validate_plan_cohorts(conn, normalized)
+            if canonical_plan_digest(
+                canonical_prefix_digest=plan.canonical_prefix_digest,
+                items=normalized,
+            ) != plan.digest:
+                return ("outline plan digest changed before sealing",)
+        except (OutlineGateError, KeyError, ValueError) as exc:
+            return (str(exc),)
+        return ()
+
+    def required_narrative_review_scope_parents(
+        self,
+        plan_revision_id: str,
+        *,
+        _connection: Optional[sqlite3.Connection] = None,
+    ) -> tuple[str, ...]:
+        """Return the direct-child cohorts that need review for this draft."""
+
+        conn = _connection or self._connection()
+        plan = self.get_plan_revision(plan_revision_id, _connection=conn)
+        return tuple(sorted(self._required_narrative_scope_parents(conn, plan)))
+
     def update_working_plan_item(
         self,
         *,
@@ -963,7 +1169,7 @@ class OutlineContractRepository:
         expected_version_digest: str,
         source: OutlineSource = OutlineSource.AUTHOR,
     ) -> OutlinePlanRevision:
-        """Edit one leaf in the open Manifest draft using a single CAS transaction."""
+        """Edit one open Manifest item in a single CAS transaction."""
 
         conn = self._connection()
         if conn.in_transaction:
@@ -997,15 +1203,6 @@ class OutlineContractRepository:
             )
             if item is None:
                 raise KeyError(f"working outline item not found: {logical_node_id}")
-            child = conn.execute(
-                "SELECT 1 FROM outline_plan_revision_items "
-                "WHERE plan_revision_id = ? AND parent_logical_node_id = ? LIMIT 1",
-                (plan.id, logical_node_id),
-            ).fetchone()
-            if child is not None:
-                raise OutlineGateError(
-                    "working outline item has direct children; use the impact-closure workflow"
-                )
             version_row = conn.execute(
                 "SELECT contract_id, revision, digest, payload_json, sealed_at "
                 "FROM outline_contract_versions WHERE id = ? AND contract_id = ?",
@@ -1085,6 +1282,25 @@ class OutlineContractRepository:
                 if next_sibling is not None
                 else None
             )
+            updated_children = {
+                candidate.logical_node_id: OutlinePlanItem(
+                    id=candidate.id,
+                    logical_node_id=candidate.logical_node_id,
+                    version_id=candidate.version_id,
+                    version_digest=candidate.version_digest,
+                    level=candidate.level,
+                    sibling_index=candidate.sibling_index,
+                    parent_logical_node_id=candidate.parent_logical_node_id,
+                    expansion_state=candidate.expansion_state,
+                    validated_parent_digest=payload.digest,
+                    validated_previous_sibling_digest=(
+                        candidate.validated_previous_sibling_digest
+                    ),
+                    is_reused=candidate.is_reused,
+                )
+                for candidate in plan.items
+                if candidate.parent_logical_node_id == logical_node_id
+            }
             updated_items = tuple(
                 updated_item
                 if candidate.logical_node_id == logical_node_id
@@ -1094,6 +1310,8 @@ class OutlineContractRepository:
                     and candidate.logical_node_id == updated_next_sibling.logical_node_id
                     else candidate
                 )
+                if candidate.logical_node_id not in updated_children
+                else updated_children[candidate.logical_node_id]
                 for candidate in plan.items
             )
             normalized = self._validate_plan_items(plan.novel_id, updated_items, conn=conn)
@@ -1132,10 +1350,33 @@ class OutlineContractRepository:
                 )
                 if next_update.rowcount != 1:
                     raise OutlineGateError("working sibling changed during edit")
+            for child in updated_children.values():
+                child_update = conn.execute(
+                    """
+                    UPDATE outline_plan_revision_items
+                    SET validated_parent_digest = ?
+                    WHERE id = ? AND plan_revision_id = ? AND version_id = ?
+                      AND validated_parent_digest = ?
+                    """,
+                    (
+                        payload.digest,
+                        child.id,
+                        plan.id,
+                        child.version_id,
+                        next(
+                            candidate.validated_parent_digest
+                            for candidate in plan.items
+                            if candidate.logical_node_id == child.logical_node_id
+                        ),
+                    ),
+                )
+                if child_update.rowcount != 1:
+                    raise OutlineGateError("working child changed during parent edit")
             plan_update = conn.execute(
                 """
                 UPDATE outline_plan_revisions
-                SET digest = ?, updated_at = ?
+                SET digest = ?, narrative_review_state = 'pending',
+                    narrative_review_receipt_json = '{}', updated_at = ?
                 WHERE id = ? AND novel_id = ? AND sealed_at IS NULL
                   AND status = ? AND digest = ?
                 """,
@@ -1875,7 +2116,8 @@ class OutlineContractRepository:
         updated = conn.execute(
             """
             UPDATE outline_plan_revisions
-            SET digest = ?, updated_at = ?
+            SET digest = ?, narrative_review_state = 'pending',
+                narrative_review_receipt_json = '{}', updated_at = ?
             WHERE id = ? AND sealed_at IS NULL AND status = ? AND digest = ?
             """,
             (digest, now, plan.id, plan.status.value, plan.digest),
@@ -2012,6 +2254,7 @@ class OutlineContractRepository:
         )
         if digest != plan.digest:
             raise OutlineGateError("outline plan digest changed before sealing")
+        self._validate_narrative_review_receipt(conn, plan)
         existing = conn.execute(
             """
             SELECT id FROM outline_plan_revisions
@@ -2082,6 +2325,240 @@ class OutlineContractRepository:
             if cleared.rowcount != 1:
                 raise OutlineGateError("outline planning Head changed during sealing")
         return self.get_plan_revision(plan.id, _connection=conn)
+
+    @classmethod
+    def _narrative_confirmation_error(
+        cls,
+        conn: sqlite3.Connection,
+        plan: OutlinePlanRevision,
+        *,
+        reason_required: Optional[bool] = None,
+    ) -> NarrativeConfirmationRequired:
+        rows = conn.execute(
+            """
+            SELECT id, scope_parent_logical_node_id, scope_fingerprint,
+                   state, decision, report_json
+            FROM outline_continuity_review_runs
+            WHERE plan_revision_id = ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (plan.id,),
+        ).fetchall()
+        reviews: list[dict[str, Any]] = []
+        decisions: list[str] = []
+        for row in rows:
+            try:
+                report = json.loads(row["report_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                report = {}
+            decision = str(row["decision"] or "")
+            if decision and decision not in decisions:
+                decisions.append(decision)
+            reviews.append(
+                {
+                    "id": str(row["id"]),
+                    "scope_parent_logical_node_id": str(
+                        row["scope_parent_logical_node_id"]
+                    ),
+                    "scope_fingerprint": str(row["scope_fingerprint"]),
+                    "state": str(row["state"]),
+                    "decision": decision,
+                    "report": report if isinstance(report, dict) else {},
+                }
+            )
+        if reason_required is None:
+            reason_required = not decisions or any(
+                decision in {"conflict", "unavailable"}
+                for decision in decisions
+            )
+        return NarrativeConfirmationRequired(
+            plan_digest=plan.digest,
+            decisions=decisions,
+            reviews=reviews,
+            reason_required=reason_required,
+        )
+
+    @staticmethod
+    def _required_narrative_scope_parents(
+        conn: sqlite3.Connection, plan: OutlinePlanRevision
+    ) -> set[str]:
+        """Return current direct-child cohorts affected since the sealed base.
+
+        Version-binding updates are deliberately excluded from the diff: a
+        parent content edit rewrites its children's technical parent digest,
+        but does not turn every deeper descendant into a separately required
+        LLM review.  The changed parent and its sibling cohort remain covered.
+        """
+
+        if not plan.parent_plan_revision_id:
+            return set()
+        base = conn.execute(
+            "SELECT id FROM outline_plan_revisions WHERE id = ? AND sealed_at IS NOT NULL",
+            (plan.parent_plan_revision_id,),
+        ).fetchone()
+        if base is None:
+            return set()
+        base_items = conn.execute(
+            """
+            SELECT item.logical_node_id, item.version_id,
+                   version.digest AS version_digest, item.level,
+                   item.sibling_index, item.parent_logical_node_id
+            FROM outline_plan_revision_items AS item
+            JOIN outline_contract_versions AS version ON version.id = item.version_id
+            WHERE plan_revision_id = ?
+            """,
+            (str(base["id"]),),
+        ).fetchall()
+        current_by_id = {item.logical_node_id: item for item in plan.items}
+        base_by_id = {str(row["logical_node_id"]): row for row in base_items}
+        changed_ids: set[str] = set()
+
+        for logical_node_id, item in current_by_id.items():
+            previous = base_by_id.pop(logical_node_id, None)
+            if previous is None or (
+                item.version_id != str(previous["version_id"])
+                or item.version_digest != str(previous["version_digest"])
+                or item.level.value != str(previous["level"])
+                or item.sibling_index != int(previous["sibling_index"])
+                or (item.parent_logical_node_id or "")
+                != str(previous["parent_logical_node_id"] or "")
+            ):
+                changed_ids.add(logical_node_id)
+
+        changed_ids.update(base_by_id)
+        children_by_parent: dict[str, list[OutlinePlanItem]] = {}
+        for item in plan.items:
+            if item.parent_logical_node_id:
+                children_by_parent.setdefault(item.parent_logical_node_id, []).append(item)
+
+        required: set[str] = set()
+        for logical_node_id in changed_ids:
+            current = current_by_id.get(logical_node_id)
+            if current is None:
+                previous = base_by_id.get(logical_node_id)
+                parent_id = str(previous["parent_logical_node_id"] or "") if previous else ""
+                if parent_id and children_by_parent.get(parent_id):
+                    required.add(parent_id)
+                continue
+            if current.parent_logical_node_id and children_by_parent.get(
+                current.parent_logical_node_id
+            ):
+                required.add(current.parent_logical_node_id)
+            if children_by_parent.get(current.logical_node_id):
+                required.add(current.logical_node_id)
+        return required
+
+    @classmethod
+    def _validate_narrative_review_receipt(
+        cls, conn: sqlite3.Connection, plan: OutlinePlanRevision
+    ) -> None:
+        """Require a current immutable review receipt for changed drafts only."""
+
+        if plan.narrative_review_state is ContinuityReviewState.NOT_REQUIRED:
+            return
+        if plan.narrative_review_state not in {
+            ContinuityReviewState.PASS,
+            ContinuityReviewState.ACKNOWLEDGED,
+        }:
+            raise cls._narrative_confirmation_error(conn, plan)
+        receipt = dict(plan.narrative_review_receipt or {})
+        if not receipt:
+            raise cls._narrative_confirmation_error(conn, plan)
+        if (
+            str(receipt.get("plan_revision_id") or "") != plan.id
+            or str(receipt.get("plan_digest") or "") != plan.digest
+            or str(receipt.get("state") or "") != plan.narrative_review_state.value
+        ):
+            raise cls._narrative_confirmation_error(conn, plan)
+        review_ids = tuple(str(value) for value in receipt.get("review_ids") or ())
+        scope_fingerprints = tuple(
+            str(value) for value in receipt.get("scope_fingerprints") or ()
+        )
+        if not review_ids or not scope_fingerprints:
+            raise cls._narrative_confirmation_error(conn, plan)
+        decisions: list[str] = []
+        review_parent_ids: set[str] = set()
+        for review_id in review_ids:
+            row = conn.execute(
+                """
+                SELECT plan_revision_id, scope_parent_logical_node_id,
+                       scope_fingerprint, state, decision
+                FROM outline_continuity_review_runs WHERE id = ?
+                """,
+                (review_id,),
+            ).fetchone()
+            if row is None or (
+                str(row["plan_revision_id"]) != plan.id
+                or str(row["scope_fingerprint"]) not in scope_fingerprints
+                or str(row["state"]) != "succeeded"
+            ):
+                raise cls._narrative_confirmation_error(conn, plan)
+            decisions.append(str(row["decision"]))
+            review_parent_ids.add(str(row["scope_parent_logical_node_id"]))
+        if not cls._required_narrative_scope_parents(
+            conn, plan
+        ).issubset(review_parent_ids):
+            raise cls._narrative_confirmation_error(conn, plan)
+        if plan.narrative_review_state is ContinuityReviewState.PASS and any(
+            decision != "pass" for decision in decisions
+        ):
+            raise cls._narrative_confirmation_error(conn, plan)
+        if plan.narrative_review_state is ContinuityReviewState.ACKNOWLEDGED:
+            cls._validate_narrative_override(
+                conn,
+                plan,
+                receipt,
+                review_ids=review_ids,
+                scope_fingerprints=scope_fingerprints,
+            )
+
+    @staticmethod
+    def _validate_narrative_override(
+        conn: sqlite3.Connection,
+        plan: OutlinePlanRevision,
+        receipt: Mapping[str, Any],
+        *,
+        review_ids: Sequence[str],
+        scope_fingerprints: Sequence[str] | set[str],
+    ) -> None:
+        override_id = str(receipt.get("override_id") or "").strip()
+        if not override_id:
+            raise NarrativeConfirmationRequired(
+                "outline_narrative_confirmation_required"
+            )
+        row = conn.execute(
+            """
+            SELECT novel_id, plan_revision_id, plan_digest, action,
+                   scope_fingerprints_json, review_ids_json
+            FROM outline_continuity_review_overrides
+            WHERE id = ?
+            """,
+            (override_id,),
+        ).fetchone()
+        if row is None:
+            raise NarrativeConfirmationRequired(
+                "outline_narrative_confirmation_required"
+            )
+        try:
+            stored_scopes = tuple(json.loads(row["scope_fingerprints_json"] or "[]"))
+            stored_reviews = tuple(json.loads(row["review_ids_json"] or "[]"))
+        except (TypeError, json.JSONDecodeError):
+            raise NarrativeConfirmationRequired(
+                "outline_narrative_confirmation_required"
+            ) from None
+        expected_scopes = tuple(str(value) for value in scope_fingerprints)
+        expected_reviews = tuple(str(value) for value in review_ids)
+        if (
+            str(row["novel_id"]) != plan.novel_id
+            or str(row["plan_revision_id"]) != plan.id
+            or str(row["plan_digest"]) != plan.digest
+            or str(row["action"]) != "acknowledge_narrative_risk"
+            or tuple(str(value) for value in stored_scopes) != expected_scopes
+            or tuple(str(value) for value in stored_reviews) != expected_reviews
+        ):
+            raise NarrativeConfirmationRequired(
+                "outline_narrative_confirmation_required"
+            )
 
     def seal_plan_revision(self, plan_revision_id: str) -> OutlinePlanRevision:
         conn = self._connection()

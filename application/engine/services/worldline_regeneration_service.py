@@ -1459,6 +1459,14 @@ class WorldlineRegenerationService:
             raise WorldlineRegenerationError(
                 "Manifest Worldline rebase changed before reconciliation was recorded"
             )
+        technical_blockers = repository.technical_blockers_for_plan(
+            plan_id, _connection=conn
+        )
+        if technical_blockers:
+            raise WorldlineRegenerationError(
+                "Manifest Worldline rebase has technical blockers: "
+                + "; ".join(technical_blockers)
+            )
         try:
             return (
                 repository._seal_plan_revision_locked(

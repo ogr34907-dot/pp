@@ -128,13 +128,12 @@ class OutlinePayload:
 
         return asdict(self)
 
-    def sibling_continuity_blockers(self) -> tuple[str, ...]:
-        """Return the minimum handoff facts required after a sibling exists.
+    def sibling_continuity_diagnostics(self) -> tuple[str, ...]:
+        """Return advisory narrative completeness observations.
 
-        Natural-language state cannot be compared mechanically, so the
-        contract requires the fields that let the following unit explicitly
-        carry the story forward.  Range continuity is checked where sibling
-        identity and ordering are available in the repository.
+        These fields help the evidence-based continuity review explain gaps,
+        but their presence and wording cannot be a deterministic publication
+        condition. Structural/range validation lives with the plan cohort.
         """
 
         required = {
@@ -146,6 +145,15 @@ class OutlinePayload:
             "handoff_conditions": self.handoff_conditions,
         }
         return tuple(f"{name}:missing" for name, value in required.items() if not value)
+
+    def sibling_continuity_blockers(self) -> tuple[str, ...]:
+        """Compatibility alias for callers that previously displayed blockers.
+
+        New plan validation must consume :meth:`sibling_continuity_diagnostics`
+        as advisory output rather than treating this method as a hard gate.
+        """
+
+        return self.sibling_continuity_diagnostics()
 
     @property
     def digest(self) -> str:

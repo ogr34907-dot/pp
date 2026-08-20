@@ -15,6 +15,9 @@ const mocks = vi.hoisted(() => ({
   bindNode: vi.fn(),
   getLatestGenerationAttempt: vi.fn(),
   cancelGenerationAttempt: vi.fn(),
+  getContinuityReview: vi.fn(),
+  requestContinuityReview: vi.fn(),
+  applyContinuityReceipt: vi.fn(),
   consumeOutlineDraftStream: vi.fn(),
   messageSuccess: vi.fn(),
 }))
@@ -49,6 +52,9 @@ vi.mock('@/api/generation', () => ({
     bindNode: mocks.bindNode,
     getLatestGenerationAttempt: mocks.getLatestGenerationAttempt,
     cancelGenerationAttempt: mocks.cancelGenerationAttempt,
+    getContinuityReview: mocks.getContinuityReview,
+    requestContinuityReview: mocks.requestContinuityReview,
+    applyContinuityReceipt: mocks.applyContinuityReceipt,
   },
   consumeOutlineDraftStream: mocks.consumeOutlineDraftStream,
 }))
@@ -103,6 +109,10 @@ describe('OutlineStudio request and payload isolation', () => {
     mocks.getLatestGenerationAttempt.mockResolvedValue(null)
     mocks.consumeOutlineDraftStream.mockResolvedValue(undefined)
     mocks.getWorkingTree.mockResolvedValue(null)
+    mocks.getContinuityReview.mockResolvedValue({
+      plan_revision_id: '', plan_digest: '', state: 'not_required', receipt: {},
+      latest: null, current: null, technical_blockers: [],
+    })
   })
 
   it('preserves a rich payload byte-for-byte when the form is saved without edits', async () => {
@@ -507,6 +517,73 @@ describe('OutlineStudio request and payload isolation', () => {
 
     expect(mocks.authorPublishCohort).not.toHaveBeenCalled()
     expect(state.error).toContain('部纲仍在生成中')
+  })
+
+  it('opens continuity confirmation instead of publishing an unacknowledged Working plan', async () => {
+    const working = {
+      ...node('manifest-root', 'contract-root'),
+      node_type: 'outline',
+      logical_node_id: 'logical-root',
+      tree_mode: 'MANIFEST_WORKING',
+      status: 'draft',
+      plan_revision_id: 'plan-1',
+      plan_digest: 'plan-v1',
+      version_digest: 'root-v1',
+      cohort_attempt_id: 'completed-attempt',
+      latest_cohort_attempt: { id: 'completed-attempt', status: 'completed', level: 'part' },
+      payload: { title: '总纲' },
+      children: [],
+    }
+    mocks.getTree.mockResolvedValue(node('root'))
+    mocks.getWorkingTree.mockResolvedValue(working)
+    mocks.getContract.mockResolvedValue(contract('contract-root', { title: '总纲' }))
+    mocks.getContinuityReview.mockResolvedValue({
+      plan_revision_id: 'plan-1', plan_digest: 'plan-v1', state: 'pending', receipt: {},
+      technical_blockers: [],
+      latest: { id: 'review-1', scope_fingerprint: 'scope-1', decision: 'review' },
+      current: { id: 'review-1', scope_fingerprint: 'scope-1', decision: 'review' },
+    })
+
+    const state = await setupStudio()
+    await state.loadTree()
+    await state.selectNode(working)
+    await flushAsyncWork()
+    await state.publishAndSync()
+
+    expect(state.continuityConfirmVisible).toBe(true)
+    expect(mocks.authorPublishCohort).not.toHaveBeenCalled()
+  })
+
+  it('does not let a slow continuity response for A overwrite B', async () => {
+    const root = node('root')
+    const a = { ...node('a', 'contract-a'), logical_node_id: 'logical-a', tree_mode: 'MANIFEST_WORKING', status: 'draft', plan_revision_id: 'plan-a', plan_digest: 'digest-a', version_digest: 'a-v1' }
+    const b = { ...node('b', 'contract-b'), logical_node_id: 'logical-b', tree_mode: 'MANIFEST_WORKING', status: 'draft', plan_revision_id: 'plan-b', plan_digest: 'digest-b', version_digest: 'b-v1' }
+    root.children = [a, b]
+    let resolveA!: (value: Record<string, unknown>) => void
+    const slowA = new Promise<Record<string, unknown>>((resolve) => { resolveA = resolve })
+    mocks.getTree.mockResolvedValue(root)
+    mocks.getWorkingTree.mockResolvedValue(root)
+    mocks.getContract.mockImplementation((id: string) => Promise.resolve(contract(id, { title: id })))
+    mocks.getContinuityReview.mockImplementation((planId: string) =>
+      planId === 'plan-a' ? slowA : Promise.resolve({
+        plan_revision_id: 'plan-b', plan_digest: 'digest-b', state: 'pending', receipt: {},
+        latest: null, current: null, technical_blockers: [],
+      }),
+    )
+
+    const state = await setupStudio()
+    await state.loadTree()
+    const selectingA = state.selectNode(a)
+    await Promise.resolve()
+    await state.selectNode(b)
+    resolveA({
+      plan_revision_id: 'plan-a', plan_digest: 'digest-a', state: 'pass', receipt: {},
+      latest: null, current: null, technical_blockers: [],
+    })
+    await selectingA
+    await flushAsyncWork()
+
+    expect(state.continuityStatus.plan_revision_id).toBe('plan-b')
   })
 
   it('keeps a retry action for a failed Working cohort after re-entering the page', async () => {

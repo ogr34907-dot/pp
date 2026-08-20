@@ -18,6 +18,8 @@ from domain.novel.candidate_chapter import (
     GenerationRunState,
     RunMode,
 )
+from domain.structure.outline_contract import OutlinePayload
+from domain.structure.outline_plan_validation import validate_prose_input_readiness
 
 
 class CandidateGateError(ValueError):
@@ -862,8 +864,6 @@ class ChapterCandidateRepository:
             ):
                 raise CandidateGateError("candidate outline chain differs from the active manifest")
             try:
-                from domain.structure.outline_contract import OutlinePayload
-
                 payload = OutlinePayload.from_dict(
                     json.loads(str(row["payload_json"] or "{}"))
                 )
@@ -871,6 +871,12 @@ class ChapterCandidateRepository:
                 raise CandidateGateError("active manifest outline payload is invalid") from exc
             if payload.digest != str(row["version_digest"] or ""):
                 raise CandidateGateError("active manifest outline payload digest is invalid")
+            if level == "chapter":
+                blockers = validate_prose_input_readiness(payload)
+                if blockers:
+                    raise CandidateGateError(
+                        "candidate prose input is not ready: " + ", ".join(blockers)
+                    )
             expected_entry = {
                 "contract_id": str(row["logical_node_id"]),
                 "logical_node_id": str(row["logical_node_id"]),
@@ -923,6 +929,45 @@ class ChapterCandidateRepository:
         ):
             raise CandidateGateError("candidate chapter is outside the active chapter outline range")
         return generation, plan_id, plan_digest
+
+    def _next_manifest_chapter_prose_input_is_ready(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        novel_id: str,
+        chapter_number: int,
+        plan_revision_id: str,
+    ) -> bool:
+        """Check the next chapter's published Manifest payload before resuming."""
+
+        rows = self._require_manifest_projection_bindings(
+            conn,
+            novel_id=novel_id,
+            plan_revision_id=plan_revision_id,
+        )
+        chapters = [
+            row
+            for row in rows
+            if str(row["level"] or "") == "chapter"
+            and int(row["binding_number"] or 0) == chapter_number
+        ]
+        if len(chapters) == 0:
+            # A macro plan may be published before its next chapter cohort is
+            # expanded. Keep the durable run paused until that cohort exists.
+            return False
+        if len(chapters) != 1:
+            raise CandidateGateError(
+                "active chapter outline does not map to the candidate chapter"
+            )
+        try:
+            payload = OutlinePayload.from_dict(
+                json.loads(str(chapters[0]["payload_json"] or "{}"))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CandidateGateError("active manifest outline payload is invalid") from exc
+        if payload.digest != str(chapters[0]["version_digest"] or ""):
+            raise CandidateGateError("active manifest outline payload digest is invalid")
+        return not validate_prose_input_readiness(payload)
 
     def _assert_plan_pin_current(
         self, conn: sqlite3.Connection, candidate: ChapterCandidate
@@ -3237,6 +3282,13 @@ class ChapterCandidateRepository:
             or run.next_action != "expand_outline_cohort"
         ):
             raise CandidateGateError("generation run changed before outline publication resume")
+        if not self._next_manifest_chapter_prose_input_is_ready(
+            conn,
+            novel_id=novel_id,
+            chapter_number=run.current_formal_chapter + 1,
+            plan_revision_id=str(head["active_plan_revision_id"]),
+        ):
+            return run
         now = self._now()
         updated = conn.execute(
             """

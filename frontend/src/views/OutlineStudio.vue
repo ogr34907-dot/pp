@@ -150,17 +150,32 @@
             <p v-if="selectedParent">{{ selectedParent.title || defaultTitle(selectedParent.node_type) }} · {{ nodeStatusLabel(selectedParent) }}</p>
             <p v-else>总纲是此书唯一的计划根节点。</p>
           </section>
-          <section class="inspector-block">
-            <h3>当前版本</h3>
+           <section class="inspector-block">
+             <h3>当前版本</h3>
             <dl v-if="selectedContract" class="inspector-facts">
               <div><dt>已发布</dt><dd>r{{ selectedContract.active?.revision ?? '—' }}</dd></div>
               <div><dt>草稿</dt><dd>r{{ selectedContract.draft?.revision ?? '—' }}</dd></div>
               <div><dt>作者锁定</dt><dd>{{ selectedContract.author_locked ? '是' : '否' }}</dd></div>
               <div><dt>人工修改</dt><dd>{{ selectedContract.has_author_edits ? '是' : '否' }}</dd></div>
             </dl>
-            <p v-else>父级发布并同步后才允许建立该层。</p>
-          </section>
-          <section class="inspector-block inspector-block--impact">
+             <p v-else>父级发布并同步后才允许建立该层。</p>
+           </section>
+           <section
+             v-if="isWorkingNode(selectedNode) && continuityPlanRevisionId"
+             class="inspector-block inspector-block--continuity"
+           >
+             <OutlineContinuityReviewPanel
+               v-model:reason="continuityReason"
+               :status="continuityStatus"
+               :loading="continuityLoading"
+                :hard-blockers="continuityHardBlockers"
+                :locked-fields="continuityLockedFields"
+               @review="requestContinuityReview"
+               @acknowledge="openContinuityConfirmation"
+                @apply-suggestion="applyContinuitySuggestion"
+             />
+           </section>
+           <section class="inspector-block inspector-block--impact">
             <h3>发布影响</h3>
             <p>未来章节将使用新版本；已经发生的正文事实不会被覆盖。若新计划与历史冲突，请从冲突章节创建世界线重生成。</p>
             <n-button text type="primary" :disabled="!selectedContract" @click="router.push(`/book/${novelId}/worldline`)">
@@ -178,6 +193,30 @@
         <div v-else class="outline-inspector__empty">选择一个节点后，可在此查看父级链、版本和发布影响。</div>
       </aside>
     </div>
+    <n-modal v-model:show="continuityConfirmVisible">
+      <n-card title="确认发布当前规划" closable @close="continuityConfirmVisible = false">
+        <p class="continuity-confirm__copy">当前连续性审查尚未形成发布收据。确认风险后才会切换 Active Manifest。</p>
+        <n-input
+          v-if="continuityNeedsReason"
+          v-model:value="continuityConfirmReason"
+          type="textarea"
+          :rows="4"
+          placeholder="确认冲突或服务不可用风险的原因"
+          aria-label="发布确认原因"
+        />
+        <div class="continuity-confirm__actions">
+          <n-button secondary @click="continuityConfirmVisible = false">取消</n-button>
+          <n-button
+            type="primary"
+            :disabled="continuityNeedsReason && !continuityConfirmReason.trim()"
+            :loading="continuityLoading"
+            @click="confirmContinuityPublish"
+          >
+            确认并发布
+          </n-button>
+        </div>
+      </n-card>
+    </n-modal>
   </main>
 </template>
 
@@ -194,10 +233,12 @@ import {
 } from '@vicons/ionicons5'
 import FieldTextarea from '@/components/outline/OutlineFieldTextarea.vue'
 import StatusPill from '@/components/outline/OutlineStatusPill.vue'
+import OutlineContinuityReviewPanel from '@/components/outline/OutlineContinuityReviewPanel.vue'
 import {
   consumeOutlineDraftStream,
   outlineApi,
   type OutlineContract,
+  type OutlineContinuityStatus,
   type OutlineGenerationAttempt,
   type OutlinePayload,
   type OutlineTreeNode,
@@ -234,9 +275,15 @@ const streamText = ref('')
 const streamAttempt = ref<OutlineGenerationAttempt | null>(null)
 const error = ref('')
 const cohortAttemptId = ref<string | null>(null)
+const continuityStatus = ref<OutlineContinuityStatus | null>(null)
+const continuityLoading = ref(false)
+const continuityReason = ref('')
+const continuityConfirmVisible = ref(false)
+const continuityConfirmReason = ref('')
 let streamController: AbortController | null = null
 let selectionEpoch = 0
 let streamEpoch = 0
+let continuityEpoch = 0
 let payloadSnapshot: OutlinePayload | null = null
 let formSnapshot: FormState | null = null
 
@@ -258,6 +305,35 @@ const flattenedTree = computed<FlattenedNode[]>(() => {
 
 const displayTree = computed(() => workingTree.value || tree.value)
 const canEditSelectedNode = computed(() => Boolean(selectedNode.value && !isManifestActiveNode(selectedNode.value) && !workingTreeLoadFailed.value))
+const continuityPlanRevisionId = computed(() => String(selectedNode.value?.plan_revision_id || ''))
+const continuityParentLogicalNodeId = computed(() => String(selectedNode.value?.logical_node_id || ''))
+const continuityHardBlockers = computed(() => continuityStatus.value?.technical_blockers || [])
+const continuityLockedFields = computed(() => {
+  const payload = selectedNode.value?.payload || {}
+  const extra = payload.extra && typeof payload.extra === 'object' ? payload.extra : {}
+  const provenance = (extra as Record<string, any>)._field_provenance || {}
+  const fieldLocks = (extra as Record<string, any>).field_locks || {}
+  return Object.keys({ ...provenance, ...fieldLocks }).filter(field =>
+    Boolean(provenance?.[field]?.locked || fieldLocks?.[field]),
+  )
+})
+const continuityCurrentRun = computed(() => continuityStatus.value?.current || null)
+const continuityNeedsReason = computed(() => {
+  const decision = String(continuityCurrentRun.value?.decision || '')
+  return !continuityCurrentRun.value || decision === 'conflict' || decision === 'unavailable'
+})
+const continuityReceiptCurrent = computed(() => {
+  const node = selectedNode.value
+  const status = continuityStatus.value
+  const receipt = status?.receipt || {}
+  if (status?.state === 'not_required') return true
+  return Boolean(
+    node?.plan_digest
+      && status?.plan_digest === node.plan_digest
+      && (status.state === 'pass' || status.state === 'acknowledged')
+      && receipt.plan_digest === node.plan_digest,
+  )
+})
 
 const nextLevel = computed<CohortLevel | null>(() => {
   const node = selectedNode.value
@@ -477,6 +553,157 @@ const streamStatus = computed(() => {
   return '正在恢复已持久化的草稿流…'
 })
 
+async function loadContinuityStatus(node: OutlineTreeNode | null = selectedNode.value) {
+  const requestEpoch = ++continuityEpoch
+  continuityStatus.value = null
+  continuityReason.value = ''
+  const planRevisionId = String(node?.plan_revision_id || '')
+  const parentLogicalNodeId = String(node?.logical_node_id || '')
+  const planDigest = String(node?.plan_digest || '')
+  if (!node || !isWorkingNode(node) || !planRevisionId || !parentLogicalNodeId) return
+  continuityLoading.value = true
+  try {
+    const status = await outlineApi.getContinuityReview(planRevisionId, parentLogicalNodeId)
+    if (requestEpoch === continuityEpoch && selectedNode.value
+      && nodeKey(selectedNode.value) === nodeKey(node)
+      && String(selectedNode.value.plan_digest || '') === planDigest) {
+      continuityStatus.value = status
+    }
+  } catch (cause) {
+    if (requestEpoch === continuityEpoch && selectedNode.value
+      && nodeKey(selectedNode.value) === nodeKey(node)
+      && String(selectedNode.value.plan_digest || '') === planDigest) {
+      error.value = cause instanceof Error ? cause.message : '读取连续性审查状态失败'
+    }
+  } finally {
+    if (requestEpoch === continuityEpoch) continuityLoading.value = false
+  }
+}
+
+async function requestContinuityReview() {
+  const node = selectedNode.value
+  const planRevisionId = String(node?.plan_revision_id || '')
+  const parentLogicalNodeId = String(node?.logical_node_id || '')
+  const expectedPlanDigest = String(node?.plan_digest || '')
+  if (!node || !isWorkingNode(node) || !planRevisionId || !parentLogicalNodeId || !expectedPlanDigest) return
+  const requestEpoch = ++continuityEpoch
+  const selection = selectionEpoch
+  const selectedKey = nodeKey(node)
+  continuityLoading.value = true
+  error.value = ''
+  try {
+    const status = await outlineApi.requestContinuityReview(planRevisionId, {
+      parent_logical_node_id: parentLogicalNodeId,
+      expected_plan_digest: expectedPlanDigest,
+    })
+    if (requestEpoch === continuityEpoch && selection === selectionEpoch
+      && selectedNode.value && nodeKey(selectedNode.value) === selectedKey
+      && status.plan_digest === expectedPlanDigest) {
+      continuityStatus.value = status
+    }
+  } catch (cause) {
+    if (requestEpoch === continuityEpoch && selection === selectionEpoch) {
+      error.value = cause instanceof Error ? cause.message : '连续性审查失败'
+    }
+  } finally {
+    if (requestEpoch === continuityEpoch) continuityLoading.value = false
+  }
+}
+
+async function acknowledgeContinuityReview(payload: { reason: string }) {
+  const node = selectedNode.value
+  const status = continuityStatus.value
+  const planRevisionId = String(node?.plan_revision_id || '')
+  const expectedPlanDigest = String(node?.plan_digest || '')
+  const run = status?.current
+  const requestEpoch = ++continuityEpoch
+  const selection = selectionEpoch
+  const selectedKey = node ? nodeKey(node) : ''
+  if (!node || !isWorkingNode(node) || !planRevisionId || !expectedPlanDigest || !run
+    || status?.plan_digest !== expectedPlanDigest) return false
+  continuityLoading.value = true
+  error.value = ''
+  try {
+    const updated = await outlineApi.applyContinuityReceipt(planRevisionId, {
+      expected_plan_digest: expectedPlanDigest,
+      state: run.decision === 'pass' ? 'pass' : 'acknowledged',
+      review_ids: [run.id],
+      scope_fingerprints: [run.scope_fingerprint],
+      actor: 'author',
+      reason: payload.reason,
+      idempotency_key: idempotencyKey('outline-continuity'),
+    })
+    if (requestEpoch !== continuityEpoch || selection !== selectionEpoch
+      || !selectedNode.value || nodeKey(selectedNode.value) !== selectedKey
+      || updated.plan_digest !== expectedPlanDigest) return false
+    continuityStatus.value = updated
+    continuityReason.value = ''
+    message.success('连续性审查收据已记录。')
+    return true
+  } catch (cause) {
+    if (requestEpoch === continuityEpoch && selection === selectionEpoch) {
+      error.value = cause instanceof Error ? cause.message : '记录连续性审查收据失败'
+    }
+    return false
+  } finally {
+    continuityLoading.value = false
+  }
+}
+
+function openContinuityConfirmation(payload: { reason: string }) {
+  if (!continuityCurrentRun.value || continuityHardBlockers.value.length) return
+  continuityConfirmReason.value = payload.reason
+  continuityConfirmVisible.value = true
+}
+
+async function applyContinuitySuggestion(payload: { suggestionId: string }) {
+  const node = selectedNode.value
+  const run = continuityCurrentRun.value
+  if (!node || !run || !isWorkingNode(node) || continuityHardBlockers.value.length) return
+  const requestEpoch = ++continuityEpoch
+  const selection = selectionEpoch
+  const selectedKey = nodeKey(node)
+  continuityLoading.value = true
+  error.value = ''
+  try {
+    const result = await outlineApi.applyContinuitySuggestion(run.id, payload.suggestionId, {
+      logical_node_id: String(node.logical_node_id || ''),
+      expected_plan_digest: String(node.plan_digest || ''),
+      expected_version_digest: String(node.version_digest || ''),
+      scope_fingerprint: run.scope_fingerprint,
+    })
+    if (requestEpoch !== continuityEpoch || selection !== selectionEpoch
+      || !selectedNode.value || nodeKey(selectedNode.value) !== selectedKey
+      || result.logical_node_id !== node.logical_node_id) return
+    await loadTree()
+    if (selection === selectionEpoch) message.success('连续性建议已应用到 Working 草稿。')
+  } catch (cause) {
+    if (requestEpoch === continuityEpoch && selection === selectionEpoch) {
+      error.value = cause instanceof Error ? cause.message : '应用连续性建议失败'
+    }
+  } finally {
+    if (requestEpoch === continuityEpoch) continuityLoading.value = false
+  }
+}
+
+async function confirmContinuityPublish() {
+  if (continuityHardBlockers.value.length) {
+    error.value = `技术硬门未通过：${continuityHardBlockers.value.join('；')}`
+    return
+  }
+  await publishAndSync({
+    expected_plan_digest: String(selectedNode.value?.plan_digest || ""),
+    confirm_narrative_risk: true,
+    override_reason: continuityConfirmReason.value.trim(),
+    review_ids: continuityCurrentRun.value ? [continuityCurrentRun.value.id] : [],
+    scope_fingerprints: continuityCurrentRun.value
+      ? [continuityCurrentRun.value.scope_fingerprint]
+      : [],
+    actor: "author",
+    idempotency_key: idempotencyKey("outline-continuity-publish"),
+  })
+}
+
 async function loadTree() {
   if (!novelId.value) return
   loading.value = true
@@ -519,7 +746,10 @@ async function selectNode(node: OutlineTreeNode) {
   cohortLoading.value = false
   cohortAttemptId.value = node.cohort_attempt_id || node.latest_cohort_attempt?.id || null
   error.value = ''
+  continuityConfirmVisible.value = false
+  continuityConfirmReason.value = ''
   payloadToForm(null)
+  void loadContinuityStatus(node)
   const contractId = node.outline_contract?.contract_id
   if (!contractId) return
   let contract: OutlineContract
@@ -610,7 +840,15 @@ async function saveDraft() {
   }
 }
 
-async function publishAndSync() {
+async function publishAndSync(continuityConfirmation?: {
+  expected_plan_digest: string
+  confirm_narrative_risk: boolean
+  override_reason?: string
+  review_ids: string[]
+  scope_fingerprints: string[]
+  actor?: string
+  idempotency_key?: string
+}) {
   if (!ensureWorkingTreeReadable() || !canEditSelectedNode.value) {
     if (!canEditSelectedNode.value && !workingTreeLoadFailed.value) {
       error.value = 'Active Manifest 只读，不能使用 Legacy 发布。'
@@ -633,6 +871,31 @@ async function publishAndSync() {
           throw new Error('部纲仍在生成中，请刷新状态后再发布')
         }
         throw new Error('部纲尚未生成完成，暂不能作者发布规划')
+      }
+      if (continuityHardBlockers.value.length) {
+        throw new Error(`技术硬门未通过：${continuityHardBlockers.value.join('；')}`)
+      }
+      if (!continuityReceiptCurrent.value) {
+        if (continuityConfirmation) {
+          await outlineApi.authorPublishCohort(
+            cohortAttemptId.value,
+            continuityConfirmation,
+          )
+          if (!isCurrentContract(context)) return
+          continuityConfirmVisible.value = false
+          continuityConfirmReason.value = ''
+          workingTree.value = null
+          cohortAttemptId.value = null
+          await loadTree()
+          if (isCurrentContract(context)) message.success('规划已由作者确认并发布。')
+          return
+        }
+        if (!continuityCurrentRun.value) {
+          throw new Error('请先运行当前范围的连续性审查')
+        }
+        continuityConfirmReason.value = continuityReason.value
+        continuityConfirmVisible.value = true
+        return
       }
       await outlineApi.authorPublishCohort(cohortAttemptId.value)
       if (!isCurrentContract(context)) return

@@ -1,0 +1,25 @@
+name: Outline continuity review
+category: review
+source: application/blueprint/services/outline_continuity_review_service.py
+description: Evidence-based semantic review of one direct-child outline cohort
+builtin: true
+output_format: json
+tags:
+- outline
+- continuity
+- review
+variables:
+- name: review_context
+  desc: Structured outline and bounded Canonical/Bible evidence
+  type: string
+  required: true
+- name: evidence_refs
+  desc: Exact fragment ids allowed as evidence
+  type: string
+  required: true
+- name: ruleset_version
+  desc: Server-owned normalization ruleset version
+  type: string
+  required: true
+id: outline-continuity-review
+sort_order: 18

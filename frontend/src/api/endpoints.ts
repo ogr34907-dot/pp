@@ -112,6 +112,14 @@ export const apiRoutes = {
       apiRootPath('outline', 'contracts', contractId, 'generation-attempts', attemptId, 'cancel'),
     chapterContext: (novelId: string, chapterNodeId: string) =>
       apiRootPath('outline', 'novels', novelId, 'chapters', chapterNodeId, 'published-context'),
+    continuityReview: (planRevisionId: string, parentLogicalNodeId?: string) =>
+      withQuery(apiRootPath('outline', 'plan-revisions', planRevisionId, 'continuity-review'), {
+        parent_logical_node_id: parentLogicalNodeId,
+      }),
+    continuityReviewApply: (planRevisionId: string) =>
+      apiRootPath('outline', 'plan-revisions', planRevisionId, 'continuity-review', 'acknowledge'),
+    continuitySuggestionApply: (reviewId: string, suggestionId: string) =>
+      apiRootPath('outline', 'continuity-reviews', reviewId, 'suggestions', suggestionId, 'apply'),
   },
   worldlineRegeneration: {
     preview: (novelId: string) => apiRootPath('worldline-regeneration', 'novels', novelId, 'preview'),

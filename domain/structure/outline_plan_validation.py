@@ -12,6 +12,7 @@ from domain.structure.outline_plan import OutlinePlanItem
 @dataclass(frozen=True)
 class CohortValidationResult:
     blockers: tuple[str, ...] = ()
+    diagnostics: tuple[str, ...] = ()
 
     @property
     def valid(self) -> bool:
@@ -99,6 +100,20 @@ def merge_author_locked_payload(
     return OutlinePayload.from_dict(authored_values), tuple(conflicts)
 
 
+def validate_prose_input_readiness(payload: OutlinePayload) -> tuple[str, ...]:
+    """Return deterministic blockers when a chapter lacks usable prose inputs."""
+
+    required_events = tuple(
+        event.strip()
+        for event in payload.required_events
+        if isinstance(event, str) and event.strip()
+    )
+    creative_goal = payload.creative_goal.strip() if isinstance(payload.creative_goal, str) else ""
+    if required_events or creative_goal:
+        return ()
+    return ("prose_input:missing_required_events_or_creative_goal",)
+
+
 def validate_sibling_cohort(
     *,
     level: OutlineLevel,
@@ -108,6 +123,7 @@ def validate_sibling_cohort(
     """Validate the hard continuity rules that prose review cannot replace."""
 
     blockers: list[str] = []
+    diagnostics: list[str] = []
     if not siblings:
         return CohortValidationResult(("cohort:empty",))
 
@@ -115,7 +131,10 @@ def validate_sibling_cohort(
     expected_end = parent_payload.chapter_end
     previous: OutlinePayload | None = None
     for index, payload in enumerate(siblings):
-        blockers.extend(f"sibling:{index}:{blocker}" for blocker in payload.sibling_continuity_blockers())
+        diagnostics.extend(
+            f"sibling:{index}:{diagnostic}"
+            for diagnostic in payload.sibling_continuity_diagnostics()
+        )
         if expected_start is not None and payload.chapter_start is None:
             blockers.append(f"chapter_range:{index}:start_missing")
         if expected_end is not None and payload.chapter_end is None:
@@ -140,9 +159,9 @@ def validate_sibling_cohort(
                         )
         if previous is None:
             if parent_payload.entry_state and payload.entry_state != parent_payload.entry_state:
-                blockers.append("handoff:first_entry_state_mismatch")
+                diagnostics.append("handoff:first_entry_state_mismatch")
         elif payload.entry_state != previous.exit_state:
-            blockers.append(f"handoff:{index}:entry_state_mismatch")
+            diagnostics.append(f"handoff:{index}:entry_state_mismatch")
         previous = payload
 
     last = siblings[-1]
@@ -151,5 +170,5 @@ def validate_sibling_cohort(
             f"chapter_range:last_end_mismatch:expected={expected_end}:actual={last.chapter_end}"
         )
     if parent_payload.exit_state and last.exit_state != parent_payload.exit_state:
-        blockers.append("handoff:last_exit_state_mismatch")
-    return CohortValidationResult(tuple(blockers))
+        diagnostics.append("handoff:last_exit_state_mismatch")
+    return CohortValidationResult(tuple(blockers), tuple(diagnostics))

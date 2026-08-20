@@ -58,6 +58,7 @@ def register_api_routes(app: FastAPI) -> None:
         beat_sheet_routes,
         continuous_planning_routes,
         outline_routes,
+        outline_review_routes,
         story_structure,
     )
     from interfaces.api.v1.blueprint.confluence_routes import router as confluence_router
@@ -117,6 +118,7 @@ def register_api_routes(app: FastAPI) -> None:
             RouterRegistration(worldbuilding_routes.router, API_V1_PREFIX),
             RouterRegistration(continuous_planning_routes.router, API_V1_PREFIX),
             RouterRegistration(outline_routes.router, API_V1_PREFIX),
+            RouterRegistration(outline_review_routes.router, API_V1_PREFIX),
             RouterRegistration(beat_sheet_routes.router, API_V1_PREFIX),
             RouterRegistration(story_structure.router, API_V1_PREFIX),
             RouterRegistration(confluence_router, API_V1_PREFIX),

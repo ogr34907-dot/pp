@@ -6,10 +6,14 @@ import json
 from typing import Any, Protocol, Sequence
 
 from application.blueprint.services.outline_contract_service import OutlineContractService
+from application.blueprint.services.outline_continuity_review_service import (
+    OutlineContinuityReviewService,
+)
 from application.blueprint.services.manifest_planning_service import ManifestPlanningService
 from domain.ai.services.llm_service import GenerationConfig
 from domain.ai.value_objects.prompt import Prompt
 from domain.structure.outline_contract import OutlineLevel, OutlinePayload
+from domain.structure.outline_continuity import ContinuityReviewState
 from domain.structure.outline_plan import (
     PlanReconciliationReport,
     PlanReconciliationStatus,
@@ -25,8 +29,12 @@ from infrastructure.persistence.database.chapter_candidate_repository import (
     CandidateGateError,
 )
 from infrastructure.persistence.database.outline_contract_repository import (
+    NarrativeConfirmationRequired,
     OutlineContractRepository,
     OutlineGateError,
+)
+from infrastructure.persistence.database.outline_continuity_review_repository import (
+    OutlineContinuityReviewRepository,
 )
 from infrastructure.persistence.database.plan_projection_writer import PlanProjectionWriter
 
@@ -204,7 +212,12 @@ class OutlineCohortGenerationService:
             self.repository.fail_manifest_cohort_attempt(attempt["id"], str(exc))
             raise
 
-    async def publish_completed_cohort(self, *, attempt_id: str) -> dict[str, Any]:
+    async def publish_completed_cohort(
+        self,
+        *,
+        attempt_id: str,
+        narrative_confirmation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Publish one completed draft cohort without invoking the LLM again."""
 
         conn = self.db.get_connection()
@@ -321,6 +334,10 @@ class OutlineCohortGenerationService:
                 raise OutlineCohortGenerationError(
                     "cohort publication requires an aligned formal boundary"
                 )
+            self._assert_technical_plan_ready(plan.id, conn)
+            plan = self._record_narrative_confirmation_locked(
+                conn, plan, narrative_confirmation, allow_acknowledged=False
+            )
             report_payload = {
                 "plan_revision_id": plan.id,
                 "status": report.status.value,
@@ -405,7 +422,12 @@ class OutlineCohortGenerationService:
                 conn.rollback()
             raise
 
-    async def publish_author_planning_cohort(self, *, attempt_id: str) -> dict[str, Any]:
+    async def publish_author_planning_cohort(
+        self,
+        *,
+        attempt_id: str,
+        narrative_confirmation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Publish a completed author cohort without touching Generation Run state."""
 
         conn = self.db.get_connection()
@@ -519,6 +541,10 @@ class OutlineCohortGenerationService:
                 raise OutlineCohortGenerationError(
                     "author cohort publication requires an aligned formal boundary"
                 )
+            self._assert_technical_plan_ready(plan.id, conn)
+            plan = self._record_narrative_confirmation_locked(
+                conn, plan, narrative_confirmation, allow_acknowledged=True
+            )
             report_payload = {
                 "plan_revision_id": plan.id,
                 "status": report.status.value,
@@ -583,6 +609,181 @@ class OutlineCohortGenerationService:
             if conn.in_transaction:
                 conn.rollback()
             raise
+
+    def _assert_technical_plan_ready(self, plan_revision_id: str, connection: Any) -> None:
+        blockers = self.repository.technical_blockers_for_plan(
+            plan_revision_id, _connection=connection
+        )
+        if blockers:
+            raise OutlineCohortGenerationError(
+                "cohort publication has technical blockers: " + "; ".join(blockers)
+            )
+
+    def _record_narrative_confirmation_locked(
+        self,
+        conn: Any,
+        plan: Any,
+        confirmation: dict[str, Any] | None,
+        *,
+        allow_acknowledged: bool,
+    ) -> Any:
+        """Write a current review receipt inside the publication transaction."""
+
+        if confirmation is None:
+            self._validate_existing_narrative_receipt_current(plan)
+            return plan
+        expected_digest = str(confirmation.get("expected_plan_digest") or "")
+        if expected_digest != plan.digest:
+            raise OutlineGateError(
+                "outline plan digest changed before narrative confirmation"
+            )
+        review_ids = tuple(
+            str(value) for value in confirmation.get("review_ids") or () if str(value)
+        )
+        scope_fingerprints = tuple(
+            str(value)
+            for value in confirmation.get("scope_fingerprints") or ()
+            if str(value)
+        )
+        reviews = OutlineContinuityReviewRepository(self.db)
+        try:
+            runs = tuple(
+                reviews.get_in_transaction(conn, review_id) for review_id in review_ids
+            )
+        except KeyError as exc:
+            raise NarrativeConfirmationRequired(
+                plan_digest=plan.digest,
+                reason_required=True,
+            ) from exc
+        self._validate_current_review_evidence(plan, review_ids, scope_fingerprints)
+        decisions = tuple(str(run.get("decision") or "") for run in runs)
+        if not review_ids or not scope_fingerprints:
+            raise NarrativeConfirmationRequired(
+                plan_digest=plan.digest,
+                decisions=decisions,
+                reviews=runs,
+                reason_required=True,
+            )
+        all_pass = bool(decisions) and all(decision == "pass" for decision in decisions)
+        state = (
+            ContinuityReviewState.PASS
+            if all_pass
+            else ContinuityReviewState.ACKNOWLEDGED
+        )
+        reason = str(confirmation.get("override_reason") or "").strip()
+        requires_reason = any(
+            decision in {"conflict", "unavailable"} for decision in decisions
+        )
+        if state is ContinuityReviewState.ACKNOWLEDGED:
+            if not allow_acknowledged:
+                raise NarrativeConfirmationRequired(
+                    plan_digest=plan.digest,
+                    decisions=decisions,
+                    reviews=runs,
+                    reason_required=requires_reason,
+                )
+            if not bool(confirmation.get("confirm_narrative_risk")):
+                raise NarrativeConfirmationRequired(
+                    plan_digest=plan.digest,
+                    decisions=decisions,
+                    reviews=runs,
+                    reason_required=requires_reason,
+                )
+            if requires_reason and not reason:
+                raise NarrativeConfirmationRequired(
+                    plan_digest=plan.digest,
+                    decisions=decisions,
+                    reviews=runs,
+                    reason_required=True,
+                )
+            override = reviews.acknowledge_in_transaction(
+                conn,
+                novel_id=plan.novel_id,
+                plan_revision_id=plan.id,
+                plan_digest=plan.digest,
+                action="acknowledge_narrative_risk",
+                idempotency_key=str(confirmation.get("idempotency_key") or ""),
+                actor=str(confirmation.get("actor") or "author"),
+                reason=reason,
+                require_reason=requires_reason,
+                scope_fingerprints=scope_fingerprints,
+                review_ids=review_ids,
+            )
+            receipt = {
+                "action": state.value,
+                "actor": str(confirmation.get("actor") or "author"),
+                "reason": reason,
+                "override_id": str(override["id"]),
+            }
+        else:
+            receipt = {
+                "action": state.value,
+                "actor": str(confirmation.get("actor") or "author"),
+            }
+        return self.repository.set_narrative_review_receipt(
+            plan_revision_id=plan.id,
+            expected_plan_digest=plan.digest,
+            state=state,
+            receipt=receipt,
+            review_ids=review_ids,
+            scope_fingerprints=scope_fingerprints,
+            _connection=conn,
+        )
+
+    def _validate_existing_narrative_receipt_current(self, plan: Any) -> None:
+        if plan.narrative_review_state is ContinuityReviewState.NOT_REQUIRED:
+            return
+        receipt = dict(plan.narrative_review_receipt or {})
+        self._validate_current_review_evidence(
+            plan,
+            tuple(str(value) for value in receipt.get("review_ids") or ()),
+            tuple(
+                str(value) for value in receipt.get("scope_fingerprints") or ()
+            ),
+        )
+
+    def _validate_current_review_evidence(
+        self,
+        plan: Any,
+        review_ids: Sequence[str],
+        scope_fingerprints: Sequence[str],
+    ) -> None:
+        review_service = OutlineContinuityReviewService(
+            self.repository,
+            OutlineContinuityReviewRepository(self.db),
+            self.llm_service,
+            self.db,
+        )
+        required_current = review_service.required_current_reports(
+            plan.id, plan.digest
+        )
+        if not required_current:
+            return
+        current_reports = tuple(
+            report for report in required_current.values() if report is not None
+        )
+        if (
+            len(current_reports) != len(required_current)
+            or any(
+                str(report["id"]) not in review_ids
+                or str(report["scope_fingerprint"]) not in scope_fingerprints
+                for report in current_reports
+            )
+        ):
+            raise NarrativeConfirmationRequired(
+                plan_digest=plan.digest,
+                decisions=tuple(
+                    str(report.get("decision") or "")
+                    for report in current_reports
+                ),
+                reviews=current_reports,
+                reason_required=any(
+                    report is None
+                    or str(report.get("decision") or "")
+                    in {"conflict", "unavailable"}
+                    for report in required_current.values()
+                ),
+            )
 
     @staticmethod
     def _stored_publication_receipt(
@@ -805,11 +1006,12 @@ class OutlineCohortGenerationService:
         )
         boundary_contract = json.dumps(
             {
-                "parent_entry_state_exact": parent_payload.entry_state,
-                "parent_exit_state_exact": parent_payload.exit_state,
-                "first_child_entry_state_exact": parent_payload.entry_state,
-                "last_child_exit_state_exact": parent_payload.exit_state,
-                "between_siblings": "child[i].entry_state must exactly equal child[i-1].exit_state",
+                "parent_entry_state": parent_payload.entry_state,
+                "parent_exit_state": parent_payload.exit_state,
+                "narrative_handoff_guidance": (
+                    "Preserve the parent and sibling narrative handoff meaning. "
+                    "Semantically equivalent entry_state and exit_state wording is allowed."
+                ),
                 "parent_chapter_start_exact": parent_payload.chapter_start,
                 "parent_chapter_end_exact": parent_payload.chapter_end,
                 "first_child_chapter_start_exact": parent_payload.chapter_start,
@@ -841,11 +1043,11 @@ class OutlineCohortGenerationService:
                 f"小说：{novel['title']}\n创意：{novel['premise'] or ''}\n"
                 f"现在整体生成：{label}\n"
                 f"规划上下文：{encoded_context}\n"
-                f"连续性硬约束（以下边界值必须逐字复制，不得同义改写）：{boundary_contract}\n"
+                f"连续性约束：{boundary_contract}\n"
                 "每项必须包含 title、narrative_text、creative_goal、entry_state、"
                 "exit_state、conflicts、state_changes、handoff_conditions、"
-                "chapter_start、chapter_end。第一项 entry_state 必须逐字等于父级 entry_state；"
-                "每个后续 entry_state 必须逐字等于前一项 exit_state；最后一项 exit_state 必须逐字等于父级 exit_state。"
+                "chapter_start、chapter_end。entry_state 和 exit_state 应保持父子及同级交接的叙事语义，"
+                "允许使用同义的措辞，不要求逐字复用。"
                 "chapter_start/chapter_end 必须严格、连续、无重叠、无缺口地覆盖上方 JSON 中父级的精确章节范围："
                 "第一项 chapter_start 必须等于 first_child_chapter_start_exact，最后一项 chapter_end 必须等于 "
                 "last_child_chapter_end_exact，任何子项不得超出 parent_chapter_start_exact 到 parent_chapter_end_exact。"
